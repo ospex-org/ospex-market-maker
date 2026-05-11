@@ -26,7 +26,11 @@
     "mm": "node dist/cli/index.js",
     "prepack": "yarn build"
   },
+  "dependencies": {
+    "js-yaml": "^4.1.0"
+  },
   "devDependencies": {
+    "@types/js-yaml": "^4.0.9",
     "@types/node": "^22.10.0",
     "eslint": "^9.17.0",
     "tsx": "^4.19.2",

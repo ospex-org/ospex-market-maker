@@ -20,15 +20,18 @@ It is built on **[`@ospex/sdk`](https://github.com/ospex-org/ospex-sdk)** — ev
 
 What works:
 
-- `yarn install && yarn build && yarn typecheck && yarn lint && yarn test` — clean (the pricing module's unit tests pass).
+- `yarn install && yarn build && yarn typecheck && yarn lint && yarn test` — clean (unit tests pass across the pricing, config, risk, state, and telemetry modules).
 - `yarn mm --help` — prints the command list. (`yarn dev --help` does the same via `tsx` without a build; `yarn build && yarn link`, then `ospex-mm --help`, puts the binary on your PATH.)
-- The **pricing module** (`src/pricing/` — vig stripping, the economics/direct spread modes with their refusal paths, odds-tick conversion + bounds, sizing) — implemented and unit-tested. Not wired to a command yet.
+- The **pricing module** (`src/pricing/` — vig stripping, the economics/direct spread modes with their refusal paths, odds-tick conversion + bounds, sizing). Pure functions, unit-tested.
+- The **config loader** (`src/config/` — `loadConfig` / `parseConfig`: parse the YAML, validate with strict unknown-key rejection, apply the `OSPEX_*` env overrides, default almost everything to `ospex-mm.example.yaml`'s values).
+- The **risk engine** (`src/risk/` — worst-case-loss-by-outcome exposure accounting over positions + visible + latent commitments; the per-commitment / contest / team / sport / bankroll caps; the headroom and verdict functions; the `PositionModule` aggregate-allowance target). Pure functions, unit-tested.
+- The **state-store and telemetry skeletons** (`src/state/` — the persisted-inventory shape, atomic JSON writes, the boot-time state-loss fail-safe; `src/telemetry/` — the NDJSON event-log writer and the `kind` vocabulary). Not wired to a command yet.
 - The design (`docs/DESIGN.md`), the annotated config (`ospex-mm.example.yaml`), and the safety checklist (`docs/OPERATOR_SAFETY.md`).
 
 What's **not** implemented yet (Phase 1+ — see `docs/DESIGN.md §14`):
 
 - `doctor`, `quote`, `run`, `cancel-stale`, `status`, `summary` — these currently exit with `not yet implemented`.
-- the config loader, the risk engine, the `@ospex/sdk` adapter, the state store, telemetry, the event loop.
+- the `@ospex/sdk` adapter (`src/ospex/`), the order lifecycle (`src/orders/`), the event loop (`src/runners/`), and wiring the modules above into the commands.
 
 So: don't run this against real funds, and read the "intended flow" below as the target shape, not as something that works today.
 

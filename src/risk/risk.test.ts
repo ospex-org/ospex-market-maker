@@ -158,3 +158,36 @@ describe('requiredPositionModuleAllowanceUSDC', () => {
     expect(requiredPositionModuleAllowanceUSDC(caps({ maxOpenCommitments: 4, maxRiskPerCommitmentUSDC: 10, bankrollUSDC: 50, maxBankrollUtilizationPct: 0.5 }))).toBe(25);
   });
 });
+
+describe('runtime guards (the money-risk boundary — malformed input throws, never fails open)', () => {
+  it('rejects NaN / negative / non-finite riskAmountUSDC', () => {
+    const bad = inventory([item({ contestId: 'C1', makerSide: 'away', riskAmountUSDC: Number.NaN })]);
+    expect(() => worstCaseByOutcome(bad.items, 'C1')).toThrow(/finite, non-negative/);
+    expect(() => totalWorstCaseUSDC(bad.items)).toThrow(/finite, non-negative/);
+    expect(() => teamExposureUSDC(bad.items, 'AWAY')).toThrow(/finite, non-negative/);
+    expect(() => headroomForSide(bad, market({ contestId: 'C1' }), 'away', caps())).toThrow(/finite, non-negative/);
+    expect(() => verdictForMarket(bad, market({ contestId: 'C1' }), caps())).toThrow(/finite, non-negative/);
+    const neg = inventory([item({ contestId: 'C1', makerSide: 'away', riskAmountUSDC: -5 })]);
+    expect(() => verdictForMarket(neg, market({ contestId: 'C1' }), caps())).toThrow(/finite, non-negative/);
+    const inf = inventory([item({ contestId: 'C1', makerSide: 'away', riskAmountUSDC: Number.POSITIVE_INFINITY })]);
+    expect(() => verdictForMarket(inf, market({ contestId: 'C1' }), caps())).toThrow(/finite, non-negative/);
+  });
+
+  it('rejects an invalid open-commitment count', () => {
+    expect(() => verdictForMarket(inventory([], Number.NaN), market(), caps())).toThrow(/openCommitmentCount.*non-negative integer/);
+    expect(() => verdictForMarket(inventory([], 1.5), market(), caps())).toThrow(/openCommitmentCount.*non-negative integer/);
+    expect(() => verdictForMarket(inventory([], -1), market(), caps())).toThrow(/openCommitmentCount.*non-negative integer/);
+  });
+
+  it('rejects invalid caps', () => {
+    expect(() => requiredPositionModuleAllowanceUSDC(caps({ bankrollUSDC: Number.NaN }))).toThrow(/bankrollUSDC.*finite, non-negative/);
+    expect(() => requiredPositionModuleAllowanceUSDC(caps({ maxBankrollUtilizationPct: 1.5 }))).toThrow(/maxBankrollUtilizationPct must be in/);
+    expect(() => requiredPositionModuleAllowanceUSDC(caps({ maxBankrollUtilizationPct: 0 }))).toThrow(/maxBankrollUtilizationPct must be in/);
+    expect(() => requiredPositionModuleAllowanceUSDC(caps({ maxOpenCommitments: 10.5 }))).toThrow(/maxOpenCommitments.*non-negative integer/);
+    expect(() => headroomForSide(inventory([]), market(), 'away', caps({ maxRiskPerContestUSDC: Number.NaN }))).toThrow(/maxRiskPerContestUSDC.*finite, non-negative/);
+  });
+
+  it('rejects an invalid makerSide (defends against JS consumers)', () => {
+    expect(() => headroomForSide(inventory([]), market(), 'sideways' as unknown as 'away', caps())).toThrow(/makerSide must be/);
+  });
+});

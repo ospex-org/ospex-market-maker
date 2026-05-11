@@ -11,12 +11,20 @@
   "bin": {
     "ospex-mm": "./dist/cli/index.js"
   },
+  "files": [
+    "dist",
+    "ospex-mm.example.yaml",
+    "docs"
+  ],
   "scripts": {
     "build": "tsc",
+    "postbuild": "node scripts/chmod-bin.mjs",
     "typecheck": "tsc --noEmit",
     "test": "vitest run --passWithNoTests",
     "lint": "eslint src",
-    "dev": "tsx src/cli/index.ts"
+    "dev": "tsx src/cli/index.ts",
+    "mm": "node dist/cli/index.js",
+    "prepack": "yarn build"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",

@@ -16,6 +16,23 @@ It is built on **[`@ospex/sdk`](https://github.com/ospex-org/ospex-sdk)** — ev
 
 ---
 
+## Current scaffold status
+
+What works in this commit:
+
+- `yarn install && yarn build && yarn typecheck && yarn lint && yarn test` — clean (no tests yet; `vitest` runs with `--passWithNoTests`, which goes away once Phase 1 lands tests).
+- `yarn mm --help` — prints the command list. (`yarn dev --help` does the same via `tsx` without a build; `yarn build && yarn link`, then `ospex-mm --help`, puts the binary on your PATH.)
+- The design (`docs/DESIGN.md`), the annotated config (`ospex-mm.example.yaml`), and the safety checklist (`docs/OPERATOR_SAFETY.md`).
+
+What's **not** implemented yet (Phase 1+ — see `docs/DESIGN.md §14`):
+
+- `doctor`, `quote`, `run`, `cancel-stale`, `status`, `summary` — these currently exit with `not yet implemented`.
+- the config loader, the pricing model, the risk engine, the `@ospex/sdk` adapter, the state store, telemetry, the event loop.
+
+So: don't run this against real funds, and read the "intended flow" below as the target shape, not as something that works today.
+
+---
+
 ## What this is
 
 - A clone-configure-run **market maker template** for Ospex. The minimum that lets an agent safely **quote, update, cancel, get filled, settle, claim, and produce metrics** — with strict bankroll controls and a clear safety model.
@@ -49,12 +66,14 @@ yarn build
 cp ospex-mm.example.yaml ospex-mm.yaml
 # edit ospex-mm.yaml — wallet.keystorePath, rpcUrl, pricing.economics (capital + target return), risk caps
 
-ospex-mm doctor                       # readiness: balances (USDC + POL), PositionModule allowance, network
-ospex-mm quote --dry-run <contestId>  # one-shot: fetch reference odds, compute a two-sided quote, print the breakdown
-ospex-mm run --dry-run                # shadow mode: the full loop, posts nothing — read the output before going live
+yarn mm doctor                       # readiness: balances (USDC + POL), PositionModule allowance, network
+yarn mm quote --dry-run <contestId>  # one-shot: fetch reference odds, compute a two-sided quote, print the breakdown
+yarn mm run --dry-run                # shadow mode: the full loop, posts nothing — read the output before going live
 # then, deliberately: set mode.dryRun: false in the config AND pass --live (the two-key model)
-ospex-mm run --live
+yarn mm run --live
 ```
+
+`yarn mm <cmd>` runs the built CLI (`node dist/cli/index.js`). `yarn dev <cmd>` runs it via `tsx` without a build, for iteration. To get the `ospex-mm` binary on your PATH: `yarn build && yarn link` (or `npm link`), then `ospex-mm <cmd>`. (Today every command except `--help` exits `not yet implemented` — see *Current scaffold status* above.)
 
 See **[`docs/QUICKSTART.md`](docs/QUICKSTART.md)** for the walkthrough and **[`docs/OPERATOR_SAFETY.md`](docs/OPERATOR_SAFETY.md)** for the safe-operation checklist before you go live.
 

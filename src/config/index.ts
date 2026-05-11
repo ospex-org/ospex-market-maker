@@ -3,10 +3,14 @@
  * annotated reference config is `ospex-mm.example.yaml` at the repo root.
  *
  * Almost everything has a default (matching the example), so a minimal config
- * needs only `rpcUrl` (here or via `OSPEX_RPC_URL`). Whatever the operator does
- * set is validated; an invalid / mistyped field throws a clear `Error` — the CLI
- * catches it and exits 1. v0-specific rejections: `marketSelection.markets` must
- * be `["moneyline"]`; `pricing.quoteBothSides` must be `true`.
+ * needs only `rpcUrl` (here or via `OSPEX_RPC_URL`). Whatever the operator sets
+ * is validated; an invalid / mistyped field — including an unknown / misspelled
+ * key at any level — throws a clear `Error` (the CLI catches it and exits 1).
+ * v0-specific rejections: `marketSelection.markets` must be `["moneyline"]`;
+ * `pricing.quoteBothSides` must be `true`.
+ *
+ * `parseConfig(raw, env)` is deterministic — `env` defaults to `{}` (no overrides).
+ * `loadConfig(path, env)` defaults `env` to `process.env`.
  */
 
 import { readFileSync } from 'node:fs';
@@ -61,11 +65,18 @@ function describe(v: unknown): string {
   if (Array.isArray(v)) return 'array';
   if (typeof v === 'number') return String(v);
   if (typeof v === 'string') return `"${v}"`;
+  if (typeof v === 'object') {
+    const name = (v as { constructor?: { name?: unknown } }).constructor?.name;
+    return typeof name === 'string' && name !== 'Object' && name !== '' ? name : 'object';
+  }
   return typeof v;
 }
 
+/** A plain `{}` object (a YAML mapping) — not `null`, not an array, not a `Date` / `RegExp` / class instance. */
 function isPlainObject(v: unknown): v is Record<string, unknown> {
-  return typeof v === 'object' && v !== null && !Array.isArray(v);
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) return false;
+  const proto: unknown = Object.getPrototypeOf(v);
+  return proto === Object.prototype || proto === null;
 }
 
 function asObject(v: unknown, name: string): Record<string, unknown> {
@@ -192,6 +203,56 @@ function def<T>(value: unknown, fallback: T, validate: (v: unknown) => T): T {
   return value === undefined ? fallback : validate(value);
 }
 
+// Known keys at every object level — anything else is a misspelling / stale field and fails closed.
+const ROOT_KEYS = [
+  'wallet', 'rpcUrl', 'apiUrl', 'chainId', 'marketSelection', 'discovery', 'odds', 'pricing',
+  'risk', 'gas', 'approvals', 'orders', 'settlement', 'telemetry', 'state', 'killSwitchFile',
+  'killCancelOnChain', 'pollIntervalMs', 'mode',
+] as const;
+const WALLET_KEYS = ['keystorePath'] as const;
+const MARKET_SELECTION_KEYS = [
+  'sports', 'markets', 'maxStartsWithinHours', 'maxTrackedContests', 'requireReferenceOdds',
+  'requireOpenSpeculation', 'contestAllowList', 'contestDenyList',
+] as const;
+const DISCOVERY_KEYS = ['everyNTicks', 'jitterPct'] as const;
+const ODDS_KEYS = ['subscribe', 'maxRealtimeChannels'] as const;
+const PRICING_KEYS = ['mode', 'economics', 'direct', 'quoteBothSides', 'minEdgeBps', 'maxPerQuotePctOfCapital'] as const;
+const ECONOMICS_KEYS = [
+  'capitalUSDC', 'targetMonthlyReturnPct', 'daysHorizon', 'estGamesPerDay', 'fillRateAssumption',
+  'capitalTurnoverPerDay', 'maxReasonableSpread',
+] as const;
+const DIRECT_KEYS = ['spreadBps'] as const;
+const RISK_KEYS = [
+  'bankrollUSDC', 'maxBankrollUtilizationPct', 'maxRiskPerCommitmentUSDC', 'maxRiskPerContestUSDC',
+  'maxRiskPerTeamUSDC', 'maxRiskPerSportUSDC', 'maxOpenCommitments', 'maxDailyFeeUSDC',
+] as const;
+const GAS_KEYS = ['maxDailyGasPOL', 'emergencyReservePOL', 'reportInUSDC', 'nativeTokenUSDCPrice'] as const;
+const APPROVALS_KEYS = ['autoApprove', 'mode'] as const;
+const ORDERS_KEYS = [
+  'expiryMode', 'expirySeconds', 'staleAfterSeconds', 'staleReferenceAfterSeconds', 'replaceOnOddsMoveBps', 'cancelMode',
+] as const;
+const SETTLEMENT_KEYS = ['autoSettleOwn', 'autoClaimOwn', 'continueOnGasBudgetExhausted'] as const;
+const TELEMETRY_KEYS = ['logDir', 'logLevel'] as const;
+const STATE_KEYS = ['dir'] as const;
+const MODE_KEYS = ['dryRun'] as const;
+
+function assertKnownKeys(obj: Record<string, unknown>, name: string, allowed: readonly string[]): void {
+  for (const key of Object.keys(obj)) {
+    if (!allowed.includes(key)) {
+      fail(`${name}.${key}`, 'is not a known config field — see ospex-mm.example.yaml / DESIGN §7 for the schema');
+    }
+  }
+}
+
+/** Read a sub-section: `undefined` → `{}`; else must be a plain object with only known keys. */
+function section(parent: Record<string, unknown>, key: string, allowed: readonly string[]): Record<string, unknown> {
+  const v = parent[key];
+  if (v === undefined) return {};
+  const obj = asObject(v, key);
+  assertKnownKeys(obj, key, allowed);
+  return obj;
+}
+
 function applyEnvOverrides(root: Record<string, unknown>, env: EnvLike): Record<string, unknown> {
   const merged: Record<string, unknown> = { ...root };
   if (env.OSPEX_RPC_URL !== undefined) merged.rpcUrl = env.OSPEX_RPC_URL;
@@ -211,13 +272,15 @@ function applyEnvOverrides(root: Record<string, unknown>, env: EnvLike): Record<
 
 /**
  * Validate + default a raw config object (e.g. parsed from YAML). Throws a clear
- * `Error` on any problem. `env` (default `process.env`) supplies the env
- * overrides (`OSPEX_RPC_URL`, `OSPEX_API_URL`, `OSPEX_CHAIN_ID`, `OSPEX_KEYSTORE_PATH`).
+ * `Error` on any problem (including an unknown / misspelled key at any level).
+ * Deterministic: `env` (default `{}`) supplies the env overrides — `OSPEX_RPC_URL`
+ * / `OSPEX_API_URL` / `OSPEX_CHAIN_ID` / `OSPEX_KEYSTORE_PATH`.
  */
-export function parseConfig(raw: unknown, env: EnvLike = process.env): Config {
+export function parseConfig(raw: unknown, env: EnvLike = {}): Config {
   const root = applyEnvOverrides(asObject(raw, 'config'), env);
+  assertKnownKeys(root, 'config', ROOT_KEYS);
 
-  const walletObj = root.wallet === undefined ? {} : asObject(root.wallet, 'wallet');
+  const walletObj = section(root, 'wallet', WALLET_KEYS);
   const wallet: WalletConfig = {};
   if (!isBlank(walletObj.keystorePath)) wallet.keystorePath = asNonEmptyString(walletObj.keystorePath, 'wallet.keystorePath');
 
@@ -230,7 +293,7 @@ export function parseConfig(raw: unknown, env: EnvLike = process.env): Config {
 
   const chainId = def<ChainId>(root.chainId, 137, (v) => asChainId(v, 'chainId'));
 
-  const ms = root.marketSelection === undefined ? {} : asObject(root.marketSelection, 'marketSelection');
+  const ms = section(root, 'marketSelection', MARKET_SELECTION_KEYS);
   const marketSelection: MarketSelectionConfig = {
     sports: def<Sport[]>(ms.sports, ['mlb'], (v) => asSportArray(v, 'marketSelection.sports')),
     markets: def<MarketType[]>(ms.markets, ['moneyline'], (v) => asMarketArray(v, 'marketSelection.markets')),
@@ -242,20 +305,20 @@ export function parseConfig(raw: unknown, env: EnvLike = process.env): Config {
     contestDenyList: def<string[]>(ms.contestDenyList, [], (v) => asStringArray(v, 'marketSelection.contestDenyList')),
   };
 
-  const d = root.discovery === undefined ? {} : asObject(root.discovery, 'discovery');
+  const d = section(root, 'discovery', DISCOVERY_KEYS);
   const discovery: DiscoveryConfig = {
     everyNTicks: def(d.everyNTicks, 10, (v) => asPositiveInt(v, 'discovery.everyNTicks')),
     jitterPct: def(d.jitterPct, 0.2, (v) => asNumberInRange(v, 'discovery.jitterPct', 0, 1, { minInclusive: true, maxInclusive: false })),
   };
 
-  const o = root.odds === undefined ? {} : asObject(root.odds, 'odds');
+  const o = section(root, 'odds', ODDS_KEYS);
   const odds: OddsConfig = {
     subscribe: def(o.subscribe, true, (v) => asBoolean(v, 'odds.subscribe')),
     maxRealtimeChannels: def(o.maxRealtimeChannels, 60, (v) => asPositiveInt(v, 'odds.maxRealtimeChannels')),
   };
 
-  const p = root.pricing === undefined ? {} : asObject(root.pricing, 'pricing');
-  const econObj = p.economics === undefined ? {} : asObject(p.economics, 'pricing.economics');
+  const p = section(root, 'pricing', PRICING_KEYS);
+  const econObj = section(p, 'economics', ECONOMICS_KEYS);
   const economics: EconomicsConfig = {
     capitalUSDC: def(econObj.capitalUSDC, 50, (v) => asPositiveAmount(v, 'pricing.economics.capitalUSDC')),
     targetMonthlyReturnPct: def(econObj.targetMonthlyReturnPct, 0.005, (v) => asPositiveNumber(v, 'pricing.economics.targetMonthlyReturnPct')),
@@ -265,7 +328,7 @@ export function parseConfig(raw: unknown, env: EnvLike = process.env): Config {
     capitalTurnoverPerDay: def(econObj.capitalTurnoverPerDay, 1, (v) => asPositiveNumber(v, 'pricing.economics.capitalTurnoverPerDay')),
     maxReasonableSpread: def(econObj.maxReasonableSpread, 0.05, (v) => asNumberInRange(v, 'pricing.economics.maxReasonableSpread', 0, 1, { minInclusive: false, maxInclusive: true })),
   };
-  const directObj = p.direct === undefined ? {} : asObject(p.direct, 'pricing.direct');
+  const directObj = section(p, 'direct', DIRECT_KEYS);
   const direct: DirectConfig = {
     spreadBps: def(directObj.spreadBps, 300, (v) => asPositiveNumber(v, 'pricing.direct.spreadBps')),
   };
@@ -280,7 +343,7 @@ export function parseConfig(raw: unknown, env: EnvLike = process.env): Config {
     maxPerQuotePctOfCapital: def(p.maxPerQuotePctOfCapital, 0.05, (v) => asNumberInRange(v, 'pricing.maxPerQuotePctOfCapital', 0, 1, { minInclusive: false, maxInclusive: true })),
   };
 
-  const r = root.risk === undefined ? {} : asObject(root.risk, 'risk');
+  const r = section(root, 'risk', RISK_KEYS);
   const risk: RiskConfig = {
     bankrollUSDC: def(r.bankrollUSDC, 50, (v) => asPositiveAmount(v, 'risk.bankrollUSDC')),
     maxBankrollUtilizationPct: def(r.maxBankrollUtilizationPct, 0.5, (v) => asNumberInRange(v, 'risk.maxBankrollUtilizationPct', 0, 1, { minInclusive: false, maxInclusive: true })),
@@ -292,7 +355,7 @@ export function parseConfig(raw: unknown, env: EnvLike = process.env): Config {
     maxDailyFeeUSDC: def(r.maxDailyFeeUSDC, 0, (v) => asAmount(v, 'risk.maxDailyFeeUSDC')),
   };
 
-  const g = root.gas === undefined ? {} : asObject(root.gas, 'gas');
+  const g = section(root, 'gas', GAS_KEYS);
   const gas: GasConfig = {
     maxDailyGasPOL: def(g.maxDailyGasPOL, 1, (v) => asPositiveAmount(v, 'gas.maxDailyGasPOL')),
     emergencyReservePOL: def(g.emergencyReservePOL, 0.2, (v) => asAmount(v, 'gas.emergencyReservePOL')),
@@ -300,13 +363,13 @@ export function parseConfig(raw: unknown, env: EnvLike = process.env): Config {
     nativeTokenUSDCPrice: def(g.nativeTokenUSDCPrice, 0.25, (v) => asPositiveAmount(v, 'gas.nativeTokenUSDCPrice')),
   };
 
-  const a = root.approvals === undefined ? {} : asObject(root.approvals, 'approvals');
+  const a = section(root, 'approvals', APPROVALS_KEYS);
   const approvals: ApprovalsConfig = {
     autoApprove: def(a.autoApprove, false, (v) => asBoolean(v, 'approvals.autoApprove')),
     mode: def<ApprovalMode>(a.mode, 'exact', (v) => asEnum(v, 'approvals.mode', APPROVAL_MODES)),
   };
 
-  const ord = root.orders === undefined ? {} : asObject(root.orders, 'orders');
+  const ord = section(root, 'orders', ORDERS_KEYS);
   const orders: OrdersConfig = {
     expiryMode: def<ExpiryMode>(ord.expiryMode, 'fixed-seconds', (v) => asEnum(v, 'orders.expiryMode', EXPIRY_MODES)),
     expirySeconds: def(ord.expirySeconds, 120, (v) => asPositiveInt(v, 'orders.expirySeconds')),
@@ -316,25 +379,25 @@ export function parseConfig(raw: unknown, env: EnvLike = process.env): Config {
     cancelMode: def<CancelMode>(ord.cancelMode, 'offchain', (v) => asEnum(v, 'orders.cancelMode', CANCEL_MODES)),
   };
 
-  const s = root.settlement === undefined ? {} : asObject(root.settlement, 'settlement');
+  const s = section(root, 'settlement', SETTLEMENT_KEYS);
   const settlement: SettlementConfig = {
     autoSettleOwn: def(s.autoSettleOwn, true, (v) => asBoolean(v, 'settlement.autoSettleOwn')),
     autoClaimOwn: def(s.autoClaimOwn, true, (v) => asBoolean(v, 'settlement.autoClaimOwn')),
     continueOnGasBudgetExhausted: def(s.continueOnGasBudgetExhausted, true, (v) => asBoolean(v, 'settlement.continueOnGasBudgetExhausted')),
   };
 
-  const t = root.telemetry === undefined ? {} : asObject(root.telemetry, 'telemetry');
+  const t = section(root, 'telemetry', TELEMETRY_KEYS);
   const telemetry: TelemetryConfig = {
     logDir: def(t.logDir, './telemetry', (v) => asNonEmptyString(v, 'telemetry.logDir')),
     logLevel: def<LogLevel>(t.logLevel, 'info', (v) => asEnum(v, 'telemetry.logLevel', LOG_LEVELS)),
   };
 
-  const st = root.state === undefined ? {} : asObject(root.state, 'state');
+  const st = section(root, 'state', STATE_KEYS);
   const state: StateConfig = {
     dir: def(st.dir, './state', (v) => asNonEmptyString(v, 'state.dir')),
   };
 
-  const m = root.mode === undefined ? {} : asObject(root.mode, 'mode');
+  const m = section(root, 'mode', MODE_KEYS);
   const mode: ModeConfig = {
     dryRun: def(m.dryRun, true, (v) => asBoolean(v, 'mode.dryRun')),
   };

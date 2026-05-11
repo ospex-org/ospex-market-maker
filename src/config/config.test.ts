@@ -89,6 +89,16 @@ describe('parseConfig', () => {
     expect(c.marketSelection.sports).toEqual(['mlb', 'nba']);
     expect(c.marketSelection.markets).toEqual(['moneyline']); // defaulted
   });
+
+  it('rejects unknown / misspelled keys at any level — fails closed so a mistyped cap cannot silently default', () => {
+    expect(() => parseConfig({ rpcUrl: 'x', chainID: 80002 }, {})).toThrow(/chainID/);
+    expect(() => parseConfig({ rpcUrl: 'x', risk: { maxRiskPerCommitmentUSD: '0.01' } }, {})).toThrow(/maxRiskPerCommitmentUSD\b/);
+    expect(() => parseConfig({ rpcUrl: 'x', pricing: { maxPerQuotePctOfCapitol: 0.005 } }, {})).toThrow(/maxPerQuotePctOfCapitol/);
+    expect(() => parseConfig({ rpcUrl: 'x', pricing: { economics: { capitolUSDC: 100 } } }, {})).toThrow(/capitolUSDC/);
+    expect(() => parseConfig({ rpcUrl: 'x', totallyMadeUp: true }, {})).toThrow(/totallyMadeUp/);
+    // a section parsed by YAML as a Date (e.g. `risk: 2024-01-01`) is rejected, not treated as `{}`
+    expect(() => parseConfig({ rpcUrl: 'x', risk: new Date('2024-01-01') }, {})).toThrow(/risk.*must be an object/);
+  });
 });
 
 describe('loadConfig', () => {

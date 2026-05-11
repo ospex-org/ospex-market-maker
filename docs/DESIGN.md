@@ -1,6 +1,6 @@
 # ospex-market-maker — Design (v0)
 
-**Status: approved for implementation (revision 5).** This defines what the v0 market maker *is allowed to do*, *forbidden from doing*, and *what metrics it must produce* — and the architecture, config, and lifecycle that follow. Four review rounds done; the design is stable. Revision 5 folds in the round-4 implementation guardrails (no design changes). The repo scaffold and Phase 1 build follow this doc.
+**Status: approved for implementation (revision 5).** This defines what the v0 market maker *is allowed to do*, *forbidden from doing*, and *what metrics it must produce* — and the architecture, config, and lifecycle that follow. Four review rounds done; the design is stable. Revision 5 folds in the round-4 implementation guardrails (no design changes). The repo scaffold and Phase 1 build follow this doc. **This is the design and the v0 *target* — not a snapshot of current state. For what actually works in the repo today, see the README's *Current scaffold status* section** (statements here like "`moneyline.ts` is implemented" or "`doctor` reports balances" describe the v0 target; the implementation lands incrementally — §14).
 
 **A note on SDK calls in this doc.** References like `client.commitments.submit(...)` name methods on [`@ospex/sdk`](https://github.com/ospex-org/ospex-sdk). `src/ospex/` wraps the SDK; wrapper method names may differ — the canonical names are the SDK's. SDK *wire-field* names — including the SDK's reference-game-id field (which currently embeds a provider name) — appear only inside that `src/ospex/` adapter; the rest of the MM, and every committed doc / config / CLI output / telemetry payload, uses neutral terms (`referenceGameId` / `upstreamGameId`). Where this doc names a *contract* method (e.g. `cancelCommitment`) it says so explicitly.
 
@@ -152,7 +152,7 @@ The MM depends on `@ospex/sdk` and nothing else from the Ospex side. It does **n
 - **Fallback:** a `vendor/` directory plus a `scripts/fetch-sdk` step documented in the README — only if neither of the above is available.
 - **Never:** commit the SDK tarball into this repo.
 
-**Prerequisite for going public.** This repo cannot become a *cloneable public* repo until the `ospex-org/ospex-sdk` repo is made public, so its Release tarball URLs resolve without auth (it's currently private). That gates the public-repo milestone (§17).
+**Public-repo status.** The repo is already public and `main` installs cleanly — there is no `@ospex/sdk` dependency on `main` yet (it's added on the Phase 1 feature branch, where the SDK-backed code lives). So what the `ospex-org/ospex-sdk` repo going public actually gates is *merging that feature branch to `main`* (once Phase 1 lands and the SDK is publicly installable) — and a clean fresh-clone `yarn install` from then on. Until then, working on the SDK-backed surface needs the SDK available locally (see `CONTRIBUTING.md`). (§17)
 
 The MM inherits the SDK's contracts wholesale: typed errors with the documented retryability semantics; the `--json` / `schemaVersion` envelope discipline; the BYO wallet + RPC posture; the vocabulary (`Contest`, `Speculation`, `Position`, `Commitment`, `MarketType`; position types translated to the actual side — never expose "upper" / "lower"). It also uses the SDK's submit preview (`speculation` mode) to detect lazy-creation paths and refuse them (§6).
 
@@ -413,7 +413,7 @@ A small set of JSON files under `state.dir`: each posted commitment by hash with
 ## 13. Distribution, deployment, license, disclaimers
 
 - **Stack.** Node 20+, TypeScript strict (`exactOptionalPropertyTypes`), yarn, `vitest`. Deps minimal: `@ospex/sdk` (exact GitHub Release tarball — §4; never a committed tarball), a YAML parser, `pino`, a CLI lib (match the `ospex` CLI's), and whatever `@ospex/sdk` pulls transitively (`viem`; `ethers` only via the keystore subpath).
-- **Deployment.** A worker process. Local: `ospex-mm run`. Heroku: a `worker` dyno (`Procfile: worker: node dist/cli/index.js run ...`) — **never `web`**. Ships an `app.json` with the worker formation.
+- **Deployment.** A worker process. Local: `ospex-mm run` (or `yarn mm run` from a clone). Heroku: a `worker` dyno (`Procfile: worker: node dist/cli/index.js run ...`) — **never `web`**. An `app.json` with the worker formation and the `Procfile` ship alongside `ospex-mm run` in Phase 3 (not in the genesis scaffold).
 - **License — MIT.** Matches `@ospex/sdk`. Only the smart contracts stay BUSL.
 - **Public README + `docs/OPERATOR_SAFETY.md` must carry, prominently:**
   - Experimental software; **no warranty**.
@@ -465,7 +465,7 @@ What *is* in this repo: the MM's own single-agent run summary (its P&L, fill rat
 
 **Still open (maintainer calls, not design questions):**
 
-1. **Timing of making the `ospex-org/ospex-sdk` repo public** — gates a *cloneable* public `ospex-org/ospex-market-maker`. The repo can be *created* public any time (docs + config + stub); `yarn install` on a fresh clone needs the public SDK Release URL to resolve.
+1. **Timing of making the `ospex-org/ospex-sdk` repo public** — the `ospex-org/ospex-market-maker` repo is already public and `main` installs cleanly (no `@ospex/sdk` dep on `main` yet). What the SDK going public gates: merging the Phase 1 feature branch (which adds the SDK dep) to `main`, and a clean fresh-clone `yarn install` from then on (§4).
 2. **Confirm the short-`fixed-seconds` expiry default** (vs `match-time`) — recommended for the latent-exposure reason; flag if you'd rather default the other way.
 3. **Sequencing the Realtime-fills cross-repo work** — design places it after Phase 3 / before the fishbowl; lead order indexer migration → SDK `subscribe` methods → MM wiring. Confirm against the broader roadmap.
 4. **Proceed to scaffold now, or one more confirming review of this revision?** The review's stated path was "patch the doc for the listed items, then proceed to scaffold" — so this revision should be clear to go to Phase 1.

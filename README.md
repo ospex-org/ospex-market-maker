@@ -14,23 +14,25 @@ It is built on **[`@ospex/sdk`](https://github.com/ospex-org/ospex-sdk)** — ev
 
 ## Current scaffold status
 
-What works:
+What works (Phase 1 — strictly read-only, no live write paths anywhere):
 
-- `yarn install && yarn build && yarn typecheck && yarn lint && yarn test` — clean (unit tests pass across the pricing, config, risk, state, telemetry, and ospex-adapter modules).
-- `yarn mm --help` — prints the command list. (`yarn dev --help` does the same via `tsx` without a build; `yarn build && yarn link`, then `ospex-mm --help`, puts the binary on your PATH.)
-- The **pricing module** (`src/pricing/` — vig stripping, the economics/direct spread modes with their refusal paths, odds-tick conversion + bounds, sizing). Pure functions, unit-tested.
+- `yarn install && yarn build && yarn typecheck && yarn lint && yarn test` — clean (120 unit tests across the pricing, config, risk, state, telemetry, ospex-adapter, and CLI-command modules).
+- **`ospex-mm doctor`** — readiness probe: config, keystore, API, RPC, POL/USDC balances, `PositionModule` allowance, and the persisted-state integrity check, plus a "Ready to" matrix (dry-run shadow / post commitments). `--address <0x…>` keeps it fully read-only (no passphrase prompt); `--json` emits a `{ schemaVersion: 1, doctor: … }` envelope.
+- **`ospex-mm quote --dry-run <contestId>`** — computes a two-sided moneyline quote breakdown (reference odds → fair value → spread → priced quote with size), or refuses with a clear message (contest closed, no open moneyline speculation, no reference odds). Never posts; `--json` emits a `{ schemaVersion: 1, quote: … }` envelope.
+- `yarn mm --help` — the command list. (`yarn dev --help` does the same via `tsx`; `yarn build && yarn link`, then `ospex-mm --help`, puts the binary on your PATH.)
+- The **pricing module** (`src/pricing/` — vig stripping, the economics/direct spread modes with their refusal paths, odds-tick conversion + bounds, sizing). Pure functions, unit-tested. Used by `quote`.
 - The **config loader** (`src/config/` — `loadConfig` / `parseConfig`: parse the YAML, validate with strict unknown-key rejection, apply the `OSPEX_*` env overrides, default almost everything to `ospex-mm.example.yaml`'s values).
-- The **risk engine** (`src/risk/` — worst-case-loss-by-outcome exposure accounting over positions + visible + latent commitments; the per-commitment / contest / team / sport / bankroll caps; the headroom and verdict functions; the `PositionModule` aggregate-allowance target). Pure functions, unit-tested.
-- The **state-store and telemetry skeletons** (`src/state/` — the persisted-inventory shape, atomic JSON writes, the boot-time state-loss fail-safe; `src/telemetry/` — the NDJSON event-log writer and the `kind` vocabulary). Not wired to a command yet.
-- The **`@ospex/sdk` adapter** (`src/ospex/` — the only module that imports `@ospex/sdk`; read-only wrappers over contests / speculations / commitments / positions / odds / balances / approvals / health; maps the SDK's provider-specific reference-game field to the neutral `referenceGameId` at this boundary). Tested with a structural fake; no on-chain calls in the tests. Not wired to a command yet.
+- The **risk engine** (`src/risk/` — worst-case-loss-by-outcome exposure accounting over positions + visible + latent commitments; the per-commitment / contest / team / sport / bankroll caps; the headroom and verdict functions; the `PositionModule` aggregate-allowance target). Pure functions, unit-tested. Used by `quote` and `doctor`.
+- The **`@ospex/sdk` adapter** (`src/ospex/` — the only module that imports `@ospex/sdk`; read-only wrappers over contests / speculations / commitments / positions / odds / balances / approvals / health; maps the SDK's provider-specific reference-game field to the neutral `referenceGameId` at this boundary). Used by `doctor` and `quote`.
+- The **state store** (`src/state/` — persisted-inventory shape, atomic JSON writes, the boot-time state-loss fail-safe; `doctor` reads it for the integrity check) and the **telemetry event-log writer** (`src/telemetry/` — NDJSON, the `kind` vocabulary; wired into `run` in Phase 2).
 - The design (`docs/DESIGN.md`), the annotated config (`ospex-mm.example.yaml`), and the safety checklist (`docs/OPERATOR_SAFETY.md`).
 
-What's **not** implemented yet (Phase 1+ — see `docs/DESIGN.md §14`):
+What's **not** implemented yet (Phase 2+ — see `docs/DESIGN.md §14`):
 
-- `doctor`, `quote`, `run`, `cancel-stale`, `status`, `summary` — these currently exit with `not yet implemented`.
-- the order lifecycle (`src/orders/`), the event loop (`src/runners/`), and wiring the modules above into the commands.
+- `run` (the event loop — `--dry-run` shadow mode in Phase 2, `--live` micro-maker in Phase 3), `cancel-stale`, `status`, `summary` — these currently exit with `not yet implemented`.
+- the order lifecycle (`src/orders/`) and the event loop (`src/runners/`) — Phase 2+.
 
-So: don't run this against real funds, and read the "intended flow" below as the target shape, not as something that works today.
+So: there is no live maker yet — `run` isn't implemented. `doctor` and `quote --dry-run` work and are read-only. Don't run anything against real funds.
 
 ---
 
@@ -67,14 +69,14 @@ yarn build
 cp ospex-mm.example.yaml ospex-mm.yaml
 # edit ospex-mm.yaml — wallet.keystorePath, rpcUrl, pricing.economics (capital + target return), risk caps
 
-yarn mm doctor                       # readiness: balances (USDC + POL), PositionModule allowance, network
+yarn mm doctor                       # readiness: balances (USDC + POL), PositionModule allowance, API/RPC, state
 yarn mm quote --dry-run <contestId>  # one-shot: fetch reference odds, compute a two-sided quote, print the breakdown
-yarn mm run --dry-run                # shadow mode: the full loop, posts nothing — read the output before going live
+yarn mm run --dry-run                # (Phase 2) shadow mode: the full loop, posts nothing — read the output before going live
 # then, deliberately: set mode.dryRun: false in the config AND pass --live (the two-key model)
-yarn mm run --live
+yarn mm run --live                   # (Phase 3) the live micro-maker
 ```
 
-`yarn mm <cmd>` runs the built CLI (`node dist/cli/index.js`). `yarn dev <cmd>` runs it via `tsx` without a build, for iteration. To get the `ospex-mm` binary on your PATH: `yarn build && yarn link` (or `npm link`), then `ospex-mm <cmd>`. (Today every command except `--help` exits `not yet implemented` — see *Current scaffold status* above.)
+`yarn mm <cmd>` runs the built CLI (`node dist/cli/index.js`). `yarn dev <cmd>` runs it via `tsx` without a build, for iteration. To get the `ospex-mm` binary on your PATH: `yarn build && yarn link` (or `npm link`), then `ospex-mm <cmd>`. Today `doctor` and `quote --dry-run` work (read-only); `run` / `cancel-stale` / `status` / `summary` exit `not yet implemented` — see *Current scaffold status* above.
 
 See **[`docs/QUICKSTART.md`](docs/QUICKSTART.md)** for the walkthrough and **[`docs/OPERATOR_SAFETY.md`](docs/OPERATOR_SAFETY.md)** for the safe-operation checklist before you go live.
 

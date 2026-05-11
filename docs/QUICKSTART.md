@@ -25,8 +25,6 @@ yarn build
 
 Then run the CLI as `yarn mm <command>` (which is `node dist/cli/index.js`), or `yarn dev <command>` to run it via `tsx` without a build. To put the `ospex-mm` binary on your PATH instead: `yarn link` (or `npm link`) after `yarn build`, then `ospex-mm <command>`.
 
-> If you're on a feature branch that depends on `@ospex/sdk` and the SDK isn't publicly released yet, see [`CONTRIBUTING.md`](../CONTRIBUTING.md) for the interim setup. The genesis scaffold on `main` builds without it.
-
 ## 3. Configure
 
 ```bash

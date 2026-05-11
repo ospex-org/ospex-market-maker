@@ -30,4 +30,4 @@ The market maker is built on [`@ospex/sdk`](https://github.com/ospex-org/ospex-s
 
 ## Tests
 
-New behaviour gets tests (`vitest`, under `tests/` or co-located `*.test.ts`). The pricing math, the risk engine's latent-exposure accounting, the aggregate-allowance target, and config-schema validation are the load-bearing units — keep their coverage tight. The genesis scaffold runs `vitest` with `--passWithNoTests` so `yarn test` passes with zero tests; **remove that flag (or add a CI guard) as soon as Phase 1 lands the first tests** — the suite must not be able to silently regress to zero.
+New behaviour gets tests (`vitest`, under `tests/` or co-located `*.test.ts`). The pricing math, the risk engine's latent-exposure accounting, the aggregate-allowance target, and config-schema validation are the load-bearing units — keep their coverage tight. (`yarn test` runs `vitest run` — no `--passWithNoTests`; the suite must not be able to silently regress to zero tests.)

@@ -4,18 +4,21 @@
  *
  * Every line of the event log is `{ ts, runId, kind, ...payload }`. **This NDJSON
  * shape is a stable contract** — a future external scorecard consumes it unchanged
- * (DESIGN §11, §16), so this module is treated as a wire boundary: `kind` must be
- * one of the known kinds, the reserved keys (`ts` / `runId` / `kind`) can't be
- * shadowed by a payload, and any value that can exceed `Number.MAX_SAFE_INTEGER`
- * (risk in wei6, block numbers, …) must already be a string — a `bigint` in a
- * payload throws rather than emit a value `JSON.stringify` can't represent (the
- * AGENT_CONTRACT numeric rule).
+ * (DESIGN §11, §16), so this module is treated as a wire boundary and fails closed:
+ * `kind` must be a known kind; the `runId` must be filename-safe (it names the
+ * file); the payload must be a plain object with none of the reserved keys (`ts` /
+ * `runId` / `kind`); and every payload value must be JSON-safe and deterministic —
+ * `bigint`s, non-finite / unsafe-integer numbers, `undefined`, functions, symbols,
+ * and non-plain objects (`Map`, `Date`, class instances, …) all throw rather than
+ * being silently dropped or mangled by `JSON.stringify`. Anything that can exceed
+ * `Number.MAX_SAFE_INTEGER` (risk in wei6, block numbers, …) is a decimal string —
+ * the AGENT_CONTRACT numeric rule.
  *
  * No SDK, no chain. Phase 2's runner is the first real consumer; this slice ships
  * the writer + the `kind` vocabulary so that vocabulary is locked early.
  */
 
-import { appendFileSync, mkdirSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
 /**
@@ -98,45 +101,102 @@ export class EventLog {
     this.path = path;
   }
 
-  /** Open (creating `logDir` if needed) the event-log file for `runId`. The file itself is created on the first `emit`. */
+  /**
+   * Open (creating `logDir` if needed) the event-log file for `runId`. The file
+   * itself is created on the first `emit`. `runId` must be filename-safe — only
+   * letters, digits, `_` and `-` (no path separators, no `..`) — since it becomes
+   * part of the file name; use `newRunId()` for a safe one.
+   */
   static open(logDir: string, runId: string): EventLog {
+    if (!/^[A-Za-z0-9_-]+$/.test(runId)) {
+      throw new Error(`telemetry: runId "${runId}" is not filename-safe — use only letters, digits, "_" and "-" (it becomes part of the log file name); call newRunId() for a safe one`);
+    }
     mkdirSync(logDir, { recursive: true });
     return new EventLog(runId, join(logDir, `run-${runId}.ndjson`));
   }
 
   /**
-   * Append one event line. Throws if `kind` is not a known kind, if `payload`
-   * shadows a reserved key, or if any (nested) payload value is a `bigint` — all
-   * three would corrupt the stable scorecard contract, so fail closed.
+   * Append one event line. Fails closed — throws if `kind` isn't a known kind, if
+   * `payload` isn't a plain object, if `payload` shadows a reserved key (`ts` /
+   * `runId` / `kind`), or if any (nested) payload value isn't JSON-safe-and-
+   * deterministic (a `bigint`, a non-finite or unsafe-integer number, `undefined`,
+   * a function, a symbol, or a non-plain object like a `Map` / `Date` / class
+   * instance). Stringify wei6 / block numbers; flatten objects (incl. `Error`s).
    */
   emit(kind: TelemetryKind, payload: TelemetryPayload = {}): void {
     if (!KNOWN_KINDS.has(kind)) {
       throw new Error(`telemetry: unknown event kind "${String(kind)}" — must be one of ${TELEMETRY_KINDS.join(', ')}`);
+    }
+    if (!isPlainObject(payload)) {
+      throw new Error(`telemetry: payload must be a plain object, got ${describeValue(payload)}`);
     }
     for (const k of RESERVED_KEYS) {
       if (Object.prototype.hasOwnProperty.call(payload, k)) {
         throw new Error(`telemetry: payload must not set the reserved key "${k}" (the writer owns ts / runId / kind)`);
       }
     }
-    assertNoBigints(payload, 'payload');
+    for (const [key, value] of Object.entries(payload)) assertWireSafe(value, `payload.${key}`);
     const line = JSON.stringify({ ts: new Date().toISOString(), runId: this.runId, kind, ...payload });
     appendFileSync(this.path, `${line}\n`, 'utf8');
   }
 }
 
-function assertNoBigints(value: unknown, path: string): void {
-  if (typeof value === 'bigint') {
-    throw new Error(
-      `telemetry: ${path} is a bigint (${value}n) — stringify it before emitting (the AGENT_CONTRACT numeric rule: wei6 / block numbers are decimal strings)`,
-    );
+/**
+ * Is there evidence of a prior run under `logDir` — at least one event-log file
+ * (`run-*.ndjson`)? The boot path feeds this to `assessStateLoss`'s
+ * `hasPriorTelemetry`: a missing state file plus prior telemetry = state loss, not
+ * a first run (DESIGN §12). A missing `logDir` means no prior run (`false`); an
+ * unreadable one is treated conservatively as a prior run (`true`).
+ */
+export function eventLogsExist(logDir: string): boolean {
+  try {
+    return readdirSync(logDir).some((name) => /^run-.+\.ndjson$/.test(name));
+  } catch (err) {
+    if ((err as { code?: string }).code === 'ENOENT') return false;
+    return true;
   }
-  if (Array.isArray(value)) {
-    value.forEach((v, i) => assertNoBigints(v, `${path}[${i}]`));
+}
+
+/** Recursively reject anything `JSON.stringify` would drop / mangle / can't represent precisely — the event log is a stable wire contract, so fail closed (DESIGN §11, AGENT_CONTRACT). */
+function assertWireSafe(value: unknown, path: string): void {
+  if (typeof value === 'bigint') {
+    throw new Error(`telemetry: ${path} is a bigint (${value}n) — stringify it (the AGENT_CONTRACT numeric rule: wei6 / block numbers are decimal strings)`);
+  }
+  if (typeof value === 'function' || typeof value === 'symbol' || value === undefined) {
+    const what = value === undefined ? 'undefined' : `a ${typeof value}`;
+    throw new Error(`telemetry: ${path} is ${what} — not JSON-representable; emit a string, number, boolean, null, plain object, or array`);
+  }
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) {
+      throw new Error(`telemetry: ${path} is ${value} — NaN / Infinity serialize to null; emit a finite number or a string`);
+    }
+    if (Number.isInteger(value) && !Number.isSafeInteger(value)) {
+      throw new Error(`telemetry: ${path} is ${value}, an integer beyond Number.MAX_SAFE_INTEGER — emit it as a decimal string (AGENT_CONTRACT numeric rule)`);
+    }
     return;
   }
-  if (value !== null && typeof value === 'object') {
-    for (const [k, v] of Object.entries(value)) assertNoBigints(v, `${path}.${k}`);
+  if (typeof value === 'string' || typeof value === 'boolean' || value === null) return;
+  if (Array.isArray(value)) {
+    value.forEach((v, i) => assertWireSafe(v, `${path}[${i}]`));
+    return;
   }
+  // a non-null, non-array object
+  if (!isPlainObject(value)) {
+    throw new Error(`telemetry: ${path} is ${describeValue(value)} — JSON.stringify would lose or mangle it; flatten it to a plain object first`);
+  }
+  for (const [k, v] of Object.entries(value)) assertWireSafe(v, `${path}.${k}`);
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype;
+}
+
+function describeValue(value: unknown): string {
+  if (value === null) return 'null';
+  if (Array.isArray(value)) return 'an array';
+  if (typeof value !== 'object') return `a ${typeof value}`;
+  const name = (value as { constructor?: { name?: string } }).constructor?.name;
+  return name ? `a ${name}` : 'an unusual object';
 }
 
 // ── run summary (the `ospex-mm summary` aggregator — Phase 3) ─────────────────

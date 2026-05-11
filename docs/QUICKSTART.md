@@ -33,22 +33,23 @@ cp ospex-mm.example.yaml ospex-mm.yaml
 
 Edit `ospex-mm.yaml` — at minimum `wallet.keystorePath`, `rpcUrl`, and `pricing.economics` (your capital and target monthly return; the math derives the quoting spread and refuses to start if your targets don't add up). Review the `risk` caps — they're conservative by default; lower them further if you want. The annotated config explains every field; the rationale is in [`DESIGN.md`](DESIGN.md) §7.
 
-## 4. Check readiness — `yarn mm doctor` *(Phase 1 target)*
+## 4. Check readiness — `yarn mm doctor`
 
 ```bash
-yarn mm doctor
+yarn mm doctor                # add --address <0x…> to skip the keystore passphrase prompt; --json for a machine-readable envelope
 ```
 
-Will report your wallet's USDC and POL balances, the `PositionModule` USDC allowance, and network status — a "ready to" view. *(Not implemented yet — currently exits `not yet implemented`.)*
+Reports your wallet's USDC and POL balances, the `PositionModule` USDC allowance, API + RPC reachability, and the persisted-state integrity check — plus a "Ready to" matrix (dry-run shadow / post commitments). Exits `0` unless something is broken; a `WARN` (no keystore yet, low POL, allowance below the cap ceiling, …) is advisory.
 
-## 5. Dry-run first *(Phase 1 / 2 target)*
+## 5. Preview a quote — `yarn mm quote --dry-run`
 
 ```bash
-yarn mm quote --dry-run <contestId>   # one-shot: reference odds → a two-sided quote with the full breakdown
-yarn mm run --dry-run                 # the full loop, posts nothing — let it run for a while
+yarn mm quote --dry-run <contestId>   # one-shot: reference odds → fair value → spread → a two-sided priced quote, with the full breakdown
 ```
 
-Read the dry-run output before going live: the would-be-stale rate, the quote-competitiveness numbers, the latent-exposure peak, and the skip reasons. If the prices or the skip pattern look wrong, fix the config — don't go live.
+Computes what the MM would quote for that contest (or refuses with a clear message if the contest is closed, has no open moneyline speculation, or has no reference odds). It never posts. Use it to sanity-check your pricing config before there's a live `run`.
+
+> `yarn mm run --dry-run` (the full shadow loop) is **Phase 2** — not implemented yet.
 
 ## 6. Going live (the two-key model) *(Phase 3 target)*
 

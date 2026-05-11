@@ -28,6 +28,7 @@
   },
   "dependencies": {
     "@ospex/sdk": "https://github.com/ospex-org/ospex-sdk/releases/download/v0.1.0/ospex-sdk-0.1.0.tgz",
+    "commander": "^14.0.3",
     "js-yaml": "^4.1.0"
   },
   "devDependencies": {

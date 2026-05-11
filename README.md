@@ -9,10 +9,6 @@ It is built on **[`@ospex/sdk`](https://github.com/ospex-org/ospex-sdk)** — ev
 > ## ⚠️ Status — v0 scaffold
 >
 > This repo is in active development. The full design is in **[`docs/DESIGN.md`](docs/DESIGN.md)** — the command surface, config schema, pricing model, risk model, and lifecycle are specified there; the implementation is landing incrementally (Phase 1 = read-only core; Phase 2 = dry-run/shadow loop; Phase 3 = live micro-maker; Phase 4 = public polish). **Do not run this against real funds yet.**
->
-> ## ⚠️ A note on the `@ospex/sdk` dependency
->
-> This builds on `@ospex/sdk`, which is being prepared for public release. Until it's published, `yarn install` from a fresh clone won't resolve `@ospex/sdk` on branches that depend on it; the genesis scaffold on `main` builds without it. See **[`CONTRIBUTING.md`](CONTRIBUTING.md)** for the interim dev setup.
 
 ---
 
@@ -26,7 +22,7 @@ What works:
 - The **config loader** (`src/config/` — `loadConfig` / `parseConfig`: parse the YAML, validate with strict unknown-key rejection, apply the `OSPEX_*` env overrides, default almost everything to `ospex-mm.example.yaml`'s values).
 - The **risk engine** (`src/risk/` — worst-case-loss-by-outcome exposure accounting over positions + visible + latent commitments; the per-commitment / contest / team / sport / bankroll caps; the headroom and verdict functions; the `PositionModule` aggregate-allowance target). Pure functions, unit-tested.
 - The **state-store and telemetry skeletons** (`src/state/` — the persisted-inventory shape, atomic JSON writes, the boot-time state-loss fail-safe; `src/telemetry/` — the NDJSON event-log writer and the `kind` vocabulary). Not wired to a command yet.
-- The **`@ospex/sdk` adapter** (`src/ospex/` — the only module that imports `@ospex/sdk`; read-only wrappers over contests / speculations / commitments / positions / odds / balances / approvals / health; maps the SDK's `jsonoddsId` to the neutral `referenceGameId` at this boundary). Tested with a structural fake; no on-chain calls in the tests. Not wired to a command yet.
+- The **`@ospex/sdk` adapter** (`src/ospex/` — the only module that imports `@ospex/sdk`; read-only wrappers over contests / speculations / commitments / positions / odds / balances / approvals / health; maps the SDK's provider-specific reference-game field to the neutral `referenceGameId` at this boundary). Tested with a structural fake; no on-chain calls in the tests. Not wired to a command yet.
 - The design (`docs/DESIGN.md`), the annotated config (`ospex-mm.example.yaml`), and the safety checklist (`docs/OPERATOR_SAFETY.md`).
 
 What's **not** implemented yet (Phase 1+ — see `docs/DESIGN.md §14`):
@@ -97,7 +93,7 @@ This is **experimental software**, provided **without warranty**. Wagering and o
 ## Development
 
 ```bash
-yarn install        # devDeps only on `main`; @ospex/sdk is added on feature branches (see CONTRIBUTING.md)
+yarn install        # pulls @ospex/sdk from its v0.1.0 GitHub Release tarball + transitive deps
 yarn build          # tsc -> dist/
 yarn typecheck      # tsc --noEmit
 yarn test           # vitest

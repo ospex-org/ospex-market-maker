@@ -152,8 +152,6 @@ The MM depends on `@ospex/sdk` and nothing else from the Ospex side. It does **n
 - **Fallback:** a `vendor/` directory plus a `scripts/fetch-sdk` step documented in the README — only if neither of the above is available.
 - **Never:** commit the SDK tarball into this repo.
 
-**Public-repo status.** The repo is already public and `main` installs cleanly — there is no `@ospex/sdk` dependency on `main` yet (it's added on the Phase 1 feature branch, where the SDK-backed code lives). So what the `ospex-org/ospex-sdk` repo going public actually gates is *merging that feature branch to `main`* (once Phase 1 lands and the SDK is publicly installable) — and a clean fresh-clone `yarn install` from then on. Until then, working on the SDK-backed surface needs the SDK available locally (see `CONTRIBUTING.md`). (§17)
-
 The MM inherits the SDK's contracts wholesale: typed errors with the documented retryability semantics; the `--json` / `schemaVersion` envelope discipline; the BYO wallet + RPC posture; the vocabulary (`Contest`, `Speculation`, `Position`, `Commitment`, `MarketType`; position types translated to the actual side — never expose "upper" / "lower"). It also uses the SDK's submit preview (`speculation` mode) to detect lazy-creation paths and refuse them (§6).
 
 ---
@@ -465,7 +463,6 @@ What *is* in this repo: the MM's own single-agent run summary (its P&L, fill rat
 
 **Still open (maintainer calls, not design questions):**
 
-1. **Timing of making the `ospex-org/ospex-sdk` repo public** — the `ospex-org/ospex-market-maker` repo is already public and `main` installs cleanly (no `@ospex/sdk` dep on `main` yet). What the SDK going public gates: merging the Phase 1 feature branch (which adds the SDK dep) to `main`, and a clean fresh-clone `yarn install` from then on (§4).
-2. **Confirm the short-`fixed-seconds` expiry default** (vs `match-time`) — recommended for the latent-exposure reason; flag if you'd rather default the other way.
-3. **Sequencing the Realtime-fills cross-repo work** — design places it after Phase 3 / before the fishbowl; lead order indexer migration → SDK `subscribe` methods → MM wiring. Confirm against the broader roadmap.
-4. **Proceed to scaffold now, or one more confirming review of this revision?** The review's stated path was "patch the doc for the listed items, then proceed to scaffold" — so this revision should be clear to go to Phase 1.
+1. **Confirm the short-`fixed-seconds` expiry default** (vs `match-time`) — recommended for the latent-exposure reason; flag if you'd rather default the other way.
+2. **Sequencing the Realtime-fills cross-repo work** — design places it after Phase 3 / before the fishbowl; lead order indexer migration → SDK `subscribe` methods → MM wiring. Confirm against the broader roadmap.
+3. **Proceed to scaffold now, or one more confirming review of this revision?** The review's stated path was "patch the doc for the listed items, then proceed to scaffold" — so this revision should be clear to go to Phase 1.

@@ -16,9 +16,9 @@ yarn lint           # eslint src
 - TypeScript is strict (`exactOptionalPropertyTypes`, `noUncheckedIndexedAccess`, no unused locals/params). New optional config fields need `| undefined` in their type. Avoid `any` — use `unknown`, specific interfaces, or generics.
 - `yarn typecheck` must pass before you push.
 
-## The `@ospex/sdk` dependency (interim)
+## The `@ospex/sdk` dependency
 
-The market maker is built on [`@ospex/sdk`](https://github.com/ospex-org/ospex-sdk), which is being prepared for public release. The genesis scaffold on `main` has **no** `@ospex/sdk` dependency, so `main` installs cleanly. Feature branches that implement the SDK-backed surface (`src/ospex/`, the `doctor` / `quote` / `run` commands) pin `@ospex/sdk` to an exact GitHub Release tarball URL — which only resolves once the SDK repo is public. Until then, to work on those branches you need the SDK available locally: build/pack it from a clone of `ospex-org/ospex-sdk` and `yarn add ./ospex-sdk-<ver>.tgz`, or use a workspace link. A `scripts/fetch-sdk` helper will be added alongside the dependency. CI on those branches will be red at the install step until the SDK is public — that's expected.
+The market maker is built on [`@ospex/sdk`](https://github.com/ospex-org/ospex-sdk), pinned in `package.json` to an exact GitHub Release tarball URL — `@ospex/sdk` is distributed via GitHub Releases rather than npm (see the SDK's distribution model). `yarn install --frozen-lockfile` resolves it deterministically; no extra setup. Bumping the SDK is `yarn add https://github.com/ospex-org/ospex-sdk/releases/download/v<ver>/ospex-sdk-<ver>.tgz` after reading the release notes — pre-1.0 minors are not guaranteed to be additive ([`AGENT_CONTRACT.md`](https://github.com/ospex-org/ospex-sdk/blob/main/docs/AGENT_CONTRACT.md) §12). Never use a caret range — a money-moving bot must not float SDK behaviour.
 
 ## Hard rules (from `docs/DESIGN.md`)
 

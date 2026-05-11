@@ -127,25 +127,45 @@ describe('StateStore.load', () => {
 });
 
 describe('assessStateLoss (the boot-time fail-safe — DESIGN §12)', () => {
-  const opts = { ignoreMissingStateOverride: false, expirySeconds: 120 };
+  const base = { hasPriorTelemetry: false, ignoreMissingStateOverride: false, expirySeconds: 120 };
 
-  it('does not hold quoting on a fresh start or a clean load', () => {
-    expect(assessStateLoss({ kind: 'fresh' }, opts).holdQuoting).toBe(false);
-    expect(assessStateLoss({ kind: 'loaded' }, opts).holdQuoting).toBe(false);
+  it('a clean load never holds quoting', () => {
+    expect(assessStateLoss({ kind: 'loaded' }, base).holdQuoting).toBe(false);
+    expect(assessStateLoss({ kind: 'loaded' }, { ...base, hasPriorTelemetry: true }).holdQuoting).toBe(false);
   });
 
-  it('holds quoting on a lost state, suggesting a one-expiry-window wait', () => {
-    const a = assessStateLoss({ kind: 'lost', reason: 'corrupt' }, opts);
+  it('no state + no prior telemetry = genuine first run — does not hold quoting', () => {
+    const a = assessStateLoss({ kind: 'fresh' }, base);
+    expect(a.holdQuoting).toBe(false);
+    expect(a.suggestedWaitSeconds).toBeUndefined();
+    expect(a.reason).toMatch(/genuine first run/);
+  });
+
+  it('no state but prior telemetry = state loss — holds quoting, suggesting a one-expiry-window wait', () => {
+    const a = assessStateLoss({ kind: 'fresh' }, { ...base, hasPriorTelemetry: true });
     expect(a.holdQuoting).toBe(true);
     expect(a.suggestedWaitSeconds).toBe(120);
     expect(a.reason).toMatch(/blank slate/);
   });
 
-  it('does not hold quoting on a lost state when --ignore-missing-state is passed', () => {
-    const a = assessStateLoss({ kind: 'lost', reason: 'corrupt' }, { ...opts, ignoreMissingStateOverride: true });
-    expect(a.holdQuoting).toBe(false);
-    expect(a.suggestedWaitSeconds).toBeUndefined();
-    expect(a.reason).toMatch(/ignore-missing-state/);
+  it('a corrupt state file holds quoting regardless of prior telemetry', () => {
+    for (const hasPriorTelemetry of [false, true]) {
+      const a = assessStateLoss({ kind: 'lost', reason: 'bad json' }, { ...base, hasPriorTelemetry });
+      expect(a.holdQuoting).toBe(true);
+      expect(a.suggestedWaitSeconds).toBe(120);
+      expect(a.reason).toMatch(/blank slate/);
+    }
+  });
+
+  it('--ignore-missing-state lifts the hold on a missing-but-prior-run state and on a corrupt one', () => {
+    const a1 = assessStateLoss({ kind: 'fresh' }, { ...base, hasPriorTelemetry: true, ignoreMissingStateOverride: true });
+    expect(a1.holdQuoting).toBe(false);
+    expect(a1.suggestedWaitSeconds).toBeUndefined();
+    expect(a1.reason).toMatch(/ignore-missing-state/);
+
+    const a2 = assessStateLoss({ kind: 'lost', reason: 'bad json' }, { ...base, ignoreMissingStateOverride: true });
+    expect(a2.holdQuoting).toBe(false);
+    expect(a2.reason).toMatch(/ignore-missing-state/);
   });
 });
 

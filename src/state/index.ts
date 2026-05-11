@@ -351,9 +351,23 @@ function validatePositionRecord(value: unknown): { ok: true; record: MakerPositi
 // ── boot-time state-loss fail-safe (DESIGN §12) ──────────────────────────────
 
 export interface AssessStateLossOptions {
-  /** The operator passed `--ignore-missing-state` — used only when they know no prior run left open commitments. */
+  /**
+   * Whether there's evidence of a *prior run* beyond the state file — in practice,
+   * whether `telemetry.logDir` holds any event-log file (use `eventLogsExist` from
+   * `src/telemetry/`). This is what separates a genuine first run (no state, no
+   * telemetry → quote freely) from state loss (no state *but* prior telemetry → a
+   * prior run's soft-cancelled set is gone → hold). A corrupt state file always
+   * means a prior run, so this flag doesn't matter there.
+   */
+  hasPriorTelemetry: boolean;
+  /**
+   * The operator passed `--ignore-missing-state` — they attest no prior run left
+   * an open / soft-cancelled commitment that could still match on chain. Use only
+   * after verifying that (block explorer / `ospex commitments list`), or on a
+   * genuine first run.
+   */
   ignoreMissingStateOverride: boolean;
-  /** The configured `orders.expirySeconds` — how long it takes any prior soft-cancelled quote to lapse. */
+  /** The configured `orders.expirySeconds` — how long any prior soft-cancelled `fixed-seconds` quote takes to lapse. (Insufficient under `match-time` expiry — there the runner must reconstruct from telemetry or use the override.) */
   expirySeconds: number;
 }
 
@@ -361,33 +375,53 @@ export interface StateLossAssessment {
   /**
    * `true` → the runner must NOT resume quoting on a blank slate. It should first
    * try to reconstruct the `softCancelled` set by replaying recent telemetry;
-   * failing that, wait `suggestedWaitSeconds` (one full expiry window) before
-   * posting; or proceed only on the explicit operator override.
+   * failing that, wait `suggestedWaitSeconds` (one full expiry window — only
+   * sufficient under `fixed-seconds` expiry) before posting; or proceed only on
+   * the explicit operator override.
    */
   holdQuoting: boolean;
   reason: string;
-  /** Present only when `holdQuoting` and the simplest mitigation is to wait — seconds for any prior soft-cancelled quote to have expired. */
+  /** Present only when `holdQuoting` and the simplest mitigation is to wait — seconds for any prior soft-cancelled `fixed-seconds` quote to have lapsed. */
   suggestedWaitSeconds?: number;
 }
 
 /**
  * Decide, from a state-load outcome, whether the boot path must hold quoting until
- * it has mitigated the latent-exposure blind spot (DESIGN §12). Pure — the runner
- * implements the chosen mitigation; this just reports the verdict and the simplest
- * one.
+ * it has mitigated the latent-exposure blind spot (DESIGN §12).
+ *
+ * A *missing* state file is not assumed safe: it's a genuine first run only when
+ * there's also no prior telemetry. If state is missing but prior event logs exist,
+ * a prior run's `softCancelled` set is gone — hold. A *corrupt* state file always
+ * holds. Either hold is lifted by `--ignore-missing-state`. (Edge: if the operator
+ * wiped *both* the state and telemetry directories there's no signal of a prior run
+ * — this is treated as a first run; after a deliberate wipe that might have left
+ * `match-time` quotes still matchable, pass `--ignore-missing-state` only once
+ * you've confirmed no prior commitment is still open.)
+ *
+ * Pure — the runner implements the chosen mitigation (telemetry replay / wait /
+ * override); this reports the verdict and the simplest mitigation.
  */
 export function assessStateLoss(status: StateLoadStatus, opts: AssessStateLossOptions): StateLossAssessment {
-  if (status.kind === 'fresh') return { holdQuoting: false, reason: 'no prior state — fresh start, nothing to under-count' };
   if (status.kind === 'loaded') return { holdQuoting: false, reason: 'state loaded cleanly' };
+
+  if (status.kind === 'fresh' && !opts.hasPriorTelemetry) {
+    return { holdQuoting: false, reason: 'no prior state and no prior telemetry — genuine first run, nothing to under-count' };
+  }
+
+  // State is lost: the file is missing but prior telemetry shows a run happened, or the file is present but corrupt.
+  const lossDesc =
+    status.kind === 'fresh'
+      ? 'the state file is missing but prior telemetry shows a prior run — its soft-cancelled set is gone'
+      : `state was lost (${status.reason})`;
   if (opts.ignoreMissingStateOverride) {
     return {
       holdQuoting: false,
-      reason: `state was lost (${status.reason}) but --ignore-missing-state was passed — proceeding; latent matchable exposure may be under-counted until any prior soft-cancelled quotes expire`,
+      reason: `${lossDesc}; --ignore-missing-state was passed — proceeding (latent matchable exposure may be under-counted until any prior soft-cancelled quotes expire)`,
     };
   }
   return {
     holdQuoting: true,
-    reason: `state was lost (${status.reason}) — must not resume quoting on a blank slate (a prior soft-cancelled quote may still be matchable on chain); reconstruct the soft-cancelled set from telemetry, or wait one expiry window, or pass --ignore-missing-state`,
+    reason: `${lossDesc} — must not resume quoting on a blank slate (a prior soft-cancelled quote may still be matchable on chain). Reconstruct the soft-cancelled set from telemetry, wait one expiry window, or pass --ignore-missing-state.`,
     suggestedWaitSeconds: opts.expirySeconds,
   };
 }

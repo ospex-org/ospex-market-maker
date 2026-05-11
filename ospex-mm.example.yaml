@@ -1,0 +1,102 @@
+# ospex-mm.example.yaml — annotated reference config (v0)
+#
+# Copy this to ospex-mm.yaml, fill in wallet / rpcUrl / pricing / risk, and run.
+# Defaults are conservative and dry-run. Going live requires BOTH mode.dryRun:
+# false here AND the --live flag on the command (the two-key model — see
+# docs/DESIGN.md §8 and docs/OPERATOR_SAFETY.md). The full schema and the
+# rationale for every field are in docs/DESIGN.md §7.
+
+wallet:
+  keystorePath: ~/.foundry/keystores/ospex-mm   # Foundry v3 keystore; prompts for passphrase on sign.
+                                                 # (Or set OSPEX_KEYSTORE_PATH instead.)
+
+rpcUrl: ""            # REQUIRED. Alchemy / Infura / QuickNode URL for the chain. No public-RPC default.
+apiUrl: ""            # Optional. Defaults to the production Ospex core API URL.
+chainId: 137          # 137 = Polygon mainnet, 80002 = Amoy testnet.
+
+marketSelection:
+  sports: ["mlb"]                  # any of: mlb, nba, nhl, ncaab, ncaaf, nfl (config-driven; add more freely)
+  markets: ["moneyline"]           # v0 supports only "moneyline"; "spread"/"total" are REJECTED by config validation.
+  maxStartsWithinHours: 24         # only quote games starting within this window
+  maxTrackedContests: 30           # hard cap on contests tracked at once (bounds odds subscriptions)
+  requireReferenceOdds: true       # skip games with no upstream odds linkage
+  requireOpenSpeculation: true     # v0: only quote markets whose speculation already exists (no lazy creation)
+  contestAllowList: []             # optional: if non-empty, ONLY these contestIds
+  contestDenyList: []              # optional: never these contestIds
+
+discovery:
+  everyNTicks: 10                  # run discovery every N ticks (10 * 30s = ~5 min)
+  jitterPct: 0.2                   # +/- jitter on the discovery interval
+
+odds:
+  subscribe: true                  # subscription-first: stream reference-odds changes. Strongly preferred.
+                                   #   false = degraded fallback to bounded snapshot polling (restricted nets only).
+  maxRealtimeChannels: 60          # hard cap on open Realtime channels (~ maxTrackedContests * markets)
+
+pricing:
+  mode: economics                  # "economics" (derive spread from your return target) or "direct"
+  economics:
+    capitalUSDC: "50"
+    targetMonthlyReturnPct: 0.005   # 0.5% / month on capital
+    daysHorizon: 30
+    estGamesPerDay: 8.0             # rough count across your configured sports
+    fillRateAssumption: 0.30        # FLAGGED ASSUMPTION — replace with measured data later
+    capitalTurnoverPerDay: 1.0      # FLAGGED ASSUMPTION
+    maxReasonableSpread: 0.05       # refuse to start if the math wants a wider spread than this
+  direct:
+    spreadBps: 300                  # only used when mode: direct (3.00%)
+  quoteBothSides: true
+  minEdgeBps: 0                     # require at least this much edge vs fair to bother quoting
+  maxPerQuotePctOfCapital: 0.05     # FLAGGED ASSUMPTION — per-quote concentration cap
+
+risk:                               # caps bind WORST-CASE USDC LOSS BY OUTCOME over positions + visible + LATENT quotes
+  bankrollUSDC: "50"
+  maxBankrollUtilizationPct: 0.50
+  maxRiskPerCommitmentUSDC: "0.25"
+  maxRiskPerContestUSDC: "1"
+  maxRiskPerTeamUSDC: "2"
+  maxRiskPerSportUSDC: "5"
+  maxOpenCommitments: 10            # counts visible + soft-cancelled-not-yet-expired commitments
+  maxDailyFeeUSDC: "0"              # genuinely zero in v0 (no lazy speculation creation)
+
+gas:
+  maxDailyGasPOL: "1"               # daily gas budget, in POL (the native token — what's actually spent)
+  emergencyReservePOL: "0.2"        # held back for on-chain risk-reduction / capital-recovery after the budget is hit
+  reportInUSDC: true                # also report gas in USDC in the run summary (best-effort)
+  nativeTokenUSDCPrice: "0.25"      # operator-provided POL->USDC for reporting (no on-chain oracle yet)
+
+approvals:
+  autoApprove: false                # the MM will NOT approve USDC on its own unless this is true
+  mode: exact                       # "exact" = set PositionModule allowance to the aggregate cap ceiling (see DESIGN §6).
+                                    #   "unlimited" = MaxUint256 (requires --yes). Discouraged.
+
+orders:
+  expiryMode: fixed-seconds         # RECOMMENDED. "fixed-seconds" = short expiry, MM rolls quotes forward.
+                                    #   "match-time" (expire at game start) is available but DANGEROUS with off-chain
+                                    #   cancel — a pulled quote stays matchable for hours. See DESIGN §6.
+  expirySeconds: 120                # used when expiryMode: fixed-seconds. Short bounds latent exposure; tunable.
+  staleAfterSeconds: 90             # pull-and-repost a quote this old (< expirySeconds, so it never just lapses)
+  staleReferenceAfterSeconds: 300   # treat reference odds as stale (pull quotes, don't repost) if nothing heard this long
+  replaceOnOddsMoveBps: 50          # pull-and-repost when fair value moves more than this since posting
+  cancelMode: offchain              # routine cancels: "offchain" (gasless, soft — see DESIGN §6) or "onchain" (authoritative, gas)
+
+settlement:
+  autoSettleOwn: true                       # settle the maker's own already-scored speculations (permissionless)
+  autoClaimOwn: true                        # claim the maker's own winning positions
+  continueOnGasBudgetExhausted: true        # allow settle/claim after the daily gas budget is hit (within the reserve)
+
+telemetry:
+  logDir: ./telemetry               # NDJSON event logs land here
+  logLevel: info
+
+state:
+  dir: ./state                      # persistent inventory / soft-cancelled set / P&L / daily counters (JSON, atomic, single-process)
+
+killSwitchFile: ./KILL
+killCancelOnChain: false            # false = soft stop (pulled quotes expire on their own); true = hard stop (gas, uses reserve)
+
+pollIntervalMs: 30000               # enforced floor 30000 (see DESIGN §7); paces discovery + fill detection, not odds
+
+mode:
+  dryRun: true                      # MASTER SAFETY FLAG. true = compute everything, post nothing.
+                                    #   Live requires dryRun: false AND the --live flag (see DESIGN §8).

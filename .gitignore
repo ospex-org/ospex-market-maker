@@ -1,0 +1,26 @@
+# dependencies / build
+node_modules/
+/dist/
+*.tsbuildinfo
+
+# never commit the SDK tarball or any vendored package
+/vendor/
+*.tgz
+
+# local-only: ops notes, scratch, the future test harness — never published
+/internal/
+
+# operator's real config + runtime state — only ospex-mm.example.yaml is committed
+# (anchored with / so these don't match src/state/, src/telemetry/, etc.)
+/ospex-mm.yaml
+/state/
+/telemetry/
+/KILL
+
+# secrets / env
+.env
+.env.local
+
+# misc
+*.log
+.DS_Store

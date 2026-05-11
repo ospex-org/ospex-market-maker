@@ -1,0 +1,29 @@
+{
+  "name": "ospex-market-maker",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Reference market maker for Ospex — a zero-vig peer-to-peer sports prediction protocol on Polygon. Clone, configure, run.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "ospex-mm": "./dist/cli/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --passWithNoTests",
+    "lint": "eslint src",
+    "dev": "tsx src/cli/index.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "eslint": "^9.17.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "typescript-eslint": "^8.18.0",
+    "vitest": "^3.0.0"
+  }
+}

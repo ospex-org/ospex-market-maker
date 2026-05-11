@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      # NOTE: once `@ospex/sdk` is added as a dependency (Phase 1, on a feature
+      # branch), this install step requires `@ospex/sdk` to be publicly
+      # installable — i.e. the `ospex-org/ospex-sdk` repo made public so its
+      # GitHub Release tarball URL resolves without auth (or the SDK published to
+      # npm). Until then, CI on branches that depend on it will fail at install.
+      # The genesis scaffold on `main` has no `@ospex/sdk` dependency.
+      - run: yarn install --frozen-lockfile
+      - run: yarn typecheck
+      - run: yarn build
+      - run: yarn lint
+      - run: yarn test

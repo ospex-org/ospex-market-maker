@@ -50,13 +50,16 @@ export function isTickInRange(tick: number): boolean {
 }
 
 /**
- * Quantize a USDC amount down to the largest valid risk amount ≤ it (in wei6).
+ * Quantize a USDC amount **down** to the largest valid risk amount ≤ it (in wei6).
  * Risk amounts must be multiples of `RISK_LOT_WEI6`, so `0.250001` USDC →
- * `250000` wei6. Negative / non-finite input → `0`.
+ * `250000` wei6 and any amount below one lot (`< 0.0001` USDC) → `0`. Negative /
+ * non-finite input → `0`. Always rounds **down** (never `Math.round`) so a quote
+ * can never exceed the caller's headroom — this helper is part of the risk/safety
+ * boundary, so it must fail closed.
  */
 export function quantizeRiskWei6(usdc: number): number {
   if (!Number.isFinite(usdc) || usdc <= 0) return 0;
-  const rawWei6 = Math.round(usdc * USDC_UNIT_WEI6);
+  const rawWei6 = Math.floor(usdc * USDC_UNIT_WEI6);
   return Math.floor(rawWei6 / RISK_LOT_WEI6) * RISK_LOT_WEI6;
 }
 

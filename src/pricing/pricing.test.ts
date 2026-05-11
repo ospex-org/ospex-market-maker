@@ -54,13 +54,19 @@ describe('odds conversions', () => {
     expect(isTickInRange(150.5)).toBe(false);
   });
 
-  it('quantizeRiskWei6 rounds down to a valid lot', () => {
+  it('quantizeRiskWei6 rounds down to a valid lot (never up — it is a risk/safety boundary)', () => {
     expect(quantizeRiskWei6(0.25)).toBe(250_000);
     expect(quantizeRiskWei6(0.250001)).toBe(250_000);
     expect(quantizeRiskWei6(50)).toBe(50_000_000);
-    expect(quantizeRiskWei6(0.00005)).toBe(0);
+    expect(quantizeRiskWei6(0.0001)).toBe(100); // exactly one lot
+    expect(quantizeRiskWei6(0.00019999)).toBe(100); // between one and two lots → one lot
+    expect(quantizeRiskWei6(0.0002)).toBe(200); // exactly two lots
+    expect(quantizeRiskWei6(0.00005)).toBe(0); // 50 wei6 — below one lot
+    expect(quantizeRiskWei6(0.0000999)).toBe(0); // 99.9 wei6 — below one lot; must NOT round up to 100
     expect(quantizeRiskWei6(0)).toBe(0);
     expect(quantizeRiskWei6(-1)).toBe(0);
+    expect(quantizeRiskWei6(Number.NaN)).toBe(0);
+    expect(quantizeRiskWei6(Number.POSITIVE_INFINITY)).toBe(0);
     expect(wei6ToUSDC(250_000)).toBe(0.25);
   });
 });
@@ -271,9 +277,30 @@ describe('computeQuote', () => {
     expect(r.notes.some((n) => /^REFUSE: both sides/.test(n))).toBe(true);
   });
 
+  it('never quotes over the available headroom — a sub-lot headroom yields no quote', () => {
+    // 0.0000999 USDC = 99.9 wei6, below the 100-wei6 lot. The previous `Math.round`
+    // rounded that up to a full lot — quoting *over* the stated headroom. With the
+    // `Math.floor` fix it quantizes to 0, so the side is pulled.
+    const r = computeQuote({
+      ...COMMON,
+      awayHeadroomUSDC: 0.0000999,
+      homeHeadroomUSDC: 0,
+      mode: 'direct',
+      direct: { spreadBps: 100 },
+    });
+    expect(r.canQuote).toBe(false);
+    expect(r.away).toBeNull();
+    expect(r.home).toBeNull();
+  });
+
   it('throws on invalid caller arguments', () => {
     expect(() => computeQuote({ ...COMMON, capitalUSDC: 0, mode: 'economics', economics: ECON })).toThrow(/capitalUSDC/);
     expect(() => computeQuote({ ...COMMON, mode: 'economics', economics: { ...ECON, fillRateAssumption: 0 } })).toThrow(/fillRateAssumption/);
     expect(() => computeQuote({ ...COMMON, awayHeadroomUSDC: -1, mode: 'direct', direct: { spreadBps: 100 } })).toThrow(/headroom/);
+    // non-finite parameters throw (they come from config / risk calcs — a NaN/Infinity there is a bug)
+    expect(() => computeQuote({ ...COMMON, capitalUSDC: Number.POSITIVE_INFINITY, mode: 'direct', direct: { spreadBps: 100 } })).toThrow(/finite/);
+    expect(() => computeQuote({ ...COMMON, awayHeadroomUSDC: Number.POSITIVE_INFINITY, mode: 'direct', direct: { spreadBps: 100 } })).toThrow(/finite/);
+    expect(() => computeQuote({ ...COMMON, mode: 'economics', economics: { ...ECON, daysHorizon: Number.NaN } })).toThrow(/finite/);
+    expect(() => computeQuote({ ...COMMON, mode: 'direct', direct: { spreadBps: Number.NaN } })).toThrow(/finite/);
   });
 });

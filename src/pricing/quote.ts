@@ -30,7 +30,23 @@ function refused(
   };
 }
 
+function requireFinite(value: number, name: string): void {
+  if (!Number.isFinite(value)) {
+    throw new Error(`computeQuote: ${name} must be a finite number, got ${value}`);
+  }
+}
+
+// Caller-argument validation. Non-finite *parameters* throw (they come from config
+// or risk calculations — a NaN / Infinity there is a bug). The *reference odds*
+// (consensusAwayDecimal / consensusHomeDecimal) are data, not parameters: a garbage
+// value there is handled downstream in `stripVig` as a refusal (DESIGN §2.2 — refuse
+// on bad reference data), not a throw.
 function validateCommon(inputs: QuoteInputs): void {
+  requireFinite(inputs.capitalUSDC, 'capitalUSDC');
+  requireFinite(inputs.maxPerQuotePctOfCapital, 'maxPerQuotePctOfCapital');
+  requireFinite(inputs.minEdgeBps, 'minEdgeBps');
+  requireFinite(inputs.awayHeadroomUSDC, 'awayHeadroomUSDC');
+  requireFinite(inputs.homeHeadroomUSDC, 'homeHeadroomUSDC');
   if (!(inputs.capitalUSDC > 0)) {
     throw new Error(`computeQuote: capitalUSDC must be positive, got ${inputs.capitalUSDC}`);
   }
@@ -48,6 +64,12 @@ function validateCommon(inputs: QuoteInputs): void {
 }
 
 function validateEconomics(e: EconomicsInputs): void {
+  requireFinite(e.targetMonthlyReturnPct, 'economics.targetMonthlyReturnPct');
+  requireFinite(e.daysHorizon, 'economics.daysHorizon');
+  requireFinite(e.estGamesPerDay, 'economics.estGamesPerDay');
+  requireFinite(e.fillRateAssumption, 'economics.fillRateAssumption');
+  requireFinite(e.capitalTurnoverPerDay, 'economics.capitalTurnoverPerDay');
+  requireFinite(e.maxReasonableSpread, 'economics.maxReasonableSpread');
   if (!(e.targetMonthlyReturnPct > 0)) {
     throw new Error(`computeQuote: economics.targetMonthlyReturnPct must be positive, got ${e.targetMonthlyReturnPct}`);
   }
@@ -95,15 +117,21 @@ function buildSide(side: 'away' | 'home', quoteProb: number, sizeUSDC: number, s
  * Returns `{ canQuote: false, notes: ['REFUSE: …', …] }` for any *operational*
  * refusal: bad reference data, infeasible economics, a lopsided line that pushes
  * a quote probability to ≥ 1, an out-of-range tick, or no exposure headroom on
- * either side. Throws only on invalid *caller* arguments (non-positive capital,
- * a missing mode sub-object, an out-of-range economics parameter, …).
+ * either side. Throws only on invalid *caller* arguments (non-finite or
+ * out-of-range parameters, a missing mode sub-object).
  *
  * Pure function — no I/O, no SDK, no chain. The risk engine supplies the per-side
  * headroom (DESIGN §6); the runner/orders layer builds `QuoteInputs` from config +
  * reference odds + current exposure.
  */
 export function computeQuote(inputs: QuoteInputs): QuoteResult {
+  // Validate all caller arguments up front, before doing any work.
   validateCommon(inputs);
+  if (inputs.mode === 'economics') {
+    validateEconomics(inputs.economics);
+  } else {
+    requireFinite(inputs.direct.spreadBps, 'direct.spreadBps');
+  }
 
   if (!inputs.quoteBothSides) {
     return refused(
@@ -123,10 +151,9 @@ export function computeQuote(inputs: QuoteInputs): QuoteResult {
     return refused([refusePrefix((err as Error).message)], null, null, null, null);
   }
 
-  // Step 2 — derive the quoting spread.
+  // Step 2 — derive the quoting spread (caller args were validated up front).
   let spreadResult: DeriveSpreadResult;
   if (inputs.mode === 'economics') {
-    validateEconomics(inputs.economics);
     spreadResult = deriveSpreadEconomics(
       inputs.capitalUSDC,
       inputs.maxPerQuotePctOfCapital,
@@ -135,9 +162,6 @@ export function computeQuote(inputs: QuoteInputs): QuoteResult {
       inputs.minEdgeBps,
     );
   } else {
-    if (!Number.isFinite(inputs.direct.spreadBps)) {
-      throw new Error(`computeQuote: direct.spreadBps must be a finite number, got ${inputs.direct.spreadBps}`);
-    }
     spreadResult = deriveSpreadDirect(inputs.direct.spreadBps, fair, inputs.minEdgeBps);
   }
   const targetReturnUSDC = spreadResult.diagnostics?.targetMonthlyReturnUSDC ?? null;

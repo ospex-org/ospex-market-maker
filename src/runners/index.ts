@@ -1,33 +1,51 @@
 /**
- * The runner — the event loop (DESIGN §3, §8). One `Runner` per process, mode set
- * by `config.mode.dryRun`. This module is the loop's *machinery* + the *discovery*
- * layer: the boot path (state load + the boot-time state-loss fail-safe — DESIGN
- * §12), the kill-switch (a file at `config.killSwitchFile`, or a SIGTERM / SIGINT →
- * a graceful shutdown), the tick loop, **discovery** (every `discovery.everyNTicks`
- * ticks — jittered — find the verified contests with an open moneyline speculation +
- * a reference-game id starting within `marketSelection.maxStartsWithinHours`, honour
- * the allow/deny lists, track up to `marketSelection.maxTrackedContests` of them,
- * untrack the departed ones; `candidate` telemetry for the skipped/tracked), age-out
- * of expired tracked commitments, the per-tick state flush, and an interruptible
- * sleep clamped to the `pollIntervalMs` floor.
+ * The runner — the event loop (DESIGN §3, §8, §10). One `Runner` per process,
+ * mode set by `config.mode.dryRun`. This module is the loop's *machinery* +
+ * *discovery* + the *reference-odds* layer:
  *
- * Still TODO follow-ups: the odds subscriptions for the tracked markets (PR 4b-ii —
- * snapshot-first, the `odds.maxRealtimeChannels` cap, the Realtime guardrails of
- * DESIGN §10), the per-market reconcile (PR 4c — `buildDesiredQuote` →
+ *   - the boot path (state load + the boot-time state-loss fail-safe — DESIGN §12);
+ *   - the kill-switch (a file at `config.killSwitchFile`, or a SIGTERM / SIGINT →
+ *     a graceful shutdown);
+ *   - the tick loop;
+ *   - **discovery** (every `discovery.everyNTicks` ticks — jittered — find the
+ *     verified contests with an open moneyline speculation + a reference-game id
+ *     starting within `marketSelection.maxStartsWithinHours`, honour the allow/deny
+ *     lists, track up to `marketSelection.maxTrackedContests` of them, untrack the
+ *     departed ones; `candidate` telemetry for the skipped/tracked);
+ *   - **reference odds** (DESIGN §10's Realtime guardrails): for each tracked
+ *     market keep its reference moneyline odds + freshness current — by default a
+ *     Supabase Realtime channel per market (snapshot-first seed, then the channel's
+ *     `onChange` / `onRefresh` / `onError`), capped at `odds.maxRealtimeChannels`
+ *     (markets over the cap stay tracked but *degraded* — no odds — and are retried
+ *     when a slot frees); `odds.subscribe: false` falls back to a bounded
+ *     per-tick snapshot poll. A channel error degrades the market and the next
+ *     discovery cycle re-subscribes it. The `dirty` flag (an `onChange` arrived) is
+ *     read-and-cleared by the (TODO) per-market reconcile — dirty-event coalescing;
+ *   - age-out of expired tracked commitments;
+ *   - the per-tick state flush;
+ *   - an interruptible sleep clamped to the `pollIntervalMs` floor.
+ *
+ * Still TODO follow-ups: the per-market reconcile (PR 4c — `buildDesiredQuote` →
  * `reconcileBook` → `would-*` telemetry + state mutation, respecting the boot-time
- * hold), and fill-detection (PR 4c).
+ * hold) and fill-detection (PR 4c).
  *
  * No `@ospex/sdk` import — all chain/API access goes through the `OspexAdapter`. The
  * clock, sleep, kill-switch probe, OS-signal registration, and randomness are
  * injectable (`RunnerDeps`) so the loop is unit-testable: run a bounded number of
  * ticks; drive shutdown via the kill probe or a simulated signal; pin discovery
- * timing.
+ * timing; drive the odds callbacks via a fake `subscribeOdds`.
  */
 
 import { existsSync } from 'node:fs';
 
 import { POLL_INTERVAL_FLOOR_MS, type Config } from '../config/index.js';
-import type { ContestView, OspexAdapter } from '../ospex/index.js';
+import type {
+  ContestView,
+  OddsSnapshotView,
+  OddsSubscribeHandlersView,
+  OspexAdapter,
+  Subscription,
+} from '../ospex/index.js';
 import { assessStateLoss, type MakerState, type StateLossAssessment, type StateStore } from '../state/index.js';
 import { EventLog, eventLogsExist } from '../telemetry/index.js';
 
@@ -115,16 +133,24 @@ export function interruptibleSleep(ms: number, signal: AbortSignal): Promise<voi
 
 type ShutdownReason = 'kill-file' | 'signal';
 
+/** The latest reference moneyline odds seen for a market (American; either side can be `null` if the upstream hasn't priced it). */
+interface MoneylineOddsPair {
+  awayOddsAmerican: number | null;
+  homeOddsAmerican: number | null;
+}
+
 /**
- * A contest the runner is tracking — its market metadata. PR 4b-ii adds the
- * odds-subscription state (the `Subscription`, the latest reference odds + their
- * freshness timestamp, the dirty flag); PR 4c's per-market reconcile reads
- * `speculationId` (re-confirms it's still open — the lazy-creation check) and
- * `matchTimeSec` (the `start-too-soon` gate / the `match-time` expiry value).
+ * A contest the runner is tracking — its market metadata + the reference-odds
+ * state. The (TODO) per-market reconcile reads `speculationId` (re-confirms it's
+ * still open — the lazy-creation check), `matchTimeSec` (the `start-too-soon`
+ * gate / the `match-time` expiry value), `lastMoneylineOdds` (the input to
+ * `buildDesiredQuote`), `lastOddsAt` (the `stale-reference` gate), and `dirty`
+ * (whether to re-quote — read-and-cleared each pass, so a burst of odds moves
+ * coalesces to one reconcile).
  */
 interface TrackedMarket {
   contestId: string;
-  /** The neutral reference-game id — always set (a contest with no upstream linkage is skipped at discovery with `no-reference-odds`). PR 4b-ii uses it to open the odds Realtime channel. */
+  /** The neutral reference-game id — always set (a contest with no upstream linkage is skipped at discovery with `no-reference-odds`). Used to open the odds Realtime channel. */
   referenceGameId: string;
   /** Contest sport / teams — for the risk engine's `Market` (per-team / per-sport caps). */
   sport: string;
@@ -134,7 +160,47 @@ interface TrackedMarket {
   speculationId: string;
   /** Contest match time, unix seconds. */
   matchTimeSec: number;
+  /**
+   * The live Realtime channel for this market's reference odds, or `null` — not
+   * yet (re)subscribed (a newcomer this discovery cycle, or one whose channel
+   * errored), over the `odds.maxRealtimeChannels` cap, or running in
+   * `odds.subscribe: false` polling mode. A `null` here on a discovery cycle is
+   * the signal to (re)subscribe.
+   */
+  subscription: Subscription | null;
+  /** The latest reference moneyline odds, or `null` if none seen yet (the seed snapshot failed / the upstream has no moneyline row for the game). */
+  lastMoneylineOdds: MoneylineOddsPair | null;
+  /** Unix seconds — when the reference odds were last seen fresh (the seed snapshot, or an `onChange` / `onRefresh` from the channel, or a polling snapshot). `null` until the first reading. */
+  lastOddsAt: number | null;
+  /** An `onChange` (a genuine price move, or a polling snapshot that differed) arrived since the per-market reconcile last consumed this market. Newly-seeded markets start `true` (they need their first reconcile). */
+  dirty: boolean;
 }
+
+/**
+ * A read-only snapshot of a tracked market's state — for diagnostics / tests /
+ * (Phase 3) `ospex-mm status`. The live `Subscription` handle is reduced to a
+ * `subscribed` boolean.
+ */
+export interface TrackedMarketView {
+  contestId: string;
+  referenceGameId: string;
+  sport: string;
+  awayTeam: string;
+  homeTeam: string;
+  speculationId: string;
+  matchTimeSec: number;
+  /** Is a Realtime odds channel live for this market right now? (`false` while degraded / over the channel cap / in `odds.subscribe: false` polling mode.) */
+  subscribed: boolean;
+  /** The latest reference moneyline odds (American), or `null` if none seen yet. */
+  lastMoneylineOdds: MoneylineOddsPair | null;
+  /** Unix seconds — when the reference odds were last seen fresh; `null` until the first reading. */
+  lastOddsAt: number | null;
+  /** Has the reference odds moved since the per-market reconcile last consumed this market? */
+  dirty: boolean;
+}
+
+/** Reasons a tracked market is in a `degraded` (no live odds channel) state — carried on the `degraded` telemetry event. */
+type DegradedReason = 'channel-error' | 'subscribe-failed' | 'channel-cap';
 
 export class Runner {
   readonly config: Config;
@@ -274,16 +340,17 @@ export class Runner {
     }
   }
 
-  /** One iteration: discovery → per-market reconcile → fill-detection → age-out → flush. (The middle two are TODO follow-ups; discovery + age-out + flush are wired.) */
+  /** One iteration: discovery → reference-odds refresh → per-market reconcile → fill-detection → age-out → flush. (The reconcile + fill-detection are TODO follow-ups; the rest are wired.) */
   private async tick(tick: number): Promise<void> {
     this.eventLog.emit('tick-start', { tick });
     try {
-      if (tick >= this.nextDiscoveryAtTick) {
+      const ranDiscovery = tick >= this.nextDiscoveryAtTick;
+      if (ranDiscovery) {
         await this.discover(tick);
         this.nextDiscoveryAtTick = tick + this.jitteredDiscoveryInterval();
       }
-      // TODO(PR 4b-ii): for each market newly tracked by this discovery cycle, getOddsSnapshot (seed) then subscribeOdds (snapshot-first, up to odds.maxRealtimeChannels); for each departed market, unsubscribe its odds channel; the Realtime guardrails (DESIGN §10) — channel-error → market degraded + retry-next-cycle, dirty-event coalescing.
-      // TODO(PR 4c): per-market reconcile — for each dirty / newly-tracked market, skip while isHoldingQuoting(): inv = inventoryFromState(this.state, now); buildDesiredQuote(config, market, refOdds, inv); the lazy-creation re-check from m.speculationId / ContestView.speculations (gone ⇒ `candidate` skipReason would-create-lazy-speculation); reconcileBook(recordsOnSpec, desired, config, now, inv.openCommitmentCount); in dry-run emit would-submit / would-replace / would-soft-cancel + `candidate` (skipReason cap-hit per deferredSides) + mutate this.state (synthetic visibleOpen records for toSubmit / toReplace.replacement; reclassify toReplace.stale / toSoftCancel.record → softCancelled).
+      await this.refreshTrackedOdds({ ranDiscovery });
+      // TODO(PR 4c): per-market reconcile — for each dirty / newly-tracked market, skip while isHoldingQuoting(): inv = inventoryFromState(this.state, now); buildDesiredQuote(config, market, m.lastMoneylineOdds, inv); the lazy-creation re-check from m.speculationId / a fresh getContest(...).speculations (gone ⇒ `candidate` skipReason would-create-lazy-speculation); the start-too-soon / stale-reference gates (m.matchTimeSec - now < threshold ⇒ `candidate` start-too-soon; now - m.lastOddsAt > orders.staleReferenceAfterSeconds ⇒ `candidate` stale-reference); reconcileBook(recordsOnSpec, desired, config, now, inv.openCommitmentCount); in dry-run emit would-submit / would-replace / would-soft-cancel + `candidate` (skipReason cap-hit per deferredSides) + mutate this.state (synthetic visibleOpen records for toSubmit / toReplace.replacement; reclassify toReplace.stale / toSoftCancel.record → softCancelled); then clear m.dirty.
       // TODO(PR 4c): fill-detection — adapter.listOpenCommitments(maker, maxOpen+buffer); diff against last tick's visibleOpen hash set; by-hash lookup of disappeared hashes → reclassify (filled / cancelled / expired); periodically adapter.getPositionStatus(maker). (In dry-run this is the live path — a no-op unless a prior live run left commitments/positions.)
       this.ageOut();
     } catch (err) {
@@ -320,15 +387,16 @@ export class Runner {
    * The discovery cycle (DESIGN §10): list the verified contests starting within
    * `marketSelection.maxStartsWithinHours` (filtered to the configured sports + the
    * allow/deny lists); drop tracked contests no longer in that set (started / scored
-   * / out of window); for each *new* candidate (soonest game first) — confirm it has
-   * an open moneyline speculation (else `candidate` `no-open-speculation`), isn't
-   * already started (else `start-too-soon`), and there's room under
-   * `marketSelection.maxTrackedContests` (else `tracking-cap-reached`); then
-   * `getContest` for the reference-game id (else `no-reference-odds`) and track it,
-   * with a `candidate` event (no `skipReason`). A `listContests` failure aborts the
-   * cycle (the tracked set is left as-is, retried next cycle); a per-candidate
-   * `getContest` failure just skips that candidate. (PR 4b-ii then seeds + subscribes
-   * each newly-tracked market's odds and unsubscribes the departed ones.)
+   * / out of window — tearing down each one's odds channel); for each *new* candidate
+   * (soonest game first) — confirm it has an open moneyline speculation (else
+   * `candidate` `no-open-speculation`), isn't already started (else `start-too-soon`),
+   * and there's room under `marketSelection.maxTrackedContests` (else
+   * `tracking-cap-reached`); then `getContest` for the reference-game id (else
+   * `no-reference-odds`) and track it, with a `candidate` event (no `skipReason`). A
+   * `listContests` failure aborts the cycle (the tracked set is left as-is, retried
+   * next cycle); a per-candidate `getContest` failure just skips that candidate.
+   * `refreshTrackedOdds` (called right after this) then seeds + subscribes each
+   * newly-tracked market's odds.
    */
   private async discover(tick: number): Promise<void> {
     const now = this.deps.now();
@@ -354,8 +422,9 @@ export class Runner {
 
     for (const id of [...this.trackedMarkets.keys()]) {
       if (!byId.has(id)) {
+        const departed = this.trackedMarkets.get(id);
         this.trackedMarkets.delete(id);
-        // TODO(PR 4b-ii): unsubscribe this market's odds channel.
+        if (departed?.subscription) void this.dropChannel(departed.subscription, departed.contestId);
       }
     }
 
@@ -402,10 +471,148 @@ export class Runner {
         homeTeam: full.homeTeam,
         speculationId: confirmedSpec.speculationId,
         matchTimeSec,
+        subscription: null,
+        lastMoneylineOdds: null,
+        lastOddsAt: null,
+        dirty: false,
       });
       this.eventLog.emit('candidate', { contestId: c.contestId, sport: full.sport, matchTime: full.matchTime, speculationId: confirmedSpec.speculationId });
-      // TODO(PR 4b-ii): seed + subscribe this market's odds (snapshot-first), up to odds.maxRealtimeChannels.
     }
+  }
+
+  /**
+   * Keep the tracked markets' reference moneyline odds + freshness current
+   * (DESIGN §10). Two modes:
+   *
+   * - `odds.subscribe: true` (default) — on a discovery cycle, (re)subscribe a
+   *   Supabase Realtime channel for each tracked market that doesn't have a live
+   *   one (a newcomer, or one whose channel errored), up to `odds.maxRealtimeChannels`
+   *   (markets over the cap stay tracked but degraded — no odds — and are retried
+   *   when a slot frees); the channel's `onChange` / `onRefresh` / `onError`
+   *   handlers keep the market's odds + freshness + dirty flag current between
+   *   cycles. The discovery interval is the (re)subscription throttle, so this is a
+   *   no-op on non-discovery ticks.
+   * - `odds.subscribe: false` — no Realtime; snapshot every tracked market every
+   *   tick (bounded — one `getOddsSnapshot` per tracked market, ≤ `maxTrackedContests`).
+   *
+   * Each (re)subscribe is "snapshot-first": a `getOddsSnapshot` seed so the market
+   * can be quoted next tick rather than only after the upstream price next moves. A
+   * per-market read failure (snapshot or subscribe) is logged / degraded and left
+   * for the next cycle; nothing here throws into the tick loop.
+   */
+  private async refreshTrackedOdds(opts: { ranDiscovery: boolean }): Promise<void> {
+    if (!this.config.odds.subscribe) {
+      await this.pollTrackedOdds();
+      return;
+    }
+    if (!opts.ranDiscovery) return; // subscription mode: the discovery cycle is the (re)subscription throttle
+    await this.syncOddsSubscriptions();
+  }
+
+  /** Subscription mode (`odds.subscribe: true`): (re)subscribe a Realtime channel for each tracked market lacking a live one, soonest games first, up to `odds.maxRealtimeChannels`; the rest get a `degraded` `channel-cap` event (retried when a slot frees). */
+  private async syncOddsSubscriptions(): Promise<void> {
+    const cap = this.config.odds.maxRealtimeChannels;
+    let live = 0;
+    const needSubscription: TrackedMarket[] = [];
+    for (const m of this.trackedMarkets.values()) {
+      if (m.subscription !== null) live += 1;
+      else needSubscription.push(m);
+    }
+    needSubscription.sort((a, b) => a.matchTimeSec - b.matchTimeSec); // soonest games get channels first
+    for (const m of needSubscription) {
+      if (live >= cap) {
+        this.emitDegraded(m, 'channel-cap');
+        continue;
+      }
+      await this.seedOdds(m); // snapshot-first; a failure is logged and doesn't block the subscribe
+      if (await this.subscribeMarketOdds(m)) live += 1;
+    }
+  }
+
+  /** `odds.subscribe: false` mode: snapshot every tracked market's reference odds this tick. A market whose moneyline odds changed since last tick (or had none) is marked dirty (the per-market reconcile re-quotes it); an unchanged one just has its freshness bumped. A per-market failure is logged and skipped. */
+  private async pollTrackedOdds(): Promise<void> {
+    for (const m of this.trackedMarkets.values()) {
+      const snap = await this.snapshotOdds(m, 'odds-poll');
+      if (snap === null) continue;
+      const ml = snap.odds.moneyline;
+      const changed = ml !== null && (m.lastMoneylineOdds === null || m.lastMoneylineOdds.awayOddsAmerican !== ml.awayOddsAmerican || m.lastMoneylineOdds.homeOddsAmerican !== ml.homeOddsAmerican);
+      this.recordOdds(m, ml, { markDirty: changed });
+    }
+  }
+
+  /** Seed a market's reference odds from a one-shot snapshot (DESIGN §10 — "snapshot-first"). A failure is logged (inside `snapshotOdds`) and ignored: the Realtime channel will deliver odds on its first `onChange`. */
+  private async seedOdds(m: TrackedMarket): Promise<void> {
+    const snap = await this.snapshotOdds(m, 'odds-seed');
+    if (snap !== null) this.recordOdds(m, snap.odds.moneyline, { markDirty: true });
+  }
+
+  /** One-shot reference-odds snapshot for a market; logs an `error` (with the given `phase`) and returns `null` on failure. */
+  private async snapshotOdds(m: TrackedMarket, phase: 'odds-seed' | 'odds-poll'): Promise<OddsSnapshotView | null> {
+    try {
+      return await this.adapter.getOddsSnapshot(m.contestId);
+    } catch (err) {
+      this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase, contestId: m.contestId });
+      return null;
+    }
+  }
+
+  /**
+   * Open a Realtime channel for a market's reference moneyline odds and install it
+   * on the market (`m.subscription`), wiring `onChange` (→ store the odds, bump
+   * freshness, mark dirty) / `onRefresh` (→ store the odds, bump freshness) /
+   * `onError` (→ degrade the market: clear its subscription, emit `degraded`, tear
+   * down the dead channel; the next discovery cycle re-subscribes it). Returns
+   * `true` if subscribed, `false` if `subscribeOdds` rejected (e.g. the
+   * Realtime-credentials fetch — `/v1/config/public` — failed), in which case a
+   * `degraded` `subscribe-failed` event is emitted and the next discovery cycle
+   * retries. The `onError` handler only acts while *its* channel is still the live
+   * one (`m.subscription === thisSub`), so a stale error from a channel already
+   * replaced by a later cycle's re-subscribe can't clobber the new one.
+   */
+  private async subscribeMarketOdds(m: TrackedMarket): Promise<boolean> {
+    let thisSub: Subscription | null = null;
+    const handlers: OddsSubscribeHandlersView = {
+      onChange: (u) => this.recordOdds(m, u, { markDirty: true }),
+      onRefresh: (u) => this.recordOdds(m, u, { markDirty: false }),
+      onError: (err) => {
+        if (thisSub === null || m.subscription !== thisSub) return; // a stale error from an already-replaced channel
+        m.subscription = null;
+        this.emitDegraded(m, 'channel-error', err.message);
+        void this.dropChannel(thisSub, m.contestId);
+      },
+    };
+    try {
+      const sub = await this.adapter.subscribeOdds({ referenceGameId: m.referenceGameId, market: 'moneyline' }, handlers);
+      thisSub = sub;
+      m.subscription = sub; // installed synchronously after the await resolves — no gap for an onError to race with
+      return true;
+    } catch (err) {
+      this.emitDegraded(m, 'subscribe-failed', errMessage(err));
+      return false;
+    }
+  }
+
+  /** Store a fresh reference-odds reading on a tracked market (bumps `lastOddsAt`; sets `dirty` if `markDirty`). A `null` reading (no moneyline row at all) is a no-op — `lastOddsAt` then ages out, which the per-market reconcile's `stale-reference` gate catches. */
+  private recordOdds(m: TrackedMarket, odds: MoneylineOddsPair | null, opts: { markDirty: boolean }): void {
+    if (odds === null) return;
+    m.lastMoneylineOdds = { awayOddsAmerican: odds.awayOddsAmerican, homeOddsAmerican: odds.homeOddsAmerican };
+    m.lastOddsAt = this.deps.now();
+    if (opts.markDirty) m.dirty = true;
+  }
+
+  /** Best-effort teardown of a Realtime channel — a failure is logged but not fatal (the server reaps idle channels). */
+  private async dropChannel(sub: Subscription, contestId: string): Promise<void> {
+    try {
+      await sub.unsubscribe();
+    } catch (err) {
+      this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'odds-unsubscribe', contestId });
+    }
+  }
+
+  private emitDegraded(m: TrackedMarket, reason: DegradedReason, detail?: string): void {
+    const payload: Record<string, unknown> = { contestId: m.contestId, referenceGameId: m.referenceGameId, reason };
+    if (detail !== undefined) payload.detail = detail;
+    this.eventLog.emit('degraded', payload);
   }
 
   /** Ticks until the next discovery cycle: `discovery.everyNTicks` jittered by ±`discovery.jitterPct` (so multiple MMs don't all discover on the same tick). At least 1. */
@@ -418,6 +625,25 @@ export class Runner {
   /** The contest ids the runner is currently tracking, sorted — for diagnostics / tests. */
   trackedContestIds(): readonly string[] {
     return [...this.trackedMarkets.keys()].sort();
+  }
+
+  /** A read-only snapshot of one tracked market's state — for diagnostics / tests / (Phase 3) `ospex-mm status`. `undefined` if `contestId` isn't tracked. */
+  trackedMarketView(contestId: string): TrackedMarketView | undefined {
+    const m = this.trackedMarkets.get(contestId);
+    if (m === undefined) return undefined;
+    return {
+      contestId: m.contestId,
+      referenceGameId: m.referenceGameId,
+      sport: m.sport,
+      awayTeam: m.awayTeam,
+      homeTeam: m.homeTeam,
+      speculationId: m.speculationId,
+      matchTimeSec: m.matchTimeSec,
+      subscribed: m.subscription !== null,
+      lastMoneylineOdds: m.lastMoneylineOdds === null ? null : { ...m.lastMoneylineOdds },
+      lastOddsAt: m.lastOddsAt,
+      dirty: m.dirty,
+    };
   }
 }
 

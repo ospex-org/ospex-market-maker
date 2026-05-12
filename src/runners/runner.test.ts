@@ -4,7 +4,17 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { parseConfig, type Config } from '../config/index.js';
-import { createOspexAdapter, type ContestView, type OspexAdapter } from '../ospex/index.js';
+import {
+  createOspexAdapter,
+  type ContestView,
+  type MoneylineOdds,
+  type OddsSnapshotView,
+  type OddsSubscribeHandlersView,
+  type OddsUpdateView,
+  type OspexAdapter,
+  type SubscribeOddsArgs,
+  type Subscription,
+} from '../ospex/index.js';
 import { StateStore, emptyMakerState, type MakerCommitmentRecord, type MakerState } from '../state/index.js';
 import { Runner, interruptibleSleep, type RunnerDeps, type RunnerOptions } from './index.js';
 
@@ -63,9 +73,12 @@ function makeRunner(opts: { config?: Config; adapter?: OspexAdapter; runId?: str
   let adapter = opts.adapter;
   if (adapter === undefined) {
     // Tests that don't exercise discovery: stub the API so the discovery cycle finds nothing (no real HTTP).
+    // The reference-odds steps are then no-ops (no tracked markets), but stub them too so an accidental track surfaces rather than hitting the network.
     adapter = createOspexAdapter(config);
     vi.spyOn(adapter, 'listContests').mockResolvedValue([]);
     vi.spyOn(adapter, 'getContest').mockRejectedValue(new Error('makeRunner: getContest not stubbed — pass an `adapter` (see `spiedAdapter`) if your test exercises discovery'));
+    vi.spyOn(adapter, 'getOddsSnapshot').mockRejectedValue(new Error('makeRunner: getOddsSnapshot not stubbed — pass an `adapter` (see `spiedAdapter`) if your test exercises odds'));
+    vi.spyOn(adapter, 'subscribeOdds').mockRejectedValue(new Error('makeRunner: subscribeOdds not stubbed — pass an `adapter` (see `spiedAdapter`) if your test exercises odds'));
   }
   const full: RunnerOptions = {
     config,
@@ -98,11 +111,77 @@ function contestView(overrides: Partial<ContestView> & { contestId: string }): C
   };
 }
 
-/** An `OspexAdapter` with `listContests` / `getContest` spied: `listContests` calls `listContests()` each time; `getContest(id)` defaults to echoing a fresh `contestView` with `referenceGameId` filled in. */
-function spiedAdapter(config: Config, listContests: () => Promise<ContestView[]>, getContest?: (id: string) => Promise<ContestView>): OspexAdapter {
+// ── odds fixtures ────────────────────────────────────────────────────────────
+
+function moneylineOdds(awayOddsAmerican: number | null, homeOddsAmerican: number | null): MoneylineOdds {
+  return { market: 'moneyline', awayOddsAmerican, homeOddsAmerican, upstreamLastUpdated: '2026-01-01T00:00:00Z', pollCapturedAt: '2026-01-01T00:00:00Z', changedAt: '2026-01-01T00:00:00Z' };
+}
+/** A one-shot odds snapshot view for a contest — `referenceGameId` echoes `GAME-<contestId>` (matching `spiedAdapter`'s default `getContest`); the moneyline defaults to `-110 / -110`, pass `null` for "no moneyline row yet". */
+function oddsSnapshotView(contestId: string, moneyline: MoneylineOdds | null = moneylineOdds(-110, -110)): OddsSnapshotView {
+  return { contestId, referenceGameId: `GAME-${contestId}`, odds: { moneyline, spread: null, total: null } };
+}
+/** A Realtime `onChange` / `onRefresh` payload for a moneyline channel. */
+function oddsUpdate(referenceGameId: string, awayOddsAmerican: number | null, homeOddsAmerican: number | null): OddsUpdateView {
+  return { referenceGameId, market: 'moneyline', network: 'polygon', line: null, awayOddsAmerican, homeOddsAmerican, upstreamLastUpdated: '2026-02-02T00:00:00Z', pollCapturedAt: '2026-02-02T00:00:00Z', changedAt: '2026-02-02T00:00:00Z' };
+}
+function noopSubscription(): Subscription {
+  return { unsubscribe: () => Promise.resolve() };
+}
+
+/**
+ * A `subscribeOdds` stub that records each call (the handlers + a per-call
+ * `unsubscribe` spy), keyed by `referenceGameId`. By default every call succeeds;
+ * `rejectWhen(matcher)` makes matching calls reject (e.g. the first attempt for a
+ * given game — simulating the Realtime-credentials fetch failing).
+ */
+function makeSubscribeRecorder() {
+  const handlers = new Map<string, OddsSubscribeHandlersView>();
+  const unsubs = new Map<string, ReturnType<typeof vi.fn>>();
+  const calls: string[] = []; // referenceGameId per successful subscribe, in order
+  const attempts = new Map<string, number>();
+  let rejectMatcher: ((referenceGameId: string, attempt: number) => boolean) | null = null;
+  return {
+    subscribe(args: SubscribeOddsArgs, h: OddsSubscribeHandlersView): Promise<Subscription> {
+      const attempt = (attempts.get(args.referenceGameId) ?? 0) + 1;
+      attempts.set(args.referenceGameId, attempt);
+      if (rejectMatcher !== null && rejectMatcher(args.referenceGameId, attempt)) {
+        return Promise.reject(new Error('subscribe failed (test)'));
+      }
+      const unsubscribe = vi.fn(); // a no-impl spy: `await unsubscribe()` resolves to undefined, which is fine
+      handlers.set(args.referenceGameId, h);
+      unsubs.set(args.referenceGameId, unsubscribe);
+      calls.push(args.referenceGameId);
+      return Promise.resolve({ unsubscribe });
+    },
+    rejectWhen(matcher: (referenceGameId: string, attempt: number) => boolean): void { rejectMatcher = matcher; },
+    handlersFor(referenceGameId: string): OddsSubscribeHandlersView | undefined { return handlers.get(referenceGameId); },
+    unsubscribeFor(referenceGameId: string): ReturnType<typeof vi.fn> | undefined { return unsubs.get(referenceGameId); },
+    successfulCalls(): string[] { return [...calls]; },
+    attemptsFor(referenceGameId: string): number { return attempts.get(referenceGameId) ?? 0; },
+  };
+}
+
+/**
+ * An `OspexAdapter` with `listContests` / `getContest` / `getOddsSnapshot` /
+ * `subscribeOdds` spied: `listContests` calls `listContests()` each time;
+ * `getContest(id)` defaults to echoing a fresh `contestView` with
+ * `referenceGameId` filled in; `getOddsSnapshot(id)` and `subscribeOdds` default
+ * to a `-110 / -110` snapshot and a no-op channel (override via `odds`).
+ */
+function spiedAdapter(
+  config: Config,
+  listContests: () => Promise<ContestView[]>,
+  getContest?: (id: string) => Promise<ContestView>,
+  odds?: {
+    snapshot?: (contestId: string) => Promise<OddsSnapshotView>;
+    subscribe?: (args: SubscribeOddsArgs, handlers: OddsSubscribeHandlersView) => Promise<Subscription>;
+  },
+): OspexAdapter {
   const adapter = createOspexAdapter(config);
   vi.spyOn(adapter, 'listContests').mockImplementation(listContests);
   vi.spyOn(adapter, 'getContest').mockImplementation(getContest ?? ((id) => Promise.resolve(contestView({ contestId: id, referenceGameId: `GAME-${id}` }))));
+  vi.spyOn(adapter, 'getOddsSnapshot').mockImplementation(odds?.snapshot ?? ((contestId) => Promise.resolve(oddsSnapshotView(contestId))));
+  vi.spyOn(adapter, 'subscribeOdds').mockImplementation(odds?.subscribe ?? (() => Promise.resolve(noopSubscription())));
   return adapter;
 }
 
@@ -456,5 +535,167 @@ describe('interruptibleSleep', () => {
     const p = interruptibleSleep(60_000, ac.signal);
     ac.abort();
     await p; // resolves via the abort listener, not the (1-minute) timer
+  });
+});
+
+// ── odds subscriptions / Realtime guardrails (DESIGN §10) ────────────────────
+
+describe('Runner — odds subscriptions', () => {
+  it('seeds odds (snapshot-first) then opens a Realtime channel for each newly-tracked market', async () => {
+    const config = cfg(); // odds.subscribe defaults true, maxRealtimeChannels 60
+    const recorder = makeSubscribeRecorder();
+    let snapshotCalls = 0;
+    const adapter = spiedAdapter(config, () => Promise.resolve([contestView({ contestId: 'A' })]), undefined, {
+      snapshot: (contestId) => { snapshotCalls += 1; return Promise.resolve(oddsSnapshotView(contestId, moneylineOdds(-150, 130))); },
+      subscribe: recorder.subscribe,
+    });
+    const runner = makeRunner({ config, adapter, maxTicks: 1 });
+    await runner.run();
+
+    expect(snapshotCalls).toBe(1); // seeded before subscribing
+    expect(recorder.successfulCalls()).toEqual(['GAME-A']);
+    expect(runner.trackedMarketView('A')).toMatchObject({
+      subscribed: true,
+      lastMoneylineOdds: { awayOddsAmerican: -150, homeOddsAmerican: 130 },
+      lastOddsAt: T0,
+      dirty: true, // a freshly-seeded market is dirty so the per-market reconcile picks it up
+    });
+  });
+
+  it('honours odds.maxRealtimeChannels — subscribes the soonest games, the rest get a degraded channel-cap event; a freed slot is taken on the next cycle', async () => {
+    const config = cfg({ odds: { maxRealtimeChannels: 2 }, discovery: { everyNTicks: 1 } });
+    const recorder = makeSubscribeRecorder();
+    const a = contestView({ contestId: 'A', matchTime: '2099-01-01T00:00:00Z' });
+    const b = contestView({ contestId: 'B', matchTime: '2099-01-02T00:00:00Z' });
+    const c = contestView({ contestId: 'C', matchTime: '2099-01-03T00:00:00Z' });
+    let listCount = 0;
+    const adapter = spiedAdapter(config, () => { listCount += 1; return Promise.resolve(listCount === 1 ? [a, b, c] : [b, c]); }, undefined, { subscribe: recorder.subscribe });
+    const runner = makeRunner({ config, adapter, maxTicks: 2 });
+    await runner.run();
+
+    // cycle 1: A, B, C tracked; A & B get channels (soonest), C is over the cap → degraded channel-cap.
+    // cycle 2: A departs → its channel frees → C is subscribed.
+    expect(runner.trackedContestIds()).toEqual(['B', 'C']);
+    expect(runner.trackedMarketView('B')?.subscribed).toBe(true);
+    expect(runner.trackedMarketView('C')?.subscribed).toBe(true);
+    const capEvents = readEvents().filter((e) => e.kind === 'degraded' && e.reason === 'channel-cap');
+    expect(capEvents.map((e) => e.contestId)).toEqual(['C']);
+    expect(recorder.successfulCalls().filter((id) => id === 'GAME-C')).toHaveLength(1); // C subscribed once, on cycle 2
+    expect(recorder.successfulCalls().filter((id) => id === 'GAME-A')).toHaveLength(1); // A subscribed cycle 1, then departed
+  });
+
+  it('a channel onChange updates the odds + marks the market dirty; onRefresh updates without marking dirty; a seed with no moneyline row leaves lastMoneylineOdds null', async () => {
+    const config = cfg();
+    const recorder = makeSubscribeRecorder();
+    let t = T0;
+    const adapter = spiedAdapter(config, () => Promise.resolve([contestView({ contestId: 'A' })]), undefined, {
+      snapshot: (contestId) => Promise.resolve(oddsSnapshotView(contestId, null)), // no moneyline row at seed time
+      subscribe: recorder.subscribe,
+    });
+    const runner = makeRunner({ config, adapter, maxTicks: 1, deps: { now: () => t } });
+    await runner.run();
+
+    // after the seed: subscribed, but no odds yet, not dirty.
+    expect(runner.trackedMarketView('A')).toMatchObject({ subscribed: true, lastMoneylineOdds: null, lastOddsAt: null, dirty: false });
+
+    const handlers = recorder.handlersFor('GAME-A');
+    expect(handlers).toBeDefined();
+
+    // onRefresh: stores the odds + bumps freshness, but does NOT mark the market dirty.
+    t = T0 + 5;
+    handlers?.onRefresh?.(oddsUpdate('GAME-A', -120, 100));
+    expect(runner.trackedMarketView('A')).toMatchObject({ lastMoneylineOdds: { awayOddsAmerican: -120, homeOddsAmerican: 100 }, lastOddsAt: T0 + 5, dirty: false });
+
+    // onChange: updates the odds, bumps freshness, marks the market dirty.
+    t = T0 + 10;
+    handlers?.onChange(oddsUpdate('GAME-A', 150, -180));
+    expect(runner.trackedMarketView('A')).toMatchObject({ lastMoneylineOdds: { awayOddsAmerican: 150, homeOddsAmerican: -180 }, lastOddsAt: T0 + 10, dirty: true });
+  });
+
+  it('a channel onError degrades the market (subscription cleared) + emits a degraded channel-error event; the next discovery cycle re-subscribes it', async () => {
+    const config = cfg({ discovery: { everyNTicks: 1 } });
+    const recorder = makeSubscribeRecorder();
+    let sleeps = 0;
+    const adapter = spiedAdapter(config, () => Promise.resolve([contestView({ contestId: 'A' })]), undefined, { subscribe: recorder.subscribe });
+    const runner = makeRunner({
+      config,
+      adapter,
+      maxTicks: 2,
+      deps: { sleep: () => { sleeps += 1; if (sleeps === 1) recorder.handlersFor('GAME-A')?.onError?.(new Error('channel boom')); return Promise.resolve(); } },
+    });
+    await runner.run();
+
+    expect(runner.trackedMarketView('A')?.subscribed).toBe(true); // re-subscribed on cycle 2
+    expect(recorder.successfulCalls()).toEqual(['GAME-A', 'GAME-A']);
+    const degraded = readEvents().filter((e) => e.kind === 'degraded');
+    expect(degraded).toHaveLength(1);
+    expect(degraded[0]).toMatchObject({ contestId: 'A', referenceGameId: 'GAME-A', reason: 'channel-error', detail: 'channel boom' });
+  });
+
+  it('a subscribeOdds rejection (e.g. the Realtime-credentials fetch failed) degrades the market with a subscribe-failed event; the next discovery cycle retries', async () => {
+    const config = cfg({ discovery: { everyNTicks: 1 } });
+    const recorder = makeSubscribeRecorder();
+    recorder.rejectWhen((referenceGameId, attempt) => referenceGameId === 'GAME-A' && attempt === 1);
+    const adapter = spiedAdapter(config, () => Promise.resolve([contestView({ contestId: 'A' })]), undefined, { subscribe: recorder.subscribe });
+    const runner = makeRunner({ config, adapter, maxTicks: 2 });
+    await runner.run();
+
+    expect(runner.trackedMarketView('A')?.subscribed).toBe(true); // succeeded on the 2nd attempt
+    expect(recorder.attemptsFor('GAME-A')).toBe(2);
+    expect(recorder.successfulCalls()).toEqual(['GAME-A']);
+    const degraded = readEvents().filter((e) => e.kind === 'degraded');
+    expect(degraded).toHaveLength(1);
+    expect(degraded[0]).toMatchObject({ contestId: 'A', reason: 'subscribe-failed', detail: 'subscribe failed (test)' });
+  });
+
+  it('a seed-snapshot failure logs an error but does not block the subscription; odds arrive on the first channel onChange', async () => {
+    const config = cfg();
+    const recorder = makeSubscribeRecorder();
+    const adapter = spiedAdapter(config, () => Promise.resolve([contestView({ contestId: 'A' })]), undefined, {
+      snapshot: () => Promise.reject(new Error('snapshot 503')),
+      subscribe: recorder.subscribe,
+    });
+    const runner = makeRunner({ config, adapter, maxTicks: 1 });
+    await runner.run();
+
+    expect(runner.trackedMarketView('A')).toMatchObject({ subscribed: true, lastMoneylineOdds: null }); // channel up despite the seed failure
+    expect(readEvents().find((e) => e.kind === 'error')).toMatchObject({ phase: 'odds-seed', contestId: 'A', detail: 'snapshot 503' });
+
+    recorder.handlersFor('GAME-A')?.onChange(oddsUpdate('GAME-A', -200, 170));
+    expect(runner.trackedMarketView('A')?.lastMoneylineOdds).toEqual({ awayOddsAmerican: -200, homeOddsAmerican: 170 });
+  });
+
+  it('a departed market has its odds channel unsubscribed', async () => {
+    const config = cfg({ discovery: { everyNTicks: 1 } });
+    const recorder = makeSubscribeRecorder();
+    let listCount = 0;
+    const adapter = spiedAdapter(config, () => { listCount += 1; return Promise.resolve(listCount === 1 ? [contestView({ contestId: 'A' }), contestView({ contestId: 'B' })] : [contestView({ contestId: 'A' })]); }, undefined, { subscribe: recorder.subscribe });
+    const runner = makeRunner({ config, adapter, maxTicks: 2 });
+    await runner.run();
+
+    expect(runner.trackedContestIds()).toEqual(['A']);
+    expect(recorder.unsubscribeFor('GAME-B')).toHaveBeenCalledTimes(1);
+    expect(recorder.unsubscribeFor('GAME-A')).not.toHaveBeenCalled(); // A is still tracked
+    expect(runner.trackedMarketView('A')?.subscribed).toBe(true);
+  });
+
+  it('odds.subscribe: false → polling mode: snapshots every tracked market each tick, never opens a Realtime channel', async () => {
+    const config = cfg({ odds: { subscribe: false }, discovery: { everyNTicks: 10 } }); // discovery runs once (tick 1)
+    let snapshotCalls = 0;
+    let subscribeCalls = 0;
+    const adapter = spiedAdapter(config, () => Promise.resolve([contestView({ contestId: 'A' })]), undefined, {
+      snapshot: (contestId) => { snapshotCalls += 1; return Promise.resolve(oddsSnapshotView(contestId, moneylineOdds(-130, 110))); },
+      subscribe: () => { subscribeCalls += 1; return Promise.resolve(noopSubscription()); },
+    });
+    const runner = makeRunner({ config, adapter, maxTicks: 3 });
+    await runner.run();
+
+    expect(subscribeCalls).toBe(0); // no Realtime in polling mode
+    expect(snapshotCalls).toBe(3); // one snapshot per tick for the one tracked market
+    expect(runner.trackedMarketView('A')).toMatchObject({
+      subscribed: false,
+      lastMoneylineOdds: { awayOddsAmerican: -130, homeOddsAmerican: 110 },
+      lastOddsAt: T0,
+    });
   });
 });

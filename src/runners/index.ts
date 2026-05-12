@@ -120,11 +120,15 @@ export class Runner {
 
   private state: MakerState;
   /**
-   * Unix-seconds deadline before which the (TODO) per-market reconcile step must
-   * not post — the boot fail-safe (DESIGN §12). `null` = no hold; a finite value =
-   * hold until then; `Number.POSITIVE_INFINITY` = hold indefinitely (only if
-   * `assessStateLoss` ever omits `suggestedWaitSeconds` while holding, which it
-   * doesn't — belt and suspenders). Set at boot; read via `isHoldingQuoting()`.
+   * Unix-seconds deadline before which the boot fail-safe holds (DESIGN §12) — the
+   * (TODO) per-market reconcile step must not post, AND state is not flushed (the
+   * loaded state is empty / loss-derived, so persisting a clean `maker-state.json`
+   * would let a restart-before-this-deadline resume with no hold). `null` = no hold;
+   * a finite value = hold until then (`fixed-seconds` expiry: `now + expirySeconds`);
+   * `Number.POSITIVE_INFINITY` = hold indefinitely (`match-time` expiry — a prior
+   * soft-cancelled quote may be matchable until game start, so only
+   * `--ignore-missing-state` / telemetry reconstruction lifts it). Set at boot; read
+   * via `isHoldingQuoting()`.
    */
   private readonly holdQuotingUntil: number | null;
   private shutdownReason: ShutdownReason | null = null;
@@ -162,8 +166,21 @@ export class Runner {
       expirySeconds: this.config.orders.expirySeconds,
     });
     if (this.bootAssessment.holdQuoting) {
-      this.deps.log(`[runner] holding quoting at boot: ${this.bootAssessment.reason}`);
-      this.holdQuotingUntil = this.bootAssessment.suggestedWaitSeconds !== undefined ? this.deps.now() + this.bootAssessment.suggestedWaitSeconds : Number.POSITIVE_INFINITY;
+      const wait = this.bootAssessment.suggestedWaitSeconds;
+      const matchTimeExpiry = this.config.orders.expiryMode === 'match-time';
+      // Under `match-time` expiry a prior soft-cancelled quote stays matchable until
+      // game start — `expirySeconds` is not a sufficient wait — so hold indefinitely
+      // (only `--ignore-missing-state` / telemetry reconstruction lifts it). Under
+      // `fixed-seconds` a one-`expirySeconds` wait suffices (DESIGN §12).
+      if (matchTimeExpiry || wait === undefined) {
+        this.holdQuotingUntil = Number.POSITIVE_INFINITY;
+        this.deps.log(
+          `[runner] holding quoting indefinitely — ${this.bootAssessment.reason}${matchTimeExpiry ? ' (match-time expiry: a soft-cancelled quote may be matchable until game start; reconstruct from telemetry or pass --ignore-missing-state once you have confirmed no prior commitment is open)' : ''}`,
+        );
+      } else {
+        this.holdQuotingUntil = this.deps.now() + wait;
+        this.deps.log(`[runner] holding quoting for ${wait}s — ${this.bootAssessment.reason}`);
+      }
     } else {
       this.holdQuotingUntil = null;
     }
@@ -191,11 +208,12 @@ export class Runner {
   /**
    * The event loop: `{ kill-check → tick → stop-check → sleep }` until killed or
    * `maxTicks` is reached. On shutdown (kill-switch file or SIGTERM/SIGINT) emits a
-   * `kill` event and does a final state flush. (In dry-run there's nothing posted to
-   * pull on shutdown; live mode's `killCancelOnChain` path is Phase 3.) Single-use —
-   * call once. The kill *file* is checked at the top of each iteration, so it's
-   * acted on within one poll interval; a *signal* aborts the in-flight sleep, so
-   * it's acted on after the current tick.
+   * `kill` event and does a final state flush (unless a boot-time state-loss hold is
+   * still active — see `tick()`). (In dry-run there's nothing posted to pull on
+   * shutdown; live mode's `killCancelOnChain` path is Phase 3.) Single-use — call
+   * once. The kill *file* is checked at the top of each iteration, so it's acted on
+   * within one poll interval; a *signal* aborts the in-flight sleep, so it's acted
+   * on after the current tick.
    */
   async run(): Promise<void> {
     const unregister = this.deps.registerShutdownSignals(() => this.requestShutdown('signal'));
@@ -215,10 +233,10 @@ export class Runner {
     } finally {
       unregister();
       if (this.shutdownReason !== null) this.eventLog.emit('kill', { reason: this.shutdownReason, ticks });
-      // Each tick already flushes; this final flush only matters when a shutdown
-      // fires before any tick (kill file present at startup) — persist the loaded
-      // state (idempotent atomic write).
-      this.stateStore.flush(this.state);
+      // Each non-held tick already flushes; this final flush only matters when a
+      // shutdown fires before the first such tick. Skipped while a state-loss hold is
+      // active — same reason as in `tick()` (DESIGN §12).
+      if (!this.isHoldingQuoting()) this.stateStore.flush(this.state);
     }
   }
 
@@ -235,8 +253,12 @@ export class Runner {
       this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'tick' });
     }
     // The flush is OUTSIDE the try/catch: if state can't be persisted the runner
-    // must not keep ticking on an un-persistable state — let it propagate.
-    this.stateStore.flush(this.state);
+    // must not keep ticking on an un-persistable state — let it propagate. It's
+    // skipped entirely while a boot-time state-loss hold is active: the loaded state
+    // is empty / loss-derived, and persisting a clean `maker-state.json` would let a
+    // restart-before-the-hold-deadline resume with no hold (DESIGN §12). Once the
+    // hold has elapsed (`fixed-seconds`) or been overridden, normal flushing resumes.
+    if (!this.isHoldingQuoting()) this.stateStore.flush(this.state);
   }
 
   /** Reclassify any tracked commitment past its `expiryUnixSec` to `expired` (dead on chain — headroom released; DESIGN §9). Emits an `expire` per reclassification. */

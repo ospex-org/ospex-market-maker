@@ -50,6 +50,28 @@ export function isTickInRange(tick: number): boolean {
 }
 
 /**
+ * The symmetric counterparty odds tick. A protocol commitment posted at maker
+ * tick `T` (decimal `T/100`) gives the taker who matches it the *opposite* side
+ * at decimal `(T/100) / (T/100 − 1) = T / (T − 100)` — in ticks,
+ * `round(100·T / (T − 100))`. So a maker tick of `150` ↔ a taker tick of `300`,
+ * `200` ↔ `200`, `300` ↔ `150`. The relation is an involution up to integer
+ * rounding (`inverseOddsTick(inverseOddsTick(T)) === T` for the great majority of
+ * ticks; double-rounding can shift the round-trip by 1 at a handful of values —
+ * the same imprecision the SDK and contract live with). For `T` in
+ * `[MIN_ODDS_TICK, MAX_ODDS_TICK]` the result is also in that range.
+ *
+ * Mirrors the SDK's `inverseOddsTick` (`commitments/buildMatchPreview.js`).
+ * Throws on a non-integer tick or one outside `[MIN_ODDS_TICK, MAX_ODDS_TICK]` —
+ * a bad tick here is a caller bug, not data.
+ */
+export function inverseOddsTick(makerTick: number): number {
+  if (!Number.isInteger(makerTick) || makerTick < MIN_ODDS_TICK || makerTick > MAX_ODDS_TICK) {
+    throw new Error(`inverseOddsTick: ${makerTick} is not an odds tick in [${MIN_ODDS_TICK}, ${MAX_ODDS_TICK}]`);
+  }
+  return Math.round((ODDS_SCALE * makerTick) / (makerTick - ODDS_SCALE));
+}
+
+/**
  * Quantize a USDC amount **down** to the largest valid risk amount ≤ it (in wei6).
  * Risk amounts must be multiples of `RISK_LOT_WEI6`, so `0.250001` USDC →
  * `250000` wei6 and any amount below one lot (`< 0.0001` USDC) → `0`. Negative /

@@ -6,11 +6,13 @@ import {
   decimalToImpliedProb,
   decimalToTick,
   impliedProbToDecimal,
+  inverseOddsTick,
   isTickInRange,
   quantizeRiskWei6,
   tickToDecimal,
   wei6ToUSDC,
 } from './odds.js';
+import { oppositeSide, positionTypeForSide, sideForPositionType, toProtocolQuote } from './protocol.js';
 import { stripVig } from './vig.js';
 import { deriveSpreadDirect, deriveSpreadEconomics, expectedMonthlyFilledVolumeUSDC } from './spread.js';
 import { computeQuote } from './quote.js';
@@ -54,6 +56,39 @@ describe('odds conversions', () => {
     expect(isTickInRange(150.5)).toBe(false);
   });
 
+  it('inverseOddsTick — symmetric counterparty tick', () => {
+    expect(inverseOddsTick(150)).toBe(300);
+    expect(inverseOddsTick(300)).toBe(150);
+    expect(inverseOddsTick(200)).toBe(200);
+    expect(inverseOddsTick(198)).toBe(202);
+    expect(inverseOddsTick(202)).toBe(198);
+    expect(inverseOddsTick(250)).toBe(167); // round(25000/150) = round(166.67)
+    expect(inverseOddsTick(101)).toBe(10_100); // protocol min ↔ max
+    expect(inverseOddsTick(10_100)).toBe(101);
+    expect(() => inverseOddsTick(100)).toThrow(/odds tick in/); // would divide by zero
+    expect(() => inverseOddsTick(10_101)).toThrow(/odds tick in/); // above MAX
+    expect(() => inverseOddsTick(150.5)).toThrow(/odds tick in/); // non-integer
+  });
+
+  it('inverseOddsTick stays in range and is the rounded exact inverse, across the whole tick range', () => {
+    for (let t = 101; t <= 10_100; t++) {
+      const inv = inverseOddsTick(t);
+      expect(isTickInRange(inv)).toBe(true);
+      expect(inv).toBe(Math.round((100 * t) / (t - 100)));
+    }
+  });
+
+  it('inverseOddsTick round-trips exactly on the canonical pairs (but is not a blind involution)', () => {
+    for (const t of [101, 150, 198, 200, 202, 300, 10_100]) {
+      expect(inverseOddsTick(inverseOddsTick(t))).toBe(t);
+    }
+    // Double-rounding loses information when the exact inverse lands just above
+    // the 1.00× floor (a very lopsided maker tick → a taker tick barely over
+    // even money), so a blind round-trip is *not* an involution in general — and
+    // nothing in the MM relies on one (every odds conversion is a single hop).
+    expect(inverseOddsTick(inverseOddsTick(6767))).not.toBe(6767);
+  });
+
   it('quantizeRiskWei6 rounds down to a valid lot (never up — it is a risk/safety boundary)', () => {
     expect(quantizeRiskWei6(0.25)).toBe(250_000);
     expect(quantizeRiskWei6(0.250001)).toBe(250_000);
@@ -68,6 +103,65 @@ describe('odds conversions', () => {
     expect(quantizeRiskWei6(Number.NaN)).toBe(0);
     expect(quantizeRiskWei6(Number.POSITIVE_INFINITY)).toBe(0);
     expect(wei6ToUSDC(250_000)).toBe(0.25);
+  });
+});
+
+// ── taker ↔ protocol conversion ───────────────────────────────────────────────
+
+describe('taker ↔ protocol conversion (DESIGN §5)', () => {
+  it('oppositeSide / positionTypeForSide / sideForPositionType', () => {
+    expect(oppositeSide('away')).toBe('home');
+    expect(oppositeSide('home')).toBe('away');
+    expect(positionTypeForSide('away')).toBe(0); // Upper
+    expect(positionTypeForSide('home')).toBe(1); // Lower
+    expect(sideForPositionType(0)).toBe('away');
+    expect(sideForPositionType(1)).toBe('home');
+    expect(() => oppositeSide('sideways' as unknown as 'away')).toThrow(/must be "away" or "home"/);
+    expect(() => positionTypeForSide('over' as unknown as 'away')).toThrow(/must be "away" or "home"/);
+    expect(() => sideForPositionType(2 as unknown as 0)).toThrow(/must be 0 or 1/);
+  });
+
+  it('toProtocolQuote inverts the side and the odds tick', () => {
+    // Offering a taker the AWAY side at tick 198 → the maker is on HOME at the inverse tick.
+    expect(toProtocolQuote({ side: 'away', oddsTick: 198 })).toEqual({
+      makerSide: 'home',
+      makerOddsTick: 202,
+      positionType: 1, // Lower = home
+    });
+    // Offering a taker the HOME side at tick 198 → the maker is on AWAY at the inverse tick.
+    expect(toProtocolQuote({ side: 'home', oddsTick: 198 })).toEqual({
+      makerSide: 'away',
+      makerOddsTick: 202,
+      positionType: 0, // Upper = away
+    });
+    // The decimal-2.00 (tick-200) midpoint maps to itself on the opposite side.
+    expect(toProtocolQuote({ side: 'away', oddsTick: 200 })).toEqual({
+      makerSide: 'home',
+      makerOddsTick: 200,
+      positionType: 1,
+    });
+    expect(() => toProtocolQuote({ side: 'away', oddsTick: 100 })).toThrow(/odds tick in/);
+  });
+
+  it('a taker-facing quote with the half-spread baked in gives the maker positive EV (the un-inverted mapping does not)', () => {
+    // Fair 50/50 market, 100 bps quoting spread → 0.005 half-spread on each side.
+    const pAway = 0.5;
+    const pHome = 0.5;
+    const halfSpread = 0.005;
+    const awayQuoteProb = pAway + halfSpread; // 0.505 — a taker backing away faces an inflated probability
+    const awayTakerTick = decimalToTick(1 / awayQuoteProb); // round(198.0198) = 198
+    expect(awayTakerTick).toBe(198);
+
+    // Correct: convert to the protocol maker side — the maker ends up on HOME at the inverse tick.
+    const proto = toProtocolQuote({ side: 'away', oddsTick: awayTakerTick });
+    expect(proto.makerSide).toBe('home');
+    expect(proto.makerOddsTick).toBe(202);
+    const makerEvPerRisk = pHome * (proto.makerOddsTick / 100 - 1) - pAway * 1;
+    expect(makerEvPerRisk).toBeGreaterThan(0); // ≈ +0.01 — the maker holds the half-spread of edge
+
+    // The bug this whole change fixes: posting the taker tick *directly* as a maker-on-away commitment.
+    const wrongMakerOnAwayEv = pAway * (awayTakerTick / 100 - 1) - pHome * 1;
+    expect(wrongMakerOnAwayEv).toBeLessThan(0); // ≈ −0.01 — the maker bleeds the spread it meant to earn
   });
 });
 

@@ -23,9 +23,21 @@ export {
   decimalToTick,
   tickToDecimal,
   isTickInRange,
+  inverseOddsTick,
   quantizeRiskWei6,
   wei6ToUSDC,
 } from './odds.js';
+
+export {
+  oppositeSide,
+  positionTypeForSide,
+  sideForPositionType,
+  toProtocolQuote,
+  type PositionType,
+  type Side,
+  type TakerQuote,
+  type ProtocolQuote,
+} from './protocol.js';
 
 export { stripVig, type FairOdds } from './vig.js';
 

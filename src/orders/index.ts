@@ -10,11 +10,14 @@
  *     + positions into the risk engine's `Inventory` (the aggregate exposure the
  *     caps bind). The runner builds the inventory it hands `buildDesiredQuote`
  *     from this each tick.
- *   - `reconcileBook(currentRecords, desired, config, nowUnixSec)` — given the
- *     maker's current commitments on a speculation and the quote it now wants,
- *     compute what to submit / replace / soft-cancel (DESIGN §9): a fresh quote on
- *     a wanted-but-empty side, a replacement for a stale or mispriced one, a pull
- *     for a side that's no longer quoted or a book-hygiene duplicate.
+ *   - `reconcileBook(currentRecords, desired, config, nowUnixSec, openCommitmentCount)`
+ *     — given the maker's current commitments on a speculation and the quote it now
+ *     wants, compute what to submit / replace / soft-cancel (DESIGN §6, §9), capped
+ *     so the plan never pushes the maker over `risk.maxOpenCommitments` matchable
+ *     commitments: a fresh quote on a wanted-but-empty side; a replacement for a
+ *     stale or mispriced one; a pull for a side that's no longer quoted, a
+ *     book-hygiene duplicate, or a stale/mispriced quote it can't yet afford to
+ *     replace (those sides land in `deferredSides` for a retry next tick).
  *
  * The runner (a later step of the dry-run plan) wires these together; `run --live`
  * (Phase 3) adds the *execution* layer — the actual SDK write calls behind each
@@ -34,7 +37,7 @@ import {
   type QuoteResult,
   type QuoteSide,
 } from '../pricing/index.js';
-import { headroomForSide, verdictForMarket, type ExposureItem, type Inventory, type Market, type RiskCaps } from '../risk/index.js';
+import { headroomForSide, verdictForMarket, type ExposureItem, type Inventory, type MakerSide, type Market, type RiskCaps } from '../risk/index.js';
 import type { CommitmentLifecycle, MakerCommitmentRecord, MakerState } from '../state/index.js';
 
 // ── types ────────────────────────────────────────────────────────────────────
@@ -65,17 +68,18 @@ export interface ReferenceMoneylineAmerican {
   home: number;
 }
 
-/** Why the runner would pull a `visibleOpen` commitment off-chain without re-posting it. */
-export type SoftCancelReason =
-  | 'side-not-quoted' //   the desired quote has no `QuoteSide` for that side (no headroom, or the whole quote was refused)
-  | 'duplicate'; //        more than one `visibleOpen` commitment on a `(speculation, side)` — keep the newest, pull the rest (book hygiene, DESIGN §9)
-
-/** Why the runner would replace a `visibleOpen` commitment: pull it off-chain → post a fresh one at the current price. */
+/** Why the runner would replace a commitment: pull it off-chain → post a fresh one at the current price. */
 export type ReplaceReason =
   | 'stale' //       older than `orders.staleAfterSeconds`
   | 'mispriced'; //  the quoted tick has moved more than `orders.replaceOnOddsMoveBps` (in implied-probability terms) since it was posted
 
-/** A `visibleOpen` commitment to pull off-chain without re-posting. */
+/** Why the runner would pull a commitment off-chain without re-posting it. */
+export type SoftCancelReason =
+  | 'side-not-quoted' //   the desired quote has no `QuoteSide` for that side (no headroom, or the whole quote was refused)
+  | 'duplicate' //         more than one API-visible commitment on a `(speculation, side)` — keep the newest, pull the rest (book hygiene, DESIGN §9)
+  | ReplaceReason; //      a stale/mispriced quote we'd replace, but the open-commitment count budget is exhausted (or a `partiallyFilled` incumbent we don't refresh in place) — pull it; a fresh post follows only if there's count headroom
+
+/** A commitment to pull off-chain without re-posting. */
 export interface SoftCancelPlan {
   record: MakerCommitmentRecord;
   reason: SoftCancelReason;
@@ -90,7 +94,10 @@ export interface ReplacePlan {
 
 /**
  * The runner's plan for one speculation's visible book: which fresh quotes to
- * submit, which existing commitments to replace, which to soft-cancel outright.
+ * submit, which existing commitments to replace, which to soft-cancel outright,
+ * and which sides it wanted to (re)post but couldn't this tick because the
+ * open-commitment count budget was exhausted (`deferredSides` — the runner records
+ * a `cap-hit` candidate and retries next tick once a slot frees up).
  * In dry-run these become `would-submit` / `would-replace` / `would-soft-cancel`
  * telemetry + hypothetical-inventory mutations; live mode (Phase 3) executes them
  * via the SDK. Per DESIGN §9 the *visible* surface ends with ≤ 1 commitment per
@@ -101,6 +108,7 @@ export interface BookReconciliation {
   toSubmit: QuoteSide[];
   toReplace: ReplacePlan[];
   toSoftCancel: SoftCancelPlan[];
+  deferredSides: MakerSide[];
 }
 
 // ── buildDesiredQuote ────────────────────────────────────────────────────────
@@ -183,9 +191,13 @@ const RELEASED_LIFECYCLES: readonly CommitmentLifecycle[] = ['filled', 'expired'
  * so it can't lose; counting it slightly over-states worst-case exposure, but
  * over-counting errs toward quoting *less*, which is the safe side.
  *
- * Big amounts are decimal strings; this goes via `Number(...)` (the USDC caps here
- * are tiny — well inside `Number.MAX_SAFE_INTEGER`). `riskAmountUSDC` is clamped
- * to ≥ 0 (a `filled > risk` record would be a logic bug, not a parse failure).
+ * Amounts are wei6 decimal strings; the `risk - filled` subtraction is done in
+ * `BigInt` (exact), then the result → `Number` for `wei6ToUSDC` (the USDC caps
+ * here are tiny — well inside `Number.MAX_SAFE_INTEGER`). A commitment with
+ * `filledRiskWei6 > riskAmountWei6` is impossible; `StateStore.load` already
+ * rejects such a record as corrupt, and this **throws** if one reaches it anyway
+ * (an in-memory corruption) rather than silently dropping it — fail closed; the
+ * dropped-and-undercounted path would under-state latent exposure.
  */
 export function inventoryFromState(state: MakerState, nowUnixSec: number): Inventory {
   const items: ExposureItem[] = [];
@@ -194,30 +206,35 @@ export function inventoryFromState(state: MakerState, nowUnixSec: number): Inven
   for (const record of Object.values(state.commitments)) {
     if (RELEASED_LIFECYCLES.includes(record.lifecycle)) continue;
     if (record.expiryUnixSec <= nowUnixSec) continue; // expired but not yet reclassified — dead on chain, headroom released
-    const remainingWei6 = Math.max(0, Number(record.riskAmountWei6) - Number(record.filledRiskWei6));
-    if (remainingWei6 <= 0) continue; // fully consumed — effectively `filled`, no latent risk left
+    const riskWei6 = BigInt(record.riskAmountWei6);
+    const filledWei6 = BigInt(record.filledRiskWei6);
+    if (filledWei6 > riskWei6) {
+      throw new Error(`orders: commitment ${record.hash} has filledRiskWei6 (${record.filledRiskWei6}) > riskAmountWei6 (${record.riskAmountWei6}) — corrupt inventory`);
+    }
+    const remainingWei6 = riskWei6 - filledWei6;
+    if (remainingWei6 === 0n) continue; // fully filled — the filled portion is a position; no latent risk left here
     items.push({
       contestId: record.contestId,
       sport: record.sport,
       awayTeam: record.awayTeam,
       homeTeam: record.homeTeam,
       makerSide: record.makerSide,
-      riskAmountUSDC: wei6ToUSDC(remainingWei6),
+      riskAmountUSDC: wei6ToUSDC(Number(remainingWei6)),
     });
     openCommitmentCount += 1;
   }
 
   for (const record of Object.values(state.positions)) {
     if (record.status === 'claimed') continue;
-    const riskAmountUSDC = wei6ToUSDC(Math.max(0, Number(record.riskAmountWei6)));
-    if (riskAmountUSDC <= 0) continue;
+    const riskWei6 = BigInt(record.riskAmountWei6);
+    if (riskWei6 === 0n) continue; // a zero-stake position carries no exposure
     items.push({
       contestId: record.contestId,
       sport: record.sport,
       awayTeam: record.awayTeam,
       homeTeam: record.homeTeam,
       makerSide: record.side,
-      riskAmountUSDC,
+      riskAmountUSDC: wei6ToUSDC(Number(riskWei6)),
     });
   }
 
@@ -228,31 +245,46 @@ export function inventoryFromState(state: MakerState, nowUnixSec: number): Inven
 
 const SIDES = ['away', 'home'] as const;
 
+/** What the reconciler wants to do on a side, before the open-commitment-count budget is allocated. */
+type SideAction =
+  | { kind: 'noop' } //                                          keep what's there (or nothing's wanted) — no new commitment
+  | { kind: 'submit'; quoteSide: QuoteSide } //                  post a fresh quote (no incumbent visible quote to refresh)
+  | { kind: 'replace'; stale: MakerCommitmentRecord; reason: ReplaceReason; replacement: QuoteSide }; // refresh a stale/mispriced `visibleOpen` incumbent in place
+
 /**
  * Reconcile the maker's *current* commitments on one speculation against the
- * *desired* quote (DESIGN §9). `currentRecords` must be the maker's commitments on
- * that one speculation (the caller filters by `speculationId`). Only `visibleOpen`
- * records still in the future (`expiryUnixSec > nowUnixSec`) form "the visible
- * book", and non-expired `partiallyFilled` records count as occupying their side
- * (they're API-visible too — don't double-post over them — but v0 doesn't
- * reconcile partials; their remainder fills or ages out). `softCancelled` /
- * `filled` / `expired` / `authoritativelyInvalidated` and expired records are
- * ignored — they aren't on the visible surface (and an expired one is dead on
- * chain; the runner ages it out).
+ * *desired* quote, **without ever planning more new matchable commitments than the
+ * count cap allows** (DESIGN §6, §9). `currentRecords` = the maker's commitments on
+ * that one speculation (the caller filters by `speculationId`).
+ * `openCommitmentCount` = the maker's current *aggregate* live-commitment count
+ * (`inventoryFromState(state, now).openCommitmentCount`, before this plan applies);
+ * every new matchable commitment the plan creates — each `toSubmit`, and each
+ * `toReplace` (a replacement is net +1, since the off-chain-cancelled old quote
+ * stays matchable until expiry) — must fit in `config.risk.maxOpenCommitments -
+ * openCommitmentCount`. When the budget runs out, would-be replaces degrade to
+ * plain soft-cancels (pull the stale/mispriced quote — it must not stay visibly
+ * mispriced — and post nothing) and would-be fresh submits are dropped; both put
+ * the side in `deferredSides` so the runner records a `cap-hit` candidate and
+ * retries next tick. Replaces take budget priority over fresh submits.
  *
- * Per side, given the desired `QuoteSide` (or `null` when that side isn't quoted —
- * no headroom, or the whole quote was refused): pull every `visibleOpen` on a side
- * that's `null` as `side-not-quoted`; on a side that's wanted, keep the newest
- * `visibleOpen`, soft-cancel the rest as `duplicate`, and replace the kept one if
- * it's `stale` (`now - postedAtUnixSec > orders.staleAfterSeconds`) or `mispriced`
- * (the kept tick's implied probability differs from the desired tick's by more than
- * `orders.replaceOnOddsMoveBps / 10000`); if a wanted side has no `visibleOpen` and
- * no `partiallyFilled`, submit a fresh quote.
+ * Only non-expired records matter (an expired commitment is dead on chain — the
+ * runner ages it out). On a side's visible surface the reconciler keeps the newest
+ * `visibleOpen`, or — absent any — the newest non-expired `partiallyFilled` (its
+ * remainder is still matchable and API-visible), and soft-cancels the rest as
+ * `duplicate`; a kept incumbent that's `stale` (`now - postedAtUnixSec >
+ * orders.staleAfterSeconds`) or `mispriced` (its tick's implied probability differs
+ * from the desired tick's by more than `orders.replaceOnOddsMoveBps / 10000`) is
+ * replaced in place if it's a `visibleOpen`, or — if it's a `partiallyFilled`
+ * incumbent (v0 doesn't refresh a partial in place) — soft-cancelled with a fresh
+ * quote posted in its place. When the side isn't quoted (`desired.result[side] ===
+ * null` — no headroom, or the whole quote was refused), *every* non-expired
+ * `visibleOpen` and `partiallyFilled` on it is soft-cancelled (`side-not-quoted`):
+ * an unwanted quote must not stay on the visible book. A wanted side with no visible
+ * / partial record gets a fresh submit.
  *
  * **v0 caveat:** the `mispriced` test compares the *posted quote tick* to the
  * *desired quote tick* — a proxy for "fair value has moved", since the quote tick =
- * fair + (roughly constant) half-spread, so the two move together. A dedicated
- * fair-value-delta check is a possible refinement.
+ * fair + (roughly constant) half-spread, so the two move together.
  *
  * Pure — no SDK, no state mutation; the runner executes / logs the plan.
  */
@@ -261,42 +293,82 @@ export function reconcileBook(
   desired: DesiredQuote,
   config: Config,
   nowUnixSec: number,
+  openCommitmentCount: number,
 ): BookReconciliation {
   const toSubmit: QuoteSide[] = [];
   const toReplace: ReplacePlan[] = [];
   const toSoftCancel: SoftCancelPlan[] = [];
+  const deferredSides: MakerSide[] = [];
 
-  const live = currentRecords.filter((r) => r.expiryUnixSec > nowUnixSec);
+  const live = currentRecords.filter((r) => r.expiryUnixSec > nowUnixSec); // expired records are dead on chain — the runner ages them out
+  const actions = new Map<MakerSide, SideAction>();
 
+  // Pass 1 — per side: emit the soft-cancels (unwanted side / book-hygiene duplicates) and classify what (if anything) we want to post.
   for (const side of SIDES) {
     const desiredSide: QuoteSide | null = side === 'away' ? desired.result.away : desired.result.home;
-    const visibleOpen = live
-      .filter((r) => r.makerSide === side && r.lifecycle === 'visibleOpen')
-      .sort((a, b) => b.postedAtUnixSec - a.postedAtUnixSec); // newest first
+    const onSide = live.filter((r) => r.makerSide === side);
+    const visibleOpen = onSide.filter((r) => r.lifecycle === 'visibleOpen').sort(newestFirst);
+    const partiallyFilled = onSide.filter((r) => r.lifecycle === 'partiallyFilled').sort(newestFirst);
 
     if (desiredSide === null) {
       for (const r of visibleOpen) toSoftCancel.push({ record: r, reason: 'side-not-quoted' });
+      for (const r of partiallyFilled) toSoftCancel.push({ record: r, reason: 'side-not-quoted' });
+      actions.set(side, { kind: 'noop' });
       continue;
     }
 
-    if (visibleOpen.length === 0) {
-      const occupiedByPartialFill = live.some((r) => r.makerSide === side && r.lifecycle === 'partiallyFilled');
-      if (!occupiedByPartialFill) toSubmit.push(desiredSide);
+    const incumbent = visibleOpen[0] ?? partiallyFilled[0]; // prefer a fresh `visibleOpen`; else the (matchable) partial remainder
+    if (incumbent === undefined) {
+      actions.set(side, { kind: 'submit', quoteSide: desiredSide });
       continue;
     }
+    // Book hygiene (DESIGN §9): exactly one visible quote per (speculation, side) — pull the rest.
+    for (const r of [...visibleOpen, ...partiallyFilled]) {
+      if (r !== incumbent) toSoftCancel.push({ record: r, reason: 'duplicate' });
+    }
 
-    // Book hygiene (DESIGN §9): keep the newest visible quote on this side, soft-cancel any older ones.
-    for (const r of visibleOpen.slice(1)) toSoftCancel.push({ record: r, reason: 'duplicate' });
-    const keep = visibleOpen[0] as MakerCommitmentRecord; // non-empty: visibleOpen.length checked above
-
-    if (nowUnixSec - keep.postedAtUnixSec > config.orders.staleAfterSeconds) {
-      toReplace.push({ stale: keep, reason: 'stale', replacement: desiredSide });
-    } else if (oddsMovedTooFar(keep.oddsTick, desiredSide.quoteTick, config.orders.replaceOnOddsMoveBps)) {
-      toReplace.push({ stale: keep, reason: 'mispriced', replacement: desiredSide });
+    const stale = nowUnixSec - incumbent.postedAtUnixSec > config.orders.staleAfterSeconds;
+    const mispriced = oddsMovedTooFar(incumbent.oddsTick, desiredSide.quoteTick, config.orders.replaceOnOddsMoveBps);
+    if (!stale && !mispriced) {
+      actions.set(side, { kind: 'noop' }); // incumbent is fresh and correctly priced — leave it
+    } else if (incumbent.lifecycle === 'visibleOpen') {
+      actions.set(side, { kind: 'replace', stale: incumbent, reason: stale ? 'stale' : 'mispriced', replacement: desiredSide });
+    } else {
+      // a stale/mispriced `partiallyFilled` incumbent — v0 pulls it and posts a fresh full quote in its place
+      toSoftCancel.push({ record: incumbent, reason: stale ? 'stale' : 'mispriced' });
+      actions.set(side, { kind: 'submit', quoteSide: desiredSide });
     }
   }
 
-  return { toSubmit, toReplace, toSoftCancel };
+  // Pass 2 — allocate the open-commitment-count budget: replaces first (refreshing a stale/mispriced quote beats adding new liquidity), then fresh submits.
+  let budget = Math.max(0, config.risk.maxOpenCommitments - openCommitmentCount);
+  for (const side of SIDES) {
+    const action = actions.get(side);
+    if (action === undefined || action.kind !== 'replace') continue;
+    if (budget > 0) {
+      toReplace.push({ stale: action.stale, reason: action.reason, replacement: action.replacement });
+      budget -= 1;
+    } else {
+      toSoftCancel.push({ record: action.stale, reason: action.reason }); // can't afford the new post — pull the stale/mispriced quote anyway
+      deferredSides.push(side);
+    }
+  }
+  for (const side of SIDES) {
+    const action = actions.get(side);
+    if (action === undefined || action.kind !== 'submit') continue;
+    if (budget > 0) {
+      toSubmit.push(action.quoteSide);
+      budget -= 1;
+    } else {
+      deferredSides.push(side);
+    }
+  }
+
+  return { toSubmit, toReplace, toSoftCancel, deferredSides };
+}
+
+function newestFirst(a: MakerCommitmentRecord, b: MakerCommitmentRecord): number {
+  return b.postedAtUnixSec - a.postedAtUnixSec;
 }
 
 /** Has the quoted tick moved more than `thresholdBps` basis points (of implied probability) from `fromTick` to `toTick`? */

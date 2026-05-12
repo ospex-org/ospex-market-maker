@@ -4,7 +4,7 @@ import { parseConfig, type Config } from '../config/index.js';
 import { decimalToAmerican, decimalToImpliedProb, tickToDecimal, type QuoteSide } from '../pricing/index.js';
 import type { ExposureItem, Inventory, Market } from '../risk/index.js';
 import { emptyMakerState, type MakerCommitmentRecord, type MakerPositionRecord, type MakerState } from '../state/index.js';
-import { breakdownReferenceOdds, buildDesiredQuote, inventoryFromState, reconcileBook, toRiskCaps, type DesiredQuote } from './index.js';
+import { breakdownReferenceOdds, buildDesiredQuote, inventoryFromState, reconcileBook, toRiskCaps, type BookReconciliation, type DesiredQuote } from './index.js';
 
 const cfg = (overrides: Record<string, unknown> = {}): Config => parseConfig({ rpcUrl: 'http://localhost:8545', ...overrides });
 
@@ -253,11 +253,14 @@ describe('inventoryFromState', () => {
     expect(inv.items).toEqual([{ contestId: 'contest-1', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', makerSide: 'away', riskAmountUSDC: 0.3 }]);
   });
 
-  it('drops a commitment whose filled amount meets or exceeds its risk (effectively filled — no latent risk left)', () => {
+  it('drops a fully-filled commitment (filled === risk — its filled portion is a position; no latent risk left here)', () => {
     const fullyFilled = commitmentRecord({ hash: 'f', lifecycle: 'partiallyFilled', riskAmountWei6: '300000', filledRiskWei6: '300000' });
-    const overFilled = commitmentRecord({ hash: 'o', lifecycle: 'partiallyFilled', riskAmountWei6: '300000', filledRiskWei6: '400000' }); // logic-bug-shaped; clamps to 0
-    const inv = inventoryFromState(stateWith({ commitments: { f: fullyFilled, o: overFilled } }), NOW);
-    expect(inv).toEqual({ items: [], openCommitmentCount: 0 });
+    expect(inventoryFromState(stateWith({ commitments: { f: fullyFilled } }), NOW)).toEqual({ items: [], openCommitmentCount: 0 });
+  });
+
+  it('throws on a corrupt commitment with filledRiskWei6 > riskAmountWei6 (fail closed — never silently drop latent exposure)', () => {
+    const overFilled = commitmentRecord({ hash: 'o', lifecycle: 'softCancelled', riskAmountWei6: '300000', filledRiskWei6: '400000' });
+    expect(() => inventoryFromState(stateWith({ commitments: { o: overFilled } }), NOW)).toThrow(/corrupt inventory/);
   });
 
   it('keeps active / pendingSettle / claimable positions; drops claimed (positions never add to the commitment count)', () => {
@@ -277,34 +280,50 @@ describe('inventoryFromState', () => {
 // ── reconcileBook ────────────────────────────────────────────────────────────
 
 describe('reconcileBook', () => {
+  const OPEN_COUNT_OK = 0; // plenty of count headroom (risk.maxOpenCommitments defaults to 10)
+  const NOTHING: BookReconciliation = { toSubmit: [], toReplace: [], toSoftCancel: [], deferredSides: [] };
+
   it('submits a fresh quote on every wanted side when the maker holds nothing on the speculation', () => {
-    const r = reconcileBook([], desiredWith(quoteSide('away', 250), quoteSide('home', 165)), cfg(), NOW);
+    const r = reconcileBook([], desiredWith(quoteSide('away', 250), quoteSide('home', 165)), cfg(), NOW, OPEN_COUNT_OK);
     expect(r.toSubmit.map((q) => q.side).sort()).toEqual(['away', 'home']);
     expect(r.toReplace).toEqual([]);
     expect(r.toSoftCancel).toEqual([]);
+    expect(r.deferredSides).toEqual([]);
   });
 
   it('soft-cancels a visibleOpen on a side the quote no longer wants, and submits the wanted side', () => {
     const homeRec = commitmentRecord({ hash: '0xh', makerSide: 'home', lifecycle: 'visibleOpen' });
-    const r = reconcileBook([homeRec], desiredWith(quoteSide('away', 250), null), cfg(), NOW);
+    const r = reconcileBook([homeRec], desiredWith(quoteSide('away', 250), null), cfg(), NOW, OPEN_COUNT_OK);
     expect(r.toSubmit.map((q) => q.side)).toEqual(['away']);
     expect(r.toSoftCancel).toEqual([{ record: homeRec, reason: 'side-not-quoted' }]);
     expect(r.toReplace).toEqual([]);
   });
 
+  it('soft-cancels a non-expired partiallyFilled remainder on a no-longer-quoted side (not just visibleOpen ones)', () => {
+    const partialHome = commitmentRecord({ hash: '0xph', makerSide: 'home', lifecycle: 'partiallyFilled', riskAmountWei6: '500000', filledRiskWei6: '200000' });
+    const visibleHome = commitmentRecord({ hash: '0xvh', makerSide: 'home', lifecycle: 'visibleOpen' });
+    const r = reconcileBook([partialHome, visibleHome], desiredWith(quoteSide('away', 250), null), cfg(), NOW, OPEN_COUNT_OK);
+    expect(r.toSubmit.map((q) => q.side)).toEqual(['away']);
+    expect(r.toSoftCancel).toEqual([
+      { record: visibleHome, reason: 'side-not-quoted' },
+      { record: partialHome, reason: 'side-not-quoted' },
+    ]);
+    expect(r.toReplace).toEqual([]);
+  });
+
   it('leaves a fresh, correctly-priced visibleOpen alone (no submit / replace / cancel)', () => {
     const awayRec = commitmentRecord({ hash: '0xa', makerSide: 'away', lifecycle: 'visibleOpen', oddsTick: 250, postedAtUnixSec: NOW - 30 });
-    const r = reconcileBook([awayRec], desiredWith(quoteSide('away', 250), null), cfg(), NOW);
-    expect(r).toEqual({ toSubmit: [], toReplace: [], toSoftCancel: [] });
+    expect(reconcileBook([awayRec], desiredWith(quoteSide('away', 250), null), cfg(), NOW, OPEN_COUNT_OK)).toEqual(NOTHING);
   });
 
   it('replaces a stale visibleOpen (reason "stale") on a wanted side', () => {
     const stale = commitmentRecord({ hash: '0xa', makerSide: 'away', lifecycle: 'visibleOpen', oddsTick: 250, postedAtUnixSec: NOW - 200 }); // > staleAfterSeconds (90)
     const replacement = quoteSide('away', 250);
-    const r = reconcileBook([stale], desiredWith(replacement, null), cfg(), NOW);
+    const r = reconcileBook([stale], desiredWith(replacement, null), cfg(), NOW, OPEN_COUNT_OK);
     expect(r.toReplace).toEqual([{ stale, reason: 'stale', replacement }]);
     expect(r.toSubmit).toEqual([]);
     expect(r.toSoftCancel).toEqual([]);
+    expect(r.deferredSides).toEqual([]);
   });
 
   it('replaces a mispriced visibleOpen (reason "mispriced"), but leaves one whose tick moved within the threshold', () => {
@@ -313,21 +332,21 @@ describe('reconcileBook', () => {
     // tick 250 → implied 0.4000; tick 200 → implied 0.5000 → ~1000 bps move → mispriced.
     const recA = commitmentRecord({ hash: '0xa', makerSide: 'away', lifecycle: 'visibleOpen', oddsTick: 250, postedAtUnixSec: NOW - 5 });
     const repl = quoteSide('away', 200);
-    let r = reconcileBook([recA], desiredWith(repl, null), conf, NOW);
+    let r = reconcileBook([recA], desiredWith(repl, null), conf, NOW, OPEN_COUNT_OK);
     expect(r.toReplace).toEqual([{ stale: recA, reason: 'mispriced', replacement: repl }]);
     expect(r.toSubmit).toEqual([]);
 
     // tick 250 → implied 0.4000; tick 253 → implied ~0.39526 → ~47 bps move < 50 → not mispriced.
     const recB = commitmentRecord({ hash: '0xb', makerSide: 'away', lifecycle: 'visibleOpen', oddsTick: 250, postedAtUnixSec: NOW - 5 });
-    r = reconcileBook([recB], desiredWith(quoteSide('away', 253), null), conf, NOW);
-    expect(r).toEqual({ toSubmit: [], toReplace: [], toSoftCancel: [] });
+    r = reconcileBook([recB], desiredWith(quoteSide('away', 253), null), conf, NOW, OPEN_COUNT_OK);
+    expect(r).toEqual(NOTHING);
   });
 
   it('keeps the newest visibleOpen on a side and soft-cancels older ones as "duplicate" (book hygiene)', () => {
     const newer = commitmentRecord({ hash: '0xnew', makerSide: 'away', lifecycle: 'visibleOpen', oddsTick: 250, postedAtUnixSec: NOW - 10 });
     const older = commitmentRecord({ hash: '0xold', makerSide: 'away', lifecycle: 'visibleOpen', oddsTick: 250, postedAtUnixSec: NOW - 60 });
     // passed in reverse posting order — reconcileBook sorts newest-first internally.
-    let r = reconcileBook([older, newer], desiredWith(quoteSide('away', 250), null), cfg(), NOW);
+    let r = reconcileBook([older, newer], desiredWith(quoteSide('away', 250), null), cfg(), NOW, OPEN_COUNT_OK);
     expect(r.toSoftCancel).toEqual([{ record: older, reason: 'duplicate' }]);
     expect(r.toReplace).toEqual([]); // the kept (newer) one is fresh + on-tick
     expect(r.toSubmit).toEqual([]);
@@ -336,7 +355,7 @@ describe('reconcileBook', () => {
     const newerStale = commitmentRecord({ hash: '0xns', makerSide: 'away', lifecycle: 'visibleOpen', oddsTick: 250, postedAtUnixSec: NOW - 100 });
     const olderStale = commitmentRecord({ hash: '0xos', makerSide: 'away', lifecycle: 'visibleOpen', oddsTick: 250, postedAtUnixSec: NOW - 200 });
     const repl = quoteSide('away', 250);
-    r = reconcileBook([olderStale, newerStale], desiredWith(repl, null), cfg(), NOW);
+    r = reconcileBook([olderStale, newerStale], desiredWith(repl, null), cfg(), NOW, OPEN_COUNT_OK);
     expect(r.toReplace).toEqual([{ stale: newerStale, reason: 'stale', replacement: repl }]);
     expect(r.toSoftCancel).toEqual([{ record: olderStale, reason: 'duplicate' }]);
     expect(r.toSubmit).toEqual([]);
@@ -345,35 +364,79 @@ describe('reconcileBook', () => {
   it('soft-cancels every visibleOpen when the quote was refused (canQuote === false ⇒ both sides null)', () => {
     const awayRec = commitmentRecord({ hash: '0xa', makerSide: 'away', lifecycle: 'visibleOpen' });
     const homeRec = commitmentRecord({ hash: '0xh', makerSide: 'home', lifecycle: 'visibleOpen' });
-    const r = reconcileBook([awayRec, homeRec], desiredWith(null, null), cfg(), NOW);
+    const r = reconcileBook([awayRec, homeRec], desiredWith(null, null), cfg(), NOW, OPEN_COUNT_OK);
     expect(r.toSoftCancel).toEqual([
       { record: awayRec, reason: 'side-not-quoted' },
       { record: homeRec, reason: 'side-not-quoted' },
     ]);
     expect(r.toSubmit).toEqual([]);
     expect(r.toReplace).toEqual([]);
+    expect(r.deferredSides).toEqual([]);
   });
 
   it('ignores softCancelled / filled records and expired visibleOpen ones — they are not the visible book', () => {
     const softCancelled = commitmentRecord({ hash: '0xsc', makerSide: 'away', lifecycle: 'softCancelled', postedAtUnixSec: NOW - 200 });
     const filled = commitmentRecord({ hash: '0xf', makerSide: 'away', lifecycle: 'filled' });
     const expiredVisible = commitmentRecord({ hash: '0xev', makerSide: 'home', lifecycle: 'visibleOpen', expiryUnixSec: NOW - 1, postedAtUnixSec: NOW - 200 });
-    const r = reconcileBook([softCancelled, filled, expiredVisible], desiredWith(quoteSide('away', 250), quoteSide('home', 165)), cfg(), NOW);
+    const r = reconcileBook([softCancelled, filled, expiredVisible], desiredWith(quoteSide('away', 250), quoteSide('home', 165)), cfg(), NOW, OPEN_COUNT_OK);
     expect(r.toSubmit.map((q) => q.side).sort()).toEqual(['away', 'home']); // both fresh-submitted; none of those records occupied a side
     expect(r.toSoftCancel).toEqual([]); // an expired visibleOpen is dead on chain — not soft-cancelled
     expect(r.toReplace).toEqual([]);
   });
 
-  it('does not double-post over a non-expired partiallyFilled remainder on a wanted side (an expired one does not suppress)', () => {
-    const partial = commitmentRecord({ hash: '0xpf', makerSide: 'away', lifecycle: 'partiallyFilled', riskAmountWei6: '500000', filledRiskWei6: '200000' });
+  it('does not double-post over a fresh, correctly-priced partiallyFilled remainder on a wanted side (an expired one does not suppress)', () => {
+    const partial = commitmentRecord({ hash: '0xpf', makerSide: 'away', lifecycle: 'partiallyFilled', oddsTick: 250, riskAmountWei6: '500000', filledRiskWei6: '200000', postedAtUnixSec: NOW - 10 });
     const d = desiredWith(quoteSide('away', 250), quoteSide('home', 165));
-    let r = reconcileBook([partial], d, cfg(), NOW);
-    expect(r.toSubmit.map((q) => q.side)).toEqual(['home']); // away occupied by the partial
-    expect(r.toReplace).toEqual([]); // v0 doesn't reconcile partials
+    let r = reconcileBook([partial], d, cfg(), NOW, OPEN_COUNT_OK);
+    expect(r.toSubmit.map((q) => q.side)).toEqual(['home']); // away occupied by the (fresh, on-tick) partial
+    expect(r.toReplace).toEqual([]);
     expect(r.toSoftCancel).toEqual([]);
 
     const expiredPartial = commitmentRecord({ hash: '0xep', makerSide: 'away', lifecycle: 'partiallyFilled', riskAmountWei6: '500000', filledRiskWei6: '200000', expiryUnixSec: NOW - 1 });
-    r = reconcileBook([expiredPartial], d, cfg(), NOW);
+    r = reconcileBook([expiredPartial], d, cfg(), NOW, OPEN_COUNT_OK);
     expect(r.toSubmit.map((q) => q.side).sort()).toEqual(['away', 'home']); // the expired partial doesn't occupy the side
+  });
+
+  it('pulls a stale partiallyFilled incumbent and posts a fresh full quote in its place (v0 doesn\'t refresh a partial in place)', () => {
+    const stalePartial = commitmentRecord({ hash: '0xsp', makerSide: 'away', lifecycle: 'partiallyFilled', oddsTick: 250, riskAmountWei6: '500000', filledRiskWei6: '200000', postedAtUnixSec: NOW - 200 }); // > staleAfterSeconds
+    const fresh = quoteSide('away', 250);
+    const r = reconcileBook([stalePartial], desiredWith(fresh, null), cfg(), NOW, OPEN_COUNT_OK);
+    expect(r.toSoftCancel).toEqual([{ record: stalePartial, reason: 'stale' }]);
+    expect(r.toSubmit).toEqual([fresh]);
+    expect(r.toReplace).toEqual([]);
+  });
+
+  // ── open-commitment-count budget (DESIGN §6) ───────────────────────────────
+
+  it('defers fresh submits when the count budget is exhausted; one slot ⇒ exactly one side posts', () => {
+    // maxOpenCommitments defaults to 10. Current count 10 ⇒ budget 0 ⇒ neither side can be posted.
+    let r = reconcileBook([], desiredWith(quoteSide('away', 250), quoteSide('home', 165)), cfg(), NOW, 10);
+    expect(r.toSubmit).toEqual([]);
+    expect(r.deferredSides).toEqual(['away', 'home']);
+
+    // Current count 9 ⇒ budget 1 ⇒ exactly one side posts (away — deterministic order), the other defers.
+    r = reconcileBook([], desiredWith(quoteSide('away', 250), quoteSide('home', 165)), cfg(), NOW, 9);
+    expect(r.toSubmit.map((q) => q.side)).toEqual(['away']);
+    expect(r.deferredSides).toEqual(['home']);
+  });
+
+  it('degrades a stale-quote replacement to a plain soft-cancel when the count budget is exhausted', () => {
+    const stale = commitmentRecord({ hash: '0xa', makerSide: 'away', lifecycle: 'visibleOpen', oddsTick: 250, postedAtUnixSec: NOW - 200 });
+    // Current count 10 (includes the stale one) ⇒ budget 0 ⇒ can't afford the +1 replacement post.
+    const r = reconcileBook([stale], desiredWith(quoteSide('away', 250), null), cfg(), NOW, 10);
+    expect(r.toReplace).toEqual([]);
+    expect(r.toSoftCancel).toEqual([{ record: stale, reason: 'stale' }]); // pulled anyway — must not stay visibly stale
+    expect(r.deferredSides).toEqual(['away']);
+    expect(r.toSubmit).toEqual([]);
+  });
+
+  it('prioritizes a replace over a fresh submit when only one slot remains', () => {
+    const staleAway = commitmentRecord({ hash: '0xa', makerSide: 'away', lifecycle: 'visibleOpen', oddsTick: 250, postedAtUnixSec: NOW - 200 });
+    const replAway = quoteSide('away', 250);
+    // away wants a replace (+1), home wants a fresh submit (+1); budget 1 ⇒ the replace wins, home defers.
+    const r = reconcileBook([staleAway], desiredWith(replAway, quoteSide('home', 165)), cfg(), NOW, 9);
+    expect(r.toReplace).toEqual([{ stale: staleAway, reason: 'stale', replacement: replAway }]);
+    expect(r.toSubmit).toEqual([]);
+    expect(r.deferredSides).toEqual(['home']);
   });
 });

@@ -37,7 +37,12 @@
  *     candidate per deferred side) and mutate the *hypothetical* inventory (add
  *     synthetic `visibleOpen` records for submits / replacements; reclassify
  *     pulled / replaced records to `softCancelled` — they stay matchable on chain,
- *     so the risk engine keeps counting them); live execution is Phase 3;
+ *     so the risk engine keeps counting them); live execution is Phase 3. Then it
+ *     measures **quote competitiveness** (DESIGN §8): for each would-be quote, where
+ *     it'd sit relative to the visible orderbook on its side (the `getSpeculation`
+ *     above already fetched it — no extra read) and to the reference odds — a
+ *     `quote-competitiveness` event per side, or one `competitiveness-unavailable`
+ *     if that orderbook somehow isn't populated;
  *   - age-out of expired tracked commitments;
  *   - a prune of old terminal (`expired` / `filled` / `authoritativelyInvalidated`)
  *     commitment records, so a long shadow run's state file stays bounded;
@@ -46,8 +51,7 @@
  *
  * Still TODO follow-ups: fill-detection (Phase 3 — in dry-run nothing real is
  * posted, so there are no fills to detect; it's the live path's read side, wired
- * with the SDK write calls in Phase 3) and the bounded quote-competitiveness reads
- * over the `getSpeculation` orderbook this reconcile already fetches (PR 5).
+ * with the SDK write calls in Phase 3).
  *
  * No `@ospex/sdk` import — all chain/API access goes through the `OspexAdapter`. The
  * clock, sleep, kill-switch probe, OS-signal registration, and randomness are
@@ -60,8 +64,9 @@
 import { existsSync } from 'node:fs';
 
 import { POLL_INTERVAL_FLOOR_MS, type Config } from '../config/index.js';
-import { buildDesiredQuote, inventoryFromState, reconcileBook, type BookReconciliation, type SoftCancelReason } from '../orders/index.js';
+import { buildDesiredQuote, inventoryFromState, reconcileBook, type BookReconciliation, type DesiredQuote, type SoftCancelReason } from '../orders/index.js';
 import type {
+  Commitment,
   ContestView,
   OddsSnapshotView,
   OddsSubscribeHandlersView,
@@ -69,7 +74,7 @@ import type {
   SpeculationView,
   Subscription,
 } from '../ospex/index.js';
-import type { QuoteSide } from '../pricing/index.js';
+import { decimalToTick, type QuoteSide } from '../pricing/index.js';
 import type { Market } from '../risk/index.js';
 import { assessStateLoss, type MakerCommitmentRecord, type MakerSide, type MakerState, type StateLossAssessment, type StateStore } from '../state/index.js';
 import { EventLog, eventLogsExist } from '../telemetry/index.js';
@@ -791,8 +796,11 @@ export class Runner {
    * pre-filtered, and a permanently-gone speculation is essentially impossible on
    * chain). Pricing / risk refusals come back as a `quote-intent` with
    * `canQuote: false` (carrying the refusal notes) plus — via `reconcileBook` — the
-   * `would-soft-cancel`s that pull any standing quote off an unwanted side. Returns
-   * `'applied'` whenever a reconcile decision (a gate-pull, or a plan) was applied.
+   * `would-soft-cancel`s that pull any standing quote off an unwanted side. After the
+   * plan is applied, `assessCompetitiveness` measures where each would-be quote sits
+   * vs the visible orderbook on its side (the `getSpeculation` read above already
+   * fetched it). Returns `'applied'` whenever a reconcile decision (a gate-pull, or a
+   * plan) was applied.
    */
   private async reconcileMarket(m: TrackedMarket, now: number): Promise<'applied' | 'transient-failure'> {
     // Gate: the game starts within one expiry window — stop quoting it (a fresh quote would still be matchable at game time / outlive the pre-game window), and pull whatever's still up.
@@ -851,6 +859,7 @@ export class Runner {
     const recordsOnSpec = Object.values(this.state.commitments).filter((r) => r.speculationId === m.speculationId);
     const plan = reconcileBook(recordsOnSpec, desired, this.config, now, inventory.openCommitmentCount);
     this.applyReconcilePlan(m, plan, now);
+    this.assessCompetitiveness(m, spec, desired);
     return 'applied';
   }
 
@@ -948,6 +957,69 @@ export class Runner {
     };
   }
 
+  /**
+   * Measure how competitive each would-be quote is (DESIGN §8) — for each side the
+   * desired quote has a `QuoteSide` for: where its `quoteTick` sits relative to the
+   * *visible orderbook on that side* (the open/partial commitments at the same
+   * `positionType` — `Upper`/`0` for away, `Lower`/`1` for home — across every maker)
+   * and to the reference odds. A higher `oddsTick` on a side is a longer payout for
+   * whoever matches that side's commitments — the offer takers reach for first — so
+   * the would-be quote is "at or inside the book" iff its tick is at least as long as
+   * the best one already there (or that side is empty). Emits a `quote-competitiveness`
+   * per assessed side.
+   *
+   * Reuses the orderbook the per-market reconcile's `getSpeculation` already fetched —
+   * no extra read; only runs for markets that passed the risk engine and only when
+   * the market was dirty / re-reconciled (the reconcile's gate), so it's bounded
+   * (DESIGN §8). If the desired quote was refused there's nothing to assess; if the
+   * speculation came back without its orderbook (the `SpeculationView.orderbook` is
+   * optional — `getContest`'s embedded specs may omit it; `getSpeculation` itself
+   * always populates it), it's a degraded read → one `competitiveness-unavailable`.
+   *
+   * In dry-run the orderbook is purely other makers' (the MM's own synthetic `dry:`
+   * commitments are never on chain); the Phase-3 live path should exclude
+   * `c.maker === <maker address>` once the runner has it.
+   */
+  private assessCompetitiveness(m: TrackedMarket, spec: SpeculationView, desired: DesiredQuote): void {
+    const sides: QuoteSide[] = [];
+    if (desired.result.away !== null) sides.push(desired.result.away);
+    if (desired.result.home !== null) sides.push(desired.result.home);
+    if (sides.length === 0) return; // the quote was refused — nothing to assess (the `quote-intent` already records the refusal)
+    const ref = desired.referenceOdds;
+    if (ref === null) return; // a non-null QuoteSide implies non-null referenceOdds, but narrow for the type checker
+    const orderbook = spec.orderbook;
+    if (orderbook === undefined) {
+      this.eventLog.emit('competitiveness-unavailable', { contestId: m.contestId, speculationId: m.speculationId, reason: 'orderbook-not-populated' });
+      return;
+    }
+    const live = orderbook.filter(isPricedLiveCommitment);
+    for (const qs of sides) {
+      const positionType = qs.side === 'away' ? 0 : 1; // Upper(0) = away/over, Lower(1) = home/under
+      let bookDepthOnSide = 0;
+      let bestBookTick: number | null = null;
+      for (const c of live) {
+        if (c.positionType !== positionType) continue;
+        bookDepthOnSide += 1;
+        if (bestBookTick === null || c.oddsTick > bestBookTick) bestBookTick = c.oddsTick;
+      }
+      const referenceTick = decimalToTick(qs.side === 'away' ? ref.awayDecimal : ref.homeDecimal);
+      const referenceProb = qs.side === 'away' ? ref.awayImpliedProb : ref.homeImpliedProb;
+      this.eventLog.emit('quote-competitiveness', {
+        contestId: m.contestId,
+        speculationId: m.speculationId,
+        side: qs.side,
+        quoteTick: qs.quoteTick,
+        quoteProb: qs.quoteProb,
+        referenceTick,
+        referenceProb,
+        vsReferenceTicks: qs.quoteTick - referenceTick,
+        bookDepthOnSide,
+        bestBookTick,
+        atOrInsideBook: bestBookTick === null || qs.quoteTick >= bestBookTick,
+      });
+    }
+  }
+
   /** Ticks until the next discovery cycle: `discovery.everyNTicks` jittered by ±`discovery.jitterPct` (so multiple MMs don't all discover on the same tick). At least 1. */
   private jitteredDiscoveryInterval(): number {
     const { everyNTicks, jitterPct } = this.config.discovery;
@@ -994,6 +1066,12 @@ function errMessage(err: unknown): string {
 /** Compact a `QuoteSide` (or `null`) for the `quote-intent` event payload — the odds tick + the quoted size (USDC, and wei6 as a decimal string). */
 function quoteSideSummary(qs: QuoteSide | null): { oddsTick: number; sizeUSDC: number; sizeWei6: string } | null {
   return qs === null ? null : { oddsTick: qs.quoteTick, sizeUSDC: qs.sizeUSDC, sizeWei6: String(qs.sizeWei6) };
+}
+
+/** An orderbook `Commitment` that's still matchable (`isLive`) and carries the fields the competitiveness check needs (`oddsTick` + `positionType`). Legacy / partially-decoded rows can have either as `null` — those are skipped. */
+type PricedLiveCommitment = Commitment & { oddsTick: number; positionType: 0 | 1 };
+function isPricedLiveCommitment(c: Commitment): c is PricedLiveCommitment {
+  return c.isLive && c.oddsTick !== null && c.positionType !== null;
 }
 
 /** The `would-soft-cancel` event payload for a pulled commitment record. */

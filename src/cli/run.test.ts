@@ -63,13 +63,17 @@ describe('runRun — mode gating', () => {
     await expect(runRun({ config: cfg(), mode: 'live', ignoreMissingState: false })).rejects.toThrow(/not yet implemented/i);
   });
 
-  it('--dry-run with config mode.dryRun=false → logs the override note, still runs the shadow loop', async () => {
+  it('--dry-run with config mode.dryRun=false → logs the override note, normalizes the effective config (the runner boots in dry-run, not live), still runs the shadow loop', async () => {
     const cap = captureLog();
+    const runnerLog = captureLog();
     await runRun(
       { config: cfg({ mode: { dryRun: false } }), mode: 'dry-run', ignoreMissingState: false },
-      { createAdapter: discoveryFindsNothing, makeRunId: () => 'test-run', runnerDeps: noopRunnerDeps, maxTicks: 1, log: cap.log },
+      { createAdapter: discoveryFindsNothing, makeRunId: () => 'test-run', runnerDeps: { ...noopRunnerDeps, log: runnerLog.log }, maxTicks: 1, log: cap.log },
     );
     expect(cap.lines().some((l) => /config has mode\.dryRun=false/.test(l))).toBe(true);
+    // The Runner derives its boot banner from the *effective* config — `--dry-run` forced it, so it must say "mode dry-run", not "mode live".
+    expect(runnerLog.lines().some((l) => l.includes('mode dry-run'))).toBe(true);
+    expect(runnerLog.lines().some((l) => l.includes('mode live'))).toBe(false);
     expect(existsSync(join(logDir, 'run-test-run.ndjson'))).toBe(true);
   });
 });

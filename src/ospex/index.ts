@@ -123,6 +123,14 @@ export interface SpeculationView {
   line: number | null;
   /** True iff the speculation is still taking commitments (SDK `speculationStatus === 0`). */
   open: boolean;
+  /**
+   * The open/partial commitments on this speculation (the "orderbook" — every
+   * maker's, not just ours). Populated by `getContest` (the contest-detail
+   * endpoint embeds it) and `getSpeculation` (always present there); absent on
+   * `listSpeculations`'s lean rows. The runner reads it for its bounded
+   * quote-competitiveness checks (DESIGN §8).
+   */
+  orderbook?: Commitment[];
 }
 
 /** One-shot reference odds for a contest, with the SDK's `jsonoddsId` renamed (DESIGN §16). The inner per-market shapes are pure SDK types (no provider names). */
@@ -213,6 +221,17 @@ export class OspexAdapter {
   async listSpeculations(options: SpeculationsListOptions = {}): Promise<SpeculationView[]> {
     const speculations = await this.client.speculations.list(options);
     return speculations.map(toSpeculationView);
+  }
+
+  /**
+   * Fetch a single speculation by id, *with its orderbook* — the detail endpoint
+   * guarantees `orderbook` is populated (unlike `listSpeculations`'s lean rows).
+   * The runner uses this for its bounded quote-competitiveness reads (DESIGN §8):
+   * fetch just the one speculation's book, on demand, rather than re-fetching the
+   * whole contest each time a market goes dirty.
+   */
+  async getSpeculation(speculationId: string): Promise<SpeculationView> {
+    return toSpeculationView(await this.client.speculations.get(speculationId));
   }
 
   // ── odds ──────────────────────────────────────────────────────────────
@@ -346,7 +365,7 @@ function toContestView(c: Contest): ContestView {
 }
 
 function toSpeculationView(s: Speculation): SpeculationView {
-  return {
+  const view: SpeculationView = {
     speculationId: s.speculationId,
     contestId: s.contestId,
     marketType: s.type,
@@ -354,6 +373,8 @@ function toSpeculationView(s: Speculation): SpeculationView {
     line: s.line,
     open: s.speculationStatus === 0,
   };
+  if (s.orderbook !== undefined) view.orderbook = s.orderbook; // present on contest-detail / speculation-detail responses; absent on the lean list endpoint
+  return view;
 }
 
 function toOddsSnapshotView(snap: ContestOddsSnapshot): OddsSnapshotView {

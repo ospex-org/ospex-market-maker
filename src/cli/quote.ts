@@ -146,6 +146,13 @@ export async function runQuote(opts: QuoteOpts): Promise<QuoteReport> {
     { away: odds.awayOddsAmerican, home: odds.homeOddsAmerican },
     { items: [], openCommitmentCount: 0 },
   );
+  if (desired.referenceOdds === null) {
+    return refused(
+      contestId,
+      `reference moneyline odds for contest ${contestId} are out of range (away=${odds.awayOddsAmerican}, home=${odds.homeOddsAmerican})`,
+      context,
+    );
+  }
 
   return {
     pipeline: 'computed',

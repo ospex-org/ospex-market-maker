@@ -49,7 +49,8 @@ describe('toRiskCaps', () => {
 describe('buildDesiredQuote', () => {
   it('prices a two-sided quote against an empty inventory (default economics config)', () => {
     const d = buildDesiredQuote(cfg(), MARKET, { away: 150, home: -180 }, EMPTY);
-    expect(d.referenceOdds.overround).toBeGreaterThan(0);
+    expect(d.referenceOdds).not.toBeNull();
+    expect(d.referenceOdds?.overround).toBeGreaterThan(0);
     // Empty inventory + default caps → headroom on each side is the per-commitment cap (0.25), the smallest.
     expect(d.headroomUSDC.away).toBeCloseTo(0.25, 9);
     expect(d.headroomUSDC.home).toBeCloseTo(0.25, 9);
@@ -90,6 +91,31 @@ describe('buildDesiredQuote', () => {
     const d = buildDesiredQuote(cfg({ pricing: { mode: 'direct', direct: { spreadBps: 9000 } } }), MARKET, { away: 150, home: -180 }, EMPTY);
     expect(d.result.canQuote).toBe(false);
     expect(d.result.notes.some((n) => n.startsWith('REFUSE:'))).toBe(true);
+  });
+
+  it('refuses (both sides null) when the open-commitment count cap is hit — even with positive exposure headroom', () => {
+    // openCommitmentCount 1 / maxOpenCommitments 1 → verdictForMarket refuses, but headroomForSide over an empty `items` array is still the full per-commitment cap.
+    const d = buildDesiredQuote(cfg({ risk: { maxOpenCommitments: 1 } }), MARKET, { away: 150, home: -180 }, { items: [], openCommitmentCount: 1 });
+    expect(d.result.canQuote).toBe(false);
+    expect(d.result.away).toBeNull();
+    expect(d.result.home).toBeNull();
+    expect(d.result.notes.some((n) => /open-commitment count/.test(n))).toBe(true);
+    // headroom + the reference breakdown are still populated (the refusal is the count cap, not the odds or the exposure size).
+    expect(d.headroomUSDC.away).toBeGreaterThan(0);
+    expect(d.referenceOdds).not.toBeNull();
+  });
+
+  it('refuses (referenceOdds: null) when the upstream reference odds are out of range — does not throw', () => {
+    for (const bad of [{ away: 0, home: -180 }, { away: Number.NaN, home: -180 }, { away: Number.POSITIVE_INFINITY, home: -180 }] as const) {
+      const d = buildDesiredQuote(cfg(), MARKET, bad, EMPTY);
+      expect(d.referenceOdds).toBeNull();
+      expect(d.result.canQuote).toBe(false);
+      expect(d.result.away).toBeNull();
+      expect(d.result.home).toBeNull();
+      expect(d.result.notes.some((n) => /invalid|out of range/.test(n))).toBe(true);
+      // headroom is still populated (the inventory was fine).
+      expect(d.headroomUSDC.away).toBeGreaterThan(0);
+    }
   });
 
   it('carries the spread mode through (economics vs direct)', () => {

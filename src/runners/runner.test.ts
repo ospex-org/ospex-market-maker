@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { parseConfig, type Config } from '../config/index.js';
 import {
   createOspexAdapter,
+  type Commitment,
   type ContestView,
   type MoneylineOdds,
   type OddsSnapshotView,
@@ -126,9 +127,36 @@ function oddsSnapshotView(contestId: string, moneyline: MoneylineOdds | null = m
 function oddsUpdate(referenceGameId: string, awayOddsAmerican: number | null, homeOddsAmerican: number | null): OddsUpdateView {
   return { referenceGameId, market: 'moneyline', network: 'polygon', line: null, awayOddsAmerican, homeOddsAmerican, upstreamLastUpdated: '2026-02-02T00:00:00Z', pollCapturedAt: '2026-02-02T00:00:00Z', changedAt: '2026-02-02T00:00:00Z' };
 }
-/** A `getSpeculation` view for a moneyline speculation — `open` defaults to true (the realistic case the per-market reconcile expects). */
-function speculationView(speculationId: string, open = true): SpeculationView {
-  return { speculationId, contestId: 'contest', marketType: 'moneyline', lineTicks: null, line: null, open };
+/** A `getSpeculation` view for a moneyline speculation — `open` defaults to true (the realistic case the per-market reconcile expects); `orderbook` defaults to `[]` (the detail endpoint always populates it — pass entries to exercise the competitiveness check, or `{ ...speculationView(id) }` without an `orderbook` override for the degraded case). */
+function speculationView(speculationId: string, open = true, orderbook: Commitment[] = []): SpeculationView {
+  return { speculationId, contestId: 'contest', marketType: 'moneyline', lineTicks: null, line: null, open, orderbook };
+}
+/** An orderbook entry (the SDK `Commitment` shape — every maker's, not just ours) — only `positionType` (0 = away/Upper, 1 = home/Lower) and `oddsTick` matter for the competitiveness check; everything else is filler. */
+function orderbookEntry(overrides: Partial<Commitment> = {}): Commitment {
+  return {
+    commitmentHash: '0xob',
+    maker: '0xothermaker',
+    contestId: 'A',
+    scorer: '0xscorer',
+    lineTicks: 0,
+    positionType: 0,
+    oddsTick: 200,
+    marketType: 'moneyline',
+    riskAmount: '100000',
+    filledRiskAmount: '0',
+    remainingRiskAmount: '100000',
+    nonce: '1',
+    expiry: '2099-01-01T00:00:00Z',
+    speculationKey: 'sk-A',
+    signature: '0xsig',
+    status: 'open',
+    source: 'agent',
+    network: 'polygon',
+    nonceInvalidated: false,
+    isLive: true,
+    createdAt: '2026-01-01T00:00:00Z',
+    ...overrides,
+  };
 }
 function noopSubscription(): Subscription {
   return { unsubscribe: () => Promise.resolve() };
@@ -826,6 +854,7 @@ describe('Runner — per-market reconcile', () => {
     expect(events.find((e) => e.kind === 'quote-intent')).toMatchObject({ contestId: 'A', canQuote: false });
     expect(events.find((e) => e.kind === 'would-soft-cancel')).toMatchObject({ commitmentHash: '0xaWay', makerSide: 'away', reason: 'side-not-quoted' });
     expect(events.some((e) => e.kind === 'would-submit' || e.kind === 'would-replace')).toBe(false);
+    expect(events.some((e) => e.kind === 'quote-competitiveness' || e.kind === 'competitiveness-unavailable')).toBe(false); // a refused quote has nothing to assess
     expect(StateStore.at(stateDir).load().state.commitments['0xaWay']?.lifecycle).toBe('softCancelled');
   });
 
@@ -842,6 +871,59 @@ describe('Runner — per-market reconcile', () => {
     expect(capHit).toHaveLength(1);
     expect(capHit[0]).toMatchObject({ contestId: 'A' });
     expect(['away', 'home']).toContain(capHit[0]?.side);
+    expect(events.filter((e) => e.kind === 'quote-competitiveness')).toHaveLength(2); // both sides' would-be prices are assessed — including the cap-deferred one
+  });
+
+  it('a quoted market emits a quote-competitiveness event per side — book depth, best on-side tick, vs the reference, at/inside the book', async () => {
+    StateStore.at(stateDir).flush(emptyMakerState());
+    const config = cfg();
+    // The MM's quote ticks for a -110 / -110 reference land near 200 (a roughly even line, clamped into [101, 10100]).
+    // Away (Upper = positionType 0): two live offers at ticks 101 & 102 — both shorter than the MM's quote, so it's the longest away offer → atOrInsideBook.
+    // Home (Lower = positionType 1): one live offer at the maximum tick 10100 — far longer than the MM's quote → it's behind that offer → not at/inside.
+    // The non-live entry, and the null-tick / null-positionType ones, are skipped (don't count toward bookDepthOnSide).
+    const book: Commitment[] = [
+      orderbookEntry({ commitmentHash: '0xob-a1', positionType: 0, oddsTick: 101 }),
+      orderbookEntry({ commitmentHash: '0xob-a2', positionType: 0, oddsTick: 102 }),
+      orderbookEntry({ commitmentHash: '0xob-h1', positionType: 1, oddsTick: 10100 }),
+      orderbookEntry({ commitmentHash: '0xob-dead', positionType: 0, oddsTick: 9000, isLive: false }), // not matchable
+      orderbookEntry({ commitmentHash: '0xob-np', positionType: null, oddsTick: 5000 }), // legacy: no position type
+      orderbookEntry({ commitmentHash: '0xob-nt', positionType: 0, oddsTick: null }), // legacy: no tick
+    ];
+    const adapter = spiedAdapter(config, () => Promise.resolve([contestView({ contestId: 'A' })]), undefined, {
+      getSpeculation: (specId) => Promise.resolve({ ...speculationView(specId), orderbook: book }),
+    });
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    const comps = readEvents().filter((e) => e.kind === 'quote-competitiveness');
+    expect(comps.map((e) => e.side).sort()).toEqual(['away', 'home']);
+    const away = comps.find((e) => e.side === 'away');
+    const home = comps.find((e) => e.side === 'home');
+    expect(away).toMatchObject({ contestId: 'A', speculationId: 'spec-A', side: 'away', bookDepthOnSide: 2, bestBookTick: 102, atOrInsideBook: true });
+    expect(home).toMatchObject({ contestId: 'A', speculationId: 'spec-A', side: 'home', bookDepthOnSide: 1, bestBookTick: 10100, atOrInsideBook: false });
+    // The rest of the payload is present and well-formed.
+    for (const c of comps) {
+      expect(typeof c.quoteTick).toBe('number');
+      expect((c.quoteTick as number) >= 101 && (c.quoteTick as number) <= 10100).toBe(true);
+      expect(typeof c.quoteProb).toBe('number');
+      expect(typeof c.referenceTick).toBe('number');
+      expect(typeof c.referenceProb).toBe('number');
+      expect(c.vsReferenceTicks).toBe((c.quoteTick as number) - (c.referenceTick as number));
+    }
+  });
+
+  it('a quoted market whose getSpeculation response carries no orderbook emits competitiveness-unavailable (but the quote itself still goes through)', async () => {
+    StateStore.at(stateDir).flush(emptyMakerState());
+    const config = cfg();
+    // A SpeculationView without `orderbook` — getSpeculation normally always populates it, so this is the degraded read path.
+    const adapter = spiedAdapter(config, () => Promise.resolve([contestView({ contestId: 'A' })]), undefined, {
+      getSpeculation: (specId): Promise<SpeculationView> => Promise.resolve({ speculationId: specId, contestId: 'A', marketType: 'moneyline', lineTicks: null, line: null, open: true }),
+    });
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    const events = readEvents();
+    expect(events.find((e) => e.kind === 'competitiveness-unavailable')).toMatchObject({ contestId: 'A', speculationId: 'spec-A' });
+    expect(events.some((e) => e.kind === 'quote-competitiveness')).toBe(false);
+    expect(events.filter((e) => e.kind === 'would-submit')).toHaveLength(2); // competitiveness is an observational extra, not a gate
   });
 
   it('a market starting within one expiry window is gated — a start-too-soon candidate, no quote', async () => {

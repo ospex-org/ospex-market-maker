@@ -80,6 +80,11 @@ export class RunRefused extends Error {
  * unavailable mode (`--live`), or a plain `Error` if construction / the loop fails
  * (e.g. the telemetry directory can't be created, or the state can't be persisted —
  * an un-persistable state must crash, not be silently continued).
+ *
+ * Before constructing anything downstream it normalizes the *effective* config so
+ * `config.mode.dryRun` matches the resolved mode — `--dry-run` wins over a stale
+ * `mode.dryRun: false`, so the adapter, the `Runner`, the runner's boot banner, and
+ * any future code that branches on `mode.dryRun` all agree there's no live path.
  */
 export async function runRun(opts: RunOpts, deps: RunDeps = {}): Promise<void> {
   const log = deps.log ?? ((line: string): void => void process.stderr.write(`${line}\n`));
@@ -90,14 +95,17 @@ export async function runRun(opts: RunOpts, deps: RunDeps = {}): Promise<void> {
     );
   }
 
-  const { config } = opts;
-
   // `--dry-run` forces dry-run regardless of config (DESIGN §8). If the config
-  // intended live (`mode.dryRun: false`), say so — `--dry-run` wins, but the
-  // operator should know their config and flag disagree.
-  if (!config.mode.dryRun) {
+  // intended live (`mode.dryRun: false`), say so — `--dry-run` wins.
+  if (!opts.config.mode.dryRun) {
     log('[run] note: config has mode.dryRun=false, but --dry-run forces the shadow loop — not running live. (Live needs both mode.dryRun=false AND --live — DESIGN §8.)');
   }
+  // Normalize the effective config to the resolved mode so every downstream
+  // component sees a self-consistent dry-run config rather than a stale
+  // `mode.dryRun: false` (which would make the runner's boot banner — and, in
+  // Phase 3, any mode-aware code — disagree with the "--dry-run forces dry-run"
+  // contract).
+  const config: Config = opts.config.mode.dryRun ? opts.config : { ...opts.config, mode: { ...opts.config.mode, dryRun: true } };
 
   const adapter = (deps.createAdapter ?? createOspexAdapter)(config);
 

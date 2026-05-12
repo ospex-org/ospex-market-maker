@@ -526,6 +526,45 @@ describe('Runner — age-out', () => {
   });
 });
 
+// ── prune of old terminal commitment records ─────────────────────────────────
+
+describe('Runner — prune terminal commitments', () => {
+  // Default orders.expirySeconds is 120, so the retention window is max(3600, 1200) = 3600s before `now`.
+  const cutoff = T0 - 3600;
+
+  it('drops terminal records (expired / filled / authoritativelyInvalidated) older than the retention window', async () => {
+    const state: MakerState = {
+      ...emptyMakerState(),
+      commitments: {
+        'old-expired': commitmentRecord({ hash: 'old-expired', lifecycle: 'expired', expiryUnixSec: T0 - 4000, postedAtUnixSec: T0 - 4100, updatedAtUnixSec: cutoff - 1 }),
+        'old-filled': commitmentRecord({ hash: 'old-filled', lifecycle: 'filled', riskAmountWei6: '300000', filledRiskWei6: '300000', expiryUnixSec: T0 - 4000, postedAtUnixSec: T0 - 4100, updatedAtUnixSec: cutoff - 50 }),
+        'old-invalidated': commitmentRecord({ hash: 'old-invalidated', lifecycle: 'authoritativelyInvalidated', expiryUnixSec: T0 - 4000, postedAtUnixSec: T0 - 4100, updatedAtUnixSec: cutoff - 999 }),
+      },
+    };
+    StateStore.at(stateDir).flush(state);
+    await makeRunner({ maxTicks: 1 }).run();
+
+    expect(Object.keys(StateStore.at(stateDir).load().state.commitments)).toEqual([]);
+  });
+
+  it('keeps recent terminal records, and all non-terminal records regardless of age', async () => {
+    const state: MakerState = {
+      ...emptyMakerState(),
+      commitments: {
+        // Terminal but within the retention window — kept.
+        'recent-expired': commitmentRecord({ hash: 'recent-expired', lifecycle: 'expired', expiryUnixSec: T0 - 200, postedAtUnixSec: T0 - 300, updatedAtUnixSec: T0 - 100 }),
+        // Non-terminal, ancient updatedAt, not past expiry — never pruned (softCancelled stays matchable on chain → the risk engine must keep counting it).
+        'old-soft': commitmentRecord({ hash: 'old-soft', lifecycle: 'softCancelled', expiryUnixSec: T0 + 5000, postedAtUnixSec: T0 - 999_999, updatedAtUnixSec: T0 - 999_999 }),
+        'old-visible': commitmentRecord({ hash: 'old-visible', lifecycle: 'visibleOpen', makerSide: 'home', expiryUnixSec: T0 + 5000, postedAtUnixSec: T0 - 999_999, updatedAtUnixSec: T0 - 999_999 }),
+      },
+    };
+    StateStore.at(stateDir).flush(state);
+    await makeRunner({ maxTicks: 1 }).run();
+
+    expect(Object.keys(StateStore.at(stateDir).load().state.commitments).sort()).toEqual(['old-soft', 'old-visible', 'recent-expired']);
+  });
+});
+
 // ── interruptibleSleep ───────────────────────────────────────────────────────
 
 describe('interruptibleSleep', () => {

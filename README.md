@@ -16,7 +16,7 @@ It is built on **[`@ospex/sdk`](https://github.com/ospex-org/ospex-sdk)** — ev
 
 What works (Phase 1 — strictly read-only, no live write paths anywhere):
 
-- `yarn install && yarn build && yarn typecheck && yarn lint && yarn test` — clean (153 unit tests across the pricing, config, risk, orders, state, telemetry, ospex-adapter, and CLI-command modules).
+- `yarn install && yarn build && yarn typecheck && yarn lint && yarn test` — clean (155 unit tests across the pricing, config, risk, orders, state, telemetry, ospex-adapter, and CLI-command modules).
 - **`ospex-mm doctor`** — readiness probe: config, keystore, API, RPC, POL/USDC balances, `PositionModule` allowance, and the persisted-state integrity check, plus a "Ready to" matrix (dry-run shadow / post commitments). `--address <0x…>` keeps it fully read-only (no passphrase prompt); `--json` emits a `{ schemaVersion: 1, doctor: … }` envelope.
 - **`ospex-mm quote --dry-run <contestId>`** — computes a two-sided moneyline quote breakdown (reference odds → fair value → spread → priced quote with size), or refuses with a clear message (contest closed, no open moneyline speculation, no reference odds). Never posts; `--json` emits a `{ schemaVersion: 1, quote: … }` envelope.
 - `yarn mm --help` — the command list. (`yarn dev --help` does the same via `tsx`; `yarn build && yarn link`, then `ospex-mm --help`, puts the binary on your PATH.)

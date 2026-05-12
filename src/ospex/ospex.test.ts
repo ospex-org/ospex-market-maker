@@ -15,6 +15,7 @@ import type {
   OddsSubscribeHandlers,
   PositionStatus,
   Speculation,
+  SpeculationDetail,
   Subscription,
 } from '@ospex/sdk';
 
@@ -121,6 +122,21 @@ const SAMPLE_COMMITMENT: Commitment = {
   nonceInvalidated: false,
   isLive: true,
   createdAt: '2026-05-11T19:59:00Z',
+};
+
+const SAMPLE_SPECULATION_DETAIL: SpeculationDetail = {
+  ...SAMPLE_SPECULATION_MONEYLINE,
+  orderbook: [SAMPLE_COMMITMENT],
+  contest: {
+    contestId: 'contest-1',
+    awayTeam: 'NYM',
+    homeTeam: 'LAD',
+    awayTeamId: null,
+    homeTeamId: null,
+    sport: 'mlb',
+    matchTime: '2026-05-12T01:30:00Z',
+    status: 'verified',
+  },
 };
 
 const EMPTY_POSITION_STATUS: PositionStatus = {
@@ -236,7 +252,7 @@ describe('OspexAdapter — contest views', () => {
     expect(list[1]?.referenceGameId).toBeNull();
   });
 
-  it('listSpeculations passes options through and maps the result', async () => {
+  it('listSpeculations passes options through and maps the result (lean — no orderbook on list rows)', async () => {
     let received: unknown = null;
     const adapter = adapterWith({
       speculations: {
@@ -258,6 +274,41 @@ describe('OspexAdapter — contest views', () => {
         open: true,
       },
     ]);
+    expect(result[0]?.orderbook).toBeUndefined();
+  });
+
+  it('getSpeculation returns the speculation with its orderbook populated (and maps speculationStatus → open)', async () => {
+    let received: unknown = null;
+    const adapter = adapterWith({
+      speculations: {
+        get: (specId) => {
+          received = specId;
+          return Promise.resolve(SAMPLE_SPECULATION_DETAIL);
+        },
+      },
+    });
+    const view = await adapter.getSpeculation('spec-1');
+    expect(received).toBe('spec-1');
+    expect(view).toEqual({
+      speculationId: 'spec-1',
+      contestId: 'contest-1',
+      marketType: 'moneyline',
+      lineTicks: null,
+      line: null,
+      open: true,
+      orderbook: [SAMPLE_COMMITMENT],
+    });
+  });
+
+  it('getContest carries orderbook on the embedded speculations the detail endpoint populated; leaves it absent otherwise', async () => {
+    const contestWithOrderbooks: Contest = {
+      ...SAMPLE_CONTEST,
+      speculations: [{ ...SAMPLE_SPECULATION_MONEYLINE, orderbook: [SAMPLE_COMMITMENT] }, SAMPLE_SPECULATION_CLOSED],
+    };
+    const adapter = adapterWith({ contests: { get: () => Promise.resolve(contestWithOrderbooks) } });
+    const view = await adapter.getContest('contest-1');
+    expect(view.speculations[0]?.orderbook).toEqual([SAMPLE_COMMITMENT]);
+    expect(view.speculations[1]?.orderbook).toBeUndefined(); // SAMPLE_SPECULATION_CLOSED has no orderbook in the SDK shape
   });
 });
 

@@ -163,6 +163,20 @@ describe('runQuote — refusals (exit 1)', () => {
       /incomplete/,
     );
   });
+
+  it('out-of-range reference moneyline odds → refused (not a crash)', async () => {
+    await expectRefused(
+      await runQuote({
+        contestId: 'contest-1',
+        config: cfg(),
+        adapter: adapterFor(
+          contestWith(),
+          oddsWith({ market: 'moneyline', awayOddsAmerican: 0, homeOddsAmerican: -180, upstreamLastUpdated: 'x', pollCapturedAt: 'x', changedAt: 'x' }),
+        ),
+      }),
+      /out of range/,
+    );
+  });
 });
 
 describe('runQuote — computed-but-canQuote-false (exit 1)', () => {

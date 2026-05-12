@@ -62,6 +62,12 @@ export interface MakerCommitmentRecord {
   hash: string;
   speculationId: string;
   contestId: string;
+  /** The contest's sport (e.g. `"mlb"`) — denormalized so the risk engine's per-sport cap doesn't need a contest re-fetch, and so the state is self-describing. */
+  sport: string;
+  /** The away team's name — denormalized for the per-team cap + telemetry. */
+  awayTeam: string;
+  /** The home team's name — denormalized for the per-team cap + telemetry. */
+  homeTeam: string;
   /** The scorer module the wager points at (a moneyline scorer address in v0). */
   scorer: string;
   /** Which side the maker is on — if this side loses, the maker loses the at-risk amount. */
@@ -85,6 +91,12 @@ export interface MakerCommitmentRecord {
 export interface MakerPositionRecord {
   speculationId: string;
   contestId: string;
+  /** The contest's sport (e.g. `"mlb"`) — denormalized so the risk engine's per-sport cap doesn't need a contest re-fetch. */
+  sport: string;
+  /** The away team's name — denormalized for the per-team cap + telemetry. */
+  awayTeam: string;
+  /** The home team's name — denormalized for the per-team cap + telemetry. */
+  homeTeam: string;
   /** The maker's side — loses this stake if this side loses. */
   side: MakerSide;
   /** The maker's own staked risk (USDC wei6, decimal string). */
@@ -299,6 +311,9 @@ function validateCommitmentRecord(
   if (typeof value.speculationId !== 'string' || typeof value.contestId !== 'string' || typeof value.scorer !== 'string') {
     return { ok: false, reason: 'speculationId / contestId / scorer must be strings' };
   }
+  if (typeof value.sport !== 'string' || typeof value.awayTeam !== 'string' || typeof value.homeTeam !== 'string') {
+    return { ok: false, reason: 'sport / awayTeam / homeTeam must be strings' };
+  }
   if (value.makerSide !== 'away' && value.makerSide !== 'home') return { ok: false, reason: `makerSide ${describe(value.makerSide)} is not "away"/"home"` };
   if (!isNonNegInt(value.oddsTick)) return { ok: false, reason: 'oddsTick must be a non-negative integer' };
   if (!isDecimalString(value.riskAmountWei6) || !isDecimalString(value.filledRiskWei6)) return { ok: false, reason: 'riskAmountWei6 / filledRiskWei6 must be decimal strings' };
@@ -314,6 +329,9 @@ function validateCommitmentRecord(
       hash: key,
       speculationId: value.speculationId,
       contestId: value.contestId,
+      sport: value.sport,
+      awayTeam: value.awayTeam,
+      homeTeam: value.homeTeam,
       scorer: value.scorer,
       makerSide: value.makerSide,
       oddsTick: value.oddsTick,
@@ -330,6 +348,9 @@ function validateCommitmentRecord(
 function validatePositionRecord(value: unknown): { ok: true; record: MakerPositionRecord } | { ok: false; reason: string } {
   if (!isPlainObject(value)) return { ok: false, reason: 'not an object' };
   if (typeof value.speculationId !== 'string' || typeof value.contestId !== 'string') return { ok: false, reason: 'speculationId / contestId must be strings' };
+  if (typeof value.sport !== 'string' || typeof value.awayTeam !== 'string' || typeof value.homeTeam !== 'string') {
+    return { ok: false, reason: 'sport / awayTeam / homeTeam must be strings' };
+  }
   if (value.side !== 'away' && value.side !== 'home') return { ok: false, reason: `side ${describe(value.side)} is not "away"/"home"` };
   if (!isDecimalString(value.riskAmountWei6) || !isDecimalString(value.counterpartyRiskWei6)) return { ok: false, reason: 'riskAmountWei6 / counterpartyRiskWei6 must be decimal strings' };
   if (!(MAKER_POSITION_STATUSES as readonly string[]).includes(value.status as string)) return { ok: false, reason: `status ${describe(value.status)} is not a known status` };
@@ -339,6 +360,9 @@ function validatePositionRecord(value: unknown): { ok: true; record: MakerPositi
     record: {
       speculationId: value.speculationId,
       contestId: value.contestId,
+      sport: value.sport,
+      awayTeam: value.awayTeam,
+      homeTeam: value.homeTeam,
       side: value.side,
       riskAmountWei6: value.riskAmountWei6,
       counterpartyRiskWei6: value.counterpartyRiskWei6,

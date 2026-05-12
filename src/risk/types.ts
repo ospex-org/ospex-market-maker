@@ -3,11 +3,14 @@
 export type MakerSide = 'away' | 'home';
 
 /**
- * One unit of the maker's at-risk exposure: a filled position, or an open /
- * soft-cancelled-not-yet-expired commitment. (Off-chain cancel is visibility-only
- * — a pulled-but-not-expired commitment is still matchable on chain, so it still
- * counts. Expired / authoritatively-invalidated commitments are excluded by the
- * caller before building the `Inventory`.)
+ * One unit of the maker's at-risk exposure: a position the maker holds (its own
+ * stake), or a still-matchable commitment's *remaining* risk. The caller
+ * (`orders.inventoryFromState`) builds these — keeping `visibleOpen` /
+ * `softCancelled` / `partiallyFilled` commitments not past their expiry (an
+ * off-chain cancel is visibility-only — a pulled-but-not-expired quote is still
+ * matchable on chain, so it still counts) and positions other than `claimed`;
+ * excluding `filled` / `expired` / `authoritatively-invalidated` commitments and
+ * anything past its expiry.
  */
 export interface ExposureItem {
   contestId: string;
@@ -23,7 +26,7 @@ export interface ExposureItem {
 /** The maker's current state, as the risk engine sees it. */
 export interface Inventory {
   items: readonly ExposureItem[];
-  /** Count of `visibleOpen` + `softCancelled`-not-yet-expired commitments (the open-commitment cap binds this). */
+  /** Count of the maker's still-live, matchable commitments — `visibleOpen`, `softCancelled`-not-yet-expired, and `partiallyFilled`-not-yet-expired (each is a distinct signed commitment a taker could match). The `maxOpenCommitments` cap binds this; `orders.inventoryFromState` computes it. */
   openCommitmentCount: number;
 }
 

@@ -109,7 +109,7 @@ describe('Runner — boot', () => {
     expect(runner.bootAssessment.reason).toMatch(/genuine first run/);
   });
 
-  it('no state file but prior telemetry = state loss — holds quoting until now + expirySeconds (and logs it)', () => {
+  it('no state file but prior telemetry = state loss — holds quoting until now + expirySeconds (fixed-seconds), and logs it', () => {
     writeFileSync(join(logDir, 'run-prior.ndjson'), '{"ts":"x","runId":"prior","kind":"tick-start","tick":1}\n', 'utf8');
     const now = 1_900_000_000;
     const lines: string[] = [];
@@ -117,7 +117,7 @@ describe('Runner — boot', () => {
     expect(runner.bootAssessment.holdQuoting).toBe(true);
     expect(runner.bootAssessment.suggestedWaitSeconds).toBe(90);
     expect(runner.isHoldingQuoting()).toBe(true);
-    expect(lines.some((l) => /holding quoting at boot/.test(l))).toBe(true);
+    expect(lines.some((l) => /holding quoting for 90s/.test(l))).toBe(true);
   });
 
   it('a corrupt state file holds quoting', () => {
@@ -132,6 +132,58 @@ describe('Runner — boot', () => {
     const runner = makeRunner({ ignoreMissingState: true });
     expect(runner.bootAssessment.holdQuoting).toBe(false);
     expect(runner.bootAssessment.reason).toMatch(/ignore-missing-state/);
+  });
+});
+
+// ── the state-loss hold is durable across restart (DESIGN §12) ───────────────
+
+describe('Runner — state-loss hold durability', () => {
+  it('a state-loss hold survives a restart before the deadline — the runner does not persist a clean state while held', async () => {
+    writeFileSync(join(logDir, 'run-prior.ndjson'), '{"ts":"x","runId":"prior","kind":"tick-start","tick":1}\n', 'utf8');
+    const T0 = 1_900_000_000;
+    // First boot: missing state + prior telemetry → hold (fixed-seconds, expirySeconds 120). Fixed clock at T0, so the deadline never elapses during the run.
+    const runner1 = makeRunner({ runId: 'first', maxTicks: 3, deps: { now: () => T0 } });
+    expect(runner1.bootAssessment.holdQuoting).toBe(true);
+    await runner1.run();
+    expect(existsSync(join(stateDir, 'maker-state.json'))).toBe(false); // never flushed — held the whole time
+
+    // Restart before the deadline → state still missing → still detects the loss → still holds.
+    const runner2 = makeRunner({ runId: 'second', deps: { now: () => T0 + 60 } });
+    expect(runner2.bootAssessment.holdQuoting).toBe(true);
+    expect(runner2.isHoldingQuoting()).toBe(true);
+  });
+
+  it('a state-loss hold releases once a continuous run survives past the deadline, so a later restart resumes', async () => {
+    writeFileSync(join(logDir, 'run-prior.ndjson'), '{"ts":"x","runId":"prior","kind":"tick-start","tick":1}\n', 'utf8');
+    const T0 = 1_900_000_000;
+    let t = T0;
+    // expirySeconds 120; advance 90s per sleep → tick 3 runs at T0 + 180, past the T0 + 120 deadline → the hold has elapsed → flush.
+    const runner1 = makeRunner({ runId: 'first', maxTicks: 3, deps: { now: () => t, sleep: () => { t += 90; return Promise.resolve(); } } });
+    expect(runner1.bootAssessment.holdQuoting).toBe(true);
+    await runner1.run();
+    expect(existsSync(join(stateDir, 'maker-state.json'))).toBe(true); // flushed on tick 3, once the deadline had passed
+
+    const runner2 = makeRunner({ runId: 'second', deps: { now: () => t + 10 } });
+    expect(runner2.bootAssessment.holdQuoting).toBe(false); // clean (empty) state loaded → no hold
+    expect(runner2.bootAssessment.reason).toMatch(/loaded cleanly/);
+  });
+
+  it('under match-time expiry, a state-loss hold is indefinite — it does not auto-release after expirySeconds; only --ignore-missing-state lifts it', async () => {
+    writeFileSync(join(logDir, 'run-prior.ndjson'), '{"ts":"x","runId":"prior","kind":"tick-start","tick":1}\n', 'utf8');
+    const T0 = 1_900_000_000;
+    let t = T0;
+    const runner1 = makeRunner({ runId: 'first', config: cfg({ orders: { expiryMode: 'match-time', expirySeconds: 120 } }), maxTicks: 3, deps: { now: () => t, sleep: () => { t += 500; return Promise.resolve(); } } });
+    expect(runner1.bootAssessment.holdQuoting).toBe(true);
+    await runner1.run(); // by tick 3 the clock is at T0 + 1000, way past expirySeconds — but the hold is indefinite
+    expect(runner1.isHoldingQuoting()).toBe(true);
+    expect(existsSync(join(stateDir, 'maker-state.json'))).toBe(false); // never flushed
+
+    const runner2 = makeRunner({ runId: 'second', config: cfg({ orders: { expiryMode: 'match-time' } }), deps: { now: () => t } });
+    expect(runner2.bootAssessment.holdQuoting).toBe(true); // a restart still detects the loss → still holds
+
+    const runner3 = makeRunner({ runId: 'third', config: cfg({ orders: { expiryMode: 'match-time' } }), ignoreMissingState: true, deps: { now: () => t } });
+    expect(runner3.bootAssessment.holdQuoting).toBe(false); // ...and --ignore-missing-state lifts it
+    expect(runner3.isHoldingQuoting()).toBe(false);
   });
 });
 

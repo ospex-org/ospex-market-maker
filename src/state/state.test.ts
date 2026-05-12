@@ -9,6 +9,7 @@ import {
   emptyMakerState,
   StateStore,
   type MakerCommitmentRecord,
+  type MakerPositionRecord,
   type MakerState,
 } from './index.js';
 
@@ -20,6 +21,9 @@ function commitment(overrides: Partial<MakerCommitmentRecord> = {}): MakerCommit
     hash: '0xabc',
     speculationId: 'spec-1',
     contestId: 'contest-1',
+    sport: 'mlb',
+    awayTeam: 'NYM',
+    homeTeam: 'LAD',
     scorer: '0xscorer',
     makerSide: 'away',
     oddsTick: 191,
@@ -29,6 +33,22 @@ function commitment(overrides: Partial<MakerCommitmentRecord> = {}): MakerCommit
     expiryUnixSec: 1_900_000_000,
     postedAtUnixSec: 1_899_999_880,
     updatedAtUnixSec: 1_899_999_900,
+    ...overrides,
+  };
+}
+
+function position(overrides: Partial<MakerPositionRecord> = {}): MakerPositionRecord {
+  return {
+    speculationId: 'spec-1',
+    contestId: 'contest-1',
+    sport: 'mlb',
+    awayTeam: 'NYM',
+    homeTeam: 'LAD',
+    side: 'away',
+    riskAmountWei6: '250000',
+    counterpartyRiskWei6: '150000',
+    status: 'active',
+    updatedAtUnixSec: 1_899_999_950,
     ...overrides,
   };
 }
@@ -52,15 +72,18 @@ describe('StateStore.load', () => {
     expect(state).toEqual(emptyMakerState());
   });
 
-  it('round-trips a flushed state and reports `loaded`', () => {
+  it('round-trips a flushed state (commitments + positions) and reports `loaded`', () => {
     const store = StateStore.at(dir);
     const c = commitment();
-    store.flush(stateWith({ lastRunId: 'r1', commitments: { [c.hash]: c }, pnl: { realizedUsdcWei6: '-5', unrealizedUsdcWei6: '12', asOfUnixSec: 100 } }));
+    const p = position();
+    store.flush(stateWith({ lastRunId: 'r1', commitments: { [c.hash]: c }, positions: { 'spec-1:away': p }, pnl: { realizedUsdcWei6: '-5', unrealizedUsdcWei6: '12', asOfUnixSec: 100 } }));
 
     const { state, status } = store.load();
     expect(status).toEqual({ kind: 'loaded' });
     expect(state.lastRunId).toBe('r1');
     expect(state.commitments['0xabc']).toEqual(c);
+    expect(state.commitments['0xabc']?.sport).toBe('mlb');
+    expect(state.positions['spec-1:away']).toEqual(p);
     expect(state.pnl).toEqual({ realizedUsdcWei6: '-5', unrealizedUsdcWei6: '12', asOfUnixSec: 100 });
     expect(typeof state.lastFlushedAt).toBe('string');
     expect(new Date(state.lastFlushedAt as string).getTime()).not.toBeNaN();
@@ -113,6 +136,20 @@ describe('StateStore.load', () => {
     status = at.load().status;
     expect(status.kind).toBe('lost');
     if (status.kind === 'lost') expect(status.reason).toMatch(/does not match its key/);
+  });
+
+  it('treats a malformed position record as `lost` (bad side / missing team metadata)', () => {
+    const at = StateStore.at(dir);
+
+    writeFileSync(join(dir, STATE_FILE), JSON.stringify(stateWith({ positions: { 'spec-1:away': position({ side: 'sideways' as unknown as 'away' }) } })), 'utf8');
+    let status = at.load().status;
+    expect(status.kind).toBe('lost');
+    if (status.kind === 'lost') expect(status.reason).toMatch(/side/);
+
+    writeFileSync(join(dir, STATE_FILE), JSON.stringify(stateWith({ positions: { 'spec-1:away': { ...position(), homeTeam: undefined as unknown as string } } })), 'utf8');
+    status = at.load().status;
+    expect(status.kind).toBe('lost');
+    if (status.kind === 'lost') expect(status.reason).toMatch(/sport \/ awayTeam \/ homeTeam/);
   });
 
   it('a well-formed soft-cancelled commitment survives the round trip', () => {

@@ -23,16 +23,21 @@
  *     read-and-cleared by the per-market reconcile — dirty-event coalescing;
  *   - **the per-market reconcile** (DESIGN §3 step 3, §8, §9): for each tracked
  *     market that needs it (its reference odds moved, or it has no fresh two-sided
- *     standing quote of ours) — skipped entirely while the boot-time hold is active
- *     (DESIGN §12) — re-confirm the speculation is still open (the lazy-creation
- *     re-check), build the desired two-sided quote (`buildDesiredQuote` over the
+ *     standing quote of ours, or it has become unquoteable while quotes are still up)
+ *     — skipped entirely while the boot-time hold is active (DESIGN §12) — first the
+ *     unquoteable gates (game imminent / reference odds missing or stale / odds
+ *     channel down / speculation closed): each pulls (soft-cancels) any visible
+ *     quote of ours on that speculation — the visible book must never carry a quote
+ *     the MM is no longer pricing (DESIGN §2.2 / §3) — and emits a `candidate` skip;
+ *     otherwise build the desired two-sided quote (`buildDesiredQuote` over the
  *     hypothetical inventory `inventoryFromState` derives from the persisted state),
  *     `reconcileBook` it against the maker's current book on that speculation, and
  *     apply the plan: in dry-run (the only mode in Phase 2) log it (`quote-intent`
  *     + `would-submit` / `would-replace` / `would-soft-cancel` + a `cap-hit`
  *     candidate per deferred side) and mutate the *hypothetical* inventory (add
  *     synthetic `visibleOpen` records for submits / replacements; reclassify
- *     pulled / replaced records to `softCancelled`); live execution is Phase 3;
+ *     pulled / replaced records to `softCancelled` — they stay matchable on chain,
+ *     so the risk engine keeps counting them); live execution is Phase 3;
  *   - age-out of expired tracked commitments;
  *   - the per-tick state flush;
  *   - an interruptible sleep clamped to the `pollIntervalMs` floor.
@@ -53,7 +58,7 @@
 import { existsSync } from 'node:fs';
 
 import { POLL_INTERVAL_FLOOR_MS, type Config } from '../config/index.js';
-import { buildDesiredQuote, inventoryFromState, reconcileBook, type BookReconciliation } from '../orders/index.js';
+import { buildDesiredQuote, inventoryFromState, reconcileBook, type BookReconciliation, type SoftCancelReason } from '../orders/index.js';
 import type {
   ContestView,
   OddsSnapshotView,
@@ -649,29 +654,73 @@ export class Runner {
    * For each tracked market that needs it — skipped entirely while the boot-time
    * state-loss hold is active (DESIGN §12, don't quote on a blank slate) — recompute
    * the desired two-sided quote and reconcile it against the maker's current book on
-   * that speculation. A market "needs reconcile" if its reference odds moved since the
-   * last reconcile (`dirty`), or it lacks a fresh two-sided standing quote of ours (a
-   * newcomer, an expired / aged-out quote, a stale quote, a half-filled book) — the
-   * latter throttled to one re-reconcile per `orders.staleAfterSeconds`. `dirty` is
-   * read-and-cleared per market here — a burst of odds moves between ticks coalesces
-   * into one reconcile.
+   * that speculation, *or* (when the market has become unquoteable) pull its visible
+   * quotes. `dirty` is read-and-cleared / `lastReconciledAt` is set only when a
+   * reconcile *decision was applied* — a transient `getSpeculation` failure leaves
+   * both alone so the market retries promptly next tick rather than hiding behind the
+   * `staleAfterSeconds` throttle (DESIGN §3).
    */
   private async reconcileMarkets(): Promise<void> {
     if (this.isHoldingQuoting()) return; // DESIGN §12 — must not resume quoting on a blank slate
     const now = this.deps.now();
     for (const m of this.trackedMarkets.values()) {
       if (!this.needsReconcile(m, now)) continue;
-      m.dirty = false; // read-and-clear (a re-fired onChange before the next tick re-arms it)
-      m.lastReconciledAt = now;
-      await this.reconcileMarket(m, now);
+      const outcome = await this.reconcileMarket(m, now);
+      if (outcome === 'applied') {
+        m.dirty = false; // read-and-clear (a re-fired onChange before the next tick re-arms it)
+        m.lastReconciledAt = now;
+      }
+      // 'transient-failure' (a getSpeculation read failed): leave `dirty` / `lastReconciledAt` so the market retries next tick
     }
   }
 
-  /** Does this market need a reconcile this pass? `dirty` (reference odds moved) → yes, now. Otherwise: only if it lacks a fresh two-sided standing quote of ours AND it hasn't been reconciled in the last `orders.staleAfterSeconds` (so a flat-odds market rolls its quote forward roughly every `staleAfterSeconds`, and a persistently-refused / always-gated market is re-evaluated at that cadence rather than every tick). */
+  /**
+   * Does this market need a reconcile this pass? `dirty` (reference odds moved) → yes,
+   * now. An *unquoteable* market that still has visible quotes of ours → yes, now
+   * (`reconcileMarket`'s gates pull them — a stale quote must not stay visible, DESIGN
+   * §2.2 / §3). Otherwise → only if it lacks a fresh two-sided standing quote of ours
+   * AND it hasn't been reconciled in the last `orders.staleAfterSeconds` (so a
+   * flat-odds market rolls its quote forward roughly every `staleAfterSeconds`, and a
+   * persistently-refused / always-gated market is re-evaluated at that cadence rather
+   * than every tick).
+   */
   private needsReconcile(m: TrackedMarket, now: number): boolean {
     if (m.dirty) return true;
+    if (this.marketUnquoteable(m, now) && this.hasVisibleQuotesOn(m.speculationId, now)) return true;
     if (!this.lacksFreshTwoSidedQuote(m, now)) return false;
     return m.lastReconciledAt === null || now - m.lastReconciledAt >= this.config.orders.staleAfterSeconds;
+  }
+
+  /**
+   * Is this market currently unquoteable on grounds the runner can see without an SDK
+   * round-trip — its game is imminent (starts within one `expirySeconds` window), its
+   * reference odds are missing / stale-beyond-`staleReferenceAfterSeconds`, or (in
+   * subscription mode) its Realtime odds channel has errored / never came up? When
+   * such a market still has visible quotes of ours, they must be pulled (DESIGN §2.2:
+   * never quote on missing / ambiguous / stale data; never leave a stale quote
+   * visible) — `needsReconcile` therefore forces a reconcile for it, and
+   * `reconcileMarket`'s matching gate does the pull. (The speculation-closed case
+   * isn't here — it needs the `getSpeculation` read to detect, so it's handled inside
+   * `reconcileMarket` after that read.)
+   */
+  private marketUnquoteable(m: TrackedMarket, now: number): boolean {
+    if (m.matchTimeSec - now <= this.config.orders.expirySeconds) return true; // the game starts within one expiry window
+    if (m.lastOddsAt === null || now - m.lastOddsAt > this.config.orders.staleReferenceAfterSeconds) return true; // no reference reading yet, or the feed has gone stale
+    const ml = m.lastMoneylineOdds; // non-null here (lastOddsAt !== null iff lastMoneylineOdds !== null)
+    if (ml === null || ml.awayOddsAmerican === null || ml.homeOddsAmerican === null) return true; // a moneyline row exists but a side isn't priced
+    if (this.config.odds.subscribe && m.subscription === null) return true; // the Realtime odds channel errored / never came up (re-subscribed on the next discovery cycle; in polling mode pollTrackedOdds re-snapshots every tick, so there's no "degraded" notion)
+    return false;
+  }
+
+  /** Does the maker have an API-visible commitment of its own (`visibleOpen` / `partiallyFilled`, not expired) on `speculationId` right now? */
+  private hasVisibleQuotesOn(speculationId: string, now: number): boolean {
+    for (const r of Object.values(this.state.commitments)) {
+      if (r.speculationId !== speculationId) continue;
+      if (r.lifecycle !== 'visibleOpen' && r.lifecycle !== 'partiallyFilled') continue;
+      if (r.expiryUnixSec <= now) continue;
+      return true;
+    }
+    return false;
   }
 
   /** True unless the maker has a `visibleOpen`, not-expired, not-yet-stale commitment of its own on `m.speculationId` for *both* sides (v0 always quotes both — `pricing.quoteBothSides`). A stale quote counts as "not a fresh standing quote", so the market re-reconciles to roll it forward before it expires. */
@@ -689,31 +738,44 @@ export class Runner {
 
   /**
    * Reconcile one market: the cheap gates, then the lazy-creation re-check, then
-   * price → plan → apply. Gates emit a `candidate` with the skip reason and return.
-   * The `getSpeculation` re-check failing is `error`-logged and the market is skipped
-   * this pass (retried next pass — it's treated as transient, not as "would lazily
-   * create a speculation": discovery already pre-filtered, and a permanently-gone
-   * speculation is essentially impossible on chain). Pricing / risk refusals come
-   * back as a `quote-intent` with `canQuote: false` (carrying the refusal notes) plus
-   * — via `reconcileBook` — the `would-soft-cancel`s that pull any standing quote off
-   * an unwanted side.
+   * price → plan → apply. A gate that fires **pulls any visible quotes of the
+   * maker's on that speculation** (the visible book must not carry a quote the MM is
+   * no longer pricing — DESIGN §2.2 / §3) and emits a `candidate` with the skip
+   * reason. The `getSpeculation` re-check failing is `error`-logged and returns
+   * `'transient-failure'` (no decision applied — `reconcileMarkets` then leaves
+   * `dirty` / `lastReconciledAt` so the market retries promptly next tick; it's
+   * treated as transient, not as "would lazily create a speculation": discovery
+   * pre-filtered, and a permanently-gone speculation is essentially impossible on
+   * chain). Pricing / risk refusals come back as a `quote-intent` with
+   * `canQuote: false` (carrying the refusal notes) plus — via `reconcileBook` — the
+   * `would-soft-cancel`s that pull any standing quote off an unwanted side. Returns
+   * `'applied'` whenever a reconcile decision (a gate-pull, or a plan) was applied.
    */
-  private async reconcileMarket(m: TrackedMarket, now: number): Promise<void> {
-    // Gate: the game starts within one expiry window — don't post a quote that would still be matchable at game time.
+  private async reconcileMarket(m: TrackedMarket, now: number): Promise<'applied' | 'transient-failure'> {
+    // Gate: the game starts within one expiry window — stop quoting it (a fresh quote would still be matchable at game time / outlive the pre-game window), and pull whatever's still up.
     if (m.matchTimeSec - now <= this.config.orders.expirySeconds) {
+      this.pullVisibleQuotes(m, now);
       this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'start-too-soon' });
-      return;
+      return 'applied';
     }
     // Gate: the reference odds have gone stale (the upstream feed stopped advancing). A never-seen-odds market (`lastOddsAt === null`) falls through to the `no-reference-odds` gate below — `lastOddsAt === null` iff `lastMoneylineOdds === null` (`recordOdds` sets both or neither).
     if (m.lastOddsAt !== null && now - m.lastOddsAt > this.config.orders.staleReferenceAfterSeconds) {
+      this.pullVisibleQuotes(m, now);
       this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'stale-reference' });
-      return;
+      return 'applied';
     }
     // Gate: no usable reference moneyline odds (both sides must be priced — `buildDesiredQuote` itself refuses out-of-range *values*, but it can't be handed a `null`).
     const ml = m.lastMoneylineOdds;
     if (ml === null || ml.awayOddsAmerican === null || ml.homeOddsAmerican === null) {
+      this.pullVisibleQuotes(m, now);
       this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'no-reference-odds' });
-      return;
+      return 'applied';
+    }
+    // Gate: the Realtime odds channel is down (subscription mode) — the reference is no longer being kept fresh, so treat it as unsafe and pull. (`syncOddsSubscriptions` re-subscribes on the next discovery cycle; the existing `degraded` event already carries the precise cause.)
+    if (this.config.odds.subscribe && m.subscription === null) {
+      this.pullVisibleQuotes(m, now);
+      this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'stale-reference' });
+      return 'applied';
     }
     // Lazy-creation re-check (DESIGN §6/§9): the speculation we'd post to must still exist + be open — discovery confirmed it; re-confirm via the per-speculation detail read (PR 5's competitiveness check reuses the `getSpeculation` orderbook).
     let spec: SpeculationView;
@@ -721,11 +783,12 @@ export class Runner {
       spec = await this.adapter.getSpeculation(m.speculationId);
     } catch (err) {
       this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'reconcile', contestId: m.contestId });
-      return;
+      return 'transient-failure'; // no decision applied — retry next tick rather than wait out the staleAfterSeconds throttle
     }
     if (!spec.open) {
+      this.pullVisibleQuotes(m, now);
       this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'no-open-speculation' });
-      return;
+      return 'applied';
     }
     // Price → plan → apply.
     const market: Market = { contestId: m.contestId, sport: m.sport, awayTeam: m.awayTeam, homeTeam: m.homeTeam };
@@ -745,6 +808,24 @@ export class Runner {
     const recordsOnSpec = Object.values(this.state.commitments).filter((r) => r.speculationId === m.speculationId);
     const plan = reconcileBook(recordsOnSpec, desired, this.config, now, inventory.openCommitmentCount);
     this.applyReconcilePlan(m, plan, now);
+    return 'applied';
+  }
+
+  /** Pull (off-chain) every API-visible commitment of the maker's on `m.speculationId` — reclassify it `softCancelled`, emit `would-soft-cancel` (reason `side-not-quoted`: when a market is unquoteable, neither side is being quoted). Used by the unquoteable-market gates above — the visible book must never carry a quote the MM is no longer pricing (DESIGN §2.2 / §3). The pulled quote's signed payload stays matchable on chain until expiry, so the risk engine keeps counting it. */
+  private pullVisibleQuotes(m: TrackedMarket, now: number): void {
+    for (const r of Object.values(this.state.commitments)) {
+      if (r.speculationId !== m.speculationId) continue;
+      if (r.lifecycle !== 'visibleOpen' && r.lifecycle !== 'partiallyFilled') continue;
+      if (r.expiryUnixSec <= now) continue; // already dead on chain — `ageOut` handles it
+      this.softCancelRecord(r, 'side-not-quoted', now);
+    }
+  }
+
+  /** Reclassify a tracked commitment `softCancelled` (off-chain pull) + emit `would-soft-cancel`. */
+  private softCancelRecord(record: MakerCommitmentRecord, reason: SoftCancelReason, now: number): void {
+    record.lifecycle = 'softCancelled';
+    record.updatedAtUnixSec = now;
+    this.eventLog.emit('would-soft-cancel', softCancelEventPayload(record, reason));
   }
 
   /** Apply a `reconcileBook` plan in dry-run: log each item (`would-submit` / `would-replace` / `would-soft-cancel`, plus a `cap-hit` candidate per deferred side) and mutate the hypothetical inventory — add a synthetic `visibleOpen` record per submit / replacement, reclassify each pulled / replaced record to `softCancelled` (its signed payload stays matchable until expiry, so the risk engine keeps counting it). Live execution — the real SDK write calls — is Phase 3. */
@@ -776,21 +857,7 @@ export class Runner {
         expiryUnixSec,
       });
     }
-    for (const sc of plan.toSoftCancel) {
-      sc.record.lifecycle = 'softCancelled';
-      sc.record.updatedAtUnixSec = now;
-      this.eventLog.emit('would-soft-cancel', {
-        commitmentHash: sc.record.hash,
-        speculationId: sc.record.speculationId,
-        contestId: sc.record.contestId,
-        sport: sc.record.sport,
-        awayTeam: sc.record.awayTeam,
-        homeTeam: sc.record.homeTeam,
-        makerSide: sc.record.makerSide,
-        oddsTick: sc.record.oddsTick,
-        reason: sc.reason,
-      });
-    }
+    for (const sc of plan.toSoftCancel) this.softCancelRecord(sc.record, sc.reason, now);
     for (const side of plan.deferredSides) {
       this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'cap-hit', side });
     }
@@ -884,4 +951,19 @@ function errMessage(err: unknown): string {
 /** Compact a `QuoteSide` (or `null`) for the `quote-intent` event payload — the odds tick + the quoted size (USDC, and wei6 as a decimal string). */
 function quoteSideSummary(qs: QuoteSide | null): { oddsTick: number; sizeUSDC: number; sizeWei6: string } | null {
   return qs === null ? null : { oddsTick: qs.quoteTick, sizeUSDC: qs.sizeUSDC, sizeWei6: String(qs.sizeWei6) };
+}
+
+/** The `would-soft-cancel` event payload for a pulled commitment record. */
+function softCancelEventPayload(record: MakerCommitmentRecord, reason: SoftCancelReason): Record<string, unknown> {
+  return {
+    commitmentHash: record.hash,
+    speculationId: record.speculationId,
+    contestId: record.contestId,
+    sport: record.sport,
+    awayTeam: record.awayTeam,
+    homeTeam: record.homeTeam,
+    makerSide: record.makerSide,
+    oddsTick: record.oddsTick,
+    reason,
+  };
 }

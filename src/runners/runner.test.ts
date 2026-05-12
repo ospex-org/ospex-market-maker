@@ -878,4 +878,64 @@ describe('Runner — per-market reconcile', () => {
     }).run();
     expect(readEvents().filter((e) => e.kind === 'quote-intent' && e.contestId === 'A')).toHaveLength(2);
   });
+
+  // ── unquoteable-market quote pulls (review-PR14) ───────────────────────────
+
+  it('a market with visible quotes that loses its reference odds has them pulled (would-soft-cancel) — not left visible', async () => {
+    const away = commitmentRecord({ hash: '0xaWay', speculationId: 'spec-A', contestId: 'A', makerSide: 'away', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 200, postedAtUnixSec: T0 - 10, updatedAtUnixSec: T0 - 10 });
+    const home = commitmentRecord({ hash: '0xaHome', speculationId: 'spec-A', contestId: 'A', makerSide: 'home', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 200, postedAtUnixSec: T0 - 10, updatedAtUnixSec: T0 - 10 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xaWay': away, '0xaHome': home } });
+    const config = cfg();
+    const adapter = spiedAdapter(config, () => Promise.resolve([contestView({ contestId: 'A' })]), undefined, { snapshot: (contestId) => Promise.resolve(oddsSnapshotView(contestId, null)) }); // no moneyline row → no usable reference odds
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    const events = readEvents();
+    const pulls = events.filter((e) => e.kind === 'would-soft-cancel');
+    expect(pulls.map((e) => e.commitmentHash).sort()).toEqual(['0xaHome', '0xaWay']);
+    expect(pulls.every((e) => e.reason === 'side-not-quoted')).toBe(true);
+    expect(events.some((e) => e.kind === 'candidate' && e.contestId === 'A' && e.skipReason === 'no-reference-odds')).toBe(true);
+    expect(events.some((e) => e.kind === 'would-submit')).toBe(false);
+    const reloaded = StateStore.at(stateDir).load().state.commitments;
+    expect([reloaded['0xaWay']?.lifecycle, reloaded['0xaHome']?.lifecycle]).toEqual(['softCancelled', 'softCancelled']);
+  });
+
+  it('a market whose odds channel errors has its visible quotes pulled the next tick (would-soft-cancel) — a degraded channel must not keep stale quotes visible', async () => {
+    StateStore.at(stateDir).flush(emptyMakerState());
+    const config = cfg();
+    const recorder = makeSubscribeRecorder();
+    let sleeps = 0;
+    const adapter = spiedAdapter(config, () => Promise.resolve([contestView({ contestId: 'A' })]), undefined, { subscribe: recorder.subscribe });
+    // tick 1: track + seed + quote A (2 synthetic visibleOpen records). sleep → the channel errors. tick 2: A is unquoteable (channel down) → its visible quotes are pulled.
+    await makeRunner({
+      config,
+      adapter,
+      maxTicks: 2,
+      deps: { sleep: () => { sleeps += 1; if (sleeps === 1) recorder.handlersFor('GAME-A')?.onError?.(new Error('channel boom')); return Promise.resolve(); } },
+    }).run();
+
+    const events = readEvents();
+    expect(events.filter((e) => e.kind === 'would-submit')).toHaveLength(2); // tick 1
+    expect(events.some((e) => e.kind === 'degraded' && e.reason === 'channel-error')).toBe(true);
+    const pulls = events.filter((e) => e.kind === 'would-soft-cancel');
+    expect(pulls).toHaveLength(2); // tick 2 pulled both
+    expect(pulls.every((e) => e.contestId === 'A' && e.reason === 'side-not-quoted')).toBe(true);
+    const records = Object.values(StateStore.at(stateDir).load().state.commitments);
+    expect(records).toHaveLength(2);
+    expect(records.every((r) => r.lifecycle === 'softCancelled')).toBe(true);
+  });
+
+  it('a transient getSpeculation failure after an odds move does not clear the dirty flag — the market retries the next tick', async () => {
+    StateStore.at(stateDir).flush(emptyMakerState());
+    const config = cfg();
+    let getSpecCalls = 0;
+    const adapter = spiedAdapter(config, () => Promise.resolve([contestView({ contestId: 'A' })]), undefined, {
+      getSpeculation: (speculationId) => { getSpecCalls += 1; return getSpecCalls === 1 ? Promise.reject(new Error('spec read transient')) : Promise.resolve(speculationView(speculationId, true)); },
+    });
+    await makeRunner({ config, adapter, maxTicks: 2 }).run();
+
+    expect(getSpecCalls).toBe(2); // tick 1 failed, tick 2 retried
+    const events = readEvents();
+    expect(events.find((e) => e.kind === 'error' && e.phase === 'reconcile')).toMatchObject({ contestId: 'A', detail: 'spec read transient' });
+    expect(events.filter((e) => e.kind === 'would-submit')).toHaveLength(2); // A got quoted on tick 2 — it would NOT if tick 1's failure had cleared dirty (the fixed clock means the staleAfterSeconds throttle never elapses)
+  });
 });

@@ -625,11 +625,27 @@ export class Runner {
     }
   }
 
-  /** Store a fresh reference-odds reading on a tracked market (bumps `lastOddsAt`; sets `dirty` if `markDirty`). A `null` reading (no moneyline row at all) is a no-op — `lastOddsAt` then ages out, which the per-market reconcile's `stale-reference` gate catches. */
+  /**
+   * Apply a fresh *reference-odds response* for a tracked market. `recordOdds` is
+   * called only when the feed actually responded (a `getOddsSnapshot` that resolved,
+   * or an `onChange` / `onRefresh` payload), so it always bumps `lastOddsAt` — that's
+   * the "the feed is alive" signal that the `stale-reference` gate keys off (a
+   * *failed* snapshot request never reaches here, so `lastOddsAt` then ages out).
+   * `odds === null` means the response had no moneyline row for this game — we have
+   * no usable reference odds *now*: clear `lastMoneylineOdds`, and if it had been
+   * usable, mark the market dirty so the next reconcile pulls our visible quotes via
+   * the `no-reference-odds` gate (distinct from the `stale-reference` gate — the feed
+   * isn't dead, it just has no moneyline). Otherwise store the new odds and set
+   * `dirty` if `markDirty` (the caller's "the price moved / appeared" signal).
+   */
   private recordOdds(m: TrackedMarket, odds: MoneylineOddsPair | null, opts: { markDirty: boolean }): void {
-    if (odds === null) return;
-    m.lastMoneylineOdds = { awayOddsAmerican: odds.awayOddsAmerican, homeOddsAmerican: odds.homeOddsAmerican };
     m.lastOddsAt = this.deps.now();
+    if (odds === null) {
+      if (m.lastMoneylineOdds !== null) m.dirty = true; // it was usable a moment ago — the next reconcile must pull our quotes (no-reference-odds gate)
+      m.lastMoneylineOdds = null;
+      return;
+    }
+    m.lastMoneylineOdds = { awayOddsAmerican: odds.awayOddsAmerican, homeOddsAmerican: odds.homeOddsAmerican };
     if (opts.markDirty) m.dirty = true;
   }
 
@@ -693,21 +709,23 @@ export class Runner {
 
   /**
    * Is this market currently unquoteable on grounds the runner can see without an SDK
-   * round-trip — its game is imminent (starts within one `expirySeconds` window), its
-   * reference odds are missing / stale-beyond-`staleReferenceAfterSeconds`, or (in
-   * subscription mode) its Realtime odds channel has errored / never came up? When
-   * such a market still has visible quotes of ours, they must be pulled (DESIGN §2.2:
-   * never quote on missing / ambiguous / stale data; never leave a stale quote
-   * visible) — `needsReconcile` therefore forces a reconcile for it, and
-   * `reconcileMarket`'s matching gate does the pull. (The speculation-closed case
-   * isn't here — it needs the `getSpeculation` read to detect, so it's handled inside
-   * `reconcileMarket` after that read.)
+   * round-trip — its game is imminent (starts within one `expirySeconds` window); we
+   * have no usable reference moneyline odds (none seen yet, the latest response had no
+   * moneyline row, or a side isn't priced); the feed has stopped responding
+   * (`now - lastOddsAt > staleReferenceAfterSeconds` — a `getOddsSnapshot` failure or
+   * no `onChange` / `onRefresh` in a while); or (in subscription mode) its Realtime
+   * odds channel has errored / never came up? When such a market still has visible
+   * quotes of ours, they must be pulled (DESIGN §2.2: never quote on missing /
+   * ambiguous / stale data; never leave a stale quote visible) — `needsReconcile`
+   * therefore forces a reconcile for it, and `reconcileMarket`'s matching gate does
+   * the pull. (The speculation-closed case isn't here — it needs the `getSpeculation`
+   * read to detect, so it's handled inside `reconcileMarket` after that read.)
    */
   private marketUnquoteable(m: TrackedMarket, now: number): boolean {
     if (m.matchTimeSec - now <= this.config.orders.expirySeconds) return true; // the game starts within one expiry window
-    if (m.lastOddsAt === null || now - m.lastOddsAt > this.config.orders.staleReferenceAfterSeconds) return true; // no reference reading yet, or the feed has gone stale
-    const ml = m.lastMoneylineOdds; // non-null here (lastOddsAt !== null iff lastMoneylineOdds !== null)
-    if (ml === null || ml.awayOddsAmerican === null || ml.homeOddsAmerican === null) return true; // a moneyline row exists but a side isn't priced
+    const ml = m.lastMoneylineOdds;
+    if (ml === null || ml.awayOddsAmerican === null || ml.homeOddsAmerican === null) return true; // no usable reference moneyline odds — none seen yet, the latest response had no moneyline row, or a side isn't priced
+    if (m.lastOddsAt !== null && now - m.lastOddsAt > this.config.orders.staleReferenceAfterSeconds) return true; // the feed has stopped responding
     if (this.config.odds.subscribe && m.subscription === null) return true; // the Realtime odds channel errored / never came up (re-subscribed on the next discovery cycle; in polling mode pollTrackedOdds re-snapshots every tick, so there's no "degraded" notion)
     return false;
   }

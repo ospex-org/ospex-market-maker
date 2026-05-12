@@ -604,8 +604,8 @@ describe('Runner — odds subscriptions', () => {
     const runner = makeRunner({ config, adapter, maxTicks: 1, deps: { now: () => t } });
     await runner.run();
 
-    // after the seed: subscribed, but no odds yet, not dirty.
-    expect(runner.trackedMarketView('A')).toMatchObject({ subscribed: true, lastMoneylineOdds: null, lastOddsAt: null, dirty: false });
+    // after the seed: subscribed, the feed responded (so lastOddsAt is set) but the response had no moneyline row, so no usable odds yet; not dirty (it had none before either).
+    expect(runner.trackedMarketView('A')).toMatchObject({ subscribed: true, lastMoneylineOdds: null, lastOddsAt: T0, dirty: false });
 
     const handlers = recorder.handlersFor('GAME-A');
     expect(handlers).toBeDefined();
@@ -937,5 +937,25 @@ describe('Runner — per-market reconcile', () => {
     const events = readEvents();
     expect(events.find((e) => e.kind === 'error' && e.phase === 'reconcile')).toMatchObject({ contestId: 'A', detail: 'spec read transient' });
     expect(events.filter((e) => e.kind === 'would-submit')).toHaveLength(2); // A got quoted on tick 2 — it would NOT if tick 1's failure had cleared dirty (the fixed clock means the staleAfterSeconds throttle never elapses)
+  });
+
+  it('polling mode: a market quoted on valid odds whose next snapshot has no moneyline row has its visible quotes pulled (would-soft-cancel) — a vanished reference must not leave quotes up', async () => {
+    StateStore.at(stateDir).flush(emptyMakerState());
+    const config = cfg({ odds: { subscribe: false }, discovery: { everyNTicks: 10 } }); // discovery runs once (tick 1)
+    let snapshotCalls = 0;
+    const adapter = spiedAdapter(config, () => Promise.resolve([contestView({ contestId: 'A' })]), undefined, {
+      snapshot: (contestId) => { snapshotCalls += 1; return Promise.resolve(oddsSnapshotView(contestId, snapshotCalls === 1 ? moneylineOdds(-150, 130) : null)); }, // tick 1: valid moneyline → quote; tick 2: the moneyline row is gone
+    });
+    await makeRunner({ config, adapter, maxTicks: 2 }).run();
+
+    const events = readEvents();
+    expect(events.filter((e) => e.kind === 'would-submit')).toHaveLength(2); // tick 1 quoted both sides
+    const pulls = events.filter((e) => e.kind === 'would-soft-cancel');
+    expect(pulls).toHaveLength(2); // tick 2 pulled both — the reference odds vanished
+    expect(pulls.every((e) => e.contestId === 'A' && e.reason === 'side-not-quoted')).toBe(true);
+    expect(events.some((e) => e.kind === 'candidate' && e.contestId === 'A' && e.skipReason === 'no-reference-odds')).toBe(true);
+    const records = Object.values(StateStore.at(stateDir).load().state.commitments);
+    expect(records).toHaveLength(2);
+    expect(records.every((r) => r.lifecycle === 'softCancelled')).toBe(true);
   });
 });

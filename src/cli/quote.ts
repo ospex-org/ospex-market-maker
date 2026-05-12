@@ -6,9 +6,10 @@
  *   1. Fetch the contest + reference odds via the adapter.
  *   2. Validate the contest is quotable (status; an open moneyline speculation
  *      exists — v0 refuses lazy-creation paths).
- *   3. Convert reference odds to decimal, build `QuoteInputs` from the config +
- *      headroom over a *clean inventory* (the runner reconciles against real
- *      positions in Phase 2's `run`), and call `computeQuote`.
+ *   3. Build the desired quote via `src/orders/buildDesiredQuote` (strip the vig,
+ *      derive the spread, size against the per-side headroom over an *empty
+ *      inventory* — the runner reconciles against real positions in Phase 2's
+ *      `run`).
  *
  * Operational failures (contest 404, network) throw — the CLI catches and exits
  * 1. Logical refusals (no speculation, no reference odds, …) return a structured
@@ -19,20 +20,9 @@
  */
 
 import type { Config } from '../config/index.js';
+import { buildDesiredQuote, type ReferenceOddsBreakdown } from '../orders/index.js';
 import type { OspexAdapter, OddsSnapshotView } from '../ospex/index.js';
-import {
-  americanToDecimal,
-  computeQuote,
-  decimalToImpliedProb,
-  type QuoteInputs,
-  type QuoteResult,
-} from '../pricing/index.js';
-import {
-  headroomForSide,
-  type Inventory,
-  type Market,
-  type RiskCaps,
-} from '../risk/index.js';
+import type { QuoteResult } from '../pricing/index.js';
 
 // ── report shape ─────────────────────────────────────────────────────────────
 
@@ -48,18 +38,6 @@ export interface QuoteContext {
   status: string;
   /** Upstream reference-game id (neutral term — DESIGN §16). `null` if no upstream linkage. */
   referenceGameId: string | null;
-}
-
-/** A breakdown of the reference moneyline odds — both formats + the consensus overround. */
-export interface ReferenceOddsBreakdown {
-  awayOddsAmerican: number;
-  homeOddsAmerican: number;
-  awayDecimal: number;
-  homeDecimal: number;
-  awayImpliedProb: number;
-  homeImpliedProb: number;
-  /** `awayImpliedProb + homeImpliedProb - 1` (the vig). */
-  overround: number;
 }
 
 /**
@@ -155,32 +133,27 @@ export async function runQuote(opts: QuoteOpts): Promise<QuoteReport> {
     );
   }
 
-  // 3. Compute the reference odds breakdown.
-  const referenceOdds = breakdownReferenceOdds(odds.awayOddsAmerican, odds.homeOddsAmerican);
-
-  // 4. Build RiskCaps + a clean inventory; compute headroom on each side.
-  const caps = toRiskCaps(config);
-  const market: Market = {
+  // 3. Build the desired quote — config + reference odds + headroom over an empty inventory.
+  const market = {
     contestId: contest.contestId,
     sport: contest.sport,
     awayTeam: contest.awayTeam,
     homeTeam: contest.homeTeam,
   };
-  const inventory: Inventory = { items: [], openCommitmentCount: 0 };
-  const awayHeadroomUSDC = headroomForSide(inventory, market, 'away', caps);
-  const homeHeadroomUSDC = headroomForSide(inventory, market, 'home', caps);
-
-  // 5. Compute the quote.
-  const inputs = buildQuoteInputs(config, referenceOdds, awayHeadroomUSDC, homeHeadroomUSDC);
-  const result = computeQuote(inputs);
+  const desired = buildDesiredQuote(
+    config,
+    market,
+    { away: odds.awayOddsAmerican, home: odds.homeOddsAmerican },
+    { items: [], openCommitmentCount: 0 },
+  );
 
   return {
     pipeline: 'computed',
     contestId,
     context,
-    referenceOdds,
+    referenceOdds: desired.referenceOdds,
     spreadMode: config.pricing.mode,
-    result,
+    result: desired.result,
     inventoryNote: INVENTORY_NOTE,
   };
 }
@@ -201,57 +174,6 @@ function extractMoneylineOdds(snapshot: OddsSnapshotView): { awayOddsAmerican: n
   const m = snapshot.odds.moneyline;
   if (m === null) return null;
   return { awayOddsAmerican: m.awayOddsAmerican, homeOddsAmerican: m.homeOddsAmerican };
-}
-
-function breakdownReferenceOdds(awayOddsAmerican: number, homeOddsAmerican: number): ReferenceOddsBreakdown {
-  const awayDecimal = americanToDecimal(awayOddsAmerican);
-  const homeDecimal = americanToDecimal(homeOddsAmerican);
-  const awayImpliedProb = decimalToImpliedProb(awayDecimal);
-  const homeImpliedProb = decimalToImpliedProb(homeDecimal);
-  return {
-    awayOddsAmerican,
-    homeOddsAmerican,
-    awayDecimal,
-    homeDecimal,
-    awayImpliedProb,
-    homeImpliedProb,
-    overround: awayImpliedProb + homeImpliedProb - 1,
-  };
-}
-
-function buildQuoteInputs(
-  config: Config,
-  refOdds: ReferenceOddsBreakdown,
-  awayHeadroomUSDC: number,
-  homeHeadroomUSDC: number,
-): QuoteInputs {
-  const { capitalUSDC, ...economicsRest } = config.pricing.economics;
-  const common = {
-    consensusAwayDecimal: refOdds.awayDecimal,
-    consensusHomeDecimal: refOdds.homeDecimal,
-    capitalUSDC,
-    maxPerQuotePctOfCapital: config.pricing.maxPerQuotePctOfCapital,
-    minEdgeBps: config.pricing.minEdgeBps,
-    quoteBothSides: config.pricing.quoteBothSides,
-    awayHeadroomUSDC,
-    homeHeadroomUSDC,
-  };
-  if (config.pricing.mode === 'economics') {
-    return { ...common, mode: 'economics', economics: economicsRest };
-  }
-  return { ...common, mode: 'direct', direct: { spreadBps: config.pricing.direct.spreadBps } };
-}
-
-function toRiskCaps(config: Config): RiskCaps {
-  return {
-    bankrollUSDC: config.risk.bankrollUSDC,
-    maxBankrollUtilizationPct: config.risk.maxBankrollUtilizationPct,
-    maxRiskPerCommitmentUSDC: config.risk.maxRiskPerCommitmentUSDC,
-    maxRiskPerContestUSDC: config.risk.maxRiskPerContestUSDC,
-    maxRiskPerTeamUSDC: config.risk.maxRiskPerTeamUSDC,
-    maxRiskPerSportUSDC: config.risk.maxRiskPerSportUSDC,
-    maxOpenCommitments: config.risk.maxOpenCommitments,
-  };
 }
 
 // ── renderers ────────────────────────────────────────────────────────────────

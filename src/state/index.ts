@@ -315,8 +315,9 @@ function validateCommitmentRecord(
     return { ok: false, reason: 'sport / awayTeam / homeTeam must be strings' };
   }
   if (value.makerSide !== 'away' && value.makerSide !== 'home') return { ok: false, reason: `makerSide ${describe(value.makerSide)} is not "away"/"home"` };
-  if (!isNonNegInt(value.oddsTick)) return { ok: false, reason: 'oddsTick must be a non-negative integer' };
+  if (!isOddsTick(value.oddsTick)) return { ok: false, reason: `oddsTick ${describe(value.oddsTick)} is not an integer in the protocol's [${MIN_ODDS_TICK}, ${MAX_ODDS_TICK}] range` };
   if (!isDecimalString(value.riskAmountWei6) || !isDecimalString(value.filledRiskWei6)) return { ok: false, reason: 'riskAmountWei6 / filledRiskWei6 must be decimal strings' };
+  if (BigInt(value.riskAmountWei6) < BigInt(value.filledRiskWei6)) return { ok: false, reason: `filledRiskWei6 (${value.filledRiskWei6}) exceeds riskAmountWei6 (${value.riskAmountWei6}) — impossible; a fill cannot exceed the commitment` };
   if (!(COMMITMENT_LIFECYCLE_STATES as readonly string[]).includes(value.lifecycle as string)) {
     return { ok: false, reason: `lifecycle ${describe(value.lifecycle)} is not a known state` };
   }
@@ -470,6 +471,13 @@ function isSignedDecimalString(v: unknown): v is string {
 
 function isNonNegInt(v: unknown): v is number {
   return typeof v === 'number' && Number.isInteger(v) && v >= 0;
+}
+
+/** uint16 odds tick within MatchingModule's `[MIN_ODDS, MAX_ODDS]` range: `1.01×` (101) … `101.00×` (10100). */
+const MIN_ODDS_TICK = 101;
+const MAX_ODDS_TICK = 10_100;
+function isOddsTick(v: unknown): v is number {
+  return typeof v === 'number' && Number.isInteger(v) && v >= MIN_ODDS_TICK && v <= MAX_ODDS_TICK;
 }
 
 function describe(v: unknown): string {

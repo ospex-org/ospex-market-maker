@@ -118,7 +118,7 @@ describe('StateStore.load', () => {
     if (status.kind === 'lost') expect(status.reason).toMatch(/commitments/);
   });
 
-  it('treats a malformed commitment record as `lost` (bad makerSide / risk-not-a-decimal-string / hash≠key)', () => {
+  it('treats a malformed commitment record as `lost` (bad makerSide / out-of-range oddsTick / risk-not-a-decimal-string / filled>risk / hash≠key)', () => {
     const at = StateStore.at(dir);
 
     writeFileSync(join(dir, STATE_FILE), JSON.stringify(stateWith({ commitments: { '0xabc': commitment({ makerSide: 'sideways' as unknown as 'away' }) } })), 'utf8');
@@ -126,11 +126,23 @@ describe('StateStore.load', () => {
     expect(status.kind).toBe('lost');
     if (status.kind === 'lost') expect(status.reason).toMatch(/makerSide/);
 
+    // oddsTick below the protocol's MIN_ODDS (101) — out of the uint16 tick range
+    writeFileSync(join(dir, STATE_FILE), JSON.stringify(stateWith({ commitments: { '0xabc': commitment({ oddsTick: 50 }) } })), 'utf8');
+    status = at.load().status;
+    expect(status.kind).toBe('lost');
+    if (status.kind === 'lost') expect(status.reason).toMatch(/oddsTick/);
+
     // a number (or a hex string) where a decimal wei6 string is required
     writeFileSync(join(dir, STATE_FILE), JSON.stringify(stateWith({ commitments: { '0xabc': commitment({ riskAmountWei6: 250000 as unknown as string }) } })), 'utf8');
     status = at.load().status;
     expect(status.kind).toBe('lost');
     if (status.kind === 'lost') expect(status.reason).toMatch(/decimal string/);
+
+    // a fill larger than the commitment is impossible — fail closed (a still-live such record would silently undercount latent exposure)
+    writeFileSync(join(dir, STATE_FILE), JSON.stringify(stateWith({ commitments: { '0xabc': commitment({ riskAmountWei6: '100000', filledRiskWei6: '200000' }) } })), 'utf8');
+    status = at.load().status;
+    expect(status.kind).toBe('lost');
+    if (status.kind === 'lost') expect(status.reason).toMatch(/exceeds riskAmountWei6/);
 
     writeFileSync(join(dir, STATE_FILE), JSON.stringify(stateWith({ commitments: { '0xabc': commitment({ hash: '0xdifferent' }) } })), 'utf8');
     status = at.load().status;

@@ -962,11 +962,15 @@ export class Runner {
    * desired quote has a `QuoteSide` for: where its `quoteTick` sits relative to the
    * *visible orderbook on that side* (the open/partial commitments at the same
    * `positionType` — `Upper`/`0` for away, `Lower`/`1` for home — across every maker)
-   * and to the reference odds. A higher `oddsTick` on a side is a longer payout for
-   * whoever matches that side's commitments — the offer takers reach for first — so
-   * the would-be quote is "at or inside the book" iff its tick is at least as long as
-   * the best one already there (or that side is empty). Emits a `quote-competitiveness`
-   * per assessed side.
+   * and to the reference odds. `oddsTick` is the *maker's* odds; a taker matching a
+   * commitment gets the *inverse* side at `inverseOddsTick(oddsTick) ≈
+   * round(100·oddsTick / (oddsTick − 100))`, which *falls* as the maker tick rises
+   * (maker 150 → taker 300; maker 200 → taker 200; maker 300 → taker 150 — see the
+   * SDK's `buildMatchPreview`). So among commitments on the same side, the one with
+   * the *lowest* `oddsTick` is the one a taker reaches for first (longest payout on
+   * the inverse side) — that's `bestBookTick` — and the would-be quote is "at or
+   * inside the book" iff its tick is at least that low (`quoteTick <= bestBookTick`),
+   * or that side is empty. Emits a `quote-competitiveness` per assessed side.
    *
    * Reuses the orderbook the per-market reconcile's `getSpeculation` already fetched —
    * no extra read; only runs for markets that passed the risk engine and only when
@@ -996,11 +1000,11 @@ export class Runner {
     for (const qs of sides) {
       const positionType = qs.side === 'away' ? 0 : 1; // Upper(0) = away/over, Lower(1) = home/under
       let bookDepthOnSide = 0;
-      let bestBookTick: number | null = null;
+      let bestBookTick: number | null = null; // the *lowest* same-side maker tick — the inverse-side payout it offers a taker is the longest, so it's the offer takers reach for first
       for (const c of live) {
         if (c.positionType !== positionType) continue;
         bookDepthOnSide += 1;
-        if (bestBookTick === null || c.oddsTick > bestBookTick) bestBookTick = c.oddsTick;
+        if (bestBookTick === null || c.oddsTick < bestBookTick) bestBookTick = c.oddsTick;
       }
       const referenceTick = decimalToTick(qs.side === 'away' ? ref.awayDecimal : ref.homeDecimal);
       const referenceProb = qs.side === 'away' ? ref.awayImpliedProb : ref.homeImpliedProb;
@@ -1015,7 +1019,7 @@ export class Runner {
         vsReferenceTicks: qs.quoteTick - referenceTick,
         bookDepthOnSide,
         bestBookTick,
-        atOrInsideBook: bestBookTick === null || qs.quoteTick >= bestBookTick,
+        atOrInsideBook: bestBookTick === null || qs.quoteTick <= bestBookTick, // at least as low (= at least as attractive to takers) as the best same-side offer
       });
     }
   }

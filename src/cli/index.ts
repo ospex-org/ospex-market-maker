@@ -3,10 +3,10 @@
  * `ospex-mm` — reference market maker CLI for Ospex.
  *
  * Command surface (DESIGN §3): `doctor`, `quote`, `run`, `cancel-stale`, `status`,
- * `summary`. Wired so far: `doctor` + `quote --dry-run` (strictly read-only) and
- * `run --dry-run` (the Phase-2 shadow loop — posts nothing). `run --live`
- * (Phase 3) and `cancel-stale` / `status` / `summary` exit 1 with a
- * "not yet implemented" message.
+ * `summary`. Wired so far: `doctor` + `quote --dry-run` (strictly read-only),
+ * `run --dry-run` (the Phase-2 shadow loop — posts nothing), and `summary` (the
+ * NDJSON-log aggregator). `run --live` (Phase 3) and `cancel-stale` / `status`
+ * exit 1 with a "not yet implemented" message.
  *
  * CLI conventions (mirroring the SDK's AGENT_CONTRACT):
  *   - `--json` prints a `{ schemaVersion: 1, … }` envelope on stdout; everything
@@ -16,10 +16,10 @@
  *     "no" answer from `doctor`'s dry-run-shadow readiness or `quote`'s `canQuote`,
  *     an unavailable `run` mode).
  *
- * The per-command logic lives in `./doctor.ts` / `./quote.ts` / `./run.ts` as
- * functions returning typed reports (or, for `run`, just running the loop); this
- * module is the thin commander wrapper — parse args, load config, build the
- * adapter, call the function, render, exit.
+ * The per-command logic lives in `./doctor.ts` / `./quote.ts` / `./run.ts` /
+ * `./summary.ts` as functions returning typed reports (or, for `run`, just running
+ * the loop); this module is the thin commander wrapper — parse args, load config,
+ * build the adapter, call the function, render, exit.
  */
 
 import { Command } from 'commander';
@@ -29,6 +29,7 @@ import { createOspexAdapter, type Hex } from '../ospex/index.js';
 import { doctorExitCode, renderDoctorReportJson, renderDoctorReportText, runDoctor } from './doctor.js';
 import { quoteExitCode, renderQuoteReportJson, renderQuoteReportText, runQuote } from './quote.js';
 import { RunRefused, runRun } from './run.js';
+import { renderSummaryReportJson, renderSummaryReportText, runSummary, summaryExitCode, type RunSummary } from './summary.js';
 
 const DEFAULT_CONFIG_PATH = './ospex-mm.yaml';
 
@@ -139,12 +140,30 @@ program
     process.exit(0);
   });
 
+program
+  .command('summary')
+  .description('Aggregate the NDJSON event logs under telemetry.logDir into the run metrics (quote competitiveness, quote age, latent-exposure peak, candidate/error counts, …).')
+  .option('-c, --config <path>', 'path to the config YAML', DEFAULT_CONFIG_PATH)
+  .option('--since <ts>', 'only aggregate events at/after this ISO-8601 timestamp (e.g. 2026-05-12T14:00:00Z)')
+  .option('--json', 'emit a JSON envelope { schemaVersion: 1, summary: … } on stdout')
+  .action((opts: { config: string; since?: string; json?: boolean }) => {
+    const config = loadConfigOrExit(opts.config);
+    let summary: RunSummary;
+    try {
+      summary = runSummary({ config, ...(opts.since !== undefined ? { sinceIso: opts.since } : {}) });
+    } catch (e) {
+      return fail(`summary failed: ${(e as Error).message}`);
+    }
+    if (opts.json === true) renderSummaryReportJson(summary, stdout);
+    else renderSummaryReportText(summary, config.telemetry.logDir, stdout);
+    process.exit(summaryExitCode(summary));
+  });
+
 // ── Phase 3+ stubs — present so `--help` lists them and a stray invocation fails clearly ──
 
 const STUBS: ReadonlyArray<readonly [name: string, note: string]> = [
   ['cancel-stale', 'Phase 3'],
   ['status', 'Phase 3'],
-  ['summary', 'Phase 3'],
 ];
 for (const [name, note] of STUBS) {
   program

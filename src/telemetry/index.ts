@@ -18,7 +18,7 @@
  * the writer + the `kind` vocabulary so that vocabulary is locked early.
  */
 
-import { appendFileSync, mkdirSync, readdirSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
 /**
@@ -199,22 +199,365 @@ function describeValue(value: unknown): string {
   return name ? `a ${name}` : 'an unusual object';
 }
 
-// ── run summary (the `ospex-mm summary` aggregator — Phase 3) ─────────────────
+// ── run summary (the `ospex-mm summary` aggregator — DESIGN §11, §2.3) ────────
 
 /**
- * The `ospex-mm summary` envelope (DESIGN §11). Phase 3 fills in the §2.3 metrics
- * (P&L, fill rate, gas, stale-quote incidents, the latent-exposure peak, …); for
- * now this is the minimal stable frame so the shape is reserved.
+ * List the event-log files under `logDir` (`run-*.ndjson`), sorted. A missing
+ * `logDir` yields `[]` (no logs yet — a fresh setup); an unreadable one (anything
+ * other than ENOENT) throws — `summarize([])` is "no events", which would be
+ * misleading if the logs are actually there but unreadable. `ospex-mm summary`
+ * feeds the result to {@link summarize}.
+ */
+export function listRunLogs(logDir: string): string[] {
+  let names: string[];
+  try {
+    names = readdirSync(logDir);
+  } catch (err) {
+    if ((err as { code?: string }).code === 'ENOENT') return [];
+    throw err;
+  }
+  return names
+    .filter((name) => /^run-.+\.ndjson$/.test(name))
+    .sort()
+    .map((name) => join(logDir, name));
+}
+
+/**
+ * The `ospex-mm summary` report (DESIGN §11) — the §2.3 run metrics aggregated
+ * from one or more NDJSON event logs. The **dry-run** metrics (would-be-stale rate,
+ * quote competitiveness, quote-age distribution, latent-exposure peak, the
+ * candidate-skip and error histograms) are fully computed here; the **live-mode**
+ * ones (fill rate, P&L, gas, fees, settlement outcomes — DESIGN §2.3) are Phase 3,
+ * when the live events (`submit` / `fill` / `settle` / `claim` / `approval`) and
+ * their payloads exist — for now those just show up in `eventCounts`, and
+ * `liveMetrics` is `null` to say "this section is intentionally absent, not lost".
+ *
+ * This is the MM's *own* report; the cross-agent platform-viability scorecard
+ * (DESIGN §16) consumes the raw NDJSON, not this.
  */
 export interface RunSummary {
   schemaVersion: 1;
-  /** ISO-8601. */
+  /** ISO-8601 — when this summary was generated. */
   generatedAt: string;
-  /** The event-log file paths this summary was aggregated from. */
+  /** The event-log file paths aggregated, in the order given. */
   sources: string[];
+  /** Structurally-valid event lines aggregated (after any `--since` filter). */
+  lines: number;
+  /** Lines that weren't a JSON object with string `ts` / `runId` / `kind` and a parseable `ts` — skipped. */
+  malformedLines: number;
+  /** Distinct `runId`s across the aggregated lines, sorted. */
+  runIds: string[];
+  /** Earliest / latest `ts` across the aggregated lines; `null` if there were none. */
+  firstEventAt: string | null;
+  lastEventAt: string | null;
+  /** Count of `tick-start` events (= ticks the loop ran). */
+  ticks: number;
+  /** Per-`kind` event count — zero-filled for every {@link TELEMETRY_KINDS}, plus any other `kind` strings seen (forward-compat). */
+  eventCounts: Record<string, number>;
+  /** `candidate` events: `tracked` = those with no `skipReason` (a contest taken on); `skipReasons` = a histogram of the `skipReason` strings on the rest. */
+  candidates: { total: number; tracked: number; skipReasons: Record<string, number> };
+  /** `quote-intent` events: how many priced a quote (`canQuote: true`) vs refused. */
+  quoteIntents: { total: number; canQuote: number; refused: number };
+  /** Dry-run "would-be" activity. */
+  wouldSubmit: number;
+  wouldReplace: { total: number; byReason: Record<string, number> };
+  wouldSoftCancel: { total: number; byReason: Record<string, number> };
+  /** `expire` events — tracked commitments that hit expiry (headroom released). */
+  expired: number;
+  /** Quote competitiveness (dry-run — DESIGN §2.3 / §8). The rate / tick-delta stats are `null` when there were no samples. */
+  quoteCompetitiveness: {
+    samples: number;
+    atOrInsideBookCount: number;
+    atOrInsideBookRate: number | null;
+    vsReferenceTicks: { min: number; p50: number; mean: number; max: number } | null;
+    unavailable: number;
+  };
+  /** How long would-be quotes stayed up before being soft-cancelled / replaced / expired, in seconds — over *completed* quotes (still-open ones at end of log are excluded). `null` if there were none. */
+  quoteAgeSeconds: { samples: number; p50: number; p90: number; max: number } | null;
+  /** The largest `visibleOpen + softCancelled-not-yet-expired` aggregate risk reached (USDC wei6, decimal string), reconstructed from the `would-submit` / `would-replace` / `expire` stream. `"0"` if nothing was posted. */
+  latentExposurePeakWei6: string;
+  /** Stale-quote incidents: `candidate[skipReason='stale-reference']` + `would-replace[reason='stale']` + `would-soft-cancel[reason='stale']`. */
+  staleQuoteIncidents: number;
+  /** `degraded` events by `reason` (`'channel-error'` / `'subscribe-failed'` / `'channel-cap'`). */
+  degradedByReason: Record<string, number>;
+  /** `error` events: total + a histogram by `phase` (`'(none)'` for errors without one). */
+  errors: { total: number; byPhase: Record<string, number> };
+  /** The `kill` event ending the run, if the log has one (graceful shutdown); `null` otherwise (still running, or crashed). */
+  kill: { reason: string; ticks: number } | null;
+  /** Live-mode metrics (fill rate / P&L / gas / fees / settlements — DESIGN §2.3) — Phase 3 (the live events and their payloads don't exist yet; see `eventCounts`). */
+  liveMetrics: null;
 }
 
-/** Aggregate one or more NDJSON event logs into a `RunSummary`. Not yet implemented (Phase 3 — DESIGN §11, §14). */
-export function summarize(_logPaths: readonly string[]): RunSummary {
-  throw new Error('telemetry.summarize: not yet implemented — the `ospex-mm summary` aggregator lands in Phase 3 (DESIGN §11, §14)');
+interface ParsedLine {
+  ts: string;
+  tsMs: number;
+  runId: string;
+  kind: string;
+  payload: Record<string, unknown>;
+}
+
+/** A tracked would-be quote, for the latent-exposure / quote-age walk: its risk, when it was posted, whether its visible-life age has been recorded, whether it's still in the latent bucket. */
+interface WalkedQuote {
+  riskWei6: bigint;
+  submitTsSec: number;
+  ageRecorded: boolean;
+  alive: boolean;
+}
+
+/** A non-negative-integer wei amount as a decimal string — `"0"`, `"250000"`. (Local copy; `src/state/`'s `isDecimalString` isn't exported.) */
+function isWei6String(v: unknown): v is string {
+  return typeof v === 'string' && /^(0|[1-9][0-9]*)$/.test(v);
+}
+
+function parseSinceOrThrow(sinceIso: string): number {
+  const ms = Date.parse(sinceIso);
+  if (!Number.isFinite(ms)) {
+    throw new Error(`telemetry.summarize: --since must be an ISO-8601 timestamp (e.g. 2026-05-12T14:00:00Z), got ${JSON.stringify(sinceIso)}`);
+  }
+  return ms;
+}
+
+function readAndParse(logPaths: readonly string[], sinceMs: number | null): { kept: ParsedLine[]; lines: number; malformed: number } {
+  const kept: ParsedLine[] = [];
+  let lines = 0;
+  let malformed = 0;
+  for (const path of logPaths) {
+    const text = readFileSync(path, 'utf8');
+    for (const raw of text.split('\n')) {
+      const trimmed = raw.trim();
+      if (trimmed === '') continue;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(trimmed);
+      } catch {
+        malformed += 1;
+        continue;
+      }
+      if (!isPlainObject(parsed)) {
+        malformed += 1;
+        continue;
+      }
+      const { ts, runId, kind } = parsed;
+      if (typeof ts !== 'string' || typeof runId !== 'string' || typeof kind !== 'string') {
+        malformed += 1;
+        continue;
+      }
+      const tsMs = Date.parse(ts);
+      if (!Number.isFinite(tsMs)) {
+        malformed += 1;
+        continue;
+      }
+      if (sinceMs !== null && tsMs < sinceMs) continue; // before `--since` — filtered out, not counted as malformed or aggregated
+      lines += 1;
+      kept.push({ ts, tsMs, runId, kind, payload: parsed });
+    }
+  }
+  kept.sort((a, b) => a.tsMs - b.tsMs); // stable sort → same-`ts` lines keep file (= emission) order, so the walk sees events causally
+  return { kept, lines, malformed };
+}
+
+function quartiles(values: readonly number[]): { min: number; p50: number; p90: number; max: number; mean: number } | null {
+  if (values.length === 0) return null;
+  const s = [...values].sort((a, b) => a - b);
+  const at = (p: number): number => s[Math.min(s.length - 1, Math.max(0, Math.ceil(p * s.length) - 1))] as number;
+  const sum = values.reduce((acc, v) => acc + v, 0);
+  return { min: s[0] as number, p50: at(0.5), p90: at(0.9), max: s[s.length - 1] as number, mean: sum / values.length };
+}
+
+/** Record a would-be quote's visible-life age (seconds it was on the visible book) on its *first* terminal event (soft-cancel / replace-of / expire). No-op if the hash wasn't seen as a `would-submit`/`would-replace`-new (e.g. it predates the log window), or if its age is already recorded, or if the computed age is negative (clock skew). */
+function recordAgeIfFirst(quotes: Map<string, WalkedQuote>, hash: string, terminalTsSec: number, completedAges: number[]): void {
+  const q = quotes.get(hash);
+  if (q === undefined || q.ageRecorded) return;
+  q.ageRecorded = true;
+  const age = terminalTsSec - q.submitTsSec;
+  if (age >= 0) completedAges.push(age);
+}
+
+/**
+ * Aggregate one or more NDJSON event logs into a {@link RunSummary} (DESIGN §11,
+ * §2.3). `logPaths` are read in order; their lines are merged, parsed (a line that
+ * isn't a JSON object with string `ts`/`runId`/`kind` and a parseable `ts` is
+ * counted in `malformedLines` and skipped), optionally filtered to events at/after
+ * `opts.sinceIso`, then walked in `ts` order to reconstruct the latent-exposure
+ * peak and the per-quote visible-life ages, and counted into the §2.3 metrics. Pure
+ * apart from `readFileSync` on each path (a missing/unreadable path throws — the CLI
+ * resolves paths via {@link listRunLogs}, which returns only existing files).
+ *
+ * The dry-run metrics are fully computed; the live-mode ones (fill rate / P&L / gas
+ * / fees / settlements) are Phase 3 — see {@link RunSummary.liveMetrics}.
+ */
+export function summarize(logPaths: readonly string[], opts: { sinceIso?: string } = {}): RunSummary {
+  const sinceMs = opts.sinceIso !== undefined ? parseSinceOrThrow(opts.sinceIso) : null;
+  const { kept, lines, malformed } = readAndParse(logPaths, sinceMs);
+
+  const eventCounts: Record<string, number> = {};
+  for (const k of TELEMETRY_KINDS) eventCounts[k] = 0;
+  const runIdSet = new Set<string>();
+  let ticks = 0;
+  let candTotal = 0;
+  let candTracked = 0;
+  const candSkipReasons: Record<string, number> = {};
+  let qiTotal = 0;
+  let qiCanQuote = 0;
+  let qiRefused = 0;
+  let wouldSubmit = 0;
+  let wouldReplaceTotal = 0;
+  const wouldReplaceByReason: Record<string, number> = {};
+  let wouldSoftCancelTotal = 0;
+  const wouldSoftCancelByReason: Record<string, number> = {};
+  let expired = 0;
+  let compSamples = 0;
+  let compAtOrInside = 0;
+  const compVsRef: number[] = [];
+  let compUnavailable = 0;
+  let staleQuoteIncidents = 0;
+  const degradedByReason: Record<string, number> = {};
+  let errTotal = 0;
+  const errByPhase: Record<string, number> = {};
+  let kill: { reason: string; ticks: number } | null = null;
+
+  // The `ts`-ordered walk: track each posted would-be quote by its synthetic hash to
+  // reconstruct the running `visibleOpen + softCancelled-not-yet-expired` risk (peak)
+  // and the per-quote visible-life ages. A `would-soft-cancel` / `would-replace`-of /
+  // `expire` records the quote's visible age; only `expire` removes it from the latent
+  // bucket (an off-chain cancel leaves the signed payload matchable until expiry).
+  const quotes = new Map<string, WalkedQuote>();
+  let runningLatentWei6 = 0n;
+  let peakLatentWei6 = 0n;
+  const completedAges: number[] = [];
+  const bump = (m: Record<string, number>, k: string): void => void (m[k] = (m[k] ?? 0) + 1);
+
+  for (const ln of kept) {
+    runIdSet.add(ln.runId);
+    eventCounts[ln.kind] = (eventCounts[ln.kind] ?? 0) + 1;
+    const p = ln.payload;
+    const tsSec = Math.floor(ln.tsMs / 1000);
+    switch (ln.kind) {
+      case 'tick-start':
+        ticks += 1;
+        break;
+      case 'candidate': {
+        candTotal += 1;
+        if (typeof p.skipReason === 'string') {
+          bump(candSkipReasons, p.skipReason);
+          if (p.skipReason === 'stale-reference') staleQuoteIncidents += 1;
+        } else {
+          candTracked += 1;
+        }
+        break;
+      }
+      case 'quote-intent':
+        qiTotal += 1;
+        if (p.canQuote === true) qiCanQuote += 1;
+        else qiRefused += 1;
+        break;
+      case 'quote-competitiveness':
+        compSamples += 1;
+        if (p.atOrInsideBook === true) compAtOrInside += 1;
+        if (typeof p.vsReferenceTicks === 'number' && Number.isFinite(p.vsReferenceTicks)) compVsRef.push(p.vsReferenceTicks);
+        break;
+      case 'competitiveness-unavailable':
+        compUnavailable += 1;
+        break;
+      case 'would-submit': {
+        wouldSubmit += 1;
+        if (typeof p.commitmentHash === 'string' && isWei6String(p.riskAmountWei6)) {
+          const risk = BigInt(p.riskAmountWei6);
+          quotes.set(p.commitmentHash, { riskWei6: risk, submitTsSec: tsSec, ageRecorded: false, alive: true });
+          runningLatentWei6 += risk;
+          if (runningLatentWei6 > peakLatentWei6) peakLatentWei6 = runningLatentWei6;
+        }
+        break;
+      }
+      case 'would-replace': {
+        wouldReplaceTotal += 1;
+        if (typeof p.reason === 'string') {
+          bump(wouldReplaceByReason, p.reason);
+          if (p.reason === 'stale') staleQuoteIncidents += 1;
+        }
+        if (typeof p.replacedCommitmentHash === 'string') recordAgeIfFirst(quotes, p.replacedCommitmentHash, tsSec, completedAges);
+        if (typeof p.newCommitmentHash === 'string' && isWei6String(p.riskAmountWei6)) {
+          const risk = BigInt(p.riskAmountWei6);
+          quotes.set(p.newCommitmentHash, { riskWei6: risk, submitTsSec: tsSec, ageRecorded: false, alive: true });
+          runningLatentWei6 += risk;
+          if (runningLatentWei6 > peakLatentWei6) peakLatentWei6 = runningLatentWei6;
+        }
+        break;
+      }
+      case 'would-soft-cancel': {
+        wouldSoftCancelTotal += 1;
+        if (typeof p.reason === 'string') {
+          bump(wouldSoftCancelByReason, p.reason);
+          if (p.reason === 'stale') staleQuoteIncidents += 1;
+        }
+        if (typeof p.commitmentHash === 'string') recordAgeIfFirst(quotes, p.commitmentHash, tsSec, completedAges);
+        break;
+      }
+      case 'expire': {
+        expired += 1;
+        if (typeof p.commitmentHash === 'string') {
+          recordAgeIfFirst(quotes, p.commitmentHash, tsSec, completedAges); // if it expired while still visibleOpen, this is its first terminal event
+          const q = quotes.get(p.commitmentHash);
+          if (q !== undefined && q.alive) {
+            q.alive = false;
+            runningLatentWei6 -= q.riskWei6;
+            if (runningLatentWei6 < 0n) runningLatentWei6 = 0n;
+          }
+        }
+        break;
+      }
+      case 'degraded':
+        if (typeof p.reason === 'string') bump(degradedByReason, p.reason);
+        break;
+      case 'error': {
+        errTotal += 1;
+        bump(errByPhase, typeof p.phase === 'string' ? p.phase : '(none)');
+        break;
+      }
+      case 'kill': {
+        const reason = typeof p.reason === 'string' ? p.reason : 'unknown';
+        const t = typeof p.ticks === 'number' && Number.isFinite(p.ticks) ? p.ticks : 0;
+        kill = { reason, ticks: t };
+        break;
+      }
+      default:
+        break; // `fair-value` / `risk-verdict` / `submit` / `soft-cancel` / `replace` / `onchain-cancel` / `nonce-floor-raise` / `approval` / `fill` / `settle` / `claim` — counted in `eventCounts` only (no derived metric in Phase 2)
+    }
+  }
+
+  const vsRefStats = quartiles(compVsRef);
+  const ageStats = quartiles(completedAges);
+
+  return {
+    schemaVersion: 1,
+    generatedAt: new Date().toISOString(),
+    sources: [...logPaths],
+    lines,
+    malformedLines: malformed,
+    runIds: [...runIdSet].sort(),
+    firstEventAt: kept[0]?.ts ?? null,
+    lastEventAt: kept[kept.length - 1]?.ts ?? null,
+    ticks,
+    eventCounts,
+    candidates: { total: candTotal, tracked: candTracked, skipReasons: candSkipReasons },
+    quoteIntents: { total: qiTotal, canQuote: qiCanQuote, refused: qiRefused },
+    wouldSubmit,
+    wouldReplace: { total: wouldReplaceTotal, byReason: wouldReplaceByReason },
+    wouldSoftCancel: { total: wouldSoftCancelTotal, byReason: wouldSoftCancelByReason },
+    expired,
+    quoteCompetitiveness: {
+      samples: compSamples,
+      atOrInsideBookCount: compAtOrInside,
+      atOrInsideBookRate: compSamples > 0 ? compAtOrInside / compSamples : null,
+      vsReferenceTicks: vsRefStats === null ? null : { min: vsRefStats.min, p50: vsRefStats.p50, mean: vsRefStats.mean, max: vsRefStats.max },
+      unavailable: compUnavailable,
+    },
+    quoteAgeSeconds: ageStats === null ? null : { samples: completedAges.length, p50: ageStats.p50, p90: ageStats.p90, max: ageStats.max },
+    latentExposurePeakWei6: peakLatentWei6.toString(),
+    staleQuoteIncidents,
+    degradedByReason,
+    errors: { total: errTotal, byPhase: errByPhase },
+    kill,
+    liveMetrics: null,
+  };
 }

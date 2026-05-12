@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { CANDIDATE_SKIP_REASONS, EventLog, eventLogsExist, newRunId, summarize, TELEMETRY_KINDS, type TelemetryKind } from './index.js';
+import { CANDIDATE_SKIP_REASONS, EventLog, eventLogsExist, listRunLogs, newRunId, summarize, TELEMETRY_KINDS, type TelemetryKind } from './index.js';
 
 function readLines(path: string): Array<Record<string, unknown>> {
   return readFileSync(path, 'utf8')
@@ -148,8 +148,173 @@ describe('vocabulary', () => {
   });
 });
 
+describe('listRunLogs', () => {
+  let dir: string;
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'ospex-mm-listlogs-')); });
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+
+  it('returns the run-*.ndjson files, sorted; other files ignored', () => {
+    writeFileSync(join(dir, 'run-b.ndjson'), '', 'utf8');
+    writeFileSync(join(dir, 'run-a.ndjson'), '', 'utf8');
+    writeFileSync(join(dir, 'notes.txt'), 'hi', 'utf8');
+    writeFileSync(join(dir, 'run-a.ndjson.bak'), '', 'utf8'); // not `run-*.ndjson`
+    expect(listRunLogs(dir)).toEqual([join(dir, 'run-a.ndjson'), join(dir, 'run-b.ndjson')]);
+  });
+  it('returns [] for a non-existent directory and for an empty one', () => {
+    expect(listRunLogs(join(dir, 'nope'))).toEqual([]);
+    expect(listRunLogs(dir)).toEqual([]);
+  });
+});
+
 describe('summarize', () => {
-  it('is a Phase-3 stub — throws "not yet implemented"', () => {
-    expect(() => summarize([])).toThrow(/not yet implemented/);
+  let dir: string;
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'ospex-mm-summarize-')); });
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+
+  /** Write an NDJSON log; if a line has no `ts`, it gets a monotonic default (1s apart from `1_900_000_000_000`) so the walk sees events in order. */
+  function writeLog(name: string, events: Array<{ kind: string; ts?: string } & Record<string, unknown>>): string {
+    const path = join(dir, name);
+    const lines = events.map((e, i) => {
+      const { kind, ts, ...payload } = e;
+      return JSON.stringify({ ts: ts ?? new Date(1_900_000_000_000 + (i + 1) * 1000).toISOString(), runId: 'r1', kind, ...payload });
+    });
+    writeFileSync(path, lines.join('\n') + '\n', 'utf8');
+    return path;
+  }
+
+  it('an empty input yields an all-zero summary', () => {
+    const s = summarize([]);
+    expect(s).toMatchObject({
+      schemaVersion: 1,
+      sources: [],
+      lines: 0,
+      malformedLines: 0,
+      runIds: [],
+      firstEventAt: null,
+      lastEventAt: null,
+      ticks: 0,
+      candidates: { total: 0, tracked: 0, skipReasons: {} },
+      quoteIntents: { total: 0, canQuote: 0, refused: 0 },
+      wouldSubmit: 0,
+      wouldReplace: { total: 0, byReason: {} },
+      wouldSoftCancel: { total: 0, byReason: {} },
+      expired: 0,
+      quoteCompetitiveness: { samples: 0, atOrInsideBookCount: 0, atOrInsideBookRate: null, vsReferenceTicks: null, unavailable: 0 },
+      quoteAgeSeconds: null,
+      latentExposurePeakWei6: '0',
+      staleQuoteIncidents: 0,
+      degradedByReason: {},
+      errors: { total: 0, byPhase: {} },
+      kill: null,
+      liveMetrics: null,
+    });
+    expect(s.eventCounts['tick-start']).toBe(0);
+    expect(s.eventCounts['would-submit']).toBe(0);
+    expect(Object.keys(s.eventCounts).sort()).toEqual([...TELEMETRY_KINDS].sort()); // zero-filled for every known kind, nothing extra
+    expect(typeof s.generatedAt).toBe('string');
+  });
+
+  it('counts the dry-run metrics from a realistic log (candidates, quote-intents, would-* by reason, competitiveness, stale incidents, degraded, errors, kill, the latent-exposure peak, quote ages)', () => {
+    const path = writeLog('run-r1.ndjson', [
+      { kind: 'tick-start', tick: 1 },
+      { kind: 'candidate', contestId: 'A', sport: 'mlb', matchTime: '2099-01-01T00:00:00Z', speculationId: 'spec-A' }, // tracked
+      { kind: 'candidate', contestId: 'B', skipReason: 'no-reference-odds' },
+      { kind: 'candidate', contestId: 'C', skipReason: 'start-too-soon' },
+      { kind: 'candidate', contestId: 'D', skipReason: 'stale-reference' },
+      { kind: 'quote-intent', contestId: 'A', speculationId: 'spec-A', canQuote: true, away: { oddsTick: 198 }, home: { oddsTick: 196 }, notes: [] },
+      { kind: 'quote-competitiveness', contestId: 'A', speculationId: 'spec-A', side: 'away', quoteTick: 198, quoteProb: 0.505, referenceTick: 191, referenceProb: 0.524, vsReferenceTicks: 7, bookDepthOnSide: 0, bestBookTick: null, atOrInsideBook: true },
+      { kind: 'quote-competitiveness', contestId: 'A', speculationId: 'spec-A', side: 'home', quoteTick: 196, quoteProb: 0.51, referenceTick: 191, referenceProb: 0.524, vsReferenceTicks: 5, bookDepthOnSide: 1, bestBookTick: 150, atOrInsideBook: false },
+      { kind: 'would-submit', commitmentHash: 'dry:r1:1', speculationId: 'spec-A', contestId: 'A', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', makerSide: 'away', oddsTick: 198, riskAmountWei6: '250000', expiryUnixSec: 1_900_000_120 },
+      { kind: 'would-submit', commitmentHash: 'dry:r1:2', speculationId: 'spec-A', contestId: 'A', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', makerSide: 'home', oddsTick: 196, riskAmountWei6: '250000', expiryUnixSec: 1_900_000_120 },
+      { kind: 'quote-intent', contestId: 'B', speculationId: 'spec-B', canQuote: false, away: null, home: null, notes: ['REFUSE: …'] },
+      { kind: 'competitiveness-unavailable', contestId: 'A', speculationId: 'spec-A', reason: 'orderbook-not-populated' },
+      { kind: 'tick-start', tick: 2 },
+      { kind: 'would-soft-cancel', commitmentHash: 'dry:r1:1', speculationId: 'spec-A', contestId: 'A', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', makerSide: 'away', oddsTick: 198, reason: 'side-not-quoted' },
+      { kind: 'would-replace', replacedCommitmentHash: 'dry:r1:2', newCommitmentHash: 'dry:r1:3', speculationId: 'spec-A', contestId: 'A', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', makerSide: 'home', reason: 'stale', fromOddsTick: 196, toOddsTick: 197, riskAmountWei6: '300000', expiryUnixSec: 1_900_000_240 },
+      { kind: 'expire', commitmentHash: 'dry:r1:1', speculationId: 'spec-A', contestId: 'A', makerSide: 'away', oddsTick: 198 },
+      { kind: 'degraded', contestId: 'A', referenceGameId: 'GAME-A', reason: 'channel-error', detail: 'boom' },
+      { kind: 'error', class: 'TypeError', detail: 'oops', phase: 'reconcile', contestId: 'A' },
+      { kind: 'kill', reason: 'kill-file', ticks: 2 },
+    ]);
+    const s = summarize([path]);
+    expect(s.sources).toEqual([path]);
+    expect(s.runIds).toEqual(['r1']);
+    expect(s.lines).toBe(19);
+    expect(s.malformedLines).toBe(0);
+    expect(s.ticks).toBe(2);
+    expect(s.candidates).toMatchObject({ total: 4, tracked: 1, skipReasons: { 'no-reference-odds': 1, 'start-too-soon': 1, 'stale-reference': 1 } });
+    expect(s.quoteIntents).toEqual({ total: 2, canQuote: 1, refused: 1 });
+    expect(s.wouldSubmit).toBe(2);
+    expect(s.wouldReplace).toEqual({ total: 1, byReason: { stale: 1 } });
+    expect(s.wouldSoftCancel).toEqual({ total: 1, byReason: { 'side-not-quoted': 1 } });
+    expect(s.expired).toBe(1);
+    expect(s.quoteCompetitiveness).toMatchObject({ samples: 2, atOrInsideBookCount: 1, atOrInsideBookRate: 0.5, unavailable: 1 });
+    expect(s.quoteCompetitiveness.vsReferenceTicks).toEqual({ min: 5, p50: 5, mean: 6, max: 7 });
+    expect(s.staleQuoteIncidents).toBe(2); // candidate[stale-reference] + would-replace[stale]
+    expect(s.degradedByReason).toEqual({ 'channel-error': 1 });
+    expect(s.errors).toEqual({ total: 1, byPhase: { reconcile: 1 } });
+    expect(s.kill).toEqual({ reason: 'kill-file', ticks: 2 });
+    expect(s.eventCounts).toMatchObject({ 'tick-start': 2, candidate: 4, 'quote-intent': 2, 'quote-competitiveness': 2, 'competitiveness-unavailable': 1, 'would-submit': 2, 'would-replace': 1, 'would-soft-cancel': 1, expire: 1, degraded: 1, error: 1, kill: 1, 'risk-verdict': 0, fill: 0 });
+    // latent-exposure: +250000 (dry:r1:1) → +250000 (dry:r1:2) = 500000 peak → soft-cancel dry:r1:1 (stays latent) → would-replace: dry:r1:2 stays + new dry:r1:3 +300000 = 800000 peak → expire dry:r1:1 −250000 = 550000.
+    expect(s.latentExposurePeakWei6).toBe('800000');
+    // quote ages: dry:r1:1 submitted then soft-cancelled 5s later; dry:r1:2 submitted then replaced-of 5s later; dry:r1:3 never terminal'd → not recorded.
+    expect(s.quoteAgeSeconds).toEqual({ samples: 2, p50: 5, p90: 5, max: 5 });
+    expect(typeof s.firstEventAt).toBe('string');
+    expect(typeof s.lastEventAt).toBe('string');
+  });
+
+  it('counts malformed lines and skips them; blank lines are ignored, not counted', () => {
+    const path = join(dir, 'run-m.ndjson');
+    writeFileSync(
+      path,
+      [
+        JSON.stringify({ ts: '2030-01-01T00:00:00Z', runId: 'r1', kind: 'tick-start', tick: 1 }), // valid
+        'not json at all', // not JSON → malformed
+        '[1, 2, 3]', // JSON but not an object → malformed
+        JSON.stringify({ runId: 'r1', kind: 'tick-start' }), // no `ts` → malformed
+        JSON.stringify({ ts: 'not-a-timestamp', runId: 'r1', kind: 'tick-start' }), // unparseable `ts` → malformed
+        JSON.stringify({ ts: '2030-01-01T00:00:01Z', runId: 'r1', kind: 42 }), // `kind` not a string → malformed
+        '   ', // blank → ignored
+        JSON.stringify({ ts: '2030-01-01T00:00:02Z', runId: 'r1', kind: 'tick-start', tick: 2 }), // valid
+      ].join('\n') + '\n',
+      'utf8',
+    );
+    const s = summarize([path]);
+    expect(s.lines).toBe(2);
+    expect(s.malformedLines).toBe(5);
+    expect(s.ticks).toBe(2);
+  });
+
+  it('--since filters events to those at/after the timestamp', () => {
+    const path = join(dir, 'run-s.ndjson');
+    writeFileSync(
+      path,
+      [
+        JSON.stringify({ ts: '2030-01-01T00:00:00Z', runId: 'r1', kind: 'tick-start', tick: 1 }),
+        JSON.stringify({ ts: '2030-01-01T00:00:00Z', runId: 'r1', kind: 'would-submit', commitmentHash: 'h1', riskAmountWei6: '100000' }),
+        JSON.stringify({ ts: '2030-01-01T01:00:00Z', runId: 'r1', kind: 'tick-start', tick: 2 }),
+        JSON.stringify({ ts: '2030-01-01T01:00:00Z', runId: 'r1', kind: 'would-submit', commitmentHash: 'h2', riskAmountWei6: '200000' }),
+      ].join('\n') + '\n',
+      'utf8',
+    );
+    expect(summarize([path])).toMatchObject({ lines: 4, ticks: 2, wouldSubmit: 2 });
+    expect(summarize([path], { sinceIso: '2030-01-01T00:30:00Z' })).toMatchObject({ lines: 2, ticks: 1, wouldSubmit: 1 });
+  });
+
+  it('--since rejects a malformed timestamp', () => {
+    expect(() => summarize([], { sinceIso: 'not-a-timestamp' })).toThrow(/ISO-8601/);
+  });
+
+  it('aggregates multiple log files — distinct runIds, merged + ts-sorted', () => {
+    const a = join(dir, 'run-aa.ndjson');
+    const b = join(dir, 'run-bb.ndjson');
+    writeFileSync(a, JSON.stringify({ ts: '2030-01-01T00:00:00Z', runId: 'aa', kind: 'tick-start', tick: 1 }) + '\n', 'utf8');
+    writeFileSync(b, JSON.stringify({ ts: '2030-01-02T00:00:00Z', runId: 'bb', kind: 'tick-start', tick: 1 }) + '\n', 'utf8');
+    const s = summarize([a, b]);
+    expect(s.sources).toEqual([a, b]);
+    expect(s.runIds).toEqual(['aa', 'bb']);
+    expect(s.ticks).toBe(2);
+    expect(s.firstEventAt).toBe('2030-01-01T00:00:00Z');
+    expect(s.lastEventAt).toBe('2030-01-02T00:00:00Z');
   });
 });

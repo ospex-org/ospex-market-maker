@@ -1,27 +1,33 @@
 /**
  * The runner — the event loop (DESIGN §3, §8). One `Runner` per process, mode set
- * by `config.mode.dryRun`. This module is the loop's *machinery*: the boot path
- * (state load + the boot-time state-loss fail-safe — DESIGN §12), the kill-switch (a
- * file at `config.killSwitchFile`, or a SIGTERM / SIGINT → a graceful shutdown), the
- * tick loop, age-out of expired tracked commitments, the per-tick state flush, and
- * an interruptible sleep clamped to the `pollIntervalMs` floor.
+ * by `config.mode.dryRun`. This module is the loop's *machinery* + the *discovery*
+ * layer: the boot path (state load + the boot-time state-loss fail-safe — DESIGN
+ * §12), the kill-switch (a file at `config.killSwitchFile`, or a SIGTERM / SIGINT →
+ * a graceful shutdown), the tick loop, **discovery** (every `discovery.everyNTicks`
+ * ticks — jittered — find the verified contests with an open moneyline speculation +
+ * a reference-game id starting within `marketSelection.maxStartsWithinHours`, honour
+ * the allow/deny lists, track up to `marketSelection.maxTrackedContests` of them,
+ * untrack the departed ones; `candidate` telemetry for the skipped/tracked), age-out
+ * of expired tracked commitments, the per-tick state flush, and an interruptible
+ * sleep clamped to the `pollIntervalMs` floor.
  *
- * What's still a TODO follow-up (so the loop's machinery lands on a reviewed
- * foundation first): discovery + odds subscriptions (tick step 2 — DESIGN §10), the
- * per-market reconcile (tick step 3 — `buildDesiredQuote` → `reconcileBook` →
- * `would-*` telemetry + state mutation, respecting the boot-time hold), and
- * fill-detection (tick step 4).
+ * Still TODO follow-ups: the odds subscriptions for the tracked markets (PR 4b-ii —
+ * snapshot-first, the `odds.maxRealtimeChannels` cap, the Realtime guardrails of
+ * DESIGN §10), the per-market reconcile (PR 4c — `buildDesiredQuote` →
+ * `reconcileBook` → `would-*` telemetry + state mutation, respecting the boot-time
+ * hold), and fill-detection (PR 4c).
  *
  * No `@ospex/sdk` import — all chain/API access goes through the `OspexAdapter`. The
- * clock, sleep, kill-switch probe, and OS-signal registration are injectable
- * (`RunnerDeps`) so the loop is unit-testable: run a bounded number of ticks; drive
- * shutdown via the kill probe or a simulated signal.
+ * clock, sleep, kill-switch probe, OS-signal registration, and randomness are
+ * injectable (`RunnerDeps`) so the loop is unit-testable: run a bounded number of
+ * ticks; drive shutdown via the kill probe or a simulated signal; pin discovery
+ * timing.
  */
 
 import { existsSync } from 'node:fs';
 
 import { POLL_INTERVAL_FLOOR_MS, type Config } from '../config/index.js';
-import type { OspexAdapter } from '../ospex/index.js';
+import type { ContestView, OspexAdapter } from '../ospex/index.js';
 import { assessStateLoss, type MakerState, type StateLossAssessment, type StateStore } from '../state/index.js';
 import { EventLog, eventLogsExist } from '../telemetry/index.js';
 
@@ -44,6 +50,8 @@ export interface RunnerDeps {
   registerShutdownSignals: (onSignal: () => void) => () => void;
   /** Human-readable diagnostic line (boot banner, clamp warning, hold reason — *not* the telemetry log). Default: a line to `process.stderr`. */
   log: (line: string) => void;
+  /** A value in `[0, 1)` — only used to jitter the discovery interval. Default: `Math.random`. */
+  random: () => number;
 }
 
 export interface RunnerOptions {
@@ -107,6 +115,27 @@ export function interruptibleSleep(ms: number, signal: AbortSignal): Promise<voi
 
 type ShutdownReason = 'kill-file' | 'signal';
 
+/**
+ * A contest the runner is tracking — its market metadata. PR 4b-ii adds the
+ * odds-subscription state (the `Subscription`, the latest reference odds + their
+ * freshness timestamp, the dirty flag); PR 4c's per-market reconcile reads
+ * `speculationId` (re-confirms it's still open — the lazy-creation check) and
+ * `matchTimeSec` (the `start-too-soon` gate / the `match-time` expiry value).
+ */
+interface TrackedMarket {
+  contestId: string;
+  /** The neutral reference-game id — always set (a contest with no upstream linkage is skipped at discovery with `no-reference-odds`). PR 4b-ii uses it to open the odds Realtime channel. */
+  referenceGameId: string;
+  /** Contest sport / teams — for the risk engine's `Market` (per-team / per-sport caps). */
+  sport: string;
+  awayTeam: string;
+  homeTeam: string;
+  /** The contest's open moneyline speculation, as last seen at discovery. */
+  speculationId: string;
+  /** Contest match time, unix seconds. */
+  matchTimeSec: number;
+}
+
 export class Runner {
   readonly config: Config;
   /** The boot-time state-loss assessment (DESIGN §12), computed in the constructor — `holdQuoting`, the reason, and (when holding) `suggestedWaitSeconds`. */
@@ -133,6 +162,10 @@ export class Runner {
   private readonly holdQuotingUntil: number | null;
   private shutdownReason: ShutdownReason | null = null;
   private readonly abortController = new AbortController();
+  /** The contests currently being tracked, keyed by `contestId`. Rebuilt each discovery cycle (add newcomers up to the cap; drop the departed). */
+  private readonly trackedMarkets = new Map<string, TrackedMarket>();
+  /** The tick number at/after which the next discovery cycle runs. `0` ⇒ the first tick (1) always discovers; bumped by `jitteredDiscoveryInterval()` after each cycle. */
+  private nextDiscoveryAtTick = 0;
 
   constructor(opts: RunnerOptions) {
     this.config = opts.config;
@@ -145,6 +178,7 @@ export class Runner {
       killFileExists: opts.deps?.killFileExists ?? (() => existsSync(this.config.killSwitchFile)),
       registerShutdownSignals: opts.deps?.registerShutdownSignals ?? defaultRegisterShutdownSignals,
       log: opts.deps?.log ?? defaultLog,
+      random: opts.deps?.random ?? Math.random,
     };
 
     // Read hasPriorTelemetry BEFORE this run's own (empty) event-log file would be
@@ -240,14 +274,17 @@ export class Runner {
     }
   }
 
-  /** One iteration: discovery → per-market reconcile → fill-detection → age-out → flush. (The first three are TODO follow-ups; only age-out + flush are wired in this PR.) */
+  /** One iteration: discovery → per-market reconcile → fill-detection → age-out → flush. (The middle two are TODO follow-ups; discovery + age-out + flush are wired.) */
   private async tick(tick: number): Promise<void> {
     this.eventLog.emit('tick-start', { tick });
     try {
-      // TODO(PR 4b): discovery — adapter.listContests(filters) ≤ marketSelection.maxTrackedContests; per contest confirm an open moneyline speculation (else `candidate` w/ skipReason no-open-speculation); adapter.subscribeOdds for new tracked markets ≤ odds.maxRealtimeChannels (snapshot-first via adapter.getOddsSnapshot); unsubscribe started / out-of-window contests; the Realtime guardrails (DESIGN §10) — backoff+jitter on reconnect, channel-error → market degraded, dirty-event coalescing, bootstrap-retry.
-      // TODO(PR 4c): per-market reconcile — for each dirty / newly-tracked market, skip while isHoldingQuoting(): inv = inventoryFromState(this.state, now); buildDesiredQuote(config, market, refOdds, inv); the lazy-creation check from the cached ContestView.speculations (no open moneyline spec ⇒ `candidate` w/ skipReason would-create-lazy-speculation); reconcileBook(recordsOnSpec, desired, config, now, inv.openCommitmentCount); in dry-run emit would-submit / would-replace / would-soft-cancel + `candidate` (skipReason cap-hit per deferredSides) + mutate this.state (synthetic visibleOpen records for toSubmit / toReplace.replacement; reclassify toReplace.stale / toSoftCancel.record → softCancelled).
+      if (tick >= this.nextDiscoveryAtTick) {
+        await this.discover(tick);
+        this.nextDiscoveryAtTick = tick + this.jitteredDiscoveryInterval();
+      }
+      // TODO(PR 4b-ii): for each market newly tracked by this discovery cycle, getOddsSnapshot (seed) then subscribeOdds (snapshot-first, up to odds.maxRealtimeChannels); for each departed market, unsubscribe its odds channel; the Realtime guardrails (DESIGN §10) — channel-error → market degraded + retry-next-cycle, dirty-event coalescing.
+      // TODO(PR 4c): per-market reconcile — for each dirty / newly-tracked market, skip while isHoldingQuoting(): inv = inventoryFromState(this.state, now); buildDesiredQuote(config, market, refOdds, inv); the lazy-creation re-check from m.speculationId / ContestView.speculations (gone ⇒ `candidate` skipReason would-create-lazy-speculation); reconcileBook(recordsOnSpec, desired, config, now, inv.openCommitmentCount); in dry-run emit would-submit / would-replace / would-soft-cancel + `candidate` (skipReason cap-hit per deferredSides) + mutate this.state (synthetic visibleOpen records for toSubmit / toReplace.replacement; reclassify toReplace.stale / toSoftCancel.record → softCancelled).
       // TODO(PR 4c): fill-detection — adapter.listOpenCommitments(maker, maxOpen+buffer); diff against last tick's visibleOpen hash set; by-hash lookup of disappeared hashes → reclassify (filled / cancelled / expired); periodically adapter.getPositionStatus(maker). (In dry-run this is the live path — a no-op unless a prior live run left commitments/positions.)
-      await Promise.resolve(); // (an `await` placeholder until the steps above land)
       this.ageOut();
     } catch (err) {
       this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'tick' });
@@ -277,6 +314,110 @@ export class Runner {
         });
       }
     }
+  }
+
+  /**
+   * The discovery cycle (DESIGN §10): list the verified contests starting within
+   * `marketSelection.maxStartsWithinHours` (filtered to the configured sports + the
+   * allow/deny lists); drop tracked contests no longer in that set (started / scored
+   * / out of window); for each *new* candidate (soonest game first) — confirm it has
+   * an open moneyline speculation (else `candidate` `no-open-speculation`), isn't
+   * already started (else `start-too-soon`), and there's room under
+   * `marketSelection.maxTrackedContests` (else `tracking-cap-reached`); then
+   * `getContest` for the reference-game id (else `no-reference-odds`) and track it,
+   * with a `candidate` event (no `skipReason`). A `listContests` failure aborts the
+   * cycle (the tracked set is left as-is, retried next cycle); a per-candidate
+   * `getContest` failure just skips that candidate. (PR 4b-ii then seeds + subscribes
+   * each newly-tracked market's odds and unsubscribes the departed ones.)
+   */
+  private async discover(tick: number): Promise<void> {
+    const now = this.deps.now();
+    const ms = this.config.marketSelection;
+    let listed: ContestView[];
+    try {
+      listed = await this.adapter.listContests({ status: 'verified', hours: ms.maxStartsWithinHours, limit: 200 });
+    } catch (err) {
+      this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'discovery', tick });
+      return;
+    }
+
+    const sportsWanted = new Set<string>(ms.sports);
+    const allow = new Set(ms.contestAllowList);
+    const deny = new Set(ms.contestDenyList);
+    const byId = new Map<string, ContestView>();
+    for (const c of listed) {
+      if (!sportsWanted.has(c.sport)) continue;
+      if (allow.size > 0 && !allow.has(c.contestId)) continue;
+      if (deny.has(c.contestId)) continue;
+      byId.set(c.contestId, c);
+    }
+
+    for (const id of [...this.trackedMarkets.keys()]) {
+      if (!byId.has(id)) {
+        this.trackedMarkets.delete(id);
+        // TODO(PR 4b-ii): unsubscribe this market's odds channel.
+      }
+    }
+
+    const newCandidates = [...byId.values()]
+      .filter((c) => !this.trackedMarkets.has(c.contestId))
+      .sort((a, b) => Date.parse(a.matchTime) - Date.parse(b.matchTime));
+    for (const c of newCandidates) {
+      const spec = c.speculations.find((s) => s.marketType === 'moneyline' && s.open);
+      if (spec === undefined) {
+        this.eventLog.emit('candidate', { contestId: c.contestId, skipReason: 'no-open-speculation' });
+        continue;
+      }
+      const matchTimeSec = Math.floor(Date.parse(c.matchTime) / 1000);
+      if (!Number.isFinite(matchTimeSec)) continue; // malformed match time — skip silently (a data error, not a quoting decision)
+      if (matchTimeSec <= now) {
+        this.eventLog.emit('candidate', { contestId: c.contestId, skipReason: 'start-too-soon' });
+        continue;
+      }
+      if (this.trackedMarkets.size >= ms.maxTrackedContests) {
+        this.eventLog.emit('candidate', { contestId: c.contestId, skipReason: 'tracking-cap-reached' });
+        continue;
+      }
+      let full: ContestView;
+      try {
+        full = await this.adapter.getContest(c.contestId);
+      } catch (err) {
+        this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'discovery', contestId: c.contestId });
+        continue;
+      }
+      if (full.referenceGameId === null) {
+        this.eventLog.emit('candidate', { contestId: c.contestId, skipReason: 'no-reference-odds' });
+        continue;
+      }
+      const confirmedSpec = full.speculations.find((s) => s.marketType === 'moneyline' && s.open);
+      if (confirmedSpec === undefined) {
+        this.eventLog.emit('candidate', { contestId: c.contestId, skipReason: 'no-open-speculation' });
+        continue;
+      }
+      this.trackedMarkets.set(c.contestId, {
+        contestId: c.contestId,
+        referenceGameId: full.referenceGameId,
+        sport: full.sport,
+        awayTeam: full.awayTeam,
+        homeTeam: full.homeTeam,
+        speculationId: confirmedSpec.speculationId,
+        matchTimeSec,
+      });
+      this.eventLog.emit('candidate', { contestId: c.contestId, sport: full.sport, matchTime: full.matchTime, speculationId: confirmedSpec.speculationId });
+      // TODO(PR 4b-ii): seed + subscribe this market's odds (snapshot-first), up to odds.maxRealtimeChannels.
+    }
+  }
+
+  /** Ticks until the next discovery cycle: `discovery.everyNTicks` jittered by ±`discovery.jitterPct` (so multiple MMs don't all discover on the same tick). At least 1. */
+  private jitteredDiscoveryInterval(): number {
+    const { everyNTicks, jitterPct } = this.config.discovery;
+    const factor = 1 + (this.deps.random() * 2 - 1) * jitterPct; // in [1 - jitterPct, 1 + jitterPct)
+    return Math.max(1, Math.round(everyNTicks * factor));
+  }
+
+  /** The contest ids the runner is currently tracking, sorted — for diagnostics / tests. */
+  trackedContestIds(): readonly string[] {
+    return [...this.trackedMarkets.keys()].sort();
   }
 }
 

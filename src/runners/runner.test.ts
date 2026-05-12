@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { parseConfig, type Config } from '../config/index.js';
-import { createOspexAdapter } from '../ospex/index.js';
+import { createOspexAdapter, type ContestView, type OspexAdapter } from '../ospex/index.js';
 import { StateStore, emptyMakerState, type MakerCommitmentRecord, type MakerState } from '../state/index.js';
 import { Runner, interruptibleSleep, type RunnerDeps, type RunnerOptions } from './index.js';
 
@@ -47,20 +47,29 @@ function readEvents(id = RUN_ID): Array<Record<string, unknown>> {
     .map((line) => JSON.parse(line) as Record<string, unknown>);
 }
 
-// Quiet, deterministic deps: an immediate sleep, a fixed clock, no kill file, no signal wiring, a swallowed log.
+// Quiet, deterministic deps: an immediate sleep, a fixed clock, no kill file, no signal wiring, a swallowed log, no discovery jitter (random → 0.5 ⇒ jitter factor 1).
+const T0 = 1_900_000_000;
 const noopDeps: Partial<RunnerDeps> = {
-  now: () => 1_900_000_000,
+  now: () => T0,
   sleep: () => Promise.resolve(),
   killFileExists: () => false,
   registerShutdownSignals: () => () => {},
   log: () => {},
+  random: () => 0.5,
 };
 
-function makeRunner(opts: { config?: Config; runId?: string; ignoreMissingState?: boolean; maxTicks?: number; deps?: Partial<RunnerDeps> } = {}): Runner {
+function makeRunner(opts: { config?: Config; adapter?: OspexAdapter; runId?: string; ignoreMissingState?: boolean; maxTicks?: number; deps?: Partial<RunnerDeps> } = {}): Runner {
   const config = opts.config ?? cfg();
+  let adapter = opts.adapter;
+  if (adapter === undefined) {
+    // Tests that don't exercise discovery: stub the API so the discovery cycle finds nothing (no real HTTP).
+    adapter = createOspexAdapter(config);
+    vi.spyOn(adapter, 'listContests').mockResolvedValue([]);
+    vi.spyOn(adapter, 'getContest').mockRejectedValue(new Error('makeRunner: getContest not stubbed — pass an `adapter` (see `spiedAdapter`) if your test exercises discovery'));
+  }
   const full: RunnerOptions = {
     config,
-    adapter: createOspexAdapter(config),
+    adapter,
     stateStore: StateStore.at(config.state.dir),
     runId: opts.runId ?? RUN_ID,
     deps: { ...noopDeps, ...opts.deps },
@@ -68,6 +77,33 @@ function makeRunner(opts: { config?: Config; runId?: string; ignoreMissingState?
   if (opts.ignoreMissingState !== undefined) full.ignoreMissingState = opts.ignoreMissingState;
   if (opts.maxTicks !== undefined) full.maxTicks = opts.maxTicks;
   return new Runner(full);
+}
+
+// ── discovery fixtures ───────────────────────────────────────────────────────
+
+const FUTURE_ISO = '2099-01-01T00:00:00Z'; // far after the test clock (T0 ≈ 2030-03)
+const PAST_ISO = '2020-01-01T00:00:00Z';
+
+function contestView(overrides: Partial<ContestView> & { contestId: string }): ContestView {
+  return {
+    awayTeam: 'NYM',
+    homeTeam: 'LAD',
+    sport: 'mlb',
+    sportId: 0,
+    matchTime: FUTURE_ISO,
+    status: 'verified',
+    referenceGameId: null, // list-endpoint default; `getContest` fills it
+    speculations: [{ speculationId: `spec-${overrides.contestId}`, contestId: overrides.contestId, marketType: 'moneyline', lineTicks: null, line: null, open: true }],
+    ...overrides, // (carries `contestId`; may override the speculations / referenceGameId / matchTime / sport above)
+  };
+}
+
+/** An `OspexAdapter` with `listContests` / `getContest` spied: `listContests` calls `listContests()` each time; `getContest(id)` defaults to echoing a fresh `contestView` with `referenceGameId` filled in. */
+function spiedAdapter(config: Config, listContests: () => Promise<ContestView[]>, getContest?: (id: string) => Promise<ContestView>): OspexAdapter {
+  const adapter = createOspexAdapter(config);
+  vi.spyOn(adapter, 'listContests').mockImplementation(listContests);
+  vi.spyOn(adapter, 'getContest').mockImplementation(getContest ?? ((id) => Promise.resolve(contestView({ contestId: id, referenceGameId: `GAME-${id}` }))));
+  return adapter;
 }
 
 function commitmentRecord(overrides: Partial<MakerCommitmentRecord>): MakerCommitmentRecord {
@@ -216,9 +252,133 @@ describe('Runner — tick loop', () => {
       throw new Error('disk full');
     });
     const config = cfg();
-    const runner = new Runner({ config, adapter: createOspexAdapter(config), stateStore, runId: RUN_ID, maxTicks: 5, deps: { ...noopDeps } });
+    const adapter = spiedAdapter(config, () => Promise.resolve([])); // discovery finds nothing — no real HTTP
+    const runner = new Runner({ config, adapter, stateStore, runId: RUN_ID, maxTicks: 5, deps: { ...noopDeps } });
     await expect(runner.run()).rejects.toThrow('disk full');
     flushSpy.mockRestore();
+  });
+});
+
+// ── discovery (DESIGN §10) ───────────────────────────────────────────────────
+
+describe('Runner — discovery', () => {
+  it('discovers on tick 1, then every discovery.everyNTicks ticks (no jitter via random → 0.5)', async () => {
+    let listCalls = 0;
+    const config = cfg({ discovery: { everyNTicks: 3 } });
+    const adapter = spiedAdapter(config, () => {
+      listCalls += 1;
+      return Promise.resolve([contestView({ contestId: 'A' })]);
+    });
+    const runner = makeRunner({ config, adapter, maxTicks: 8 });
+    await runner.run();
+    expect(listCalls).toBe(3); // ticks 1, 4, 7 (next at 10 > 8)
+    expect(runner.trackedContestIds()).toEqual(['A']);
+  });
+
+  it('tracks contests with an open moneyline speculation + a reference-game id; skips the rest with the right candidate reasons', async () => {
+    const config = cfg(); // sports: ['mlb'], default caps
+    const A = contestView({ contestId: 'A' });
+    const B = contestView({ contestId: 'B', speculations: [{ speculationId: 'spec-B', contestId: 'B', marketType: 'spread', lineTicks: -35, line: -3.5, open: true }] }); // no open moneyline spec
+    const C = contestView({ contestId: 'C', sport: 'nba' }); // wrong sport — filtered out before any candidate event
+    const D = contestView({ contestId: 'D' }); // looks fine in the list, but getContest(D) has no referenceGameId
+    const E = contestView({ contestId: 'E', matchTime: PAST_ISO }); // already started
+    const adapter = spiedAdapter(config, () => Promise.resolve([A, B, C, D, E]), (id) =>
+      Promise.resolve(id === 'D' ? contestView({ contestId: 'D', referenceGameId: null }) : contestView({ contestId: id, referenceGameId: `GAME-${id}` })),
+    );
+    const runner = makeRunner({ config, adapter, maxTicks: 1 });
+    await runner.run();
+
+    expect(runner.trackedContestIds()).toEqual(['A']);
+    const candidates = readEvents().filter((e) => e.kind === 'candidate');
+    expect(candidates.map((e) => e.contestId).sort()).toEqual(['A', 'B', 'D', 'E']); // no event for C (wrong sport)
+    expect(candidates.find((e) => e.contestId === 'A')?.skipReason).toBeUndefined(); // tracked
+    expect(candidates.find((e) => e.contestId === 'B')?.skipReason).toBe('no-open-speculation');
+    expect(candidates.find((e) => e.contestId === 'D')?.skipReason).toBe('no-reference-odds');
+    expect(candidates.find((e) => e.contestId === 'E')?.skipReason).toBe('start-too-soon');
+  });
+
+  it('honours marketSelection.maxTrackedContests — tracks the soonest games, the rest get tracking-cap-reached', async () => {
+    const config = cfg({ marketSelection: { sports: ['mlb'], maxTrackedContests: 2 } });
+    const listed = [
+      contestView({ contestId: 'A', matchTime: '2099-01-01T00:00:00Z' }),
+      contestView({ contestId: 'B', matchTime: '2099-01-02T00:00:00Z' }),
+      contestView({ contestId: 'C', matchTime: '2099-01-03T00:00:00Z' }),
+      contestView({ contestId: 'D', matchTime: '2099-01-04T00:00:00Z' }),
+      contestView({ contestId: 'E', matchTime: '2099-01-05T00:00:00Z' }),
+    ];
+    const adapter = spiedAdapter(config, () => Promise.resolve(listed));
+    const runner = makeRunner({ config, adapter, maxTicks: 1 });
+    await runner.run();
+    expect(runner.trackedContestIds()).toEqual(['A', 'B']); // the two earliest
+    const capped = readEvents().filter((e) => e.kind === 'candidate' && e.skipReason === 'tracking-cap-reached');
+    expect(capped.map((e) => e.contestId).sort()).toEqual(['C', 'D', 'E']);
+  });
+
+  it('untracks a contest that drops out of the candidate set (started / scored / out of window)', async () => {
+    let listCount = 0;
+    const config = cfg({ discovery: { everyNTicks: 1 } });
+    const adapter = spiedAdapter(config, () => {
+      listCount += 1;
+      return Promise.resolve(listCount === 1 ? [contestView({ contestId: 'A' }), contestView({ contestId: 'B' })] : [contestView({ contestId: 'A' })]);
+    });
+    const runner = makeRunner({ config, adapter, maxTicks: 2 });
+    await runner.run();
+    expect(runner.trackedContestIds()).toEqual(['A']); // B departed on the 2nd cycle
+  });
+
+  it('a listContests failure aborts the cycle (emits an error event, keeps the existing tracked set)', async () => {
+    let listCount = 0;
+    const config = cfg({ discovery: { everyNTicks: 1 } });
+    const adapter = spiedAdapter(config, () => {
+      listCount += 1;
+      return listCount === 1 ? Promise.resolve([contestView({ contestId: 'A' })]) : Promise.reject(new Error('api down'));
+    });
+    const runner = makeRunner({ config, adapter, maxTicks: 2 });
+    await runner.run();
+    expect(runner.trackedContestIds()).toEqual(['A']); // unchanged after the failed 2nd cycle
+    const err = readEvents().find((e) => e.kind === 'error');
+    expect(err).toMatchObject({ phase: 'discovery', detail: 'api down' });
+  });
+
+  it('a getContest failure for one candidate skips it (emits an error event), tracks the others', async () => {
+    const config = cfg();
+    const adapter = spiedAdapter(config, () => Promise.resolve([contestView({ contestId: 'A' }), contestView({ contestId: 'B' })]), (id) =>
+      id === 'B' ? Promise.reject(new Error('boom')) : Promise.resolve(contestView({ contestId: id, referenceGameId: `GAME-${id}` })),
+    );
+    const runner = makeRunner({ config, adapter, maxTicks: 1 });
+    await runner.run();
+    expect(runner.trackedContestIds()).toEqual(['A']);
+    expect(readEvents().find((e) => e.kind === 'error')).toMatchObject({ phase: 'discovery', contestId: 'B', detail: 'boom' });
+  });
+
+  it('honours the allow / deny lists (a denied / disallowed contest is filtered out before any candidate event)', async () => {
+    const denyConfig = cfg({ marketSelection: { sports: ['mlb'], contestDenyList: ['B'] } });
+    const denyAdapter = spiedAdapter(denyConfig, () => Promise.resolve([contestView({ contestId: 'A' }), contestView({ contestId: 'B' })]));
+    const denyRunner = makeRunner({ config: denyConfig, adapter: denyAdapter, maxTicks: 1 });
+    await denyRunner.run();
+    expect(denyRunner.trackedContestIds()).toEqual(['A']);
+    expect(readEvents().some((e) => e.kind === 'candidate' && e.contestId === 'B')).toBe(false);
+
+    // (fresh logDir/stateDir from beforeEach won't reset mid-test, but a separate runId keeps the event logs apart)
+    const allowConfig = cfg({ marketSelection: { sports: ['mlb'], contestAllowList: ['A'] } });
+    const allowAdapter = spiedAdapter(allowConfig, () => Promise.resolve([contestView({ contestId: 'A' }), contestView({ contestId: 'B' })]));
+    const allowRunner = makeRunner({ config: allowConfig, adapter: allowAdapter, runId: 'allow-run', maxTicks: 1 });
+    await allowRunner.run();
+    expect(allowRunner.trackedContestIds()).toEqual(['A']);
+    expect(readEvents('allow-run').some((e) => e.kind === 'candidate' && e.contestId === 'B')).toBe(false);
+  });
+
+  it('jitters the discovery interval by ±jitterPct (random shifts how often discovery runs)', async () => {
+    const config = cfg({ discovery: { everyNTicks: 4, jitterPct: 0.5 } });
+    const listed = [contestView({ contestId: 'A' })];
+
+    let shortCalls = 0;
+    await makeRunner({ config, adapter: spiedAdapter(config, () => { shortCalls += 1; return Promise.resolve(listed); }), runId: 'short', maxTicks: 6, deps: { random: () => 0 } }).run();
+    expect(shortCalls).toBe(3); // factor 0.5 ⇒ interval round(4*0.5)=2 ⇒ ticks 1, 3, 5 (next at 7)
+
+    let longCalls = 0;
+    await makeRunner({ config, adapter: spiedAdapter(config, () => { longCalls += 1; return Promise.resolve(listed); }), runId: 'long', maxTicks: 6, deps: { random: () => 1 } }).run();
+    expect(longCalls).toBe(1); // factor 1.5 ⇒ interval round(4*1.5)=6 ⇒ tick 1 only (next at 7)
   });
 });
 

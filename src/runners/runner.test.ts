@@ -878,14 +878,15 @@ describe('Runner — per-market reconcile', () => {
     StateStore.at(stateDir).flush(emptyMakerState());
     const config = cfg();
     // The MM's quote ticks for a -110 / -110 reference land near 200 (a roughly even line, clamped into [101, 10100]).
-    // Away (Upper = positionType 0): two live offers at ticks 101 & 102 — both shorter than the MM's quote, so it's the longest away offer → atOrInsideBook.
-    // Home (Lower = positionType 1): one live offer at the maximum tick 10100 — far longer than the MM's quote → it's behind that offer → not at/inside.
+    // `oddsTick` is the maker's odds; a taker matching gets the inverse side at inverseOddsTick = ~100·tick/(tick−100), which FALLS as the maker tick rises.
+    // Away (Upper = positionType 0): two live offers at maker ticks 101 & 102 — those give the inverse-side taker a huge payout (~10100 / ~5100), so takers reach for them first → the MM's ~200 is BEHIND them → not at/inside (bestBookTick = the lowest, 101).
+    // Home (Lower = positionType 1): one live offer at maker tick 10100 — that gives the inverse-side taker the worst possible payout (~101), so the MM's ~200 is AHEAD of it → at/inside.
     // The non-live entry, and the null-tick / null-positionType ones, are skipped (don't count toward bookDepthOnSide).
     const book: Commitment[] = [
       orderbookEntry({ commitmentHash: '0xob-a1', positionType: 0, oddsTick: 101 }),
       orderbookEntry({ commitmentHash: '0xob-a2', positionType: 0, oddsTick: 102 }),
       orderbookEntry({ commitmentHash: '0xob-h1', positionType: 1, oddsTick: 10100 }),
-      orderbookEntry({ commitmentHash: '0xob-dead', positionType: 0, oddsTick: 9000, isLive: false }), // not matchable
+      orderbookEntry({ commitmentHash: '0xob-dead', positionType: 0, oddsTick: 100, isLive: false }), // not matchable (and oddsTick below the protocol min — irrelevant since it's filtered out)
       orderbookEntry({ commitmentHash: '0xob-np', positionType: null, oddsTick: 5000 }), // legacy: no position type
       orderbookEntry({ commitmentHash: '0xob-nt', positionType: 0, oddsTick: null }), // legacy: no tick
     ];
@@ -898,8 +899,8 @@ describe('Runner — per-market reconcile', () => {
     expect(comps.map((e) => e.side).sort()).toEqual(['away', 'home']);
     const away = comps.find((e) => e.side === 'away');
     const home = comps.find((e) => e.side === 'home');
-    expect(away).toMatchObject({ contestId: 'A', speculationId: 'spec-A', side: 'away', bookDepthOnSide: 2, bestBookTick: 102, atOrInsideBook: true });
-    expect(home).toMatchObject({ contestId: 'A', speculationId: 'spec-A', side: 'home', bookDepthOnSide: 1, bestBookTick: 10100, atOrInsideBook: false });
+    expect(away).toMatchObject({ contestId: 'A', speculationId: 'spec-A', side: 'away', bookDepthOnSide: 2, bestBookTick: 101, atOrInsideBook: false });
+    expect(home).toMatchObject({ contestId: 'A', speculationId: 'spec-A', side: 'home', bookDepthOnSide: 1, bestBookTick: 10100, atOrInsideBook: true });
     // The rest of the payload is present and well-formed.
     for (const c of comps) {
       expect(typeof c.quoteTick).toBe('number');

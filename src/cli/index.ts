@@ -3,19 +3,23 @@
  * `ospex-mm` — reference market maker CLI for Ospex.
  *
  * Command surface (DESIGN §3): `doctor`, `quote`, `run`, `cancel-stale`, `status`,
- * `summary`. Phase 1 wires `doctor` + `quote --dry-run` (both strictly read-only);
- * `run` / `cancel-stale` / `status` / `summary` are stubs that exit 1 with a
+ * `summary`. Wired so far: `doctor` + `quote --dry-run` (strictly read-only) and
+ * `run --dry-run` (the Phase-2 shadow loop — posts nothing). `run --live`
+ * (Phase 3) and `cancel-stale` / `status` / `summary` exit 1 with a
  * "not yet implemented" message.
  *
  * CLI conventions (mirroring the SDK's AGENT_CONTRACT):
  *   - `--json` prints a `{ schemaVersion: 1, … }` envelope on stdout; everything
- *     else goes to stderr.
+ *     else goes to stderr. (`run` has no `--json` — it's a loop, not a query; its
+ *     structured output is the NDJSON event log under `telemetry.logDir`.)
  *   - exit `0` on success, `1` on any failure (config load, operational error, a
- *     "no" answer from `doctor`'s dry-run-shadow readiness or `quote`'s `canQuote`).
+ *     "no" answer from `doctor`'s dry-run-shadow readiness or `quote`'s `canQuote`,
+ *     an unavailable `run` mode).
  *
- * The per-command logic lives in `./doctor.ts` / `./quote.ts` as pure(-ish)
- * functions returning typed reports; this module is the thin commander wrapper —
- * parse args, load config, build the adapter, call the function, render, exit.
+ * The per-command logic lives in `./doctor.ts` / `./quote.ts` / `./run.ts` as
+ * functions returning typed reports (or, for `run`, just running the loop); this
+ * module is the thin commander wrapper — parse args, load config, build the
+ * adapter, call the function, render, exit.
  */
 
 import { Command } from 'commander';
@@ -24,6 +28,7 @@ import { loadConfig, type Config } from '../config/index.js';
 import { createOspexAdapter, type Hex } from '../ospex/index.js';
 import { doctorExitCode, renderDoctorReportJson, renderDoctorReportText, runDoctor } from './doctor.js';
 import { quoteExitCode, renderQuoteReportJson, renderQuoteReportText, runQuote } from './quote.js';
+import { RunRefused, runRun } from './run.js';
 
 const DEFAULT_CONFIG_PATH = './ospex-mm.yaml';
 
@@ -102,10 +107,41 @@ program
     process.exit(quoteExitCode(report));
   });
 
-// ── Phase 2+ stubs — present so `--help` lists them and a stray invocation fails clearly ──
+program
+  .command('run')
+  .description('Run the market-maker loop. v0: --dry-run (the Phase-2 shadow loop — discovers, prices, reconciles, logs would-be quotes; posts nothing). --live is Phase 3 (not yet implemented).')
+  .option('-c, --config <path>', 'path to the config YAML', DEFAULT_CONFIG_PATH)
+  .option('--dry-run', 'run the shadow loop — everything except the writes (DESIGN §8)')
+  .option('--live', '(not yet implemented — Phase 3) post real commitments; also requires mode.dryRun: false in the config (the two-key model)')
+  .option('-a, --address <addr>', 'maker wallet address (defaults to the keystore; dry-run does not require it)')
+  .option('-k, --keystore <path>', 'path to a Foundry v3 keystore — overrides config wallet.keystorePath / OSPEX_KEYSTORE_PATH')
+  .option('--ignore-missing-state', 'proceed even if the persisted state is missing/corrupt — attests no prior run left a still-matchable commitment (DESIGN §12)')
+  .action(async (opts: { config: string; dryRun?: boolean; live?: boolean; address?: string; keystore?: string; ignoreMissingState?: boolean }) => {
+    const wantDry = opts.dryRun === true;
+    const wantLive = opts.live === true;
+    if (wantDry && wantLive) fail('pass exactly one of --dry-run / --live, not both');
+    if (!wantDry && !wantLive) fail('pass --dry-run (the Phase-2 shadow loop) or --live (Phase 3 — not yet implemented)');
+    // Reject --live before loading config (same as `quote` validating --dry-run up front); `runRun` also guards this, for direct callers.
+    if (wantLive) fail('`ospex-mm run --live` is not yet implemented — live execution is Phase 3 (DESIGN §14). Use --dry-run for the Phase-2 shadow loop, which does everything except the writes.');
+    let config = loadConfigOrExit(opts.config);
+    if (opts.keystore !== undefined) config = { ...config, wallet: { ...config.wallet, keystorePath: opts.keystore } };
+    const address = parseAddressOrExit(opts.address);
+    await runRun({
+      config,
+      mode: 'dry-run', // --live short-circuited above
+      ...(address !== undefined ? { address } : {}),
+      ignoreMissingState: opts.ignoreMissingState === true,
+    }).catch((e: unknown): never => {
+      if (e instanceof RunRefused) return fail(e.message);
+      return fail(`run failed: ${(e as Error).message}`);
+    });
+    // `runRun` returns only on a graceful shutdown (kill-switch file / SIGTERM / SIGINT).
+    process.exit(0);
+  });
+
+// ── Phase 3+ stubs — present so `--help` lists them and a stray invocation fails clearly ──
 
 const STUBS: ReadonlyArray<readonly [name: string, note: string]> = [
-  ['run', 'Phase 2 for --dry-run shadow mode; Phase 3 for --live'],
   ['cancel-stale', 'Phase 3'],
   ['status', 'Phase 3'],
   ['summary', 'Phase 3'],

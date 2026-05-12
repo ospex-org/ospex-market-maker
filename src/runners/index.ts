@@ -39,6 +39,8 @@
  *     pulled / replaced records to `softCancelled` — they stay matchable on chain,
  *     so the risk engine keeps counting them); live execution is Phase 3;
  *   - age-out of expired tracked commitments;
+ *   - a prune of old terminal (`expired` / `filled` / `authoritativelyInvalidated`)
+ *     commitment records, so a long shadow run's state file stays bounded;
  *   - the per-tick state flush;
  *   - an interruptible sleep clamped to the `pollIntervalMs` floor.
  *
@@ -372,7 +374,7 @@ export class Runner {
     }
   }
 
-  /** One iteration: discovery → reference-odds refresh → per-market reconcile → age-out → flush. (Fill-detection — Phase 3 — comes between the reconcile and age-out; nothing real is posted in dry-run, so there's nothing to detect yet.) */
+  /** One iteration: discovery → reference-odds refresh → per-market reconcile → age-out → terminal-record prune → flush. (Fill-detection — Phase 3 — comes between the reconcile and age-out; nothing real is posted in dry-run, so there's nothing to detect yet.) */
   private async tick(tick: number): Promise<void> {
     this.eventLog.emit('tick-start', { tick });
     try {
@@ -385,6 +387,7 @@ export class Runner {
       await this.reconcileMarkets();
       // TODO(Phase 3): fill-detection — adapter.listOpenCommitments(maker, maxOpen+buffer); diff against last tick's visibleOpen hash set; by-hash lookup of disappeared hashes → reclassify (filled / cancelled / expired); periodically adapter.getPositionStatus(maker). Lives next to the live write path — in dry-run nothing real was posted, so there's nothing of the MM's to detect.
       this.ageOut();
+      this.pruneTerminalCommitments();
     } catch (err) {
       this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'tick' });
     }
@@ -412,6 +415,28 @@ export class Runner {
           oddsTick: record.oddsTick,
         });
       }
+    }
+  }
+
+  /**
+   * Drop terminal commitment records (`expired` / `filled` /
+   * `authoritativelyInvalidated` — the lifecycles where headroom is released and
+   * nothing more can happen on chain) once they're older than the retention window,
+   * so a long shadow run's `maker-state.json` stays bounded. Retention =
+   * `max(3600, 10 × orders.expirySeconds)` past `updatedAtUnixSec`: long enough to
+   * still serve a telemetry-replay reconstruction after a crash and to keep a
+   * just-replaced commitment's record around for cross-referencing, short enough not
+   * to grow without limit. `visibleOpen` / `softCancelled` / `partiallyFilled`
+   * records are never pruned — `softCancelled` in particular stays matchable on
+   * chain until expiry, so the risk engine must keep counting it (DESIGN §9, §12).
+   * No telemetry event — `expire` (emitted when the record became terminal) is the
+   * meaningful lifecycle signal; this is just garbage collection.
+   */
+  private pruneTerminalCommitments(): void {
+    const cutoff = this.deps.now() - Math.max(3600, 10 * this.config.orders.expirySeconds);
+    for (const [hash, record] of Object.entries(this.state.commitments)) {
+      const terminal = record.lifecycle === 'expired' || record.lifecycle === 'filled' || record.lifecycle === 'authoritativelyInvalidated';
+      if (terminal && record.updatedAtUnixSec < cutoff) delete this.state.commitments[hash];
     }
   }
 

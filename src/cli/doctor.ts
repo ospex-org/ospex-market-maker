@@ -370,19 +370,20 @@ function computeReadiness(
     };
   }
 
-  // dryRunShadow needs a keystore (run-time signing for fill-detection) — but the file just has to be present + readable.
-  const keystoreStatus = checks.find((c) => c.name === 'keystore')?.status;
-  const dryRunShadow: DoctorReadiness =
-    keystoreStatus === 'ok'
-      ? { ok: true, reason: 'no FAILs; keystore in place — `ospex-mm run --dry-run` should boot' }
-      : {
-          ok: false,
-          reason: 'no keystore configured — `run --dry-run` needs one for fill-detection (set wallet.keystorePath or OSPEX_KEYSTORE_PATH)',
-        };
+  // The dry-run shadow loop posts nothing — it signs nothing — so it needs no
+  // keystore and no resolved wallet address. Any FAIL above already short-circuited;
+  // with none, `ospex-mm run --dry-run` should boot. (A WARN — no keystore, low POL,
+  // a `lost` state file — is advisory and doesn't block it.)
+  const dryRunShadow: DoctorReadiness = {
+    ok: true,
+    reason: 'no FAILs — `ospex-mm run --dry-run` should boot (the shadow loop posts nothing, so a keystore is not required)',
+  };
 
-  // postCommitments is dryRunShadow + the live prereqs.
+  // postCommitments is the live prereqs: a usable keystore (live signing needs one),
+  // a resolved address, mode.dryRun: false, and a funded/approved wallet.
+  const keystoreStatus = checks.find((c) => c.name === 'keystore')?.status;
   const postReasons: string[] = [];
-  if (!dryRunShadow.ok) postReasons.push('dry-run-shadow prerequisites not met');
+  if (keystoreStatus !== 'ok') postReasons.push('no usable keystore (set wallet.keystorePath or OSPEX_KEYSTORE_PATH — live signing needs one)');
   if (walletAddress === null) postReasons.push('wallet address unresolved (pass --address or use an ethers-style keystore)');
   if (config.mode.dryRun) postReasons.push('config has mode.dryRun: true (flip to false; you would also pass --live at run time)');
   const balanceWarn = checks.find((c) => c.name === 'pol-balance')?.status === 'warn';

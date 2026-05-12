@@ -202,8 +202,9 @@ describe('runDoctor — advisory WARNs do not fail the exit', () => {
     expect(detailOf(report, 'state')).toMatch(/fail-safe/);
     expect(report.checks.some((c) => c.status === 'fail')).toBe(false);
     expect(doctorExitCode(report)).toBe(0);
-    expect(report.ready.dryRunShadow.ok).toBe(false); // no keystore
-    expect(report.ready.postCommitments.ok).toBe(false);
+    expect(report.ready.dryRunShadow.ok).toBe(true); // no FAILs → the shadow loop (which posts nothing) is good to boot; the missing keystore is a WARN
+    expect(report.ready.postCommitments.ok).toBe(false); // a keystore is a live prereq
+    expect(report.ready.postCommitments.reason).toMatch(/no usable keystore/);
   });
 
   it('with a wallet but a low POL balance + short allowance → those checks WARN, exit 0, postCommitments NO', async () => {
@@ -241,8 +242,9 @@ describe('runDoctor — wallet resolution + state check', () => {
     expect(statusOf(report, 'allowance')).toBe('skipped');
     expect(statusOf(report, 'keystore')).toBe('ok'); // the file is there; it just has no `address` field
     expect(report.checks.some((c) => c.status === 'fail')).toBe(false);
-    expect(report.ready.dryRunShadow.ok).toBe(true); // keystore present → run --dry-run can unlock it at run time
-    expect(report.ready.postCommitments.ok).toBe(false); // no wallet address resolved
+    expect(report.ready.dryRunShadow.ok).toBe(true); // no FAILs → run --dry-run can boot (it posts nothing)
+    expect(report.ready.postCommitments.ok).toBe(false); // no wallet address resolved (a Foundry keystore omits it; pass --address for the live path)
+    expect(report.ready.postCommitments.reason).toMatch(/wallet address unresolved/);
   });
 
   it('a loaded state file → state OK with counts + last-flushed', async () => {

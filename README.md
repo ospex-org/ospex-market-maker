@@ -16,7 +16,7 @@ It is built on **[`@ospex/sdk`](https://github.com/ospex-org/ospex-sdk)** — ev
 
 What works (Phase 1 — strictly read-only, no live write paths anywhere):
 
-- `yarn install && yarn build && yarn typecheck && yarn lint && yarn test` — clean (155 unit tests across the pricing, config, risk, orders, state, telemetry, ospex-adapter, and CLI-command modules).
+- `yarn install && yarn build && yarn typecheck && yarn lint && yarn test` — clean (169 unit tests across the pricing, config, risk, orders, state, telemetry, ospex-adapter, runner, and CLI-command modules).
 - **`ospex-mm doctor`** — readiness probe: config, keystore, API, RPC, POL/USDC balances, `PositionModule` allowance, and the persisted-state integrity check, plus a "Ready to" matrix (dry-run shadow / post commitments). `--address <0x…>` keeps it fully read-only (no passphrase prompt); `--json` emits a `{ schemaVersion: 1, doctor: … }` envelope.
 - **`ospex-mm quote --dry-run <contestId>`** — computes a two-sided moneyline quote breakdown (reference odds → fair value → spread → priced quote with size), or refuses with a clear message (contest closed, no open moneyline speculation, no reference odds). Never posts; `--json` emits a `{ schemaVersion: 1, quote: … }` envelope.
 - `yarn mm --help` — the command list. (`yarn dev --help` does the same via `tsx`; `yarn build && yarn link`, then `ospex-mm --help`, puts the binary on your PATH.)
@@ -24,6 +24,7 @@ What works (Phase 1 — strictly read-only, no live write paths anywhere):
 - The **config loader** (`src/config/` — `loadConfig` / `parseConfig`: parse the YAML, validate with strict unknown-key rejection, apply the `OSPEX_*` env overrides, default almost everything to `ospex-mm.example.yaml`'s values).
 - The **risk engine** (`src/risk/` — worst-case-loss-by-outcome exposure accounting over positions + visible + latent commitments; the per-commitment / contest / team / sport / bankroll caps; the headroom and verdict functions; the `PositionModule` aggregate-allowance target). Pure functions, unit-tested. Used by `quote` and `doctor`.
 - The **order-planning layer** (`src/orders/` — `buildDesiredQuote` turns config + reference odds + exposure headroom into a two-sided quote, which is what `quote --dry-run` runs; `inventoryFromState` translates the persisted state into the risk engine's `Inventory`; `reconcileBook` decides what to submit / replace / soft-cancel against the maker's current book on a speculation, per DESIGN §9). Pure functions, unit-tested. The dry-run runner (Phase 2) wires these into the loop; the *execution* layer — the SDK write calls behind each plan item — is Phase 3.
+- The **runner skeleton** (`src/runners/` — the `Runner` class: the tick loop, the boot-time state-loss fail-safe (DESIGN §12), the kill-switch (a `KILL` file or a SIGTERM / SIGINT → a graceful shutdown that emits `kill` and flushes), age-out of expired tracked commitments → `expired` + an `expire` event, the per-tick state flush, and an interruptible sleep clamped to the `pollIntervalMs` floor; the clock / sleep / kill-probe / signal seams are injectable, so it's unit-tested with bounded tick runs). **It doesn't quote yet** — discovery + odds subscriptions (DESIGN §10), the per-market reconcile (`buildDesiredQuote` → `reconcileBook` → `would-*` telemetry + state mutation), and fill-detection are documented TODO follow-ups.
 - The **`@ospex/sdk` adapter** (`src/ospex/` — the only module that imports `@ospex/sdk`; read-only wrappers over contests / speculations / commitments / positions / odds / balances / approvals / health; maps the SDK's provider-specific reference-game field to the neutral `referenceGameId` at this boundary). Used by `doctor` and `quote`.
 - The **state store** (`src/state/` — persisted-inventory shape, atomic JSON writes, the boot-time state-loss fail-safe; `doctor` reads it for the integrity check) and the **telemetry event-log writer** (`src/telemetry/` — NDJSON, the `kind` vocabulary; wired into `run` in Phase 2).
 - The design (`docs/DESIGN.md`), the annotated config (`ospex-mm.example.yaml`), and the safety checklist (`docs/OPERATOR_SAFETY.md`).
@@ -31,7 +32,7 @@ What works (Phase 1 — strictly read-only, no live write paths anywhere):
 What's **not** implemented yet (Phase 2+ — see `docs/DESIGN.md §14`):
 
 - `run` (the event loop — `--dry-run` shadow mode in Phase 2, `--live` micro-maker in Phase 3), `cancel-stale`, `status`, `summary` — these currently exit with `not yet implemented`.
-- the event loop (`src/runners/`) — Phase 2+ — and the order *execution* layer (the SDK write calls behind submit / replace / soft-cancel) — Phase 3.
+- the runner's discovery / per-market reconcile / fill-detection steps (the rest of `src/runners/` past the skeleton above) — Phase 2+ — and the order *execution* layer (the SDK write calls behind submit / replace / soft-cancel) — Phase 3.
 
 So: there is no live maker yet — `run` isn't implemented. `doctor` and `quote --dry-run` work and are read-only. Don't run anything against real funds.
 

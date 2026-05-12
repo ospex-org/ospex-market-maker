@@ -20,33 +20,51 @@
  *     when a slot frees); `odds.subscribe: false` falls back to a bounded
  *     per-tick snapshot poll. A channel error degrades the market and the next
  *     discovery cycle re-subscribes it. The `dirty` flag (an `onChange` arrived) is
- *     read-and-cleared by the (TODO) per-market reconcile — dirty-event coalescing;
+ *     read-and-cleared by the per-market reconcile — dirty-event coalescing;
+ *   - **the per-market reconcile** (DESIGN §3 step 3, §8, §9): for each tracked
+ *     market that needs it (its reference odds moved, or it has no fresh two-sided
+ *     standing quote of ours) — skipped entirely while the boot-time hold is active
+ *     (DESIGN §12) — re-confirm the speculation is still open (the lazy-creation
+ *     re-check), build the desired two-sided quote (`buildDesiredQuote` over the
+ *     hypothetical inventory `inventoryFromState` derives from the persisted state),
+ *     `reconcileBook` it against the maker's current book on that speculation, and
+ *     apply the plan: in dry-run (the only mode in Phase 2) log it (`quote-intent`
+ *     + `would-submit` / `would-replace` / `would-soft-cancel` + a `cap-hit`
+ *     candidate per deferred side) and mutate the *hypothetical* inventory (add
+ *     synthetic `visibleOpen` records for submits / replacements; reclassify
+ *     pulled / replaced records to `softCancelled`); live execution is Phase 3;
  *   - age-out of expired tracked commitments;
  *   - the per-tick state flush;
  *   - an interruptible sleep clamped to the `pollIntervalMs` floor.
  *
- * Still TODO follow-ups: the per-market reconcile (PR 4c — `buildDesiredQuote` →
- * `reconcileBook` → `would-*` telemetry + state mutation, respecting the boot-time
- * hold) and fill-detection (PR 4c).
+ * Still TODO follow-ups: fill-detection (Phase 3 — in dry-run nothing real is
+ * posted, so there are no fills to detect; it's the live path's read side, wired
+ * with the SDK write calls in Phase 3) and the bounded quote-competitiveness reads
+ * over the `getSpeculation` orderbook this reconcile already fetches (PR 5).
  *
  * No `@ospex/sdk` import — all chain/API access goes through the `OspexAdapter`. The
  * clock, sleep, kill-switch probe, OS-signal registration, and randomness are
- * injectable (`RunnerDeps`) so the loop is unit-testable: run a bounded number of
- * ticks; drive shutdown via the kill probe or a simulated signal; pin discovery
- * timing; drive the odds callbacks via a fake `subscribeOdds`.
+ * injectable (`RunnerDeps`) and so is the `OspexAdapter`, so the loop is
+ * unit-testable: run a bounded number of ticks; drive shutdown via the kill probe
+ * or a simulated signal; pin discovery timing; drive the odds callbacks via a fake
+ * `subscribeOdds`; fake `getContest` / `getSpeculation` / `getOddsSnapshot`.
  */
 
 import { existsSync } from 'node:fs';
 
 import { POLL_INTERVAL_FLOOR_MS, type Config } from '../config/index.js';
+import { buildDesiredQuote, inventoryFromState, reconcileBook, type BookReconciliation } from '../orders/index.js';
 import type {
   ContestView,
   OddsSnapshotView,
   OddsSubscribeHandlersView,
   OspexAdapter,
+  SpeculationView,
   Subscription,
 } from '../ospex/index.js';
-import { assessStateLoss, type MakerState, type StateLossAssessment, type StateStore } from '../state/index.js';
+import type { QuoteSide } from '../pricing/index.js';
+import type { Market } from '../risk/index.js';
+import { assessStateLoss, type MakerCommitmentRecord, type MakerSide, type MakerState, type StateLossAssessment, type StateStore } from '../state/index.js';
 import { EventLog, eventLogsExist } from '../telemetry/index.js';
 
 // ── injectable seams (the defaults are the real impls; tests override) ───────
@@ -174,6 +192,8 @@ interface TrackedMarket {
   lastOddsAt: number | null;
   /** An `onChange` (a genuine price move, or a polling snapshot that differed) arrived since the per-market reconcile last consumed this market. Newly-seeded markets start `true` (they need their first reconcile). */
   dirty: boolean;
+  /** Unix seconds — when the per-market reconcile last processed this market (a quote computed, or a gate hit), or `null` if never. Throttles the "we have no fresh standing quote" re-reconcile (a `dirty` event always triggers an immediate reconcile regardless). */
+  lastReconciledAt: number | null;
 }
 
 /**
@@ -197,6 +217,8 @@ export interface TrackedMarketView {
   lastOddsAt: number | null;
   /** Has the reference odds moved since the per-market reconcile last consumed this market? */
   dirty: boolean;
+  /** Unix seconds — when the per-market reconcile last processed this market, or `null` if never. */
+  lastReconciledAt: number | null;
 }
 
 /** Reasons a tracked market is in a `degraded` (no live odds channel) state — carried on the `degraded` telemetry event. */
@@ -212,6 +234,10 @@ export class Runner {
   private readonly eventLog: EventLog;
   private readonly maxTicks: number | undefined;
   private readonly deps: RunnerDeps;
+  /** The chain's moneyline scorer module address — every commitment the MM (would) post points at it (v0 quotes moneyline only). Cached at boot from `adapter.addresses()`. */
+  private readonly moneylineScorer: string;
+  /** Monotonic suffix for the synthetic commitment hashes the dry-run reconcile mints (`dry:<runId>:<n>`) — unique within a run; a run's id makes them unique across runs, so a restart's loaded state can't collide. */
+  private syntheticCommitmentSeq = 0;
 
   private state: MakerState;
   /**
@@ -236,6 +262,7 @@ export class Runner {
   constructor(opts: RunnerOptions) {
     this.config = opts.config;
     this.adapter = opts.adapter;
+    this.moneylineScorer = this.adapter.addresses().scorers.moneyline;
     this.stateStore = opts.stateStore;
     this.maxTicks = opts.maxTicks;
     this.deps = {
@@ -340,7 +367,7 @@ export class Runner {
     }
   }
 
-  /** One iteration: discovery → reference-odds refresh → per-market reconcile → fill-detection → age-out → flush. (The reconcile + fill-detection are TODO follow-ups; the rest are wired.) */
+  /** One iteration: discovery → reference-odds refresh → per-market reconcile → age-out → flush. (Fill-detection — Phase 3 — comes between the reconcile and age-out; nothing real is posted in dry-run, so there's nothing to detect yet.) */
   private async tick(tick: number): Promise<void> {
     this.eventLog.emit('tick-start', { tick });
     try {
@@ -350,8 +377,8 @@ export class Runner {
         this.nextDiscoveryAtTick = tick + this.jitteredDiscoveryInterval();
       }
       await this.refreshTrackedOdds({ ranDiscovery });
-      // TODO(PR 4c): per-market reconcile — for each dirty / newly-tracked market, skip while isHoldingQuoting(): inv = inventoryFromState(this.state, now); buildDesiredQuote(config, market, m.lastMoneylineOdds, inv); the lazy-creation re-check from m.speculationId / a fresh getContest(...).speculations (gone ⇒ `candidate` skipReason would-create-lazy-speculation); the start-too-soon / stale-reference gates (m.matchTimeSec - now < threshold ⇒ `candidate` start-too-soon; now - m.lastOddsAt > orders.staleReferenceAfterSeconds ⇒ `candidate` stale-reference); reconcileBook(recordsOnSpec, desired, config, now, inv.openCommitmentCount); in dry-run emit would-submit / would-replace / would-soft-cancel + `candidate` (skipReason cap-hit per deferredSides) + mutate this.state (synthetic visibleOpen records for toSubmit / toReplace.replacement; reclassify toReplace.stale / toSoftCancel.record → softCancelled); then clear m.dirty.
-      // TODO(PR 4c): fill-detection — adapter.listOpenCommitments(maker, maxOpen+buffer); diff against last tick's visibleOpen hash set; by-hash lookup of disappeared hashes → reclassify (filled / cancelled / expired); periodically adapter.getPositionStatus(maker). (In dry-run this is the live path — a no-op unless a prior live run left commitments/positions.)
+      await this.reconcileMarkets();
+      // TODO(Phase 3): fill-detection — adapter.listOpenCommitments(maker, maxOpen+buffer); diff against last tick's visibleOpen hash set; by-hash lookup of disappeared hashes → reclassify (filled / cancelled / expired); periodically adapter.getPositionStatus(maker). Lives next to the live write path — in dry-run nothing real was posted, so there's nothing of the MM's to detect.
       this.ageOut();
     } catch (err) {
       this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'tick' });
@@ -475,6 +502,7 @@ export class Runner {
         lastMoneylineOdds: null,
         lastOddsAt: null,
         dirty: false,
+        lastReconciledAt: null,
       });
       this.eventLog.emit('candidate', { contestId: c.contestId, sport: full.sport, matchTime: full.matchTime, speculationId: confirmedSpec.speculationId });
     }
@@ -615,6 +643,201 @@ export class Runner {
     this.eventLog.emit('degraded', payload);
   }
 
+  // ── per-market reconcile (DESIGN §3 step 3, §8, §9) ───────────────────────
+
+  /**
+   * For each tracked market that needs it — skipped entirely while the boot-time
+   * state-loss hold is active (DESIGN §12, don't quote on a blank slate) — recompute
+   * the desired two-sided quote and reconcile it against the maker's current book on
+   * that speculation. A market "needs reconcile" if its reference odds moved since the
+   * last reconcile (`dirty`), or it lacks a fresh two-sided standing quote of ours (a
+   * newcomer, an expired / aged-out quote, a stale quote, a half-filled book) — the
+   * latter throttled to one re-reconcile per `orders.staleAfterSeconds`. `dirty` is
+   * read-and-cleared per market here — a burst of odds moves between ticks coalesces
+   * into one reconcile.
+   */
+  private async reconcileMarkets(): Promise<void> {
+    if (this.isHoldingQuoting()) return; // DESIGN §12 — must not resume quoting on a blank slate
+    const now = this.deps.now();
+    for (const m of this.trackedMarkets.values()) {
+      if (!this.needsReconcile(m, now)) continue;
+      m.dirty = false; // read-and-clear (a re-fired onChange before the next tick re-arms it)
+      m.lastReconciledAt = now;
+      await this.reconcileMarket(m, now);
+    }
+  }
+
+  /** Does this market need a reconcile this pass? `dirty` (reference odds moved) → yes, now. Otherwise: only if it lacks a fresh two-sided standing quote of ours AND it hasn't been reconciled in the last `orders.staleAfterSeconds` (so a flat-odds market rolls its quote forward roughly every `staleAfterSeconds`, and a persistently-refused / always-gated market is re-evaluated at that cadence rather than every tick). */
+  private needsReconcile(m: TrackedMarket, now: number): boolean {
+    if (m.dirty) return true;
+    if (!this.lacksFreshTwoSidedQuote(m, now)) return false;
+    return m.lastReconciledAt === null || now - m.lastReconciledAt >= this.config.orders.staleAfterSeconds;
+  }
+
+  /** True unless the maker has a `visibleOpen`, not-expired, not-yet-stale commitment of its own on `m.speculationId` for *both* sides (v0 always quotes both — `pricing.quoteBothSides`). A stale quote counts as "not a fresh standing quote", so the market re-reconciles to roll it forward before it expires. */
+  private lacksFreshTwoSidedQuote(m: TrackedMarket, now: number): boolean {
+    const fresh = new Set<MakerSide>();
+    for (const r of Object.values(this.state.commitments)) {
+      if (r.speculationId !== m.speculationId) continue;
+      if (r.lifecycle !== 'visibleOpen') continue;
+      if (r.expiryUnixSec <= now) continue;
+      if (now - r.postedAtUnixSec > this.config.orders.staleAfterSeconds) continue;
+      fresh.add(r.makerSide);
+    }
+    return !(fresh.has('away') && fresh.has('home'));
+  }
+
+  /**
+   * Reconcile one market: the cheap gates, then the lazy-creation re-check, then
+   * price → plan → apply. Gates emit a `candidate` with the skip reason and return.
+   * The `getSpeculation` re-check failing is `error`-logged and the market is skipped
+   * this pass (retried next pass — it's treated as transient, not as "would lazily
+   * create a speculation": discovery already pre-filtered, and a permanently-gone
+   * speculation is essentially impossible on chain). Pricing / risk refusals come
+   * back as a `quote-intent` with `canQuote: false` (carrying the refusal notes) plus
+   * — via `reconcileBook` — the `would-soft-cancel`s that pull any standing quote off
+   * an unwanted side.
+   */
+  private async reconcileMarket(m: TrackedMarket, now: number): Promise<void> {
+    // Gate: the game starts within one expiry window — don't post a quote that would still be matchable at game time.
+    if (m.matchTimeSec - now <= this.config.orders.expirySeconds) {
+      this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'start-too-soon' });
+      return;
+    }
+    // Gate: the reference odds have gone stale (the upstream feed stopped advancing). A never-seen-odds market (`lastOddsAt === null`) falls through to the `no-reference-odds` gate below — `lastOddsAt === null` iff `lastMoneylineOdds === null` (`recordOdds` sets both or neither).
+    if (m.lastOddsAt !== null && now - m.lastOddsAt > this.config.orders.staleReferenceAfterSeconds) {
+      this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'stale-reference' });
+      return;
+    }
+    // Gate: no usable reference moneyline odds (both sides must be priced — `buildDesiredQuote` itself refuses out-of-range *values*, but it can't be handed a `null`).
+    const ml = m.lastMoneylineOdds;
+    if (ml === null || ml.awayOddsAmerican === null || ml.homeOddsAmerican === null) {
+      this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'no-reference-odds' });
+      return;
+    }
+    // Lazy-creation re-check (DESIGN §6/§9): the speculation we'd post to must still exist + be open — discovery confirmed it; re-confirm via the per-speculation detail read (PR 5's competitiveness check reuses the `getSpeculation` orderbook).
+    let spec: SpeculationView;
+    try {
+      spec = await this.adapter.getSpeculation(m.speculationId);
+    } catch (err) {
+      this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'reconcile', contestId: m.contestId });
+      return;
+    }
+    if (!spec.open) {
+      this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'no-open-speculation' });
+      return;
+    }
+    // Price → plan → apply.
+    const market: Market = { contestId: m.contestId, sport: m.sport, awayTeam: m.awayTeam, homeTeam: m.homeTeam };
+    const inventory = inventoryFromState(this.state, now);
+    const desired = buildDesiredQuote(this.config, market, { away: ml.awayOddsAmerican, home: ml.homeOddsAmerican }, inventory);
+    this.eventLog.emit('quote-intent', {
+      contestId: m.contestId,
+      speculationId: m.speculationId,
+      sport: m.sport,
+      awayTeam: m.awayTeam,
+      homeTeam: m.homeTeam,
+      canQuote: desired.result.canQuote,
+      away: quoteSideSummary(desired.result.away),
+      home: quoteSideSummary(desired.result.home),
+      notes: desired.result.notes,
+    });
+    const recordsOnSpec = Object.values(this.state.commitments).filter((r) => r.speculationId === m.speculationId);
+    const plan = reconcileBook(recordsOnSpec, desired, this.config, now, inventory.openCommitmentCount);
+    this.applyReconcilePlan(m, plan, now);
+  }
+
+  /** Apply a `reconcileBook` plan in dry-run: log each item (`would-submit` / `would-replace` / `would-soft-cancel`, plus a `cap-hit` candidate per deferred side) and mutate the hypothetical inventory — add a synthetic `visibleOpen` record per submit / replacement, reclassify each pulled / replaced record to `softCancelled` (its signed payload stays matchable until expiry, so the risk engine keeps counting it). Live execution — the real SDK write calls — is Phase 3. */
+  private applyReconcilePlan(m: TrackedMarket, plan: BookReconciliation, now: number): void {
+    const expiryUnixSec = this.expiryForNewCommitment(m, now);
+    for (const qs of plan.toSubmit) {
+      const record = this.mintSyntheticCommitment(m, qs, now, expiryUnixSec);
+      this.state.commitments[record.hash] = record;
+      this.eventLog.emit('would-submit', this.commitmentEventPayload(record));
+    }
+    for (const rp of plan.toReplace) {
+      rp.stale.lifecycle = 'softCancelled';
+      rp.stale.updatedAtUnixSec = now;
+      const record = this.mintSyntheticCommitment(m, rp.replacement, now, expiryUnixSec);
+      this.state.commitments[record.hash] = record;
+      this.eventLog.emit('would-replace', {
+        replacedCommitmentHash: rp.stale.hash,
+        newCommitmentHash: record.hash,
+        speculationId: m.speculationId,
+        contestId: m.contestId,
+        sport: m.sport,
+        awayTeam: m.awayTeam,
+        homeTeam: m.homeTeam,
+        makerSide: rp.replacement.side,
+        reason: rp.reason,
+        fromOddsTick: rp.stale.oddsTick,
+        toOddsTick: rp.replacement.quoteTick,
+        riskAmountWei6: record.riskAmountWei6,
+        expiryUnixSec,
+      });
+    }
+    for (const sc of plan.toSoftCancel) {
+      sc.record.lifecycle = 'softCancelled';
+      sc.record.updatedAtUnixSec = now;
+      this.eventLog.emit('would-soft-cancel', {
+        commitmentHash: sc.record.hash,
+        speculationId: sc.record.speculationId,
+        contestId: sc.record.contestId,
+        sport: sc.record.sport,
+        awayTeam: sc.record.awayTeam,
+        homeTeam: sc.record.homeTeam,
+        makerSide: sc.record.makerSide,
+        oddsTick: sc.record.oddsTick,
+        reason: sc.reason,
+      });
+    }
+    for (const side of plan.deferredSides) {
+      this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'cap-hit', side });
+    }
+  }
+
+  /** A new commitment's expiry, unix seconds: `now + orders.expirySeconds` under `fixed-seconds` mode (the v0 default — short-lived, rolled forward), or the contest's match time under `match-time` mode (the quote lapses exactly at game start). */
+  private expiryForNewCommitment(m: TrackedMarket, now: number): number {
+    return this.config.orders.expiryMode === 'match-time' ? m.matchTimeSec : now + this.config.orders.expirySeconds;
+  }
+
+  /** Mint a `visibleOpen` `MakerCommitmentRecord` for a `QuoteSide` the dry-run reconcile would post — a synthetic EIP-712 hash (`dry:<runId>:<n>`, unique within / across runs), the quote's tick + size, the contest / speculation metadata. (Live mode posts the real commitment and records its real hash; this is the hypothetical-inventory equivalent.) */
+  private mintSyntheticCommitment(m: TrackedMarket, qs: QuoteSide, now: number, expiryUnixSec: number): MakerCommitmentRecord {
+    this.syntheticCommitmentSeq += 1;
+    return {
+      hash: `dry:${this.eventLog.runId}:${this.syntheticCommitmentSeq}`,
+      speculationId: m.speculationId,
+      contestId: m.contestId,
+      sport: m.sport,
+      awayTeam: m.awayTeam,
+      homeTeam: m.homeTeam,
+      scorer: this.moneylineScorer,
+      makerSide: qs.side,
+      oddsTick: qs.quoteTick,
+      riskAmountWei6: String(qs.sizeWei6),
+      filledRiskWei6: '0',
+      lifecycle: 'visibleOpen',
+      expiryUnixSec,
+      postedAtUnixSec: now,
+      updatedAtUnixSec: now,
+    };
+  }
+
+  private commitmentEventPayload(record: MakerCommitmentRecord): Record<string, unknown> {
+    return {
+      commitmentHash: record.hash,
+      speculationId: record.speculationId,
+      contestId: record.contestId,
+      sport: record.sport,
+      awayTeam: record.awayTeam,
+      homeTeam: record.homeTeam,
+      makerSide: record.makerSide,
+      oddsTick: record.oddsTick,
+      riskAmountWei6: record.riskAmountWei6,
+      expiryUnixSec: record.expiryUnixSec,
+    };
+  }
+
   /** Ticks until the next discovery cycle: `discovery.everyNTicks` jittered by ±`discovery.jitterPct` (so multiple MMs don't all discover on the same tick). At least 1. */
   private jitteredDiscoveryInterval(): number {
     const { everyNTicks, jitterPct } = this.config.discovery;
@@ -643,6 +866,7 @@ export class Runner {
       lastMoneylineOdds: m.lastMoneylineOdds === null ? null : { ...m.lastMoneylineOdds },
       lastOddsAt: m.lastOddsAt,
       dirty: m.dirty,
+      lastReconciledAt: m.lastReconciledAt,
     };
   }
 }
@@ -655,4 +879,9 @@ function errClass(err: unknown): string {
 
 function errMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/** Compact a `QuoteSide` (or `null`) for the `quote-intent` event payload — the odds tick + the quoted size (USDC, and wei6 as a decimal string). */
+function quoteSideSummary(qs: QuoteSide | null): { oddsTick: number; sizeUSDC: number; sizeWei6: string } | null {
+  return qs === null ? null : { oddsTick: qs.quoteTick, sizeUSDC: qs.sizeUSDC, sizeWei6: String(qs.sizeWei6) };
 }

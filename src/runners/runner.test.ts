@@ -12,6 +12,7 @@ import {
   type OddsSubscribeHandlersView,
   type OddsUpdateView,
   type OspexAdapter,
+  type SpeculationView,
   type SubscribeOddsArgs,
   type Subscription,
 } from '../ospex/index.js';
@@ -79,6 +80,7 @@ function makeRunner(opts: { config?: Config; adapter?: OspexAdapter; runId?: str
     vi.spyOn(adapter, 'getContest').mockRejectedValue(new Error('makeRunner: getContest not stubbed — pass an `adapter` (see `spiedAdapter`) if your test exercises discovery'));
     vi.spyOn(adapter, 'getOddsSnapshot').mockRejectedValue(new Error('makeRunner: getOddsSnapshot not stubbed — pass an `adapter` (see `spiedAdapter`) if your test exercises odds'));
     vi.spyOn(adapter, 'subscribeOdds').mockRejectedValue(new Error('makeRunner: subscribeOdds not stubbed — pass an `adapter` (see `spiedAdapter`) if your test exercises odds'));
+    vi.spyOn(adapter, 'getSpeculation').mockRejectedValue(new Error('makeRunner: getSpeculation not stubbed — pass an `adapter` (see `spiedAdapter`) if your test exercises the reconcile'));
   }
   const full: RunnerOptions = {
     config,
@@ -124,6 +126,10 @@ function oddsSnapshotView(contestId: string, moneyline: MoneylineOdds | null = m
 function oddsUpdate(referenceGameId: string, awayOddsAmerican: number | null, homeOddsAmerican: number | null): OddsUpdateView {
   return { referenceGameId, market: 'moneyline', network: 'polygon', line: null, awayOddsAmerican, homeOddsAmerican, upstreamLastUpdated: '2026-02-02T00:00:00Z', pollCapturedAt: '2026-02-02T00:00:00Z', changedAt: '2026-02-02T00:00:00Z' };
 }
+/** A `getSpeculation` view for a moneyline speculation — `open` defaults to true (the realistic case the per-market reconcile expects). */
+function speculationView(speculationId: string, open = true): SpeculationView {
+  return { speculationId, contestId: 'contest', marketType: 'moneyline', lineTicks: null, line: null, open };
+}
 function noopSubscription(): Subscription {
   return { unsubscribe: () => Promise.resolve() };
 }
@@ -163,10 +169,11 @@ function makeSubscribeRecorder() {
 
 /**
  * An `OspexAdapter` with `listContests` / `getContest` / `getOddsSnapshot` /
- * `subscribeOdds` spied: `listContests` calls `listContests()` each time;
- * `getContest(id)` defaults to echoing a fresh `contestView` with
- * `referenceGameId` filled in; `getOddsSnapshot(id)` and `subscribeOdds` default
- * to a `-110 / -110` snapshot and a no-op channel (override via `odds`).
+ * `subscribeOdds` / `getSpeculation` spied: `listContests` calls `listContests()`
+ * each time; `getContest(id)` defaults to echoing a fresh `contestView` with
+ * `referenceGameId` filled in; `getOddsSnapshot(id)` / `subscribeOdds` /
+ * `getSpeculation(id)` default to a `-110 / -110` snapshot, a no-op channel, and an
+ * open speculation (override via `odds`).
  */
 function spiedAdapter(
   config: Config,
@@ -175,6 +182,7 @@ function spiedAdapter(
   odds?: {
     snapshot?: (contestId: string) => Promise<OddsSnapshotView>;
     subscribe?: (args: SubscribeOddsArgs, handlers: OddsSubscribeHandlersView) => Promise<Subscription>;
+    getSpeculation?: (speculationId: string) => Promise<SpeculationView>;
   },
 ): OspexAdapter {
   const adapter = createOspexAdapter(config);
@@ -182,6 +190,7 @@ function spiedAdapter(
   vi.spyOn(adapter, 'getContest').mockImplementation(getContest ?? ((id) => Promise.resolve(contestView({ contestId: id, referenceGameId: `GAME-${id}` }))));
   vi.spyOn(adapter, 'getOddsSnapshot').mockImplementation(odds?.snapshot ?? ((contestId) => Promise.resolve(oddsSnapshotView(contestId))));
   vi.spyOn(adapter, 'subscribeOdds').mockImplementation(odds?.subscribe ?? (() => Promise.resolve(noopSubscription())));
+  vi.spyOn(adapter, 'getSpeculation').mockImplementation(odds?.getSpeculation ?? ((speculationId) => Promise.resolve(speculationView(speculationId))));
   return adapter;
 }
 
@@ -558,7 +567,7 @@ describe('Runner — odds subscriptions', () => {
       subscribed: true,
       lastMoneylineOdds: { awayOddsAmerican: -150, homeOddsAmerican: 130 },
       lastOddsAt: T0,
-      dirty: true, // a freshly-seeded market is dirty so the per-market reconcile picks it up
+      dirty: false, // seeded dirty, but the same tick's per-market reconcile picked it up and cleared the flag
     });
   });
 
@@ -697,5 +706,176 @@ describe('Runner — odds subscriptions', () => {
       lastMoneylineOdds: { awayOddsAmerican: -130, homeOddsAmerican: 110 },
       lastOddsAt: T0,
     });
+  });
+});
+
+// ── per-market reconcile (DESIGN §3 step 3, §8, §9) ──────────────────────────
+
+describe('Runner — per-market reconcile', () => {
+  it('a tracked market with reference odds gets a two-sided quote — a quote-intent, would-submit per side, synthetic visibleOpen records', async () => {
+    StateStore.at(stateDir).flush(emptyMakerState()); // clean state → no boot hold
+    const config = cfg(); // economics-mode pricing, conservative defaults
+    const adapter = spiedAdapter(config, () => Promise.resolve([contestView({ contestId: 'A' })]));
+    const runner = makeRunner({ config, adapter, maxTicks: 1 });
+    await runner.run();
+
+    const events = readEvents();
+    const submits = events.filter((e) => e.kind === 'would-submit');
+    expect(submits.map((e) => e.makerSide).sort()).toEqual(['away', 'home']);
+    for (const e of submits) {
+      expect(e).toMatchObject({ contestId: 'A', speculationId: 'spec-A', sport: 'mlb', riskAmountWei6: '250000', expiryUnixSec: T0 + 120 });
+    }
+    expect(events.find((e) => e.kind === 'quote-intent')).toMatchObject({ contestId: 'A', speculationId: 'spec-A', canQuote: true });
+
+    const records = Object.values(StateStore.at(stateDir).load().state.commitments);
+    expect(records).toHaveLength(2);
+    expect(records.map((r) => r.makerSide).sort()).toEqual(['away', 'home']);
+    for (const r of records) {
+      expect(r.lifecycle).toBe('visibleOpen');
+      expect(r.speculationId).toBe('spec-A');
+      expect(r.contestId).toBe('A');
+      expect(r.sport).toBe('mlb');
+      expect(r.riskAmountWei6).toBe('250000');
+      expect(r.filledRiskWei6).toBe('0');
+      expect(r.expiryUnixSec).toBe(T0 + 120);
+      expect(r.postedAtUnixSec).toBe(T0);
+      expect(r.scorer).toBe(adapter.addresses().scorers.moneyline);
+      expect(r.oddsTick).toBeGreaterThanOrEqual(101);
+      expect(r.oddsTick).toBeLessThanOrEqual(10100);
+    }
+    expect(runner.trackedMarketView('A')).toMatchObject({ dirty: false, lastReconciledAt: T0 }); // the reconcile consumed the dirty flag
+  });
+
+  it('match-time expiry mode: a synthetic quote expires at the contest match time, not now + expirySeconds', async () => {
+    StateStore.at(stateDir).flush(emptyMakerState());
+    const config = cfg({ orders: { expiryMode: 'match-time', expirySeconds: 120 } });
+    const matchTimeSec = Math.floor(Date.parse(FUTURE_ISO) / 1000);
+    const adapter = spiedAdapter(config, () => Promise.resolve([contestView({ contestId: 'A' })]));
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    const records = Object.values(StateStore.at(stateDir).load().state.commitments);
+    expect(records).toHaveLength(2);
+    for (const r of records) expect(r.expiryUnixSec).toBe(matchTimeSec);
+  });
+
+  it('a stale incumbent gets replaced (would-replace; the old record → softCancelled; a fresh synthetic record); a missing side gets submitted', async () => {
+    const stale = commitmentRecord({ hash: '0xstaleAway', speculationId: 'spec-A', contestId: 'A', makerSide: 'away', lifecycle: 'visibleOpen', oddsTick: 250, riskAmountWei6: '250000', expiryUnixSec: T0 + 50, postedAtUnixSec: T0 - 200, updatedAtUnixSec: T0 - 200 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xstaleAway': stale } });
+    const config = cfg(); // default staleAfterSeconds 90 → posted 200s ago is stale
+    const adapter = spiedAdapter(config, () => Promise.resolve([contestView({ contestId: 'A' })]));
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    const events = readEvents();
+    expect(events.find((e) => e.kind === 'would-replace')).toMatchObject({ replacedCommitmentHash: '0xstaleAway', makerSide: 'away', reason: 'stale', speculationId: 'spec-A' });
+    expect(events.find((e) => e.kind === 'would-submit')).toMatchObject({ makerSide: 'home', speculationId: 'spec-A' });
+
+    const reloaded = StateStore.at(stateDir).load().state.commitments;
+    expect(reloaded['0xstaleAway']?.lifecycle).toBe('softCancelled'); // pulled, but still counted (matchable on chain)
+    const records = Object.values(reloaded);
+    expect(records).toHaveLength(3); // the old (softCancelled) + the away replacement + the home submit
+    expect(records.filter((r) => r.lifecycle === 'visibleOpen').map((r) => r.makerSide).sort()).toEqual(['away', 'home']);
+  });
+
+  it('a market the risk engine refuses gets a quote-intent with canQuote: false; its standing quotes are soft-cancelled (would-soft-cancel side-not-quoted)', async () => {
+    const onOther = commitmentRecord({ hash: '0xother', speculationId: 'spec-other', contestId: 'B', sport: 'nba', awayTeam: 'BOS', homeTeam: 'NYY', makerSide: 'away', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 100, postedAtUnixSec: T0 - 10, updatedAtUnixSec: T0 - 10 });
+    const onA = commitmentRecord({ hash: '0xaWay', speculationId: 'spec-A', contestId: 'A', makerSide: 'away', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 100, postedAtUnixSec: T0 - 10, updatedAtUnixSec: T0 - 10 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xother': onOther, '0xaWay': onA } });
+    const config = cfg({ risk: { maxOpenCommitments: 2 } }); // the open-commitment count is already 2 → market A is refused (count cap)
+    const adapter = spiedAdapter(config, () => Promise.resolve([contestView({ contestId: 'A' })]));
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    const events = readEvents();
+    expect(events.find((e) => e.kind === 'quote-intent')).toMatchObject({ contestId: 'A', canQuote: false });
+    expect(events.find((e) => e.kind === 'would-soft-cancel')).toMatchObject({ commitmentHash: '0xaWay', makerSide: 'away', reason: 'side-not-quoted' });
+    expect(events.some((e) => e.kind === 'would-submit' || e.kind === 'would-replace')).toBe(false);
+    expect(StateStore.at(stateDir).load().state.commitments['0xaWay']?.lifecycle).toBe('softCancelled');
+  });
+
+  it('when the open-commitment count budget runs out mid-plan a side is deferred — a cap-hit candidate, only the affordable side submitted', async () => {
+    const onOther = commitmentRecord({ hash: '0xother', speculationId: 'spec-other', contestId: 'B', sport: 'nba', awayTeam: 'BOS', homeTeam: 'NYY', makerSide: 'away', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 100, postedAtUnixSec: T0 - 10, updatedAtUnixSec: T0 - 10 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xother': onOther } });
+    const config = cfg({ risk: { maxOpenCommitments: 2 } }); // count 1 < 2 → A allowed, but room for only 1 more new commitment → one side of the two-sided quote is deferred
+    const adapter = spiedAdapter(config, () => Promise.resolve([contestView({ contestId: 'A' })]));
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    const events = readEvents();
+    expect(events.filter((e) => e.kind === 'would-submit')).toHaveLength(1);
+    const capHit = events.filter((e) => e.kind === 'candidate' && e.skipReason === 'cap-hit');
+    expect(capHit).toHaveLength(1);
+    expect(capHit[0]).toMatchObject({ contestId: 'A' });
+    expect(['away', 'home']).toContain(capHit[0]?.side);
+  });
+
+  it('a market starting within one expiry window is gated — a start-too-soon candidate, no quote', async () => {
+    const config = cfg(); // expirySeconds 120
+    const SOON_ISO = new Date((T0 + 60) * 1000).toISOString(); // 60s past the test clock — past discovery's "started" gate, inside the reconcile's start-too-soon gate
+    const adapter = spiedAdapter(config, () => Promise.resolve([contestView({ contestId: 'A', matchTime: SOON_ISO })]));
+    const runner = makeRunner({ config, adapter, maxTicks: 1 });
+    await runner.run();
+    expect(runner.trackedContestIds()).toEqual(['A']); // tracked at discovery
+    expect(readEvents().some((e) => e.kind === 'candidate' && e.contestId === 'A' && e.skipReason === 'start-too-soon')).toBe(true);
+    expect(readEvents().some((e) => e.kind === 'would-submit' || e.kind === 'quote-intent')).toBe(false);
+  });
+
+  it('a tracked market with no usable reference odds is gated — a no-reference-odds candidate, no quote', async () => {
+    const config = cfg();
+    const adapter = spiedAdapter(config, () => Promise.resolve([contestView({ contestId: 'A' })]), undefined, { snapshot: () => Promise.reject(new Error('no odds')) });
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    expect(readEvents().some((e) => e.kind === 'candidate' && e.contestId === 'A' && e.skipReason === 'no-reference-odds')).toBe(true);
+    expect(readEvents().some((e) => e.kind === 'would-submit' || e.kind === 'quote-intent')).toBe(false);
+  });
+
+  it('a tracked market whose speculation has closed is gated — a no-open-speculation candidate, no quote', async () => {
+    const config = cfg();
+    const adapter = spiedAdapter(config, () => Promise.resolve([contestView({ contestId: 'A' })]), undefined, { getSpeculation: (specId) => Promise.resolve(speculationView(specId, false)) });
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    expect(readEvents().some((e) => e.kind === 'candidate' && e.contestId === 'A' && e.skipReason === 'no-open-speculation')).toBe(true);
+    expect(readEvents().some((e) => e.kind === 'would-submit' || e.kind === 'quote-intent')).toBe(false);
+  });
+
+  it('a market whose reference odds have gone stale is gated — a stale-reference candidate', async () => {
+    let t = T0;
+    const config = cfg({ orders: { staleAfterSeconds: 1, staleReferenceAfterSeconds: 1 } });
+    const adapter = spiedAdapter(config, () => Promise.resolve([contestView({ contestId: 'A' })]));
+    // tick 1: seed odds (lastOddsAt = T0) + quote. sleep → clock advances 2s. tick 2 (now = T0+2): the odds are now 2s old > staleReferenceAfterSeconds(1) → stale-reference.
+    await makeRunner({ config, adapter, maxTicks: 2, deps: { now: () => t, sleep: () => { t += 2; return Promise.resolve(); } } }).run();
+    expect(readEvents().some((e) => e.kind === 'candidate' && e.contestId === 'A' && e.skipReason === 'stale-reference')).toBe(true);
+  });
+
+  it('a getSpeculation failure during the reconcile is logged (error, phase reconcile) and the market is skipped this pass', async () => {
+    const config = cfg();
+    const adapter = spiedAdapter(config, () => Promise.resolve([contestView({ contestId: 'A' })]), undefined, { getSpeculation: () => Promise.reject(new Error('spec read failed')) });
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    expect(readEvents().find((e) => e.kind === 'error' && e.phase === 'reconcile')).toMatchObject({ contestId: 'A', detail: 'spec read failed' });
+    expect(readEvents().some((e) => e.kind === 'would-submit')).toBe(false);
+  });
+
+  it('the per-market reconcile is skipped while the boot-time state-loss hold is active (DESIGN §12) — discovery + odds still run', async () => {
+    writeFileSync(join(logDir, 'run-prior.ndjson'), '{"ts":"x","runId":"prior","kind":"tick-start","tick":1}\n', 'utf8'); // prior telemetry, no state file → state loss → hold
+    const config = cfg(); // fixed-seconds expiry; the fixed clock never reaches the deadline
+    const adapter = spiedAdapter(config, () => Promise.resolve([contestView({ contestId: 'A' })]));
+    const runner = makeRunner({ config, adapter, maxTicks: 1, deps: { now: () => T0 } });
+    expect(runner.bootAssessment.holdQuoting).toBe(true);
+    await runner.run();
+    expect(runner.trackedContestIds()).toEqual(['A']); // discovery runs while held
+    expect(runner.trackedMarketView('A')?.subscribed).toBe(true); // odds subscription runs while held
+    expect(readEvents().some((e) => e.kind === 'would-submit' || e.kind === 'quote-intent')).toBe(false); // but no quoting
+    expect(existsSync(join(stateDir, 'maker-state.json'))).toBe(false); // not flushed while held
+    expect(runner.trackedMarketView('A')?.dirty).toBe(true); // dirty stays armed — the reconcile never consumed it
+  });
+
+  it('an onChange between ticks re-arms a market that already has a fresh quote — it is reconciled again the next tick', async () => {
+    StateStore.at(stateDir).flush(emptyMakerState());
+    const config = cfg();
+    const recorder = makeSubscribeRecorder();
+    let sleeps = 0;
+    const adapter = spiedAdapter(config, () => Promise.resolve([contestView({ contestId: 'A' })]), undefined, { subscribe: recorder.subscribe });
+    // tick 1: track + seed + quote A (dirty consumed). sleep → an onChange re-arms A. tick 2: A is reconciled again (no discovery this tick).
+    await makeRunner({
+      config,
+      adapter,
+      maxTicks: 2,
+      deps: { sleep: () => { sleeps += 1; if (sleeps === 1) recorder.handlersFor('GAME-A')?.onChange(oddsUpdate('GAME-A', -110, -110)); return Promise.resolve(); } },
+    }).run();
+    expect(readEvents().filter((e) => e.kind === 'quote-intent' && e.contestId === 'A')).toHaveLength(2);
   });
 });

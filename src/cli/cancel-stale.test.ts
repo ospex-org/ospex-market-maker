@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { parseConfig, type Config } from '../config/index.js';
 import { createLiveOspexAdapter, type CancelOnchainResult, type Hex, type OspexAdapter, type Signer } from '../ospex/index.js';
 import { StateStore, emptyMakerState, type MakerCommitmentRecord, type MakerState } from '../state/index.js';
-import { CancelStaleRefused, runCancelStale } from './cancel-stale.js';
+import { CancelStaleRefused, cancelStaleExitCode, runCancelStale, type CancelStaleReport } from './cancel-stale.js';
 
 // ── harness ──────────────────────────────────────────────────────────────────
 
@@ -59,11 +59,6 @@ function liveAdapter(config: Config, signer: Signer): OspexAdapter {
   return adapter;
 }
 
-function captureLog(): { log: (line: string) => void; lines: () => readonly string[] } {
-  const lines: string[] = [];
-  return { log: (line) => void lines.push(line), lines: () => lines };
-}
-
 /** Build a maker-commitment record at `postedAtUnixSec`; everything else defaulted. */
 function rec(hash: string, postedAtUnixSec: number, overrides: Partial<MakerCommitmentRecord> = {}): MakerCommitmentRecord {
   return {
@@ -103,13 +98,14 @@ function readEvents(runId: string): { kind: string; [k: string]: unknown }[] {
   return readFileSync(path, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l) as { kind: string });
 }
 
-/** Common deps — fixed clock, fake signer unlock, silenced log. */
+/** Common deps — fixed clock, fake signer unlock, silenced log, no prior telemetry by default. */
 const baseDeps = (): Parameters<typeof runCancelStale>[1] => ({
   unlockSigner: () => Promise.resolve(fakeSigner()),
   createLiveAdapter: liveAdapter,
   env: { OSPEX_KEYSTORE_PASSPHRASE: 'pw' },
   now: () => T0,
   makeRunId: () => 'cs-run',
+  hasPriorTelemetry: () => false,
   log: () => {},
 });
 
@@ -119,7 +115,7 @@ describe('runCancelStale — refusals', () => {
   it('config.mode.dryRun=true → CancelStaleRefused; no signer unlock attempted', async () => {
     const unlockSigner = vi.fn();
     await expect(runCancelStale(
-      { config: liveConfig({ mode: { dryRun: true } }), authoritative: false },
+      { config: liveConfig({ mode: { dryRun: true } }), authoritative: false, ignoreMissingState: false },
       { ...baseDeps(), unlockSigner },
     )).rejects.toMatchObject({ name: 'CancelStaleRefused', message: expect.stringMatching(/mode\.dryRun=true/) as unknown });
     expect(unlockSigner).not.toHaveBeenCalled();
@@ -133,7 +129,7 @@ describe('runCancelStale — refusals', () => {
       mode: { dryRun: false },
       killSwitchFile: join(stateDir, 'KILL'),
     });
-    await expect(runCancelStale({ config: cfg, authoritative: false }, baseDeps())).rejects.toMatchObject({
+    await expect(runCancelStale({ config: cfg, authoritative: false, ignoreMissingState: false }, baseDeps())).rejects.toMatchObject({
       name: 'CancelStaleRefused',
       message: expect.stringMatching(/keystorePath/) as unknown,
     });
@@ -142,22 +138,24 @@ describe('runCancelStale — refusals', () => {
   it('env unset and prompt rejects (no TTY) → CancelStaleRefused with a clear hint about OSPEX_KEYSTORE_PASSPHRASE', async () => {
     const promptPassphrase = vi.fn(() => Promise.reject(new Error('stdin is not a TTY')));
     await expect(runCancelStale(
-      { config: liveConfig(), authoritative: false },
+      { config: liveConfig(), authoritative: false, ignoreMissingState: false },
       { ...baseDeps(), env: {}, promptPassphrase },
     )).rejects.toMatchObject({ name: 'CancelStaleRefused', message: expect.stringMatching(/OSPEX_KEYSTORE_PASSPHRASE/) as unknown });
   });
 
-  it('corrupt state file → CancelStaleRefused (operator must fix it first; we refuse to write blind)', async () => {
+  it('corrupt state file → CancelStaleRefused (operator must fix it first; we refuse to write blind); refuses BEFORE signer unlock', async () => {
     writeFileSync(join(stateDir, 'maker-state.json'), 'not valid json', 'utf8');
+    const unlockSigner = vi.fn(() => Promise.resolve(fakeSigner()));
     await expect(runCancelStale(
-      { config: liveConfig(), authoritative: false },
-      baseDeps(),
+      { config: liveConfig(), authoritative: false, ignoreMissingState: false },
+      { ...baseDeps(), unlockSigner },
     )).rejects.toMatchObject({ name: 'CancelStaleRefused', message: expect.stringMatching(/corrupt state/) as unknown });
+    expect(unlockSigner).not.toHaveBeenCalled(); // refused before the (expensive) scrypt unlock
   });
 
   it('bad passphrase (unlock throws) → plain Error, not CancelStaleRefused (operational failure, surfaces as "cancel-stale failed: …")', async () => {
     const err = await runCancelStale(
-      { config: liveConfig(), authoritative: false },
+      { config: liveConfig(), authoritative: false, ignoreMissingState: false },
       { ...baseDeps(), unlockSigner: () => Promise.reject(new Error('invalid password')) },
     ).then(() => null, (e: unknown): Error => e as Error);
     expect(err).not.toBeNull();
@@ -166,20 +164,67 @@ describe('runCancelStale — refusals', () => {
   });
 });
 
-// ── happy paths — off-chain leg only ─────────────────────────────────────────
+// ── boot-time state-loss fail-safe (DESIGN §12 / Hermes review-PR30 blocker #2) ─
 
-describe('runCancelStale — off-chain leg (default, no --authoritative)', () => {
-  it('fresh state (no file) → 0 inspected; the state file is created (best-effort no-op flush)', async () => {
-    const cap = captureLog();
+describe('runCancelStale — state-loss fail-safe', () => {
+  it('fresh state + prior telemetry exists → CancelStaleRefused (the prior softCancelled set is gone — refusing protects the state-loss signal a subsequent run --live boot needs); no signer unlock attempted; no state file written', async () => {
+    const unlockSigner = vi.fn(() => Promise.resolve(fakeSigner()));
+    await expect(runCancelStale(
+      { config: liveConfig(), authoritative: false, ignoreMissingState: false },
+      { ...baseDeps(), unlockSigner, hasPriorTelemetry: () => true },
+    )).rejects.toMatchObject({ name: 'CancelStaleRefused', message: expect.stringMatching(/--ignore-missing-state/) as unknown });
+    expect(unlockSigner).not.toHaveBeenCalled();
+    // Crucial — must NOT have written an empty state file (that would erase the state-loss signal for the next runner boot).
+    expect(existsSync(join(stateDir, 'maker-state.json'))).toBe(false);
+  });
+
+  it('fresh state + prior telemetry + --ignore-missing-state → proceeds (operator attestation lifts the hold; behaves like a genuine empty-state run)', async () => {
+    const unlockSigner = vi.fn(() => Promise.resolve(fakeSigner()));
     const report = await runCancelStale(
-      { config: liveConfig(), authoritative: false },
-      { ...baseDeps(), log: cap.log },
+      { config: liveConfig(), authoritative: false, ignoreMissingState: true },
+      { ...baseDeps(), unlockSigner, hasPriorTelemetry: () => true },
     );
-    expect(report).toMatchObject({ inspected: 0, offchainCancelled: 0, onchainCancelled: 0, errored: 0, runId: 'cs-run' });
-    expect(cap.lines().some((l) => l.includes('nothing to do'))).toBe(true);
+    expect(unlockSigner).toHaveBeenCalledTimes(1);
+    expect(report).toMatchObject({ inspected: 0, errored: 0 });
+    // With no prior state file and no records touched, we STILL must not flush a blank state (would erase the state-loss signal next boot).
+    expect(existsSync(join(stateDir, 'maker-state.json'))).toBe(false);
+  });
+
+  it('fresh state + no prior telemetry → proceeds (genuine first run; nothing to do); does NOT write an empty state file', async () => {
+    const report = await runCancelStale(
+      { config: liveConfig(), authoritative: false, ignoreMissingState: false },
+      baseDeps(), // hasPriorTelemetry: () => false
+    );
+    expect(report).toMatchObject({ inspected: 0, offchainCancelled: 0, runId: 'cs-run' });
+    // The state file is NOT created on a fresh+no-prior-telemetry run — flushing one would not be harmful, but skipping it is the simpler invariant: a no-op cancel-stale leaves the state directory untouched.
+    expect(existsSync(join(stateDir, 'maker-state.json'))).toBe(false);
+  });
+
+  it('loaded state + no stale records → flushes the (unchanged) state file (no signal-erasure risk; the file already existed)', async () => {
+    seedState([rec('0xaa', T0 - 30)]); // not stale (30s old, staleAfterSeconds default 90)
+    const report = await runCancelStale(
+      { config: liveConfig(), authoritative: false, ignoreMissingState: false },
+      baseDeps(),
+    );
+    expect(report).toMatchObject({ inspected: 0 });
+    // The state file existed before and after; flushing refreshes lastFlushedAt.
     expect(existsSync(join(stateDir, 'maker-state.json'))).toBe(true);
   });
 
+  it('dry-run synthetic hash in loaded state → CancelStaleRefused (mirrors the runner\'s live-mode ctor refusal); no signer unlock', async () => {
+    seedState([rec('dry:run-1:0', T0 - 200)]);
+    const unlockSigner = vi.fn(() => Promise.resolve(fakeSigner()));
+    await expect(runCancelStale(
+      { config: liveConfig(), authoritative: false, ignoreMissingState: false },
+      { ...baseDeps(), unlockSigner },
+    )).rejects.toMatchObject({ name: 'CancelStaleRefused', message: expect.stringMatching(/dry-run synthetic commitment/) as unknown });
+    expect(unlockSigner).not.toHaveBeenCalled();
+  });
+});
+
+// ── happy paths — off-chain leg only ─────────────────────────────────────────
+
+describe('runCancelStale — off-chain leg (default, no --authoritative)', () => {
   it('cancels every stale visibleOpen record off-chain; emits soft-cancel reason:"stale"; reclassifies to softCancelled; flushes state', async () => {
     seedState([
       rec('0xaa', T0 - 200), // stale: posted 200s ago, staleAfterSeconds default 90
@@ -193,7 +238,7 @@ describe('runCancelStale — off-chain leg (default, no --authoritative)', () =>
       return a;
     };
     const report = await runCancelStale(
-      { config: liveConfig(), authoritative: false },
+      { config: liveConfig(), authoritative: false, ignoreMissingState: false },
       { ...baseDeps(), createLiveAdapter },
     );
     expect(report).toMatchObject({ inspected: 2, offchainCancelled: 2, offchainSkippedAlready: 0, onchainCancelled: 0, gasDenied: 0, errored: 0, gasPolWei: '0' });
@@ -219,7 +264,7 @@ describe('runCancelStale — off-chain leg (default, no --authoritative)', () =>
       return captured;
     };
     const report = await runCancelStale(
-      { config: liveConfig(), authoritative: false },
+      { config: liveConfig(), authoritative: false, ignoreMissingState: false },
       { ...baseDeps(), createLiveAdapter },
     );
     expect(report).toMatchObject({ inspected: 2, offchainCancelled: 1, offchainSkippedAlready: 1, errored: 0 });
@@ -227,6 +272,27 @@ describe('runCancelStale — off-chain leg (default, no --authoritative)', () =>
     expect(captured!.cancelCommitmentOffchain).toHaveBeenCalledWith('0xbb');
     const events = readEvents('cs-run');
     expect(events.filter((e) => e.kind === 'soft-cancel')).toHaveLength(1);
+  });
+
+  it('stale partiallyFilled records are included — pulled off-chain, reclassified to softCancelled, filledRiskWei6 preserved (Hermes review-PR30 blocker #1)', async () => {
+    seedState([
+      rec('0xpf', T0 - 200, { lifecycle: 'partiallyFilled', filledRiskWei6: '50', riskAmountWei6: '100' }),
+    ]);
+    let captured: OspexAdapter | null = null;
+    const createLiveAdapter = (cfg: Config, signer: Signer): OspexAdapter => {
+      captured = liveAdapter(cfg, signer);
+      return captured;
+    };
+    const report = await runCancelStale(
+      { config: liveConfig(), authoritative: false, ignoreMissingState: false },
+      { ...baseDeps(), createLiveAdapter },
+    );
+    expect(report).toMatchObject({ inspected: 1, offchainCancelled: 1 });
+    expect(captured!.cancelCommitmentOffchain).toHaveBeenCalledWith('0xpf');
+    const state = StateStore.at(stateDir).load().state;
+    expect(state.commitments['0xpf']!.lifecycle).toBe('softCancelled');
+    // Crucial: the partial-fill record's filledRiskWei6 must be preserved across the lifecycle stamp.
+    expect(state.commitments['0xpf']!.filledRiskWei6).toBe('50');
   });
 
   it('off-chain throw → counted in errored; lifecycle unchanged; emits error phase:"cancel"; continues to next record', async () => {
@@ -243,7 +309,7 @@ describe('runCancelStale — off-chain leg (default, no --authoritative)', () =>
       return captured;
     };
     const report = await runCancelStale(
-      { config: liveConfig(), authoritative: false },
+      { config: liveConfig(), authoritative: false, ignoreMissingState: false },
       { ...baseDeps(), createLiveAdapter },
     );
     expect(report).toMatchObject({ inspected: 2, offchainCancelled: 1, errored: 1 });
@@ -256,9 +322,8 @@ describe('runCancelStale — off-chain leg (default, no --authoritative)', () =>
     expect(StateStore.at(stateDir).load().state.commitments['0xbb']!.lifecycle).toBe('softCancelled');
   });
 
-  it('partiallyFilled / filled / expired / authoritativelyInvalidated records are excluded from the stale set', async () => {
+  it('terminal lifecycles (filled / expired / authoritativelyInvalidated) are excluded from the stale set', async () => {
     seedState([
-      rec('0xpf', T0 - 200, { lifecycle: 'partiallyFilled', filledRiskWei6: '50' }),
       rec('0xfi', T0 - 200, { lifecycle: 'filled', filledRiskWei6: '100' }),
       rec('0xex', T0 - 200, { lifecycle: 'expired' }),
       rec('0xai', T0 - 200, { lifecycle: 'authoritativelyInvalidated' }),
@@ -269,7 +334,7 @@ describe('runCancelStale — off-chain leg (default, no --authoritative)', () =>
       return captured;
     };
     const report = await runCancelStale(
-      { config: liveConfig(), authoritative: false },
+      { config: liveConfig(), authoritative: false, ignoreMissingState: false },
       { ...baseDeps(), createLiveAdapter },
     );
     expect(report).toMatchObject({ inspected: 0, offchainCancelled: 0, errored: 0 });
@@ -301,7 +366,7 @@ describe('runCancelStale — --authoritative (on-chain leg)', () => {
       return captured;
     };
     const report = await runCancelStale(
-      { config: liveConfig(), authoritative: true },
+      { config: liveConfig(), authoritative: true, ignoreMissingState: false },
       { ...baseDeps(), createLiveAdapter },
     );
     expect(report).toMatchObject({ inspected: 2, offchainCancelled: 2, onchainCancelled: 2, gasDenied: 0, errored: 0 });
@@ -331,13 +396,31 @@ describe('runCancelStale — --authoritative (on-chain leg)', () => {
       return captured;
     };
     const report = await runCancelStale(
-      { config: liveConfig(), authoritative: true },
+      { config: liveConfig(), authoritative: true, ignoreMissingState: false },
       { ...baseDeps(), createLiveAdapter },
     );
     expect(report).toMatchObject({ inspected: 1, offchainCancelled: 0, offchainSkippedAlready: 1, onchainCancelled: 1, errored: 0 });
     expect(captured!.cancelCommitmentOffchain).not.toHaveBeenCalled();
     expect(captured!.cancelCommitmentOnchain).toHaveBeenCalledWith('0xaa');
     expect(StateStore.at(stateDir).load().state.commitments['0xaa']!.lifecycle).toBe('authoritativelyInvalidated');
+  });
+
+  it('--authoritative + a stale partiallyFilled record → off-chain → softCancelled → on-chain → authoritativelyInvalidated; filledRiskWei6 preserved through both stamps (Hermes review-PR30 blocker #1)', async () => {
+    seedState([rec('0xpf', T0 - 200, { lifecycle: 'partiallyFilled', filledRiskWei6: '40', riskAmountWei6: '100' })]);
+    let captured: OspexAdapter | null = null;
+    const createLiveAdapter = (cfg: Config, signer: Signer): OspexAdapter => {
+      captured = liveAdapter(cfg, signer);
+      vi.spyOn(captured, 'cancelCommitmentOnchain').mockResolvedValueOnce(onchainOk('0xtx'));
+      return captured;
+    };
+    const report = await runCancelStale(
+      { config: liveConfig(), authoritative: true, ignoreMissingState: false },
+      { ...baseDeps(), createLiveAdapter },
+    );
+    expect(report).toMatchObject({ inspected: 1, offchainCancelled: 1, onchainCancelled: 1, errored: 0 });
+    const state = StateStore.at(stateDir).load().state;
+    expect(state.commitments['0xpf']!.lifecycle).toBe('authoritativelyInvalidated');
+    expect(state.commitments['0xpf']!.filledRiskWei6).toBe('40');
   });
 
   it('--authoritative + on-chain throw → counted in errored; lifecycle stays at softCancelled; continues to next record', async () => {
@@ -354,7 +437,7 @@ describe('runCancelStale — --authoritative (on-chain leg)', () => {
       return captured;
     };
     const report = await runCancelStale(
-      { config: liveConfig(), authoritative: true },
+      { config: liveConfig(), authoritative: true, ignoreMissingState: false },
       { ...baseDeps(), createLiveAdapter },
     );
     expect(report).toMatchObject({ inspected: 2, offchainCancelled: 2, onchainCancelled: 1, errored: 1 });
@@ -379,7 +462,7 @@ describe('runCancelStale — --authoritative (on-chain leg)', () => {
       return captured;
     };
     const report = await runCancelStale(
-      { config: liveConfig(), authoritative: true },
+      { config: liveConfig(), authoritative: true, ignoreMissingState: false },
       { ...baseDeps(), createLiveAdapter },
     );
     // Off-chain still happened for both records.
@@ -391,5 +474,24 @@ describe('runCancelStale — --authoritative (on-chain leg)', () => {
     const events = readEvents('cs-run');
     const denial = events.filter((e) => e.kind === 'candidate' && e.skipReason === 'gas-budget-blocks-onchain-cancel');
     expect(denial).toHaveLength(1);
+  });
+});
+
+// ── exit code policy (Hermes review-PR30 non-blocker hardening) ──────────────
+
+describe('cancelStaleExitCode', () => {
+  const baseReport: CancelStaleReport = {
+    inspected: 0, offchainCancelled: 0, offchainSkippedAlready: 0, onchainCancelled: 0,
+    gasDenied: 0, errored: 0, gasPolWei: '0', runId: 'r',
+  };
+  it('clean run → 0', () => {
+    expect(cancelStaleExitCode(baseReport)).toBe(0);
+    expect(cancelStaleExitCode({ ...baseReport, inspected: 3, offchainCancelled: 3 })).toBe(0);
+  });
+  it('any errored → 1 (per-record write failed; automation needs to detect the incomplete cleanup)', () => {
+    expect(cancelStaleExitCode({ ...baseReport, errored: 1 })).toBe(1);
+  });
+  it('any gasDenied → 1 (the on-chain leg stopped before completing)', () => {
+    expect(cancelStaleExitCode({ ...baseReport, gasDenied: 1 })).toBe(1);
   });
 });

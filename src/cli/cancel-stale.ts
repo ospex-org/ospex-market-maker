@@ -6,8 +6,10 @@
  *   - default — gasless off-chain cancels only (`adapter.cancelCommitmentOffchain`).
  *     Removes the quotes from the API book so takers stop seeing them, but anyone
  *     holding a still-signed payload can match them on chain until natural expiry.
- *     Records move `visibleOpen` → `softCancelled` (latent exposure stays counted
- *     in the risk engine until the record expires or is on-chain-cancelled).
+ *     Records move `visibleOpen` → `softCancelled` and `partiallyFilled` →
+ *     `softCancelled` (preserving `filledRiskWei6`); the latent matchable
+ *     remainder stays counted in the risk engine until the record expires or is
+ *     on-chain-cancelled.
  *
  *   - `--authoritative` — same off-chain step (or a skip for already-softCancelled
  *     records), then an on-chain `cancelCommitmentOnchain` per non-terminal record.
@@ -22,14 +24,42 @@
  *     grows — subsequent records would deny the same way). The operator can top
  *     up POL and re-run.
  *
- * The command refuses if `config.mode.dryRun: true` — the same two-key principle
- * as `run --live`: the operator must have explicitly switched the config to the
- * live posture before invoking real writes (gasless or not). The keystore unlock
- * mirrors `run --live`: passphrase from `OSPEX_KEYSTORE_PASSPHRASE` (preferred for
- * non-interactive use) else a no-echo TTY prompt; `--address` is rejected (the
- * maker address is the signer's). State is loaded from `state.dir` — a missing
- * state file is treated as "nothing tracked" (exit 0); a corrupt state file
- * refuses (the operator should diagnose first rather than have us write blind).
+ * **Stale set covers every API-visible / latently matchable lifecycle**:
+ * `visibleOpen` (still on the book), `partiallyFilled` (the unfilled remainder is
+ * still on the book and matchable), and `softCancelled` (already pulled but the
+ * signed payload is still matchable until expiry — `--authoritative` is the only
+ * way to invalidate). Matches the shutdown / on-chain-kill posture in
+ * `src/runners/index.ts`. Filter: `postedAtUnixSec + orders.staleAfterSeconds <=
+ * now`. Already-terminal records (`filled` / `expired` /
+ * `authoritativelyInvalidated`) are excluded — there's nothing matchable left.
+ *
+ * Order of operations (`runCancelStale`): the cheap, no-passphrase checks run
+ * first so a doomed invocation doesn't pay the scrypt cost or prompt the
+ * operator:
+ *   1. `mode.dryRun: true` → refuse (two-key gate, matches `run --live`).
+ *   2. Missing `wallet.keystorePath` → refuse.
+ *   3. **State load + boot-time fail-safe** (DESIGN §12 — *same model the runner
+ *      uses*): if the state file is missing but prior telemetry exists, the
+ *      `softCancelled` set from a prior run is gone; refuse unless
+ *      `--ignore-missing-state`. A corrupt state file always refuses. This MUST
+ *      run before opening this command's own event log (else `eventLogsExist`
+ *      would see our just-created run-id file and miss the prior-telemetry
+ *      signal). Catches the failure where a deleted `maker-state.json` followed
+ *      by a cancel-stale run would have *erased* the state-loss signal — see
+ *      `assessStateLoss`.
+ *   4. **Dry-run synthetic-hash guard**: refuse if any loaded record has a
+ *      `dry:<runId>:<n>` hash, mirroring `Runner`'s live-mode ctor refusal.
+ *      Off-chain DELETE / on-chain cancel against a synthetic hash would
+ *      corrupt the local state + spam the relay.
+ *   5. *Only now*: unlock the signer (passphrase from `OSPEX_KEYSTORE_PASSPHRASE`
+ *      or a TTY prompt) and build the live adapter.
+ *   6. Open the event log, identify stale records, run the off-chain + on-chain
+ *      legs, flush state (conditionally — see below).
+ *
+ * **Flush policy**: if the state was `fresh` (no file on disk) AND no records
+ * were touched, the command does **not** flush — flushing an empty file would
+ * erase the state-loss signal for a subsequent `run --live` boot. Otherwise
+ * flush as usual (the lifecycle changes need to persist).
  *
  * Single-writer caveat: the JSON state file isn't multi-process safe (DESIGN §12).
  * **Stop a running `ospex-mm run --live` first** — running both concurrently
@@ -41,6 +71,11 @@
  * typed `CancelStaleReport` (counts of inspected / off-chain-cancelled /
  * on-chain-cancelled / gas-denied / errored records) so the CLI can render it
  * (`--json` envelope or human text), and so tests can assert on the outcome.
+ *
+ * **Exit code**: `0` on a clean cleanup; `1` if any per-record write errored
+ * (`errored > 0`) or a gas-budget verdict denied an on-chain cancel
+ * (`gasDenied > 0`). Operators wiring this into automation can rely on the exit
+ * code to detect an incomplete sweep without parsing the JSON envelope.
  */
 
 import type { Config } from '../config/index.js';
@@ -53,8 +88,8 @@ import {
 } from '../ospex/index.js';
 import { canSpendGas } from '../risk/index.js';
 import { polFloatToWei18, softCancelEventPayload, todayUTCDateString } from '../runners/index.js';
-import { StateStore, type MakerState } from '../state/index.js';
-import { EventLog, newRunId } from '../telemetry/index.js';
+import { assessStateLoss, StateStore, type MakerState } from '../state/index.js';
+import { EventLog, eventLogsExist, newRunId } from '../telemetry/index.js';
 
 // ── opts + deps ──────────────────────────────────────────────────────────────
 
@@ -62,6 +97,8 @@ export interface CancelStaleOpts {
   config: Config;
   /** `--authoritative` — also issue on-chain `cancelCommitment` per record (costs POL gas, gas-gated with `mayUseReserve: true`). Default `false` — off-chain DELETE only (gasless). */
   authoritative: boolean;
+  /** `--ignore-missing-state` — the operator attests no prior run left an open / soft-cancelled commitment that could still match on chain. Lifts the state-loss refusal (same semantics as the runner — DESIGN §12). */
+  ignoreMissingState: boolean;
 }
 
 /** Injectable seams so `runCancelStale` can be exercised without a TTY / live RPC / real scrypt / real filesystem outside the temp dirs. Same shape as `RunDeps`. */
@@ -78,6 +115,8 @@ export interface CancelStaleDeps {
   makeRunId?: () => string;
   /** Open the state store for `state.dir`. Default: `StateStore.at`. */
   makeStateStore?: (dir: string) => StateStore;
+  /** Does `telemetry.logDir` hold any prior `run-*.ndjson` files? Default: {@link eventLogsExist}. Captured **before** this command opens its own event log so the prior-telemetry signal is sound (DESIGN §12). */
+  hasPriorTelemetry?: (logDir: string) => boolean;
   /** Wall clock — unix seconds. Default: `Math.floor(Date.now() / 1000)`. */
   now?: () => number;
   /** Human-readable diagnostics. Default: a line to `process.stderr`. */
@@ -87,9 +126,10 @@ export interface CancelStaleDeps {
 /**
  * Thrown by `runCancelStale` when the command is refused before any work starts
  * — a missing two-key match, a missing precondition (no keystore path, no
- * passphrase), or a corrupt state file. Distinct from a plain `Error` (which is
- * "cancel-stale failed: …"); the CLI catches `CancelStaleRefused` and prints the
- * message verbatim, then exits `1`.
+ * passphrase), state-loss without `--ignore-missing-state`, a corrupt state
+ * file, or a dry-run synthetic hash in a live state. Distinct from a plain
+ * `Error` (which is "cancel-stale failed: …"); the CLI catches
+ * `CancelStaleRefused` and prints the message verbatim, then exits `1`.
  */
 export class CancelStaleRefused extends Error {
   constructor(message: string) {
@@ -125,10 +165,10 @@ export interface CancelStaleReport {
 /**
  * Run the cancel-stale command. Resolves with the {@link CancelStaleReport};
  * throws `CancelStaleRefused` for a preconditions failure (config not in live
- * posture, no keystore, no passphrase, corrupt state, `--address` not allowed
- * (none is taken)), or a plain `Error` for an operational failure (a bad
- * passphrase, the telemetry directory can't be created, the state can't be
- * flushed).
+ * posture, no keystore, no passphrase, corrupt state, state-loss without
+ * `--ignore-missing-state`, a dry-run synthetic hash in a live state), or a
+ * plain `Error` for an operational failure (a bad passphrase, the telemetry
+ * directory can't be created, the state can't be flushed).
  *
  * Never throws on a per-record cancel failure — counted in `errored` and the
  * loop continues (an `error` event lands in the log with `phase: 'cancel'` /
@@ -138,10 +178,12 @@ export async function runCancelStale(opts: CancelStaleOpts, deps: CancelStaleDep
   const log = deps.log ?? ((line: string): void => void process.stderr.write(`${line}\n`));
   const now = deps.now ?? ((): number => Math.floor(Date.now() / 1000));
 
-  // Two-key gate (the same principle as `run --live`'s DESIGN §8): a real
-  // cancel-stale invocation writes to chain (off-chain DELETE is signed too).
-  // Refuse unless the config has explicitly opted into the live posture — a
-  // stray invocation against a `dryRun: true` config shouldn't be enough.
+  // ── 1. Two-key gate (config posture) ─────────────────────────────────────
+  // The same principle as `run --live`'s DESIGN §8: a real cancel-stale
+  // invocation writes (off-chain DELETE is a signed action; `--authoritative`
+  // also writes on chain). Refuse unless the config has explicitly opted into
+  // the live posture — a stray invocation against a `dryRun: true` config
+  // shouldn't be enough.
   if (opts.config.mode.dryRun) {
     throw new CancelStaleRefused(
       'refusing to cancel-stale: config has mode.dryRun=true. cancel-stale always writes (off-chain DELETE is a signed action; --authoritative also writes on chain) — set mode.dryRun=false in your config to opt in to the live posture first.',
@@ -153,9 +195,51 @@ export async function runCancelStale(opts: CancelStaleOpts, deps: CancelStaleDep
     );
   }
 
-  // Unlock the signer (passphrase from env, else a TTY prompt) — same code
-  // path as `run --live` (duplicated rather than imported to avoid a cycle
-  // through `run.ts`; both call into the same `unlockKeystoreSigner`).
+  // ── 2. State load + boot-time fail-safe (DESIGN §12) ─────────────────────
+  // BEFORE opening this command's own event log: capture `hasPriorTelemetry`,
+  // load the state, run `assessStateLoss`. Refuse on:
+  //   - a corrupt state file (always — the operator should diagnose first);
+  //   - a missing state file PLUS prior telemetry (the prior `softCancelled`
+  //     set is gone — same posture as the runner; lifted only by
+  //     `--ignore-missing-state`).
+  // ALSO before the (expensive) signer unlock — a refused command shouldn't
+  // pay the scrypt cost or prompt the operator for a passphrase.
+  const stateStore = (deps.makeStateStore ?? ((dir: string): StateStore => StateStore.at(dir)))(opts.config.state.dir);
+  const hasPriorTelemetry = (deps.hasPriorTelemetry ?? eventLogsExist)(opts.config.telemetry.logDir);
+  const loadResult = stateStore.load();
+  if (loadResult.status.kind === 'lost') {
+    throw new CancelStaleRefused(
+      `cancel-stale refuses to run with a corrupt state file (${loadResult.status.reason}). Fix the state at ${stateStore.statePath} before invoking — operating without an accurate softCancelled set would be writing blind.`,
+    );
+  }
+  const assessment = assessStateLoss(loadResult.status, {
+    hasPriorTelemetry,
+    ignoreMissingStateOverride: opts.ignoreMissingState,
+    expirySeconds: opts.config.orders.expirySeconds,
+  });
+  if (assessment.holdQuoting) {
+    throw new CancelStaleRefused(
+      `cancel-stale refusing: ${assessment.reason} (writing an empty state here would erase the state-loss signal a subsequent run --live boot relies on). Pass --ignore-missing-state once you have confirmed no prior commitment is still matchable, or run \`ospex-mm run --live\` first to reconstruct the state from telemetry.`,
+    );
+  }
+  const state = loadResult.state;
+
+  // ── 3. Dry-run synthetic-hash guard ──────────────────────────────────────
+  // Mirrors the runner's live-mode ctor refusal (src/runners/index.ts:376-383):
+  // a `dry:<runId>:<n>` synthetic hash can never be a real on-chain commitment
+  // — off-chain DELETE / on-chain cancel against one corrupts local accounting
+  // and spams the relay with bad hashes. Point `state.dir` at a fresh directory,
+  // or clear the dry-run state first.
+  const synthetic = Object.values(state.commitments).find((r) => r.hash.startsWith('dry:'));
+  if (synthetic !== undefined) {
+    throw new CancelStaleRefused(
+      `cancel-stale refusing: the loaded state contains a dry-run synthetic commitment ("${synthetic.hash}") — a dry-run state directory was reused. Point \`state.dir\` at a fresh directory, or clear the dry-run state first.`,
+    );
+  }
+
+  // ── 4. Signer unlock (only now) ──────────────────────────────────────────
+  // Mirrors `run --live`'s passphrase resolution (env wins; else TTY prompt).
+  // A non-TTY / cancelled prompt → CancelStaleRefused with a clear hint.
   const env = deps.env ?? process.env;
   const promptPassphrase = deps.promptPassphrase ?? defaultPromptPassphrase;
   let passphrase: string;
@@ -176,37 +260,25 @@ export async function runCancelStale(opts: CancelStaleOpts, deps: CancelStaleDep
   const makerAddress = await signer.getAddress();
   log(`[cancel-stale] maker wallet: ${makerAddress}`);
 
-  // Load state. A `fresh` state (no file) means "nothing tracked, nothing to do"
-  // — exit successfully. A `lost` state (corrupt) refuses — operating on an
-  // unknown set of soft-cancelled records would be writing blind; the operator
-  // should diagnose first.
-  const stateStore = (deps.makeStateStore ?? ((dir: string): StateStore => StateStore.at(dir)))(opts.config.state.dir);
-  const loadResult = stateStore.load();
-  if (loadResult.status.kind === 'lost') {
-    throw new CancelStaleRefused(
-      `cancel-stale refuses to run with a corrupt state file (${loadResult.status.reason}). Fix the state at ${stateStore.statePath} before invoking — operating without an accurate softCancelled set would be writing blind.`,
-    );
-  }
-  const state = loadResult.state;
-
+  // ── 5. Open event log + identify stale records ───────────────────────────
+  // Stale set: every still-matchable lifecycle whose age has crossed
+  // `orders.staleAfterSeconds`. Includes `partiallyFilled` (the unfilled
+  // remainder is still on the API book + matchable; the reconciler treats
+  // these as live and the shutdown / on-chain-kill paths sweep them too — the
+  // operator-driven cancel-stale must close the same latent-exposure window).
+  // `softCancelled` is included because `--authoritative` is the only way to
+  // invalidate the still-matchable signed payload. Terminal lifecycles
+  // (`filled` / `expired` / `authoritativelyInvalidated`) are excluded —
+  // there's nothing matchable left to invalidate.
   const adapter = (deps.createLiveAdapter ?? createLiveOspexAdapter)(opts.config, signer);
   const runId = (deps.makeRunId ?? newRunId)();
   const eventLog = EventLog.open(opts.config.telemetry.logDir, runId);
 
-  // Identify stale records: tracked commitments whose age (wall-clock since
-  // posted) has crossed `orders.staleAfterSeconds`. Includes both `visibleOpen`
-  // (still in the API book) and `softCancelled` (already pulled off chain but
-  // still matchable until expiry) — the on-chain leg is what makes
-  // `--authoritative` distinct, so `softCancelled` records belong in the set
-  // for that leg too. `partiallyFilled` records are excluded — a partial fill
-  // means a taker has already matched some of the risk; pulling the remainder
-  // is a runner concern (the reconcile leaves them alone), not an
-  // operator-driven cleanup.
   const wallNow = now();
   const staleAfter = opts.config.orders.staleAfterSeconds;
   const stale = Object.values(state.commitments).filter(
     (r) =>
-      (r.lifecycle === 'visibleOpen' || r.lifecycle === 'softCancelled') &&
+      (r.lifecycle === 'visibleOpen' || r.lifecycle === 'softCancelled' || r.lifecycle === 'partiallyFilled') &&
       r.postedAtUnixSec + staleAfter <= wallNow,
   );
 
@@ -222,19 +294,25 @@ export async function runCancelStale(opts: CancelStaleOpts, deps: CancelStaleDep
   };
   if (stale.length === 0) {
     log(`[cancel-stale] nothing to do — no tracked commitments older than orders.staleAfterSeconds (${staleAfter}s).`);
-    stateStore.flush(state); // best-effort no-op flush; refreshes lastFlushedAt
+    // Conditional flush: only flush if the state was loaded (i.e. there was
+    // a prior `maker-state.json`). A `fresh` state means there's no file on
+    // disk — flushing an empty one would erase the state-loss signal a
+    // subsequent `run --live` boot relies on (DESIGN §12 / Hermes review-PR30).
+    if (loadResult.status.kind === 'loaded') stateStore.flush(state);
     return report;
   }
   log(`[cancel-stale] ${stale.length} stale commitment(s) — running off-chain cancels${opts.authoritative ? ' + on-chain authoritative cancels' : ''}.`);
 
-  // ── off-chain leg (always) ───────────────────────────────────────────────
+  // ── 6. Off-chain leg (always) ────────────────────────────────────────────
   // Already-softCancelled records skip the off-chain step (they're already
   // gone from the API book) but stay in the set for the on-chain leg. A
-  // failed off-chain DELETE for a `visibleOpen` record is logged but does NOT
-  // exclude that record from the on-chain leg — the off-chain failure could
-  // be a transient API blip; the on-chain cancel is the authoritative path
-  // (`MatchingModule.cancelCommitment` operates on chain regardless of book
-  // visibility), which is exactly the reason for `--authoritative`.
+  // failed off-chain DELETE for a `visibleOpen` / `partiallyFilled` record
+  // is logged but does NOT exclude that record from the on-chain leg — the
+  // off-chain failure could be a transient API blip; `cancelCommitmentOnchain`
+  // is the authoritative path (`MatchingModule.cancelCommitment` operates on
+  // chain regardless of book visibility), which is exactly the reason for
+  // `--authoritative`. `partiallyFilled` records move to `softCancelled`
+  // preserving `filledRiskWei6` (we only stamp `lifecycle` + `updatedAtUnixSec`).
   for (const r of stale) {
     if (r.lifecycle === 'softCancelled') {
       report.offchainSkippedAlready += 1;
@@ -253,7 +331,7 @@ export async function runCancelStale(opts: CancelStaleOpts, deps: CancelStaleDep
     eventLog.emit('soft-cancel', softCancelEventPayload(r, 'stale'));
   }
 
-  // ── on-chain leg (only with --authoritative) ────────────────────────────
+  // ── 7. On-chain leg (only with --authoritative) ──────────────────────────
   // Iterates every stale record (regardless of off-chain outcome). Gas-gated
   // with `mayUseReserve: true` — `--authoritative` is operator-explicit, like
   // the shutdown's on-chain kill path. Verdict denial emits `candidate`
@@ -270,7 +348,7 @@ export async function runCancelStale(opts: CancelStaleOpts, deps: CancelStaleDep
     for (const r of stale) {
       // Skip already-authoritatively-cancelled records (paranoia — only
       // possible via state edits while we run; the stale filter above only
-      // admits `visibleOpen` / `softCancelled`).
+      // admits `visibleOpen` / `softCancelled` / `partiallyFilled`).
       if (r.lifecycle === 'authoritativelyInvalidated') continue;
       const today = todayUTCDateString(wallNow);
       const todayGasSpentPolWei = BigInt(state.dailyCounters[today]?.gasPolWei ?? '0');
@@ -316,17 +394,21 @@ export async function runCancelStale(opts: CancelStaleOpts, deps: CancelStaleDep
     report.gasPolWei = totalGasPolWei.toString();
   }
 
-  // Persist the lifecycle changes (always — even a fully-erroring run may have
-  // landed some records, and `lastFlushedAt` always advances).
+  // Persist the lifecycle changes — we touched records.
   stateStore.flush(state);
   return report;
 }
 
 // ── renderers ────────────────────────────────────────────────────────────────
 
-/** A successful cancel-stale run always exits `0`; per-record failures are surfaced in the report (`errored`), not the exit code. Operational failures throw and the CLI maps those to `1`. */
-export function cancelStaleExitCode(_report: CancelStaleReport): number {
-  return 0;
+/**
+ * Exit code policy. `0` on a clean cleanup; `1` if any per-record write
+ * errored (`errored > 0`) or a gas-budget verdict denied an on-chain cancel
+ * (`gasDenied > 0`). Operators wiring this into automation can rely on the
+ * exit code to detect an incomplete sweep without parsing the JSON envelope.
+ */
+export function cancelStaleExitCode(report: CancelStaleReport): number {
+  return report.errored > 0 || report.gasDenied > 0 ? 1 : 0;
 }
 
 /** Write the JSON envelope `{ schemaVersion: 1, cancelStale: CancelStaleReport }` to `out`. */
@@ -409,4 +491,3 @@ function defaultPromptPassphrase(): Promise<string> {
     stdin.on('data', onData);
   });
 }
-

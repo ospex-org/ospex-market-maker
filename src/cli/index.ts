@@ -168,17 +168,19 @@ program
 
 program
   .command('cancel-stale')
-  .description('One-shot operator command: pull every tracked commitment whose age exceeds orders.staleAfterSeconds. Off-chain (gasless) DELETE by default; --authoritative also runs an on-chain cancelCommitment per record (costs POL gas, drawn from the emergency reserve via mayUseReserve:true). STOP `run --live` FIRST — the JSON state file is not multi-process safe (DESIGN §12). Requires mode.dryRun:false in the config (the two-key principle from `run --live`); reads the keystore passphrase from OSPEX_KEYSTORE_PASSPHRASE, else prompts on a TTY.')
+  .description('One-shot operator command: pull every tracked commitment whose age exceeds orders.staleAfterSeconds (visibleOpen + partiallyFilled + softCancelled — the unfilled remainder of a partial fill is still on the book and matchable, so it gets swept too). Off-chain (gasless) DELETE by default; --authoritative also runs an on-chain cancelCommitment per record (costs POL gas, drawn from the emergency reserve via mayUseReserve:true). STOP `run --live` FIRST — the JSON state file is not multi-process safe (DESIGN §12). Requires mode.dryRun:false in the config (the two-key principle from `run --live`); reads the keystore passphrase from OSPEX_KEYSTORE_PASSPHRASE, else prompts on a TTY. Exits non-zero if any record failed to cancel (errored > 0) or a gas-budget denial blocked the on-chain leg.')
   .option('-c, --config <path>', 'path to the config YAML', DEFAULT_CONFIG_PATH)
   .option('--authoritative', 'also call cancelCommitment on chain per record — gas-gated with mayUseReserve:true (operator-explicit, like the shutdown kill path). Without this, only the gasless off-chain DELETE runs and the signed payload stays matchable on chain until natural expiry.')
   .option('-k, --keystore <path>', 'path to a v3 keystore — overrides config wallet.keystorePath / OSPEX_KEYSTORE_PATH')
+  .option('--ignore-missing-state', 'proceed even if the persisted state is missing while prior telemetry exists — attests no prior run left a still-matchable commitment (same semantics as `run --live`, DESIGN §12)')
   .option('--json', 'emit a JSON envelope { schemaVersion: 1, cancelStale: … } on stdout')
-  .action(async (opts: { config: string; authoritative?: boolean; keystore?: string; json?: boolean }) => {
+  .action(async (opts: { config: string; authoritative?: boolean; keystore?: string; ignoreMissingState?: boolean; json?: boolean }) => {
     let config = loadConfigOrExit(opts.config);
     if (opts.keystore !== undefined) config = { ...config, wallet: { ...config.wallet, keystorePath: opts.keystore } };
     const report = await runCancelStale({
       config,
       authoritative: opts.authoritative === true,
+      ignoreMissingState: opts.ignoreMissingState === true,
     }).catch((e: unknown): never => {
       if (e instanceof CancelStaleRefused) return fail(e.message);
       return fail(`cancel-stale failed: ${(e as Error).message}`);

@@ -71,7 +71,8 @@
  * Still TODO follow-ups: P&L (realized over settled / claimed; unrealized over
  * active marked to fair), gas budgeting in POL, and auto-settle / auto-claim.
  * The `getPositionStatus(maker)` poll is wired (it backfills missing positions
- * from soft-cancelled-then-matched commitments); status transitions
+ * from soft-cancelled-then-matched commitments and fails closed when it can't
+ * read while any non-terminal `softCancelled` records exist); status transitions
  * (`active` → `pendingSettle` → `claimable` → `claimed`) and the P&L computation
  * are the next slice.
  *
@@ -455,11 +456,20 @@ export class Runner {
    * prune → flush. Fill detection runs *before* the reconcile so a fill within this
    * tick dirties the market and the same reconcile re-prices the now-imbalanced book.
    *
-   * **Fail-closed on lost fill visibility (live mode).** If `detectFills` can't read
-   * the maker's open commitments (`listOpenCommitments` threw), the tick skips the
-   * position poll, the reconcile (no submit / replace / soft-cancel based on
-   * unverified fill state), AND `ageOut` (don't terminalize a record that might
-   * have filled just before expiry). The markets stay `dirty`; next tick retries.
+   * **Fail-closed on lost fill visibility (live mode).** Two gates, same outcome
+   * (skip reconcile + ageOut, markets stay dirty, next tick retries):
+   *   1. `detectFills` can't read the maker's open commitments
+   *      (`listOpenCommitments` threw) → also skips the position poll.
+   *   2. `pollPositionStatus` can't read the maker's positions
+   *      (`getPositionStatus` threw) AND any non-terminal `softCancelled`
+   *      commitment exists in local state. Soft-cancelled commitments are
+   *      API-hidden from `listOpenCommitments`, so a stale-signed-payload
+   *      match on one is detectable ONLY through the position poll —
+   *      proceeding without that read could submit replacements on
+   *      already-matched exposure and let `ageOut` terminalize a record that
+   *      a taker just filled. With no softCancelled records, the maker's
+   *      own posted-commitment fills are fully covered by `detectFills`, so
+   *      a position-poll failure is non-fatal.
    * `pruneTerminalCommitments` still runs (it only touches already-terminal
    * records, which are safe).
    */
@@ -475,9 +485,14 @@ export class Runner {
       let liveStateReadOk = true;
       if (!this.config.mode.dryRun) liveStateReadOk = await this.detectFills();
       if (liveStateReadOk) {
-        if (!this.config.mode.dryRun) await this.pollPositionStatus(); // best-effort: failure is logged but doesn't block reconcile (detectFills already covered the maker's own commitments)
-        await this.reconcileMarkets();
-        this.ageOut();
+        let positionPollOk = true;
+        if (!this.config.mode.dryRun) positionPollOk = await this.pollPositionStatus();
+        const hasSoftCancelled = !this.config.mode.dryRun && Object.values(this.state.commitments).some((r) => r.lifecycle === 'softCancelled');
+        if (positionPollOk || !hasSoftCancelled) {
+          await this.reconcileMarkets();
+          this.ageOut();
+        }
+        // else: live mode + getPositionStatus failed AND softCancelled records exist — skip reconcile + ageOut (fail-closed; markets stay dirty for next-tick retry).
       }
       // else: live mode + listOpenCommitments failed — skip all state-mutating live steps this tick (fail-closed; the markets stay dirty for next-tick retry).
       this.pruneTerminalCommitments();
@@ -1284,7 +1299,10 @@ export class Runner {
    * Soft-cancelled records are NOT tracked here (they're API-hidden from
    * `listOpenCommitments`, so a per-hash poll would be O(softCancelled count)
    * forever). A taker matching a soft-cancelled commitment via the stale signed
-   * payload is caught by `pollPositionStatus` (one aggregate call) below.
+   * payload is caught by `pollPositionStatus` (one aggregate call) below — and
+   * `tick()` fails closed when that poll throws while any non-terminal
+   * `softCancelled` records exist, so a lost-poll tick can't terminalize a
+   * record that just filled.
    */
   private async detectFills(): Promise<boolean> {
     if (this.makerAddress === null) return true; // dry-run path — defensive (the caller skips); treat as ok so the rest of the tick proceeds
@@ -1459,20 +1477,25 @@ export class Runner {
    *
    * Status transitions (`active` → `pendingSettle` → `claimable` → `claimed`) and
    * P&L computation are deferred to the next slice; this method only ever creates
-   * or extends positions to backfill missing fills, never updates statuses. A
-   * `getPositionStatus` throw is logged + the tick continues — fill detection for
-   * the maker's own posted commitments already covered the common case, and the
-   * runner stays open to a next-tick retry. (Hermes review-PR23 §4.)
+   * or extends positions to backfill missing fills, never updates statuses.
+   *
+   * Returns `false` on a `getPositionStatus` throw (logged as `error`
+   * `phase: 'position-poll'`). The caller in `tick()` fails closed
+   * (skips reconcile + ageOut) only when local state holds any non-terminal
+   * `softCancelled` commitment — those are the records whose stale-signed-payload
+   * fills are visible ONLY through this poll. When no softCancelled records
+   * exist, `detectFills` has already covered the maker's posted commitments
+   * and the tick proceeds. (Hermes review-PR23 §4 + round-2.)
    */
-  private async pollPositionStatus(): Promise<void> {
-    if (this.makerAddress === null) return; // dry-run path — defensive (the caller skips)
+  private async pollPositionStatus(): Promise<boolean> {
+    if (this.makerAddress === null) return true; // dry-run path — defensive (the caller skips); treat as ok
     const now = this.deps.now();
     let status: PositionStatus;
     try {
       status = await this.adapter.getPositionStatus(this.makerAddress);
     } catch (err) {
       this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'position-poll' });
-      return; // best-effort; detectFills already handled the maker's own posted commitments
+      return false; // caller fails closed iff any non-terminal softCancelled commitments exist
     }
     const apiPositions = [...status.active, ...status.pendingSettle, ...status.claimable];
     for (const p of apiPositions) {
@@ -1541,6 +1564,7 @@ export class Runner {
         cumulativeRiskWei6: (localRiskWei6 + delta).toString(),
       });
     }
+    return true;
   }
 
   /** Ticks until the next discovery cycle: `discovery.everyNTicks` jittered by ±`discovery.jitterPct` (so multiple MMs don't all discover on the same tick). At least 1. */

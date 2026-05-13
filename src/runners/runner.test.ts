@@ -6,15 +6,20 @@ import { join } from 'node:path';
 import { parseConfig, type Config } from '../config/index.js';
 import { inverseOddsTick } from '../pricing/index.js';
 import {
+  createLiveOspexAdapter,
   createOspexAdapter,
   type Commitment,
   type ContestView,
+  type Hex,
   type MoneylineOdds,
   type OddsSnapshotView,
   type OddsSubscribeHandlersView,
   type OddsUpdateView,
   type OspexAdapter,
+  type Signer,
   type SpeculationView,
+  type SubmitCommitmentArgs,
+  type SubmitCommitmentResult,
   type SubscribeOddsArgs,
   type Subscription,
 } from '../ospex/index.js';
@@ -220,6 +225,58 @@ function spiedAdapter(
   vi.spyOn(adapter, 'getOddsSnapshot').mockImplementation(odds?.snapshot ?? ((contestId) => Promise.resolve(oddsSnapshotView(contestId))));
   vi.spyOn(adapter, 'subscribeOdds').mockImplementation(odds?.subscribe ?? (() => Promise.resolve(noopSubscription())));
   vi.spyOn(adapter, 'getSpeculation').mockImplementation(odds?.getSpeculation ?? ((speculationId) => Promise.resolve(speculationView(speculationId))));
+  return adapter;
+}
+
+/** A minimal `Signer` — deterministic address, dummy signatures (the live adapter never inspects them in these tests; the write methods are spied). */
+function fakeSigner(): Signer {
+  return {
+    getAddress: () => Promise.resolve('0x9999999999999999999999999999999999999999' as Hex),
+    signTypedData: () => Promise.resolve('0xsig' as Hex),
+    signTransaction: () => Promise.resolve('0xtx' as Hex),
+  };
+}
+
+/** A successful `submitCommitment` stub that hands back `0xlive<n>` hashes in call order. */
+function submitRecorder(): { fn: (args: SubmitCommitmentArgs) => Promise<SubmitCommitmentResult>; calls: SubmitCommitmentArgs[] } {
+  const calls: SubmitCommitmentArgs[] = [];
+  return {
+    calls,
+    fn: (args) => {
+      calls.push(args);
+      return Promise.resolve({ hash: `0xlive${calls.length}` as Hex, commitment: {} as unknown as Commitment });
+    },
+  };
+}
+
+/**
+ * A *signed* adapter (`createLiveOspexAdapter`, so `isLive()` is true) with the same
+ * reads spied as {@link spiedAdapter}, plus the live writes: `submitCommitment`
+ * defaults to rejecting (a test that triggers a submit must stub it via `writes`),
+ * `cancelCommitmentOffchain` defaults to a no-op success.
+ */
+function liveSpiedAdapter(
+  config: Config,
+  listContests: () => Promise<ContestView[]>,
+  writes?: {
+    submitCommitment?: (args: SubmitCommitmentArgs) => Promise<SubmitCommitmentResult>;
+    cancelCommitmentOffchain?: (hash: Hex) => Promise<void>;
+  },
+  getContest?: (id: string) => Promise<ContestView>,
+  odds?: {
+    snapshot?: (contestId: string) => Promise<OddsSnapshotView>;
+    subscribe?: (args: SubscribeOddsArgs, handlers: OddsSubscribeHandlersView) => Promise<Subscription>;
+    getSpeculation?: (speculationId: string) => Promise<SpeculationView>;
+  },
+): OspexAdapter {
+  const adapter = createLiveOspexAdapter(config, fakeSigner());
+  vi.spyOn(adapter, 'listContests').mockImplementation(listContests);
+  vi.spyOn(adapter, 'getContest').mockImplementation(getContest ?? ((id) => Promise.resolve(contestView({ contestId: id, referenceGameId: `GAME-${id}` }))));
+  vi.spyOn(adapter, 'getOddsSnapshot').mockImplementation(odds?.snapshot ?? ((contestId) => Promise.resolve(oddsSnapshotView(contestId))));
+  vi.spyOn(adapter, 'subscribeOdds').mockImplementation(odds?.subscribe ?? (() => Promise.resolve(noopSubscription())));
+  vi.spyOn(adapter, 'getSpeculation').mockImplementation(odds?.getSpeculation ?? ((speculationId) => Promise.resolve(speculationView(speculationId))));
+  vi.spyOn(adapter, 'submitCommitment').mockImplementation(writes?.submitCommitment ?? (() => Promise.reject(new Error('liveSpiedAdapter: submitCommitment not stubbed — pass `writes.submitCommitment`'))));
+  vi.spyOn(adapter, 'cancelCommitmentOffchain').mockImplementation(writes?.cancelCommitmentOffchain ?? (() => Promise.resolve()));
   return adapter;
 }
 
@@ -1097,5 +1154,166 @@ describe('Runner — per-market reconcile', () => {
     const records = Object.values(StateStore.at(stateDir).load().state.commitments);
     expect(records).toHaveLength(2);
     expect(records.every((r) => r.lifecycle === 'softCancelled')).toBe(true);
+  });
+});
+
+// ── live execution — the per-market reconcile's write path (Phase 3) ─────────
+//
+// `config.mode.dryRun: false` + a signed adapter (`createLiveOspexAdapter`). Same
+// reconcile machinery as dry-run — only the leaves differ: submits go through
+// `submitCommitment` (and the recorded hash is the real one), pulls go through
+// `cancelCommitmentOffchain`, and the event kinds are `submit` / `replace` /
+// `soft-cancel` rather than the `would-` counterparts. The `run --live` *on-switch*
+// (CLI / config) lands in a later slice — until then live mode is reachable only
+// here, with a fake adapter; a live-mode config with a read-only adapter is rejected.
+
+describe('Runner — live execution', () => {
+  it('a live-mode config with a read-only adapter is rejected at construction', () => {
+    StateStore.at(stateDir).flush(emptyMakerState());
+    expect(() => makeRunner({ config: cfg({ mode: { dryRun: false } }) })).toThrow(/live mode .* requires a signed adapter/);
+  });
+
+  it('posts both sides via submitCommitment, records the real hashes, emits `submit` (not `would-submit`) — the protocol tuple flows through `toProtocolQuote`', async () => {
+    StateStore.at(stateDir).flush(emptyMakerState());
+    const config = cfg({ mode: { dryRun: false } });
+    const submit = submitRecorder();
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([contestView({ contestId: '1234' })]), { submitCommitment: submit.fn });
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    const events = readEvents();
+    expect(events.some((e) => e.kind === 'would-submit')).toBe(false);
+    const submitEvents = events.filter((e) => e.kind === 'submit');
+    expect(submitEvents.map((e) => e.takerSide).sort()).toEqual(['away', 'home']);
+    expect(submitEvents.map((e) => e.commitmentHash).sort()).toEqual(['0xlive1', '0xlive2']);
+
+    expect(submit.calls).toHaveLength(2);
+    for (const a of submit.calls) {
+      expect(a).toMatchObject({ contestId: 1234n, scorer: adapter.addresses().scorers.moneyline, lineTicks: 0, expiry: BigInt(T0 + 120) });
+      expect(typeof a.riskAmount).toBe('bigint');
+      expect([0, 1]).toContain(a.positionType);
+      expect(a.oddsTick).toBeGreaterThanOrEqual(101);
+      expect(a.oddsTick).toBeLessThanOrEqual(10100);
+    }
+    // The conversion happened at the boundary, end to end: each submit event's makerSide is the opposite of its takerSide,
+    // makerOddsTick is inverseOddsTick(takerOddsTick), positionType matches makerSide — and the submitCommitment call for that
+    // positionType used that same oddsTick.
+    for (const e of submitEvents) {
+      expect(e.makerSide).toBe(e.takerSide === 'away' ? 'home' : 'away');
+      expect(e.makerOddsTick).toBe(inverseOddsTick(e.takerOddsTick as number));
+      expect(e.positionType).toBe(e.makerSide === 'away' ? 0 : 1);
+      const call = submit.calls.find((a) => a.positionType === e.positionType);
+      expect(call?.oddsTick).toBe(e.makerOddsTick);
+      expect(call?.riskAmount).toBe(BigInt(e.riskAmountWei6 as string));
+    }
+
+    const records = Object.values(StateStore.at(stateDir).load().state.commitments);
+    expect(records).toHaveLength(2);
+    expect(records.map((r) => r.hash).sort()).toEqual(['0xlive1', '0xlive2']);
+    expect(records.every((r) => r.lifecycle === 'visibleOpen' && r.expiryUnixSec === T0 + 120)).toBe(true);
+    expect(records.map((r) => r.makerSide).sort()).toEqual(['away', 'home']);
+  });
+
+  it('match-time expiry: submitCommitment is called with expiry = the contest match time', async () => {
+    StateStore.at(stateDir).flush(emptyMakerState());
+    const config = cfg({ mode: { dryRun: false }, orders: { expiryMode: 'match-time', expirySeconds: 120 } });
+    const matchTimeSec = Math.floor(Date.parse(FUTURE_ISO) / 1000);
+    const submit = submitRecorder();
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([contestView({ contestId: '1234' })]), { submitCommitment: submit.fn });
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    expect(submit.calls).toHaveLength(2);
+    for (const a of submit.calls) expect(a.expiry).toBe(BigInt(matchTimeSec));
+  });
+
+  it('a submitCommitment failure is logged (error, phase submit) and the tick continues — no record, no submit event', async () => {
+    StateStore.at(stateDir).flush(emptyMakerState());
+    const config = cfg({ mode: { dryRun: false } });
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([contestView({ contestId: '1234' })]), { submitCommitment: () => Promise.reject(new Error('relay 503')) });
+    await makeRunner({ config, adapter, maxTicks: 1 }).run(); // must not throw
+
+    const events = readEvents();
+    const submitErrors = events.filter((e) => e.kind === 'error' && e.phase === 'submit');
+    expect(submitErrors).toHaveLength(2); // both sides attempted, both failed
+    expect(submitErrors[0]).toMatchObject({ contestId: '1234', detail: 'relay 503' });
+    expect(submitErrors.map((e) => e.takerSide).sort()).toEqual(['away', 'home']);
+    expect(events.some((e) => e.kind === 'submit')).toBe(false);
+    expect(Object.keys(StateStore.at(stateDir).load().state.commitments)).toHaveLength(0);
+  });
+
+  it('a stale incumbent is replaced — off-chain cancel then submit, a `replace` event, the old record softCancelled', async () => {
+    const stale = commitmentRecord({ hash: '0xstaleAway', speculationId: 'spec-1234', contestId: '1234', makerSide: 'away', lifecycle: 'visibleOpen', oddsTick: 250, riskAmountWei6: '250000', expiryUnixSec: T0 + 50, postedAtUnixSec: T0 - 200, updatedAtUnixSec: T0 - 200 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xstaleAway': stale } });
+    const config = cfg({ mode: { dryRun: false } }); // default staleAfterSeconds 90 → posted 200s ago is stale
+    const submit = submitRecorder();
+    const cancels: string[] = [];
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([contestView({ contestId: '1234' })]), {
+      submitCommitment: submit.fn,
+      cancelCommitmentOffchain: (h) => { cancels.push(h); return Promise.resolve(); },
+    });
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    const events = readEvents();
+    expect(cancels).toContain('0xstaleAway'); // the incumbent was pulled off the API book
+    expect(events.find((e) => e.kind === 'replace')).toMatchObject({ replacedCommitmentHash: '0xstaleAway', takerSide: 'home', makerSide: 'away', reason: 'stale', speculationId: 'spec-1234' });
+    expect(events.find((e) => e.kind === 'submit')).toMatchObject({ takerSide: 'away', makerSide: 'home', speculationId: 'spec-1234' });
+    expect(events.some((e) => e.kind === 'would-replace' || e.kind === 'would-submit')).toBe(false);
+
+    const reloaded = StateStore.at(stateDir).load().state.commitments;
+    expect(reloaded['0xstaleAway']?.lifecycle).toBe('softCancelled');
+    expect(submit.calls).toHaveLength(2); // the away offer's fresh submit + the home offer's replacement
+    expect(Object.values(reloaded).filter((r) => r.lifecycle === 'visibleOpen').map((r) => r.makerSide).sort()).toEqual(['away', 'home']);
+  });
+
+  it('an unquoteable-gate pull does a real off-chain cancel — a `soft-cancel` event, the record softCancelled', async () => {
+    const SOON_ISO = new Date((T0 + 60) * 1000).toISOString(); // 60s ahead — past discovery's "started" gate, inside the reconcile's start-too-soon gate (60 <= 120)
+    const visible = commitmentRecord({ hash: '0xvisible', speculationId: 'spec-1234', contestId: '1234', makerSide: 'away', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 100, postedAtUnixSec: T0 - 5, updatedAtUnixSec: T0 - 5 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xvisible': visible } });
+    const config = cfg({ mode: { dryRun: false } });
+    const cancels: string[] = [];
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([contestView({ contestId: '1234', matchTime: SOON_ISO })]), {
+      cancelCommitmentOffchain: (h) => { cancels.push(h); return Promise.resolve(); },
+    });
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    const events = readEvents();
+    expect(events.find((e) => e.kind === 'candidate' && e.skipReason === 'start-too-soon')).toMatchObject({ contestId: '1234' });
+    expect(cancels).toEqual(['0xvisible']);
+    expect(events.find((e) => e.kind === 'soft-cancel')).toMatchObject({ commitmentHash: '0xvisible', reason: 'side-not-quoted' });
+    expect(events.some((e) => e.kind === 'would-soft-cancel' || e.kind === 'submit')).toBe(false);
+    expect(StateStore.at(stateDir).load().state.commitments['0xvisible']?.lifecycle).toBe('softCancelled');
+  });
+
+  it('a side the reconcile decides not to quote has its standing commitment pulled via a real off-chain cancel (`soft-cancel` side-not-quoted)', async () => {
+    const onA = commitmentRecord({ hash: '0xaWay', speculationId: 'spec-1234', contestId: '1234', makerSide: 'away', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 100, postedAtUnixSec: T0 - 5, updatedAtUnixSec: T0 - 5 });
+    const onOther = commitmentRecord({ hash: '0xother', speculationId: 'spec-other', contestId: 'B', sport: 'nba', awayTeam: 'BOS', homeTeam: 'NYY', makerSide: 'away', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 100, postedAtUnixSec: T0 - 5, updatedAtUnixSec: T0 - 5 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xaWay': onA, '0xother': onOther } });
+    const config = cfg({ mode: { dryRun: false }, risk: { maxOpenCommitments: 2 } }); // count is already 2 → market 1234 is refused (count cap)
+    const cancels: string[] = [];
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([contestView({ contestId: '1234' })]), {
+      cancelCommitmentOffchain: (h) => { cancels.push(h); return Promise.resolve(); },
+    });
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    const events = readEvents();
+    expect(events.find((e) => e.kind === 'quote-intent')).toMatchObject({ contestId: '1234', canQuote: false });
+    expect(cancels).toEqual(['0xaWay']);
+    expect(events.find((e) => e.kind === 'soft-cancel')).toMatchObject({ commitmentHash: '0xaWay', reason: 'side-not-quoted' });
+    expect(events.some((e) => e.kind === 'submit' || e.kind === 'replace')).toBe(false);
+    expect(StateStore.at(stateDir).load().state.commitments['0xaWay']?.lifecycle).toBe('softCancelled');
+  });
+
+  it('an off-chain-cancel failure is logged (error, phase cancel) and the record stays visibleOpen for retry', async () => {
+    const SOON_ISO = new Date((T0 + 60) * 1000).toISOString();
+    const visible = commitmentRecord({ hash: '0xvisible', speculationId: 'spec-1234', contestId: '1234', makerSide: 'away', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 100, postedAtUnixSec: T0 - 5, updatedAtUnixSec: T0 - 5 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xvisible': visible } });
+    const config = cfg({ mode: { dryRun: false } });
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([contestView({ contestId: '1234', matchTime: SOON_ISO })]), {
+      cancelCommitmentOffchain: () => Promise.reject(new Error('relay 500')),
+    });
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    const events = readEvents();
+    expect(events.find((e) => e.kind === 'error' && e.phase === 'cancel')).toMatchObject({ contestId: '1234', commitmentHash: '0xvisible', detail: 'relay 500' });
+    expect(events.some((e) => e.kind === 'soft-cancel' || e.kind === 'would-soft-cancel')).toBe(false);
+    expect(StateStore.at(stateDir).load().state.commitments['0xvisible']?.lifecycle).toBe('visibleOpen'); // still up — next pass retries the pull
   });
 });

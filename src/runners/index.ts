@@ -32,26 +32,38 @@
  *     otherwise build the desired two-sided quote (`buildDesiredQuote` over the
  *     hypothetical inventory `inventoryFromState` derives from the persisted state),
  *     `reconcileBook` it against the maker's current book on that speculation, and
- *     apply the plan: in dry-run (the only mode in Phase 2) log it (`quote-intent`
- *     + `would-submit` / `would-replace` / `would-soft-cancel` + a `cap-hit`
- *     candidate per deferred side) and mutate the *hypothetical* inventory (add
- *     synthetic `visibleOpen` records for submits / replacements; reclassify
- *     pulled / replaced records to `softCancelled` — they stay matchable on chain,
- *     so the risk engine keeps counting them); live execution is Phase 3. Then it
- *     measures **quote competitiveness** (DESIGN §8): for each would-be quote, where
- *     it'd sit relative to the visible orderbook on its side (the `getSpeculation`
- *     above already fetched it — no extra read) and to the reference odds — a
+ *     apply the plan — the reconcile is **mode-aware**: in live mode the submits go
+ *     through `commitments.submitRaw` (the SDK signs + POSTs the 9-field EIP-712
+ *     commitment) and the pulls (off a replaced incumbent, an unwanted side, or an
+ *     unquoteable market) through `commitments.cancel` (the gasless off-chain
+ *     cancel); in dry-run nothing leaves the process — a synthetic `dry:` hash is
+ *     minted instead of a real one and the cancel is a no-op. Either way the same
+ *     state mutations and the same event stream are produced — only the kind names
+ *     differ (`submit` / `replace` / `soft-cancel` in live, the `would-` prefixed
+ *     counterparts in dry-run) and the recorded `commitmentHash` is the real one in
+ *     live. A live submit / cancel that throws is logged (`error`, `phase: 'submit'`
+ *     / `'cancel'`) and the tick continues — never crashes; a failed pull leaves the
+ *     quote `visibleOpen` for the next pass to retry. A `cap-hit` candidate is
+ *     emitted per deferred side in both modes. Then it measures **quote
+ *     competitiveness** (DESIGN §8): for each would-be quote, where it'd sit
+ *     relative to the visible orderbook on its side (the `getSpeculation` above
+ *     already fetched it — no extra read) and to the reference odds — a
  *     `quote-competitiveness` event per side, or one `competitiveness-unavailable`
- *     if that orderbook somehow isn't populated;
+ *     if that orderbook somehow isn't populated (in live mode the orderbook still
+ *     includes the MM's own commitments — excluding `c.maker === <maker address>`
+ *     rides along with the fill-detection slice that plumbs the maker address);
  *   - age-out of expired tracked commitments;
  *   - a prune of old terminal (`expired` / `filled` / `authoritativelyInvalidated`)
  *     commitment records, so a long shadow run's state file stays bounded;
  *   - the per-tick state flush;
  *   - an interruptible sleep clamped to the `pollIntervalMs` floor.
  *
- * Still TODO follow-ups: fill-detection (Phase 3 — in dry-run nothing real is
- * posted, so there are no fills to detect; it's the live path's read side, wired
- * with the SDK write calls in Phase 3).
+ * Still TODO follow-ups: fill-detection (the live path's read side — diff the
+ * maker's open commitments tick-over-tick, reclassify the disappeared ones), gas
+ * budgeting in POL, and auto-settle / auto-claim. Note: the `run --live` *on-switch*
+ * lives upstream in `cli/run.ts` — until that lands, the only way a `Runner` runs in
+ * live mode (`config.mode.dryRun === false`) is a test passing a signed adapter; a
+ * live-mode `Runner` with a read-only adapter is rejected at construction.
  *
  * No `@ospex/sdk` import — all chain/API access goes through the `OspexAdapter`. The
  * clock, sleep, kill-switch probe, OS-signal registration, and randomness are
@@ -68,13 +80,14 @@ import { buildDesiredQuote, inventoryFromState, reconcileBook, type BookReconcil
 import type {
   Commitment,
   ContestView,
+  Hex,
   OddsSnapshotView,
   OddsSubscribeHandlersView,
   OspexAdapter,
   SpeculationView,
   Subscription,
 } from '../ospex/index.js';
-import { decimalToTick, inverseOddsTick, isTickInRange, oppositeSide, positionTypeForSide, toProtocolQuote, type QuoteSide } from '../pricing/index.js';
+import { decimalToTick, inverseOddsTick, isTickInRange, oppositeSide, positionTypeForSide, toProtocolQuote, type ProtocolQuote, type QuoteSide } from '../pricing/index.js';
 import type { Market } from '../risk/index.js';
 import { assessStateLoss, type MakerCommitmentRecord, type MakerSide, type MakerState, type StateLossAssessment, type StateStore } from '../state/index.js';
 import { EventLog, eventLogsExist } from '../telemetry/index.js';
@@ -246,8 +259,8 @@ export class Runner {
   private readonly eventLog: EventLog;
   private readonly maxTicks: number | undefined;
   private readonly deps: RunnerDeps;
-  /** The chain's moneyline scorer module address — every commitment the MM (would) post points at it (v0 quotes moneyline only). Cached at boot from `adapter.addresses()`. */
-  private readonly moneylineScorer: string;
+  /** The chain's moneyline scorer module address — every commitment the MM posts (live) / would post (dry-run) points at it (v0 quotes moneyline only). Cached at boot from `adapter.addresses()`. */
+  private readonly moneylineScorer: Hex;
   /** Monotonic suffix for the synthetic commitment hashes the dry-run reconcile mints (`dry:<runId>:<n>`) — unique within a run; a run's id makes them unique across runs, so a restart's loaded state can't collide. */
   private syntheticCommitmentSeq = 0;
 
@@ -274,6 +287,13 @@ export class Runner {
   constructor(opts: RunnerOptions) {
     this.config = opts.config;
     this.adapter = opts.adapter;
+    // Live mode needs a signed adapter — refuse a config/adapter mismatch up front
+    // (the SDK would otherwise only throw on the first write, deep inside a tick).
+    if (!this.config.mode.dryRun && !this.adapter.isLive()) {
+      throw new Error(
+        'Runner: live mode (config.mode.dryRun=false) requires a signed adapter — build it with createLiveOspexAdapter(config, signer), not createOspexAdapter(config)',
+      );
+    }
     this.moneylineScorer = this.adapter.addresses().scorers.moneyline;
     this.stateStore = opts.stateStore;
     this.maxTicks = opts.maxTicks;
@@ -805,26 +825,26 @@ export class Runner {
   private async reconcileMarket(m: TrackedMarket, now: number): Promise<'applied' | 'transient-failure'> {
     // Gate: the game starts within one expiry window — stop quoting it (a fresh quote would still be matchable at game time / outlive the pre-game window), and pull whatever's still up.
     if (m.matchTimeSec - now <= this.config.orders.expirySeconds) {
-      this.pullVisibleQuotes(m, now);
+      await this.pullVisibleQuotes(m, now);
       this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'start-too-soon' });
       return 'applied';
     }
     // Gate: the reference odds have gone stale (the upstream feed stopped advancing). A never-seen-odds market (`lastOddsAt === null`) falls through to the `no-reference-odds` gate below — `lastOddsAt === null` iff `lastMoneylineOdds === null` (`recordOdds` sets both or neither).
     if (m.lastOddsAt !== null && now - m.lastOddsAt > this.config.orders.staleReferenceAfterSeconds) {
-      this.pullVisibleQuotes(m, now);
+      await this.pullVisibleQuotes(m, now);
       this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'stale-reference' });
       return 'applied';
     }
     // Gate: no usable reference moneyline odds (both sides must be priced — `buildDesiredQuote` itself refuses out-of-range *values*, but it can't be handed a `null`).
     const ml = m.lastMoneylineOdds;
     if (ml === null || ml.awayOddsAmerican === null || ml.homeOddsAmerican === null) {
-      this.pullVisibleQuotes(m, now);
+      await this.pullVisibleQuotes(m, now);
       this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'no-reference-odds' });
       return 'applied';
     }
     // Gate: the Realtime odds channel is down (subscription mode) — the reference is no longer being kept fresh, so treat it as unsafe and pull. (`syncOddsSubscriptions` re-subscribes on the next discovery cycle; the existing `degraded` event already carries the precise cause.)
     if (this.config.odds.subscribe && m.subscription === null) {
-      this.pullVisibleQuotes(m, now);
+      await this.pullVisibleQuotes(m, now);
       this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'stale-reference' });
       return 'applied';
     }
@@ -837,7 +857,7 @@ export class Runner {
       return 'transient-failure'; // no decision applied — retry next tick rather than wait out the staleAfterSeconds throttle
     }
     if (!spec.open) {
-      this.pullVisibleQuotes(m, now);
+      await this.pullVisibleQuotes(m, now);
       this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'no-open-speculation' });
       return 'applied';
     }
@@ -858,46 +878,99 @@ export class Runner {
     });
     const recordsOnSpec = Object.values(this.state.commitments).filter((r) => r.speculationId === m.speculationId);
     const plan = reconcileBook(recordsOnSpec, desired, this.config, now, inventory.openCommitmentCount);
-    this.applyReconcilePlan(m, plan, now);
+    await this.applyReconcilePlan(m, plan, now);
     this.assessCompetitiveness(m, spec, desired);
     return 'applied';
   }
 
-  /** Pull (off-chain) every API-visible commitment of the maker's on `m.speculationId` — reclassify it `softCancelled`, emit `would-soft-cancel` (reason `side-not-quoted`: when a market is unquoteable, neither side is being quoted). Used by the unquoteable-market gates above — the visible book must never carry a quote the MM is no longer pricing (DESIGN §2.2 / §3). The pulled quote's signed payload stays matchable on chain until expiry, so the risk engine keeps counting it. */
-  private pullVisibleQuotes(m: TrackedMarket, now: number): void {
+  /** Pull (off-chain) every API-visible commitment of the maker's on `m.speculationId` — in live mode an actual `cancelCommitmentOffchain` per record (a failed one stays `visibleOpen` for the next pass), in dry-run a state-only simulation — then reclassify the pulled ones `softCancelled` and emit `would-soft-cancel` / `soft-cancel` (reason `side-not-quoted`: when a market is unquoteable, neither side is being quoted). Used by the unquoteable-market gates above — the visible book must never carry a quote the MM is no longer pricing (DESIGN §2.2 / §3). The pulled quote's signed payload stays matchable on chain until expiry, so the risk engine keeps counting it. */
+  private async pullVisibleQuotes(m: TrackedMarket, now: number): Promise<void> {
     for (const r of Object.values(this.state.commitments)) {
       if (r.speculationId !== m.speculationId) continue;
       if (r.lifecycle !== 'visibleOpen' && r.lifecycle !== 'partiallyFilled') continue;
       if (r.expiryUnixSec <= now) continue; // already dead on chain — `ageOut` handles it
-      this.softCancelRecord(r, 'side-not-quoted', now);
+      await this.softCancelRecord(r, 'side-not-quoted', now);
     }
   }
 
-  /** Reclassify a tracked commitment `softCancelled` (off-chain pull) + emit `would-soft-cancel`. */
-  private softCancelRecord(record: MakerCommitmentRecord, reason: SoftCancelReason, now: number): void {
+  /**
+   * Pull a tracked commitment off the API book — in live mode a real off-chain
+   * cancel (`cancelCommitmentOffchain`; if it throws, log `error` `phase: 'cancel'`
+   * and leave the record `visibleOpen` so the next reconcile pass retries the pull),
+   * in dry-run a state-only no-op — then (on success) reclassify it `softCancelled`,
+   * stamp `updatedAtUnixSec`, and emit `soft-cancel` (live) / `would-soft-cancel`
+   * (dry-run). The off-chain cancel is visibility-only: the signed payload stays
+   * matchable on chain until expiry, so the risk engine keeps counting it.
+   */
+  private async softCancelRecord(record: MakerCommitmentRecord, reason: SoftCancelReason, now: number): Promise<void> {
+    if (!this.config.mode.dryRun) {
+      try {
+        // In live mode every tracked record's hash is a real EIP-712 hash (`0x…`) —
+        // it came from `submitCommitment` (or a prior live run's state). The `dry:` form
+        // only exists in dry-run, where this branch never runs.
+        await this.adapter.cancelCommitmentOffchain(record.hash as Hex);
+      } catch (err) {
+        this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'cancel', contestId: record.contestId, commitmentHash: record.hash });
+        return; // still visible — the next reconcile pass will see it and retry the pull
+      }
+    }
     record.lifecycle = 'softCancelled';
     record.updatedAtUnixSec = now;
-    this.eventLog.emit('would-soft-cancel', softCancelEventPayload(record, reason));
+    this.eventLog.emit(this.config.mode.dryRun ? 'would-soft-cancel' : 'soft-cancel', softCancelEventPayload(record, reason));
   }
 
-  /** Apply a `reconcileBook` plan in dry-run: log each item (`would-submit` / `would-replace` / `would-soft-cancel`, plus a `cap-hit` candidate per deferred side) and mutate the hypothetical inventory — add a synthetic `visibleOpen` record per submit / replacement, reclassify each pulled / replaced record to `softCancelled` (its signed payload stays matchable until expiry, so the risk engine keeps counting it). Live execution — the real SDK write calls — is Phase 3. */
-  private applyReconcilePlan(m: TrackedMarket, plan: BookReconciliation, now: number): void {
+  /**
+   * Apply a `reconcileBook` plan — **mode-aware**. In live mode each `toSubmit` /
+   * `toReplace.replacement` goes through `commitments.submitRaw` (the SDK signs +
+   * POSTs the 9-field EIP-712 commitment, picks the nonce) and the recorded hash is
+   * the real one; each `toReplace.stale` and `toSoftCancel` goes through
+   * `commitments.cancel` (the gasless off-chain pull). In dry-run nothing leaves the
+   * process: a synthetic `dry:<runId>:<n>` hash is minted and the cancel is a no-op.
+   * Either way the same state mutations and event stream — only the kind names differ
+   * (`submit` / `replace` / `soft-cancel` in live; `would-`-prefixed in dry-run). A
+   * live submit / cancel that throws is logged (`error`, `phase: 'submit'` /
+   * `'cancel'`) and the loop moves on — never crashes the tick; on a failed submit no
+   * record is created (and no `submit` / `replace` event); on a failed stale-pull the
+   * old quote stays `visibleOpen` (the replacement still goes up; the next pass pulls
+   * the stale one as a duplicate). A `cap-hit` candidate is emitted per deferred side
+   * in both modes. The pulled / replaced records stay `softCancelled`-not-expired, so
+   * their signed payloads keep counting toward exposure until expiry.
+   */
+  private async applyReconcilePlan(m: TrackedMarket, plan: BookReconciliation, now: number): Promise<void> {
     const expiryUnixSec = this.expiryForNewCommitment(m, now);
+    const submitKind = this.config.mode.dryRun ? 'would-submit' : 'submit';
+    const replaceKind = this.config.mode.dryRun ? 'would-replace' : 'replace';
+
     for (const qs of plan.toSubmit) {
-      const record = this.mintSyntheticCommitment(m, qs, now, expiryUnixSec);
-      this.state.commitments[record.hash] = record;
-      this.eventLog.emit('would-submit', {
+      const record = await this.submitQuote(m, qs, now, expiryUnixSec);
+      if (record === null) continue; // live submit threw — `error` already emitted
+      this.eventLog.emit(submitKind, {
         ...this.commitmentEventPayload(record),
         takerOddsTick: qs.quoteTick,
         takerImpliedProb: qs.quoteProb,
       });
     }
+
     for (const rp of plan.toReplace) {
-      rp.stale.lifecycle = 'softCancelled';
-      rp.stale.updatedAtUnixSec = now;
-      const record = this.mintSyntheticCommitment(m, rp.replacement, now, expiryUnixSec);
-      this.state.commitments[record.hash] = record;
-      this.eventLog.emit('would-replace', {
+      // Pull the incumbent first (a brief no-quote gap is safer than a brief stale double-quote),
+      // then post the replacement. In live mode a failed pull doesn't block the replacement — the
+      // stale one then surfaces as a duplicate next pass and gets pulled then.
+      let stalePulled = true;
+      if (!this.config.mode.dryRun) {
+        try {
+          await this.adapter.cancelCommitmentOffchain(rp.stale.hash as Hex); // live: a real `0x…` hash (see softCancelRecord)
+        } catch (err) {
+          this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'cancel', contestId: m.contestId, commitmentHash: rp.stale.hash });
+          stalePulled = false;
+        }
+      }
+      if (stalePulled) {
+        rp.stale.lifecycle = 'softCancelled';
+        rp.stale.updatedAtUnixSec = now;
+      }
+      const record = await this.submitQuote(m, rp.replacement, now, expiryUnixSec);
+      if (record === null) continue; // live submit threw — `error` already emitted; the stale's status is per `stalePulled`
+      this.eventLog.emit(replaceKind, {
         replacedCommitmentHash: rp.stale.hash,
         newCommitmentHash: record.hash,
         speculationId: m.speculationId,
@@ -917,7 +990,8 @@ export class Runner {
         expiryUnixSec,
       });
     }
-    for (const sc of plan.toSoftCancel) this.softCancelRecord(sc.record, sc.reason, now);
+
+    for (const sc of plan.toSoftCancel) await this.softCancelRecord(sc.record, sc.reason, now);
     for (const offerSide of plan.deferredSides) {
       this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'cap-hit', takerSide: offerSide });
     }
@@ -929,20 +1003,50 @@ export class Runner {
   }
 
   /**
-   * Mint a `visibleOpen` `MakerCommitmentRecord` for a `QuoteSide` (a taker offer)
-   * the dry-run reconcile would post — a synthetic EIP-712 hash (`dry:<runId>:<n>`,
-   * unique within / across runs), the contest / speculation metadata, and the
-   * **protocol commitment** parameters (`toProtocolQuote`: offering a taker the away
-   * side ⇒ the maker is on `home` at `inverseOddsTick(quoteTick)`). Live mode posts
-   * the real commitment and records its real hash; this is the hypothetical-inventory
-   * equivalent — same `makerSide` / `oddsTick` shape, so the risk engine sees the
-   * same exposure.
+   * Place one quote for a `QuoteSide` (a taker offer) the reconcile decided to post:
+   * convert it to the protocol commitment params (`toProtocolQuote` — offering a
+   * taker the away side ⇒ the maker is on `home` at `inverseOddsTick(quoteTick)`),
+   * then in **live** mode sign + POST it via `commitments.submitRaw` (the SDK reads
+   * the on-chain nonce floor + picks the nonce; we pass the short `fixed-seconds` /
+   * `match-time` expiry explicitly so the SDK's 24-h default doesn't apply) and
+   * record the *real* commitment hash; in **dry-run** mint a synthetic `dry:<runId>:<n>`
+   * hash and post nothing. Stores the resulting `visibleOpen` `MakerCommitmentRecord`
+   * in `state.commitments` and returns it; returns `null` if a live submit threw
+   * (the `error` `phase: 'submit'` event is already emitted — the caller skips the
+   * corresponding `submit` / `replace` event).
    */
-  private mintSyntheticCommitment(m: TrackedMarket, qs: QuoteSide, now: number, expiryUnixSec: number): MakerCommitmentRecord {
-    this.syntheticCommitmentSeq += 1;
+  private async submitQuote(m: TrackedMarket, qs: QuoteSide, now: number, expiryUnixSec: number): Promise<MakerCommitmentRecord | null> {
     const proto = toProtocolQuote({ side: qs.takerSide, oddsTick: qs.quoteTick });
+    let hash: string;
+    if (this.config.mode.dryRun) {
+      this.syntheticCommitmentSeq += 1;
+      hash = `dry:${this.eventLog.runId}:${this.syntheticCommitmentSeq}`;
+    } else {
+      try {
+        const result = await this.adapter.submitCommitment({
+          contestId: BigInt(m.contestId),
+          scorer: this.moneylineScorer,
+          lineTicks: 0,
+          positionType: proto.positionType,
+          oddsTick: proto.makerOddsTick,
+          riskAmount: BigInt(qs.sizeWei6),
+          expiry: BigInt(expiryUnixSec),
+        });
+        hash = result.hash;
+      } catch (err) {
+        this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'submit', contestId: m.contestId, takerSide: qs.takerSide });
+        return null;
+      }
+    }
+    const record = this.commitmentRecord(m, qs, now, expiryUnixSec, hash, proto);
+    this.state.commitments[record.hash] = record;
+    return record;
+  }
+
+  /** Build a `visibleOpen` `MakerCommitmentRecord` for a taker offer (`qs`) at a given commitment `hash`, with the already-computed protocol params (`proto`) — the maker side + odds tick the risk engine accounts against (so the synthetic dry-run record and the real live one have the identical exposure shape). */
+  private commitmentRecord(m: TrackedMarket, qs: QuoteSide, now: number, expiryUnixSec: number, hash: string, proto: ProtocolQuote): MakerCommitmentRecord {
     return {
-      hash: `dry:${this.eventLog.runId}:${this.syntheticCommitmentSeq}`,
+      hash,
       speculationId: m.speculationId,
       contestId: m.contestId,
       sport: m.sport,

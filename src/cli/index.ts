@@ -4,9 +4,11 @@
  *
  * Command surface (DESIGN §3): `doctor`, `quote`, `run`, `cancel-stale`, `status`,
  * `summary`. Wired so far: `doctor` + `quote --dry-run` (strictly read-only),
- * `run --dry-run` (the Phase-2 shadow loop — posts nothing), and `summary` (the
- * NDJSON-log aggregator). `run --live` (Phase 3) and `cancel-stale` / `status`
- * exit 1 with a "not yet implemented" message.
+ * `run --dry-run` (the shadow loop — posts nothing) + `run --live` (executes the
+ * reconcile's submits / off-chain cancels on chain — the two-key model from
+ * DESIGN §8 gates it; later Phase-3 slices add fill detection, gas budgeting,
+ * auto-settle / auto-claim, the on-chain kill path), and `summary` (the NDJSON-log
+ * aggregator). `cancel-stale` / `status` still exit 1 with "not yet implemented".
  *
  * CLI conventions (mirroring the SDK's AGENT_CONTRACT):
  *   - `--json` prints a `{ schemaVersion: 1, … }` envelope on stdout; everything
@@ -96,7 +98,7 @@ program
   .option('--json', 'emit a JSON envelope { schemaVersion: 1, quote: … } on stdout')
   .action(async (contestId: string, opts: { config: string; dryRun?: boolean; json?: boolean }) => {
     if (opts.dryRun !== true) {
-      fail('`quote` is dry-run-only in v0 — pass --dry-run. (Posting quotes is `ospex-mm run --live`, Phase 3.)');
+      fail('`quote` is dry-run-only in v0 — pass --dry-run. (Posting quotes is `ospex-mm run --live`.)');
     }
     const config = loadConfigOrExit(opts.config);
     const adapter = createOspexAdapter(config);
@@ -110,26 +112,24 @@ program
 
 program
   .command('run')
-  .description('Run the market-maker loop. v0: --dry-run (the Phase-2 shadow loop — discovers, prices, reconciles, logs would-be quotes; posts nothing). --live is Phase 3 (not yet implemented).')
+  .description('Run the market-maker loop. --dry-run is the shadow loop (discovers, prices, reconciles, logs would-be quotes; posts nothing). --live posts real commitments (and also requires mode.dryRun: false in the config — the two-key model, DESIGN §8); the keystore passphrase comes from OSPEX_KEYSTORE_PASSPHRASE, else a TTY prompt.')
   .option('-c, --config <path>', 'path to the config YAML', DEFAULT_CONFIG_PATH)
   .option('--dry-run', 'run the shadow loop — everything except the writes (DESIGN §8)')
-  .option('--live', '(not yet implemented — Phase 3) post real commitments; also requires mode.dryRun: false in the config (the two-key model)')
-  .option('-a, --address <addr>', 'maker wallet address (defaults to the keystore; dry-run does not require it)')
-  .option('-k, --keystore <path>', 'path to a Foundry v3 keystore — overrides config wallet.keystorePath / OSPEX_KEYSTORE_PATH')
+  .option('--live', 'post real commitments — also requires mode.dryRun: false in the config (the two-key model); reads the keystore passphrase from OSPEX_KEYSTORE_PASSPHRASE, else prompts on a TTY')
+  .option('-a, --address <addr>', 'maker wallet address (dry-run only; in live mode the address is the signer\'s — passing it with --live is refused)')
+  .option('-k, --keystore <path>', 'path to a v3 keystore — overrides config wallet.keystorePath / OSPEX_KEYSTORE_PATH')
   .option('--ignore-missing-state', 'proceed even if the persisted state is missing/corrupt — attests no prior run left a still-matchable commitment (DESIGN §12)')
   .action(async (opts: { config: string; dryRun?: boolean; live?: boolean; address?: string; keystore?: string; ignoreMissingState?: boolean }) => {
     const wantDry = opts.dryRun === true;
     const wantLive = opts.live === true;
     if (wantDry && wantLive) fail('pass exactly one of --dry-run / --live, not both');
-    if (!wantDry && !wantLive) fail('pass --dry-run (the Phase-2 shadow loop) or --live (Phase 3 — not yet implemented)');
-    // Reject --live before loading config (same as `quote` validating --dry-run up front); `runRun` also guards this, for direct callers.
-    if (wantLive) fail('`ospex-mm run --live` is not yet implemented — live execution is Phase 3 (DESIGN §14). Use --dry-run for the Phase-2 shadow loop, which does everything except the writes.');
+    if (!wantDry && !wantLive) fail('pass --dry-run (the shadow loop) or --live (post real commitments — also requires mode.dryRun: false in the config)');
     let config = loadConfigOrExit(opts.config);
     if (opts.keystore !== undefined) config = { ...config, wallet: { ...config.wallet, keystorePath: opts.keystore } };
     const address = parseAddressOrExit(opts.address);
     await runRun({
       config,
-      mode: 'dry-run', // --live short-circuited above
+      mode: wantLive ? 'live' : 'dry-run',
       ...(address !== undefined ? { address } : {}),
       ignoreMissingState: opts.ignoreMissingState === true,
     }).catch((e: unknown): never => {

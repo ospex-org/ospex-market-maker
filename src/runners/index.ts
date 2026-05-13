@@ -69,12 +69,14 @@
  *   - an interruptible sleep clamped to the `pollIntervalMs` floor.
  *
  * Still TODO follow-ups: P&L (realized over settled / claimed; unrealized over
- * active marked to fair), gas budgeting in POL, and auto-settle / auto-claim.
- * The `getPositionStatus(maker)` poll is wired (it backfills missing positions
- * from soft-cancelled-then-matched commitments and fails closed when it can't
- * read while any non-terminal `softCancelled` records exist); status transitions
- * (`active` → `pendingSettle` → `claimable` → `claimed`) and the P&L computation
- * are the next slice.
+ * active marked to fair — natural home is the `summary` aggregator that walks
+ * `fill` / `position-transition` / `settle` / `claim` events), gas budgeting
+ * in POL, and auto-settle / auto-claim. The `getPositionStatus(maker)` poll
+ * backfills missing positions from soft-cancelled-then-matched commitments,
+ * fails closed when it can't read while any non-terminal `softCancelled`
+ * records exist, AND mirrors API bucket → local `MakerPositionStatus` with a
+ * `position-transition` event on each forward step (`active` →
+ * `pendingSettle` → `claimable`); `claimed` is stamped by the auto-claim path.
  *
  * No `@ospex/sdk` import — all chain/API access goes through the `OspexAdapter`. The
  * clock, sleep, kill-switch probe, OS-signal registration, and randomness are
@@ -101,7 +103,7 @@ import type {
 } from '../ospex/index.js';
 import { decimalToTick, inverseOddsTick, isTickInRange, oppositeSide, positionTypeForSide, toProtocolQuote, type ProtocolQuote, type QuoteSide } from '../pricing/index.js';
 import type { Market } from '../risk/index.js';
-import { assessStateLoss, type CommitmentLifecycle, type MakerCommitmentRecord, type MakerPositionRecord, type MakerSide, type MakerState, type StateLossAssessment, type StateStore } from '../state/index.js';
+import { assessStateLoss, type CommitmentLifecycle, type MakerCommitmentRecord, type MakerPositionRecord, type MakerPositionStatus, type MakerSide, type MakerState, type StateLossAssessment, type StateStore } from '../state/index.js';
 import { EventLog, eventLogsExist } from '../telemetry/index.js';
 
 // ── injectable seams (the defaults are the real impls; tests override) ───────
@@ -1475,9 +1477,22 @@ export class Runner {
    * log `error` `phase: 'position-poll'` and skip — we don't create incomplete
    * position records that would corrupt the risk engine's per-team / per-sport caps.
    *
-   * Status transitions (`active` → `pendingSettle` → `claimable` → `claimed`) and
-   * P&L computation are deferred to the next slice; this method only ever creates
-   * or extends positions to backfill missing fills, never updates statuses.
+   * **Status transitions** (DESIGN §10). The API's three buckets — `active`,
+   * `pendingSettle`, `claimable` — map 1:1 to the local `MakerPositionStatus`.
+   * A new position is created with the bucket's status (not always `'active'`);
+   * an existing position whose API bucket has advanced (the strict order is
+   * `active` → `pendingSettle` → `claimable` → `claimed`) is updated and a
+   * `position-transition` event fires carrying `fromStatus` / `toStatus` plus
+   * the bucket-specific `result` (`'won' | 'push' | 'void'`) and, for
+   * `pendingSettle`, `predictedWinSide`. A backwards bucket (e.g. `claimable`
+   * reverting to `active`) signals state corruption — logged as `error`
+   * `class: 'BackwardsPositionTransition'`, refused. `'claimed'` is never set
+   * by the poll (claimed positions disappear from the API); the auto-claim
+   * path (Phase 3 settlement slice) stamps it locally.
+   *
+   * A first-observation in `pendingSettle` / `claimable` is BOTH a fill (new
+   * risk → `fill` event) AND a creation at a non-`active` status (no transition
+   * event — the position has no prior local status to transition *from*).
    *
    * Returns `false` on a `getPositionStatus` throw (logged as `error`
    * `phase: 'position-poll'`). The caller in `tick()` fails closed
@@ -1497,59 +1512,113 @@ export class Runner {
       this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'position-poll' });
       return false; // caller fails closed iff any non-terminal softCancelled commitments exist
     }
-    const apiPositions = [...status.active, ...status.pendingSettle, ...status.claimable];
-    for (const p of apiPositions) {
-      // Convert USDC float → wei6 integer. `Math.round` accepts the loss; for v0
-      // amounts (well within 2^53) this is exact for whole-cent values and at
-      // worst off-by-one wei for sub-cent fractions — acceptable when the goal
-      // is "detect a missing position" rather than penny-perfect accounting.
-      const apiRiskWei6 = BigInt(Math.round(p.riskAmountUSDC * 1_000_000));
-      const apiCounterpartyWei6 = BigInt(Math.round(p.profitAmountUSDC * 1_000_000));
-      const side: MakerSide = p.positionType === 0 ? 'away' : 'home';
-      const key = `${p.speculationId}:${side}`;
-      const existing = this.state.positions[key];
-      const localRiskWei6 = existing !== undefined ? BigInt(existing.riskAmountWei6) : 0n;
-      if (apiRiskWei6 <= localRiskWei6) continue; // already caught up — idempotent on no-change
-      const delta = apiRiskWei6 - localRiskWei6;
-      const counterpartyDelta = existing !== undefined ? apiCounterpartyWei6 - BigInt(existing.counterpartyRiskWei6) : apiCounterpartyWei6;
-      // Source-context lookup: copy contest / sport / teams from any local commitment
-      // record on this `(speculationId, makerSide)`. We always have one (we wouldn't
-      // have a position without having submitted a commitment); a miss signals state
-      // pre-seeding / external corruption — skip + log rather than create incomplete.
-      const sourceCommitment = Object.values(this.state.commitments).find(
-        (r) => r.speculationId === p.speculationId && r.makerSide === side,
-      );
-      if (sourceCommitment === undefined) {
-        this.eventLog.emit('error', {
-          class: 'PositionWithoutCommitment',
-          detail: `getPositionStatus reports a position on (${p.speculationId}, ${side}) but no local commitment with that (speculationId, makerSide) is present — refusing to create an incomplete MakerPositionRecord`,
-          phase: 'position-poll',
-          speculationId: p.speculationId,
-        });
-        continue;
-      }
-      if (existing === undefined) {
-        this.state.positions[key] = {
-          speculationId: p.speculationId,
-          contestId: sourceCommitment.contestId,
-          sport: sourceCommitment.sport,
-          awayTeam: sourceCommitment.awayTeam,
-          homeTeam: sourceCommitment.homeTeam,
-          side,
-          riskAmountWei6: delta.toString(),
-          counterpartyRiskWei6: counterpartyDelta > 0n ? counterpartyDelta.toString() : '0',
-          status: 'active',
-          updatedAtUnixSec: now,
-        };
-      } else {
+    for (const p of status.active) {
+      this.syncPolledPosition('active', p, undefined, undefined, now);
+    }
+    for (const p of status.pendingSettle) {
+      this.syncPolledPosition('pendingSettle', p, p.result, p.predictedWinSide, now);
+    }
+    for (const p of status.claimable) {
+      this.syncPolledPosition('claimable', p, p.result, undefined, now);
+    }
+    return true;
+  }
+
+  /**
+   * Apply one polled position from `getPositionStatus` to local state. Shared by
+   * all three API buckets — `apiStatus` is the bucket name (`active` /
+   * `pendingSettle` / `claimable`), which maps 1:1 to `MakerPositionStatus`.
+   *
+   * Three paths: (1) no local record + positive `apiRiskWei6` → create with
+   * `status = apiStatus`, emit `fill` (the position's birth — no transition
+   * event); (2) existing record, status unchanged + risk grew → fill-only
+   * (the c-i fill-detection path, unchanged); (3) existing record, status
+   * advanced → update status (and risk delta, if any), emit `position-transition`
+   * (and `fill` if risk grew). A backwards transition is refused + logged.
+   */
+  private syncPolledPosition(
+    apiStatus: 'active' | 'pendingSettle' | 'claimable',
+    p: { positionId: string; speculationId: string; positionType: 0 | 1; riskAmountUSDC: number; profitAmountUSDC: number },
+    result: 'won' | 'push' | 'void' | undefined,
+    predictedWinSide: 'away' | 'home' | 'over' | 'under' | 'push' | undefined,
+    now: number,
+  ): void {
+    // Convert USDC float → wei6 integer. `Math.round` accepts the loss; for v0
+    // amounts (well within 2^53) this is exact for whole-cent values and at
+    // worst off-by-one wei for sub-cent fractions — acceptable when the goal
+    // is "detect a missing position" rather than penny-perfect accounting.
+    const apiRiskWei6 = BigInt(Math.round(p.riskAmountUSDC * 1_000_000));
+    const apiCounterpartyWei6 = BigInt(Math.round(p.profitAmountUSDC * 1_000_000));
+    const side: MakerSide = p.positionType === 0 ? 'away' : 'home';
+    const key = `${p.speculationId}:${side}`;
+    const existing = this.state.positions[key];
+    const localRiskWei6 = existing !== undefined ? BigInt(existing.riskAmountWei6) : 0n;
+    const riskGrew = apiRiskWei6 > localRiskWei6;
+    const statusChanged = existing !== undefined && existing.status !== apiStatus;
+    if (existing !== undefined && !riskGrew && !statusChanged) return; // already caught up — idempotent on no-change
+    if (existing === undefined && !riskGrew) return; // never seen + zero risk — nothing to record
+
+    // Source-context lookup: copy contest / sport / teams from any local commitment
+    // record on this `(speculationId, makerSide)`. We always have one (we wouldn't
+    // have a position without having submitted a commitment); a miss signals state
+    // pre-seeding / external corruption — skip + log rather than create incomplete.
+    const sourceCommitment = Object.values(this.state.commitments).find(
+      (r) => r.speculationId === p.speculationId && r.makerSide === side,
+    );
+    if (sourceCommitment === undefined) {
+      this.eventLog.emit('error', {
+        class: 'PositionWithoutCommitment',
+        detail: `getPositionStatus reports a position on (${p.speculationId}, ${side}) but no local commitment with that (speculationId, makerSide) is present — refusing to create an incomplete MakerPositionRecord`,
+        phase: 'position-poll',
+        speculationId: p.speculationId,
+      });
+      return;
+    }
+
+    // Backwards-transition guard: forward-only. A non-existent reversal —
+    // claimed disappears from the API, so we'd never see it; a settled
+    // speculation can't un-settle on chain — signals state corruption.
+    if (existing !== undefined && statusChanged && positionStatusRank(apiStatus) < positionStatusRank(existing.status)) {
+      this.eventLog.emit('error', {
+        class: 'BackwardsPositionTransition',
+        detail: `getPositionStatus reports (${p.speculationId}, ${side}) in bucket '${apiStatus}' but local state has it as '${existing.status}' — refusing to revert`,
+        phase: 'position-poll',
+        speculationId: p.speculationId,
+      });
+      return;
+    }
+
+    const delta = riskGrew ? apiRiskWei6 - localRiskWei6 : 0n;
+    const counterpartyDelta = existing !== undefined ? apiCounterpartyWei6 - BigInt(existing.counterpartyRiskWei6) : apiCounterpartyWei6;
+    const fromStatus: MakerPositionStatus | undefined = existing?.status;
+
+    if (existing === undefined) {
+      this.state.positions[key] = {
+        speculationId: p.speculationId,
+        contestId: sourceCommitment.contestId,
+        sport: sourceCommitment.sport,
+        awayTeam: sourceCommitment.awayTeam,
+        homeTeam: sourceCommitment.homeTeam,
+        side,
+        riskAmountWei6: delta.toString(),
+        counterpartyRiskWei6: counterpartyDelta > 0n ? counterpartyDelta.toString() : '0',
+        status: apiStatus,
+        updatedAtUnixSec: now,
+      };
+    } else {
+      if (riskGrew) {
         existing.riskAmountWei6 = (BigInt(existing.riskAmountWei6) + delta).toString();
         if (counterpartyDelta > 0n) {
           existing.counterpartyRiskWei6 = (BigInt(existing.counterpartyRiskWei6) + counterpartyDelta).toString();
         }
-        existing.updatedAtUnixSec = now;
       }
+      if (statusChanged) existing.status = apiStatus;
+      existing.updatedAtUnixSec = now;
+    }
+
+    if (riskGrew) {
       const m = this.trackedMarkets.get(sourceCommitment.contestId);
-      if (m !== undefined) m.dirty = true;
+      if (m !== undefined) m.dirty = true; // a new fill changes the book imbalance; a status-only transition does not
       this.eventLog.emit('fill', {
         source: 'position-poll',
         positionId: p.positionId,
@@ -1564,7 +1633,23 @@ export class Runner {
         cumulativeRiskWei6: (localRiskWei6 + delta).toString(),
       });
     }
-    return true;
+    if (existing !== undefined && statusChanged) {
+      const payload: Record<string, unknown> = {
+        positionId: p.positionId,
+        speculationId: p.speculationId,
+        contestId: sourceCommitment.contestId,
+        sport: sourceCommitment.sport,
+        awayTeam: sourceCommitment.awayTeam,
+        homeTeam: sourceCommitment.homeTeam,
+        makerSide: side,
+        positionType: p.positionType,
+        fromStatus,
+        toStatus: apiStatus,
+      };
+      if (result !== undefined) payload.result = result;
+      if (predictedWinSide !== undefined) payload.predictedWinSide = predictedWinSide;
+      this.eventLog.emit('position-transition', payload);
+    }
   }
 
   /** Ticks until the next discovery cycle: `discovery.everyNTicks` jittered by ±`discovery.jitterPct` (so multiple MMs don't all discover on the same tick). At least 1. */
@@ -1608,6 +1693,16 @@ function errClass(err: unknown): string {
 
 function errMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/** Strict forward-only ordering of `MakerPositionStatus` — used by `pollPositionStatus` to reject a backwards transition (e.g. a `claimable` record reported back in `active`). */
+function positionStatusRank(s: MakerPositionStatus): number {
+  switch (s) {
+    case 'active': return 0;
+    case 'pendingSettle': return 1;
+    case 'claimable': return 2;
+    case 'claimed': return 3;
+  }
 }
 
 /** Compact a `QuoteSide` (a taker offer) for the `quote-intent` event payload — the taker-facing price (tick + implied prob) and size, plus the protocol commitment params it converts to (`toProtocolQuote`: `makerSide` / `makerOddsTick` / `positionType`). `null` for a side the desired quote pulled / refused. */

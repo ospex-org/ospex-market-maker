@@ -16,6 +16,7 @@ import {
   type OddsSubscribeHandlersView,
   type OddsUpdateView,
   type OspexAdapter,
+  type PositionStatus,
   type Signer,
   type SpeculationView,
   type SubmitCommitmentArgs,
@@ -282,6 +283,7 @@ function liveSpiedAdapter(
   reads?: {
     listOpenCommitments?: (maker: string, limit: number) => Promise<Commitment[]>;
     getCommitment?: (hash: Hex) => Promise<Commitment>;
+    getPositionStatus?: (owner: string) => Promise<PositionStatus>;
   },
 ): OspexAdapter {
   const adapter = createLiveOspexAdapter(config, fakeSigner());
@@ -294,8 +296,15 @@ function liveSpiedAdapter(
   vi.spyOn(adapter, 'cancelCommitmentOffchain').mockImplementation(writes?.cancelCommitmentOffchain ?? (() => Promise.resolve()));
   vi.spyOn(adapter, 'listOpenCommitments').mockImplementation(reads?.listOpenCommitments ?? (() => Promise.resolve([])));
   vi.spyOn(adapter, 'getCommitment').mockImplementation(reads?.getCommitment ?? (() => Promise.reject(new Error('liveSpiedAdapter: getCommitment not stubbed — pass `reads.getCommitment`'))));
+  vi.spyOn(adapter, 'getPositionStatus').mockImplementation(reads?.getPositionStatus ?? (() => Promise.resolve(EMPTY_POSITION_STATUS)));
   return adapter;
 }
+
+/** Empty `PositionStatus` — `liveSpiedAdapter`'s default `getPositionStatus` return so the position poll is a no-op unless a test overrides it. */
+const EMPTY_POSITION_STATUS: PositionStatus = {
+  active: [], pendingSettle: [], claimable: [],
+  totals: { activeCount: 0, pendingSettleCount: 0, claimableCount: 0, estimatedPayoutUSDC: 0, estimatedPayoutWei6: '0', pendingSettlePayoutUSDC: 0, pendingSettlePayoutWei6: '0' },
+};
 
 function commitmentRecord(overrides: Partial<MakerCommitmentRecord>): MakerCommitmentRecord {
   const NOW = 1_900_000_000;
@@ -1555,5 +1564,210 @@ describe('Runner — fill detection', () => {
     expect(homeOffer).toMatchObject({ bookDepthOnSide: 0, bestBookTakerTick: null, atOrInsideBook: true });
     const awayOffer = comps.find((e) => e.takerSide === 'away');
     expect(awayOffer).toMatchObject({ bookDepthOnSide: 1, bestBookTakerTick: 200 });
+  });
+});
+
+// ── review-PR23 fixes (fill-detection blockers + position-status poll) ───────
+
+describe('Runner — fill detection — past-local-expiry classification (review-PR23 B1, B2)', () => {
+  it('a visibleOpen record past local expiry whose API status is `filled` is reclassified BEFORE ageOut terminalizes it (the fill is not lost)', async () => {
+    // The bug Hermes reproduced: tick order is detectFills → reconcile → ageOut, and the previous
+    // detectFills skipped records past local expiry; ageOut then marked them `expired` without
+    // calling getCommitment. A fill that landed right before expiry was permanently missed.
+    const record = commitmentRecord({ hash: '0xrealAway', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '250000', lifecycle: 'visibleOpen', expiryUnixSec: T0 - 10 /* past-expiry */, postedAtUnixSec: T0 - 200 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xrealAway': record } });
+    const config = cfg({ mode: { dryRun: false } });
+    const apiFilled: Commitment = orderbookEntry({ commitmentHash: '0xrealAway', maker: DEFAULT_FAKE_MAKER_ADDRESS, contestId: '1234', positionType: 1, oddsTick: 200, riskAmount: '250000', filledRiskAmount: '250000', remainingRiskAmount: '0', status: 'filled', isLive: false });
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]), undefined, undefined, undefined,
+      { listOpenCommitments: () => Promise.resolve([]), getCommitment: () => Promise.resolve(apiFilled) },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    const reloaded = StateStore.at(stateDir).load().state;
+    expect(reloaded.commitments['0xrealAway']?.lifecycle).toBe('filled'); // detectFills classified it BEFORE ageOut got a chance to call it `expired`
+    expect(reloaded.commitments['0xrealAway']?.filledRiskWei6).toBe('250000');
+    expect(reloaded.positions['spec-1234:home']?.riskAmountWei6).toBe('250000');
+    const events = readEvents();
+    expect(events.find((e) => e.kind === 'fill' && e.commitmentHash === '0xrealAway')).toMatchObject({ partial: false, newFillWei6: '250000', source: 'commitment-diff' });
+    expect(events.some((e) => e.kind === 'expire' && e.commitmentHash === '0xrealAway')).toBe(false); // ageOut's `expire` did not fire
+  });
+
+  it('a disappeared `expired` API status with prior unobserved filledRiskAmount applies the partial fill BEFORE terminalizing — the position records the matched portion', async () => {
+    const record = commitmentRecord({ hash: '0xpartialThenExpired', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '500000', lifecycle: 'visibleOpen', filledRiskWei6: '0', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 5 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xpartialThenExpired': record } });
+    const config = cfg({ mode: { dryRun: false } });
+    // Partial fill of 100000 wei6 landed before the commitment expired — neither was seen locally before now.
+    const apiExpired: Commitment = orderbookEntry({ commitmentHash: '0xpartialThenExpired', maker: DEFAULT_FAKE_MAKER_ADDRESS, contestId: '1234', positionType: 1, oddsTick: 200, riskAmount: '500000', filledRiskAmount: '100000', remainingRiskAmount: '400000', status: 'expired', isLive: false });
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]), undefined, undefined, undefined,
+      { listOpenCommitments: () => Promise.resolve([]), getCommitment: () => Promise.resolve(apiExpired) },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    const reloaded = StateStore.at(stateDir).load().state;
+    expect(reloaded.commitments['0xpartialThenExpired']?.lifecycle).toBe('expired'); // terminalized
+    expect(reloaded.commitments['0xpartialThenExpired']?.filledRiskWei6).toBe('100000'); // the partial fill was applied
+    expect(reloaded.positions['spec-1234:home']?.riskAmountWei6).toBe('100000'); // position records the matched portion
+    expect(reloaded.positions['spec-1234:home']?.counterpartyRiskWei6).toBe('100000'); // 100000 × (200 − 100) / 100
+    const events = readEvents();
+    expect(events.find((e) => e.kind === 'fill' && e.commitmentHash === '0xpartialThenExpired')).toMatchObject({ partial: false, newFillWei6: '100000' });
+    expect(events.find((e) => e.kind === 'expire' && e.commitmentHash === '0xpartialThenExpired')).toBeDefined(); // expire still fires (the terminal status was 'expired')
+  });
+
+  it('a disappeared `cancelled` API status with prior unobserved filledRiskAmount applies the partial fill BEFORE terminalizing', async () => {
+    const record = commitmentRecord({ hash: '0xpartialThenCancelled', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '500000', lifecycle: 'visibleOpen', filledRiskWei6: '0', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 5 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xpartialThenCancelled': record } });
+    const config = cfg({ mode: { dryRun: false } });
+    const apiCancelled: Commitment = orderbookEntry({ commitmentHash: '0xpartialThenCancelled', maker: DEFAULT_FAKE_MAKER_ADDRESS, contestId: '1234', positionType: 1, oddsTick: 200, riskAmount: '500000', filledRiskAmount: '100000', remainingRiskAmount: '400000', status: 'cancelled', isLive: false });
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]), undefined, undefined, undefined,
+      { listOpenCommitments: () => Promise.resolve([]), getCommitment: () => Promise.resolve(apiCancelled) },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    const reloaded = StateStore.at(stateDir).load().state;
+    expect(reloaded.commitments['0xpartialThenCancelled']?.lifecycle).toBe('authoritativelyInvalidated');
+    expect(reloaded.commitments['0xpartialThenCancelled']?.filledRiskWei6).toBe('100000');
+    expect(reloaded.positions['spec-1234:home']?.riskAmountWei6).toBe('100000');
+    const events = readEvents();
+    expect(events.find((e) => e.kind === 'fill' && e.commitmentHash === '0xpartialThenCancelled')).toMatchObject({ partial: false, newFillWei6: '100000' });
+    expect(events.some((e) => e.kind === 'expire' && e.commitmentHash === '0xpartialThenCancelled')).toBe(false); // cancelled is not expired
+  });
+});
+
+describe('Runner — fail-closed on lost fill visibility (review-PR23 B3)', () => {
+  it('live mode: a `listOpenCommitments` failure SKIPS reconcile (no live writes) and ageOut (no terminalization on unverified fill state); the market stays dirty for next-tick retry', async () => {
+    // Without the fail-closed fix, the runner would proceed to reconcile on a tracked-quoteable market
+    // with no fill visibility, submitting a fresh commitment based on stale exposure state.
+    // (Numeric contestId so live `submitCommitment`'s `BigInt(contestId)` doesn't throw — the absence
+    // of a submit must prove the *fail-closed gate* worked, not a downstream BigInt error.)
+    const record = commitmentRecord({ hash: '0xtracked', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '250000', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 1 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xtracked': record } });
+    const config = cfg({ mode: { dryRun: false } });
+    const submit = submitRecorder();
+    const adapter = liveSpiedAdapter(
+      config,
+      () => Promise.resolve([contestView({ contestId: '1234' })]),
+      { submitCommitment: submit.fn },
+      undefined,
+      undefined,
+      { listOpenCommitments: () => Promise.reject(new Error('API 503')) },
+    );
+    const runner = makeRunner({ config, adapter, maxTicks: 1 });
+    await runner.run();
+
+    const events = readEvents();
+    expect(events.find((e) => e.kind === 'error' && e.phase === 'fill-detection')).toMatchObject({ detail: 'API 503' });
+    expect(submit.calls).toHaveLength(0); // reconcile was skipped — no submit despite the tracked market being quoteable
+    expect(events.some((e) => e.kind === 'submit' || e.kind === 'replace' || e.kind === 'soft-cancel')).toBe(false);
+    expect(events.some((e) => e.kind === 'quote-intent')).toBe(false); // reconcileMarkets never ran
+    expect(StateStore.at(stateDir).load().state.commitments['0xtracked']?.lifecycle).toBe('visibleOpen'); // ageOut didn't run either
+  });
+
+  it('dry-run mode: a `listOpenCommitments` failure is irrelevant — detectFills doesn\'t run in dry-run, so the reconcile proceeds normally', async () => {
+    // Defensive: confirm the fail-closed gate is live-only — dry-run should never be blocked by it.
+    StateStore.at(stateDir).flush(emptyMakerState());
+    const config = cfg(); // dryRun:true
+    const adapter = spiedAdapter(config, () => Promise.resolve([contestView({ contestId: 'A' })]));
+    // listOpenCommitments isn't even spied on the read-only adapter (no live writes path); the
+    // dry-run tick never calls it. We assert by exercising a full would-submit and seeing the loop run.
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    const events = readEvents();
+    expect(events.filter((e) => e.kind === 'would-submit')).toHaveLength(2); // reconcile ran in dry-run despite the absence of fill detection
+  });
+});
+
+describe('Runner — position-status poll (review-PR23 B4)', () => {
+  /** A bare `getPositionStatus` response with one `active` position for `(speculationId, makerSide)`. */
+  function withActivePosition(speculationId: string, positionType: 0 | 1, riskUSDC: number, profitUSDC: number, positionId = '0xpos'): PositionStatus {
+    return {
+      active: [{ positionId, speculationId, positionType, team: 'X', opponent: 'Y', market: 'moneyline', oddsDecimal: null, riskAmountUSDC: riskUSDC, profitAmountUSDC: profitUSDC }],
+      pendingSettle: [], claimable: [],
+      totals: { activeCount: 1, pendingSettleCount: 0, claimableCount: 0, estimatedPayoutUSDC: 0, estimatedPayoutWei6: '0', pendingSettlePayoutUSDC: 0, pendingSettlePayoutWei6: '0' },
+    };
+  }
+
+  it('a position the API reports but local state is missing → `MakerPositionRecord` created + `fill` event (source: position-poll). Context (contestId, sport, teams) is copied from the matching local commitment.', async () => {
+    // Setup: a soft-cancelled commitment (a quote we pulled off-chain). A taker matched it via the
+    // stale signed payload before expiry → the chain has a position the commitment-list diff can't see.
+    // The position poll catches it.
+    const softCancelled = commitmentRecord({ hash: '0xstaleSignedPayload', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '250000', lifecycle: 'softCancelled', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 5, updatedAtUnixSec: T0 - 5 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xstaleSignedPayload': softCancelled } });
+    const config = cfg({ mode: { dryRun: false } });
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]), undefined, undefined, undefined,
+      { getPositionStatus: () => Promise.resolve(withActivePosition('spec-1234', 1 /* home */, 0.25, 0.25)) },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    const reloaded = StateStore.at(stateDir).load().state;
+    expect(reloaded.positions['spec-1234:home']).toMatchObject({
+      speculationId: 'spec-1234', contestId: '1234', side: 'home',
+      sport: softCancelled.sport, awayTeam: softCancelled.awayTeam, homeTeam: softCancelled.homeTeam, // copied from the source commitment
+      riskAmountWei6: '250000', counterpartyRiskWei6: '250000', // 0.25 USDC × 1e6
+      status: 'active',
+    });
+    expect(reloaded.commitments['0xstaleSignedPayload']?.lifecycle).toBe('softCancelled'); // commitment record untouched (we can't attribute the fill to a specific commitment, and the soft-cancelled risk + position will reconcile naturally once ageOut terminalizes)
+    const fills = readEvents().filter((e) => e.kind === 'fill');
+    expect(fills).toHaveLength(1);
+    expect(fills[0]).toMatchObject({ source: 'position-poll', speculationId: 'spec-1234', makerSide: 'home', positionType: 1, newFillWei6: '250000', cumulativeRiskWei6: '250000' });
+  });
+
+  it('a `getPositionStatus` response that matches local state is a no-op (idempotent — no `fill` event, no position update on subsequent ticks)', async () => {
+    // The position record already reflects the on-chain risk; subsequent polls shouldn't emit phantom fills.
+    StateStore.at(stateDir).flush({
+      ...emptyMakerState(),
+      commitments: {
+        '0xc': commitmentRecord({ hash: '0xc', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, lifecycle: 'filled', riskAmountWei6: '250000', filledRiskWei6: '250000' }),
+      },
+      positions: {
+        'spec-1234:home': { speculationId: 'spec-1234', contestId: '1234', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', side: 'home', riskAmountWei6: '250000', counterpartyRiskWei6: '250000', status: 'active', updatedAtUnixSec: T0 - 5 },
+      },
+    });
+    const config = cfg({ mode: { dryRun: false } });
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]), undefined, undefined, undefined,
+      { getPositionStatus: () => Promise.resolve(withActivePosition('spec-1234', 1, 0.25, 0.25)) },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    expect(readEvents().some((e) => e.kind === 'fill')).toBe(false); // already caught up
+    expect(StateStore.at(stateDir).load().state.positions['spec-1234:home']?.riskAmountWei6).toBe('250000'); // unchanged
+  });
+
+  it('a position with no matching local commitment is skipped + logged (don\'t create an incomplete `MakerPositionRecord`)', async () => {
+    // Setup: the API reports a position on a speculation we have NO commitment for (state pre-seeded
+    // externally, or a long-running discrepancy). Refuse to create the record — the risk engine's
+    // per-team/sport caps need real metadata.
+    StateStore.at(stateDir).flush(emptyMakerState());
+    const config = cfg({ mode: { dryRun: false } });
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]), undefined, undefined, undefined,
+      { getPositionStatus: () => Promise.resolve(withActivePosition('spec-orphan', 0, 0.5, 0.5)) },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    const reloaded = StateStore.at(stateDir).load().state;
+    expect(reloaded.positions['spec-orphan:away']).toBeUndefined();
+    const events = readEvents();
+    expect(events.find((e) => e.kind === 'error' && e.phase === 'position-poll')).toMatchObject({ class: 'PositionWithoutCommitment' });
+    expect(events.some((e) => e.kind === 'fill')).toBe(false);
+  });
+
+  it('a `getPositionStatus` failure is logged (`error` phase position-poll) and the tick continues normally — reconcile still runs', async () => {
+    StateStore.at(stateDir).flush(emptyMakerState());
+    const config = cfg({ mode: { dryRun: false } });
+    const submit = submitRecorder();
+    const adapter = liveSpiedAdapter(
+      config,
+      () => Promise.resolve([contestView({ contestId: '1234' })]), // numeric so live `submitCommitment` can BigInt() it
+      { submitCommitment: submit.fn },
+      undefined,
+      undefined,
+      { getPositionStatus: () => Promise.reject(new Error('positions API 500')) },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    const events = readEvents();
+    expect(events.find((e) => e.kind === 'error' && e.phase === 'position-poll')).toMatchObject({ detail: 'positions API 500' });
+    expect(submit.calls.length).toBeGreaterThan(0); // reconcile still ran (position poll failure is best-effort, not fail-closed)
   });
 });

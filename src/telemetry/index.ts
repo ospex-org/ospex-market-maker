@@ -45,6 +45,7 @@ export const TELEMETRY_KINDS = [
   'expire', //                     a tracked commitment hit expiry — headroom released
   'approval', //                   { purpose, spender, currentAllowance, requiredAggregateAllowance, amountSetTo }
   'fill',
+  'position-transition', //         a tracked position's status moved forward (active → pendingSettle → claimable; claimed is set by the auto-claim path, not by the poll)
   'settle',
   'claim',
   'degraded', //                   a market's odds channel errored

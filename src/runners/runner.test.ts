@@ -1801,3 +1801,197 @@ describe('Runner — position-status poll (review-PR23 B4)', () => {
     expect(events.some((e) => e.kind === 'expire')).toBe(false);
   });
 });
+
+// ── position-status transitions (Phase 3 c-ii) ───────────────────────────────
+
+describe('Runner — position-status transitions (Phase 3 c-ii)', () => {
+  /** A `PositionStatus` with one `pendingSettle` position. The estimated payout = risk + profit (Ospex pays back the winner's risk + the counterparty's risk; this test only needs a self-consistent shape). */
+  function withPendingSettlePosition(
+    speculationId: string,
+    positionType: 0 | 1,
+    riskUSDC: number,
+    profitUSDC: number,
+    result: 'won' | 'push' | 'void' = 'won',
+    predictedWinSide: 'away' | 'home' | 'over' | 'under' | 'push' = 'home',
+    positionId = '0xpos',
+  ): PositionStatus {
+    const payout = riskUSDC + profitUSDC;
+    const payoutWei6 = BigInt(Math.round(payout * 1_000_000)).toString();
+    return {
+      active: [],
+      pendingSettle: [{ positionId, speculationId, positionType, team: 'X', opponent: 'Y', market: 'moneyline', oddsDecimal: null, riskAmountUSDC: riskUSDC, profitAmountUSDC: profitUSDC, result, predictedWinSide, estimatedPayoutUSDC: payout, estimatedPayoutWei6: payoutWei6 }],
+      claimable: [],
+      totals: { activeCount: 0, pendingSettleCount: 1, claimableCount: 0, estimatedPayoutUSDC: 0, estimatedPayoutWei6: '0', pendingSettlePayoutUSDC: payout, pendingSettlePayoutWei6: payoutWei6 },
+    };
+  }
+
+  /** A `PositionStatus` with one `claimable` position. */
+  function withClaimablePosition(
+    speculationId: string,
+    positionType: 0 | 1,
+    riskUSDC: number,
+    profitUSDC: number,
+    result: 'won' | 'push' | 'void' = 'won',
+    positionId = '0xpos',
+  ): PositionStatus {
+    const payout = riskUSDC + profitUSDC;
+    const payoutWei6 = BigInt(Math.round(payout * 1_000_000)).toString();
+    return {
+      active: [],
+      pendingSettle: [],
+      claimable: [{ positionId, speculationId, positionType, team: 'X', opponent: 'Y', market: 'moneyline', oddsDecimal: null, riskAmountUSDC: riskUSDC, profitAmountUSDC: profitUSDC, result, estimatedPayoutUSDC: payout, estimatedPayoutWei6: payoutWei6 }],
+      totals: { activeCount: 0, pendingSettleCount: 0, claimableCount: 1, estimatedPayoutUSDC: payout, estimatedPayoutWei6: payoutWei6, pendingSettlePayoutUSDC: 0, pendingSettlePayoutWei6: '0' },
+    };
+  }
+
+  /** Pre-seed an `active` `MakerPositionRecord` on `(speculationId, side='home')` matched to a `filled` commitment. The poll's transition path needs both to assemble context. */
+  function seedActiveHomePosition(speculationId: string, contestId: string, riskWei6 = '250000', counterpartyRiskWei6 = '250000'): MakerState {
+    const commitment = commitmentRecord({ hash: '0xc', speculationId, contestId, makerSide: 'home', oddsTick: 200, lifecycle: 'filled', riskAmountWei6: riskWei6, filledRiskWei6: riskWei6 });
+    return {
+      ...emptyMakerState(),
+      commitments: { '0xc': commitment },
+      positions: {
+        [`${speculationId}:home`]: { speculationId, contestId, sport: commitment.sport, awayTeam: commitment.awayTeam, homeTeam: commitment.homeTeam, side: 'home', riskAmountWei6: riskWei6, counterpartyRiskWei6, status: 'active', updatedAtUnixSec: T0 - 60 },
+      },
+    };
+  }
+
+  it('a position the API has moved from active → pendingSettle is updated locally + emits `position-transition` (fromStatus active, toStatus pendingSettle, result, predictedWinSide)', async () => {
+    StateStore.at(stateDir).flush(seedActiveHomePosition('spec-1234', '1234'));
+    const config = cfg({ mode: { dryRun: false } });
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]), undefined, undefined, undefined,
+      { getPositionStatus: () => Promise.resolve(withPendingSettlePosition('spec-1234', 1, 0.25, 0.25, 'won', 'home')) },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    const reloaded = StateStore.at(stateDir).load().state;
+    expect(reloaded.positions['spec-1234:home']?.status).toBe('pendingSettle');
+    expect(reloaded.positions['spec-1234:home']?.riskAmountWei6).toBe('250000'); // risk unchanged — pure status transition
+
+    const events = readEvents();
+    const transitions = events.filter((e) => e.kind === 'position-transition');
+    expect(transitions).toHaveLength(1);
+    expect(transitions[0]).toMatchObject({ speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', positionType: 1, fromStatus: 'active', toStatus: 'pendingSettle', result: 'won', predictedWinSide: 'home' });
+    expect(events.some((e) => e.kind === 'fill')).toBe(false); // status-only transition, no fill
+  });
+
+  it('a position the API has moved from pendingSettle → claimable is updated locally + emits `position-transition` (result carried, predictedWinSide omitted — claimable view does not surface it)', async () => {
+    const state = seedActiveHomePosition('spec-1234', '1234');
+    state.positions['spec-1234:home']!.status = 'pendingSettle';
+    StateStore.at(stateDir).flush(state);
+    const config = cfg({ mode: { dryRun: false } });
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]), undefined, undefined, undefined,
+      { getPositionStatus: () => Promise.resolve(withClaimablePosition('spec-1234', 1, 0.25, 0.25, 'won')) },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    expect(StateStore.at(stateDir).load().state.positions['spec-1234:home']?.status).toBe('claimable');
+    const transitions = readEvents().filter((e) => e.kind === 'position-transition');
+    expect(transitions).toHaveLength(1);
+    expect(transitions[0]).toMatchObject({ fromStatus: 'pendingSettle', toStatus: 'claimable', result: 'won' });
+    expect(transitions[0]?.predictedWinSide).toBeUndefined(); // not on the claimable view
+  });
+
+  it('a position the API has moved from active → claimable (skipping pendingSettle within the poll window) is a single forward transition (one `position-transition` event)', async () => {
+    StateStore.at(stateDir).flush(seedActiveHomePosition('spec-1234', '1234'));
+    const config = cfg({ mode: { dryRun: false } });
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]), undefined, undefined, undefined,
+      { getPositionStatus: () => Promise.resolve(withClaimablePosition('spec-1234', 1, 0.25, 0.25, 'won')) },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    expect(StateStore.at(stateDir).load().state.positions['spec-1234:home']?.status).toBe('claimable');
+    const transitions = readEvents().filter((e) => e.kind === 'position-transition');
+    expect(transitions).toHaveLength(1);
+    expect(transitions[0]).toMatchObject({ fromStatus: 'active', toStatus: 'claimable' });
+  });
+
+  it('a position first observed directly in claimable (no prior local record) is CREATED with status claimable + emits `fill` (the position\'s birth — NO `position-transition` event)', async () => {
+    // The soft-cancelled-stale-payload path can land a position straight into pendingSettle/claimable
+    // (the indexer is slow OR the speculation scored fast). We must record the maker's risk and at
+    // the right status — but it's a birth, not a transition, so no transition event.
+    const softCancelled = commitmentRecord({ hash: '0xstale', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, lifecycle: 'softCancelled', riskAmountWei6: '250000' });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xstale': softCancelled } });
+    const config = cfg({ mode: { dryRun: false } });
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]), undefined, undefined, undefined,
+      { getPositionStatus: () => Promise.resolve(withClaimablePosition('spec-1234', 1, 0.25, 0.25, 'won')) },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    expect(StateStore.at(stateDir).load().state.positions['spec-1234:home']).toMatchObject({ status: 'claimable', riskAmountWei6: '250000', counterpartyRiskWei6: '250000' });
+    const events = readEvents();
+    expect(events.filter((e) => e.kind === 'fill')).toHaveLength(1);
+    expect(events.some((e) => e.kind === 'position-transition')).toBe(false);
+  });
+
+  it('a backwards transition (API reports claimable as active) is refused + logged (`error` class BackwardsPositionTransition); the local status stays claimable', async () => {
+    // This shouldn't happen in production — a settled speculation can't un-settle, claimed positions
+    // disappear from the API. It signals state corruption (manual edit, version skew). The runner
+    // refuses to revert the local record to a less-advanced status.
+    const state = seedActiveHomePosition('spec-1234', '1234');
+    state.positions['spec-1234:home']!.status = 'claimable';
+    StateStore.at(stateDir).flush(state);
+    const config = cfg({ mode: { dryRun: false } });
+    const apiActive: PositionStatus = {
+      active: [{ positionId: '0xpos', speculationId: 'spec-1234', positionType: 1, team: 'X', opponent: 'Y', market: 'moneyline', oddsDecimal: null, riskAmountUSDC: 0.25, profitAmountUSDC: 0.25 }],
+      pendingSettle: [], claimable: [],
+      totals: { activeCount: 1, pendingSettleCount: 0, claimableCount: 0, estimatedPayoutUSDC: 0, estimatedPayoutWei6: '0', pendingSettlePayoutUSDC: 0, pendingSettlePayoutWei6: '0' },
+    };
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]), undefined, undefined, undefined,
+      { getPositionStatus: () => Promise.resolve(apiActive) },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    expect(StateStore.at(stateDir).load().state.positions['spec-1234:home']?.status).toBe('claimable'); // unchanged
+    const events = readEvents();
+    expect(events.find((e) => e.kind === 'error' && e.phase === 'position-poll')).toMatchObject({ class: 'BackwardsPositionTransition' });
+    expect(events.some((e) => e.kind === 'position-transition')).toBe(false);
+  });
+
+  it('a poll that matches local status + risk is a no-op across two ticks (idempotent — no `position-transition`, no `fill`)', async () => {
+    const state = seedActiveHomePosition('spec-1234', '1234');
+    state.positions['spec-1234:home']!.status = 'pendingSettle';
+    StateStore.at(stateDir).flush(state);
+    const config = cfg({ mode: { dryRun: false } });
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]), undefined, undefined, undefined,
+      { getPositionStatus: () => Promise.resolve(withPendingSettlePosition('spec-1234', 1, 0.25, 0.25, 'won', 'home')) },
+    );
+    await makeRunner({ config, adapter, maxTicks: 2 }).run();
+
+    expect(StateStore.at(stateDir).load().state.positions['spec-1234:home']?.status).toBe('pendingSettle');
+    const events = readEvents();
+    expect(events.some((e) => e.kind === 'position-transition')).toBe(false);
+    expect(events.some((e) => e.kind === 'fill')).toBe(false);
+  });
+
+  it('a poll carrying BOTH a risk delta AND a forward status transition emits both `fill` and `position-transition`', async () => {
+    // E.g. the speculation just scored AND the indexer just caught up on a prior fill the maker
+    // missed — first poll observes the position with more risk AND in a non-`active` bucket.
+    const state = seedActiveHomePosition('spec-1234', '1234', '100000', '100000'); // local: 0.10 USDC
+    StateStore.at(stateDir).flush(state);
+    const config = cfg({ mode: { dryRun: false } });
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]), undefined, undefined, undefined,
+      { getPositionStatus: () => Promise.resolve(withPendingSettlePosition('spec-1234', 1, 0.25, 0.25, 'won', 'home')) }, // API: 0.25 USDC risk, pendingSettle
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    const reloaded = StateStore.at(stateDir).load().state;
+    expect(reloaded.positions['spec-1234:home']?.status).toBe('pendingSettle');
+    expect(reloaded.positions['spec-1234:home']?.riskAmountWei6).toBe('250000'); // 0.10 + 0.15 delta
+
+    const events = readEvents();
+    const fills = events.filter((e) => e.kind === 'fill');
+    expect(fills).toHaveLength(1);
+    expect(fills[0]).toMatchObject({ source: 'position-poll', newFillWei6: '150000', cumulativeRiskWei6: '250000' });
+    const transitions = events.filter((e) => e.kind === 'position-transition');
+    expect(transitions).toHaveLength(1);
+    expect(transitions[0]).toMatchObject({ fromStatus: 'active', toStatus: 'pendingSettle' });
+  });
+});

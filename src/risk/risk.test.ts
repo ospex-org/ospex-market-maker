@@ -239,4 +239,10 @@ describe('canSpendGas (Phase 3 d-ii)', () => {
     expect(v.allowed).toBe(false);
     if (!v.allowed) expect(v.reason).toMatch(/emergencyReservePOL/);
   });
+
+  it('defense-in-depth: denies on a negative todayGasSpentPolWei (state corruption / caller bug) — the state validator already rejects negative decimal strings on load, but the verdict is the money/gas safety boundary (Hermes review-PR26)', () => {
+    const v = canSpendGas({ todayGasSpentPolWei: -1n, maxDailyGasPolWei: POL, emergencyReservePolWei: POL / 5n });
+    expect(v.allowed).toBe(false);
+    if (!v.allowed) expect(v.reason).toMatch(/todayGasSpentPolWei.*>= 0/);
+  });
 });

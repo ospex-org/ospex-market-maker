@@ -245,6 +245,13 @@ export function canSpendGas(args: {
   emergencyReservePolWei: bigint;
 }): { allowed: true } | { allowed: false; reason: string } {
   const { todayGasSpentPolWei, maxDailyGasPolWei, emergencyReservePolWei } = args;
+  // Defense-in-depth — the state validator (`src/state/`) already rejects negative
+  // decimal strings on load, but `canSpendGas` is the money/gas safety boundary
+  // for the whole runner; refuse the call rather than silently allow when a caller
+  // somehow constructs a negative spent value (state corruption, future caller bug).
+  if (todayGasSpentPolWei < 0n) {
+    return { allowed: false, reason: `todayGasSpentPolWei must be >= 0; got ${todayGasSpentPolWei.toString()} wei (state corruption?)` };
+  }
   if (maxDailyGasPolWei <= 0n) {
     return { allowed: false, reason: `gas.maxDailyGasPOL must be > 0; got ${maxDailyGasPolWei.toString()} wei` };
   }

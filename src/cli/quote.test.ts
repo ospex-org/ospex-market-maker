@@ -64,8 +64,19 @@ function fakeAdapter(client: ClientOverrides): OspexAdapter {
   const full: OspexClientLike = {
     contests: { get: notStubbed('contests.get'), list: notStubbed('contests.list'), ...client.contests },
     speculations: { list: notStubbed('speculations.list'), get: notStubbed('speculations.get'), ...client.speculations },
-    commitments: { list: notStubbed('commitments.list'), get: notStubbed('commitments.get'), ...client.commitments },
-    positions: { status: notStubbed('positions.status'), byAddress: notStubbed('positions.byAddress'), ...client.positions },
+    commitments: {
+      list: notStubbed('commitments.list'), get: notStubbed('commitments.get'),
+      submitRaw: notStubbed('commitments.submitRaw'), cancel: notStubbed('commitments.cancel'),
+      cancelOnchain: notStubbed('commitments.cancelOnchain'), raiseMinNonce: notStubbed('commitments.raiseMinNonce'),
+      approve: notStubbed('commitments.approve'), getNonceFloor: notStubbed('commitments.getNonceFloor'),
+      ...client.commitments,
+    },
+    positions: {
+      status: notStubbed('positions.status'), byAddress: notStubbed('positions.byAddress'),
+      settleSpeculation: notStubbed('positions.settleSpeculation'), claim: notStubbed('positions.claim'),
+      claimAll: notStubbed('positions.claimAll'),
+      ...client.positions,
+    },
     balances: { read: notStubbed('balances.read'), ...client.balances },
     approvals: { read: notStubbed('approvals.read'), ...client.approvals },
     health: { check: notStubbed('health.check'), ...client.health },

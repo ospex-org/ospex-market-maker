@@ -1,7 +1,8 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { randomBytes } from 'node:crypto';
 
 import { DEFAULT_API_URL } from '@ospex/sdk';
 import type {
@@ -10,19 +11,24 @@ import type {
   Commitment,
   Contest,
   ContestOddsSnapshot,
+  Hex,
   OddsSnapshot,
   OddsSubscribeArgs,
   OddsSubscribeHandlers,
   PositionStatus,
+  Signer,
   Speculation,
   SpeculationDetail,
   Subscription,
 } from '@ospex/sdk';
+import { KeystoreSigner } from '@ospex/sdk/signers/keystore';
 
 import {
   OspexAdapter,
+  createLiveOspexAdapter,
   createOspexAdapter,
   readKeystoreAddress,
+  unlockKeystoreSigner,
   type OspexClientLike,
 } from './index.js';
 import { parseConfig } from '../config/index.js';
@@ -195,8 +201,25 @@ function makeFakeClient(overrides: DeepPartial<OspexClientLike> = {}): OspexClie
   return {
     contests: { get: notStubbed('contests.get'), list: notStubbed('contests.list'), ...overrides.contests },
     speculations: { list: notStubbed('speculations.list'), get: notStubbed('speculations.get'), ...overrides.speculations },
-    commitments: { list: notStubbed('commitments.list'), get: notStubbed('commitments.get'), ...overrides.commitments },
-    positions: { status: notStubbed('positions.status'), byAddress: notStubbed('positions.byAddress'), ...overrides.positions },
+    commitments: {
+      list: notStubbed('commitments.list'),
+      get: notStubbed('commitments.get'),
+      submitRaw: notStubbed('commitments.submitRaw'),
+      cancel: notStubbed('commitments.cancel'),
+      cancelOnchain: notStubbed('commitments.cancelOnchain'),
+      raiseMinNonce: notStubbed('commitments.raiseMinNonce'),
+      approve: notStubbed('commitments.approve'),
+      getNonceFloor: notStubbed('commitments.getNonceFloor'),
+      ...overrides.commitments,
+    },
+    positions: {
+      status: notStubbed('positions.status'),
+      byAddress: notStubbed('positions.byAddress'),
+      settleSpeculation: notStubbed('positions.settleSpeculation'),
+      claim: notStubbed('positions.claim'),
+      claimAll: notStubbed('positions.claimAll'),
+      ...overrides.positions,
+    },
     balances: { read: notStubbed('balances.read'), ...overrides.balances },
     approvals: { read: notStubbed('approvals.read'), ...overrides.approvals },
     health: { check: notStubbed('health.check'), ...overrides.health },
@@ -204,8 +227,24 @@ function makeFakeClient(overrides: DeepPartial<OspexClientLike> = {}): OspexClie
   };
 }
 
+const FAKE_CTX = { chainId: 137 as const, apiUrl: 'https://api.test' };
+
 function adapterWith(overrides: DeepPartial<OspexClientLike> = {}): OspexAdapter {
-  return new OspexAdapter(makeFakeClient(overrides), { chainId: 137, apiUrl: 'https://api.test' });
+  return new OspexAdapter(makeFakeClient(overrides), FAKE_CTX);
+}
+
+/** A minimal `Signer` fake — deterministic address, dummy signatures (the adapter never inspects them). */
+function fakeSigner(address: Hex = '0x9999999999999999999999999999999999999999'): Signer {
+  return {
+    getAddress: () => Promise.resolve(address),
+    signTypedData: () => Promise.resolve('0xsignature' as Hex),
+    signTransaction: () => Promise.resolve('0xsignedtx' as Hex),
+  };
+}
+
+/** An adapter built with a signer attached — `isLive()` is true, the write wrappers reach the (overridable) fake client. */
+function liveAdapterWith(overrides: DeepPartial<OspexClientLike> = {}, signer: Signer = fakeSigner()): OspexAdapter {
+  return new OspexAdapter(makeFakeClient(overrides), { ...FAKE_CTX, signer });
 }
 
 // ── view-mapping tests (the provider-name boundary) ──────────────────────────
@@ -505,6 +544,207 @@ describe('createOspexAdapter', () => {
   });
 });
 
+// ── createLiveOspexAdapter — the signed factory ──────────────────────────────
+
+describe('createLiveOspexAdapter', () => {
+  it('builds a live adapter: isLive() true, makerAddress() resolves to the signer\'s address', async () => {
+    const adapter = createLiveOspexAdapter(
+      parseConfig({ rpcUrl: 'http://localhost:8545' }),
+      fakeSigner('0xabc0000000000000000000000000000000000abc'),
+    );
+    expect(adapter.isLive()).toBe(true);
+    expect(await adapter.makerAddress()).toBe('0xabc0000000000000000000000000000000000abc');
+  });
+
+  it('honours apiUrl / chainId like the read-only factory', () => {
+    const a = createLiveOspexAdapter(parseConfig({ rpcUrl: 'http://localhost:8545' }), fakeSigner());
+    expect(a.apiUrl).toBe(DEFAULT_API_URL);
+    expect(a.chainId).toBe(137);
+
+    const b = createLiveOspexAdapter(
+      parseConfig({ rpcUrl: 'http://localhost:8545', apiUrl: 'https://my-api.test', chainId: 80002 }),
+      fakeSigner(),
+    );
+    expect(b.apiUrl).toBe('https://my-api.test');
+    expect(b.chainId).toBe(80002);
+  });
+});
+
+// ── signer / live-mode identity ──────────────────────────────────────────────
+
+describe('OspexAdapter — signer / live mode', () => {
+  it('a read-only adapter: isLive() false, makerAddress() throws', async () => {
+    const adapter = adapterWith();
+    expect(adapter.isLive()).toBe(false);
+    await expect(adapter.makerAddress()).rejects.toThrow(/no signer attached/);
+  });
+
+  it('a live adapter: isLive() true, makerAddress() returns the signer\'s address', async () => {
+    const adapter = liveAdapterWith({}, fakeSigner('0x1234123412341234123412341234123412341234'));
+    expect(adapter.isLive()).toBe(true);
+    expect(await adapter.makerAddress()).toBe('0x1234123412341234123412341234123412341234');
+  });
+});
+
+// ── write surface — thin SDK passthroughs (live) ─────────────────────────────
+
+describe('OspexAdapter — write surface', () => {
+  it('submitCommitment forwards the protocol tuple to commitments.submitRaw and returns its result', async () => {
+    let received: unknown = null;
+    const result = { hash: '0xdeadbeef' as Hex, commitment: SAMPLE_COMMITMENT };
+    const adapter = liveAdapterWith({
+      commitments: {
+        submitRaw: (args) => {
+          received = args;
+          return Promise.resolve(result);
+        },
+      },
+    });
+    const args = {
+      contestId: 1234n,
+      scorer: '0x2222222222222222222222222222222222222222' as Hex,
+      lineTicks: 0,
+      positionType: 1 as const,
+      oddsTick: 202,
+      riskAmount: 250_000n,
+    };
+    expect(await adapter.submitCommitment(args)).toBe(result);
+    expect(received).toEqual(args);
+  });
+
+  it('cancelCommitmentOffchain forwards the hash to commitments.cancel and resolves void', async () => {
+    let received: unknown = null;
+    const adapter = liveAdapterWith({
+      commitments: {
+        cancel: (h) => {
+          received = h;
+          return Promise.resolve({ ok: true as const });
+        },
+      },
+    });
+    await expect(adapter.cancelCommitmentOffchain('0xabc')).resolves.toBeUndefined();
+    expect(received).toBe('0xabc');
+  });
+
+  it('cancelCommitmentOnchain forwards the hash to commitments.cancelOnchain and returns its result', async () => {
+    let received: unknown = null;
+    const result = { txHash: '0xtx' as Hex, receipt: {} as unknown as never, commitmentHash: '0xabc' as Hex };
+    const adapter = liveAdapterWith({
+      commitments: {
+        cancelOnchain: (h) => {
+          received = h;
+          return Promise.resolve(result);
+        },
+      },
+    });
+    expect(await adapter.cancelCommitmentOnchain('0xabc')).toBe(result);
+    expect(received).toBe('0xabc');
+  });
+
+  it('raiseMinNonce forwards { contestId, scorer, lineTicks, newMinNonce } to commitments.raiseMinNonce', async () => {
+    let received: unknown = null;
+    const result = { txHash: '0xtx' as Hex, receipt: {} as unknown as never };
+    const adapter = liveAdapterWith({
+      commitments: {
+        raiseMinNonce: (args) => {
+          received = args;
+          return Promise.resolve(result);
+        },
+      },
+    });
+    const args = { contestId: 1234n, scorer: '0x2222222222222222222222222222222222222222' as Hex, lineTicks: 0, newMinNonce: 5n };
+    expect(await adapter.raiseMinNonce(args)).toBe(result);
+    expect(received).toEqual(args);
+  });
+
+  it('readMinNonceFloor forwards to commitments.getNonceFloor and returns the bigint floor', async () => {
+    let received: unknown = null;
+    const adapter = liveAdapterWith({
+      commitments: {
+        getNonceFloor: (args) => {
+          received = args;
+          return Promise.resolve(42n);
+        },
+      },
+    });
+    const args = {
+      maker: '0x1111111111111111111111111111111111111111' as Hex,
+      contestId: 1234n,
+      scorer: '0x2222222222222222222222222222222222222222' as Hex,
+      lineTicks: 0,
+    };
+    expect(await adapter.readMinNonceFloor(args)).toBe(42n);
+    expect(received).toEqual(args);
+  });
+
+  it('approveUSDC forwards the amount to commitments.approve (exact wei6 and the "max" sentinel)', async () => {
+    const received: unknown[] = [];
+    const result = { txHash: '0xtx' as Hex, receipt: {} as unknown as never, spender: '0xpos', token: '0xusdc', amount: 5_000_000n };
+    const adapter = liveAdapterWith({
+      commitments: {
+        approve: (amount) => {
+          received.push(amount);
+          return Promise.resolve(result);
+        },
+      },
+    });
+    expect(await adapter.approveUSDC(5_000_000n)).toBe(result);
+    await adapter.approveUSDC('max');
+    expect(received).toEqual([5_000_000n, 'max']);
+  });
+
+  it('settleSpeculation forwards { speculationId } to positions.settleSpeculation', async () => {
+    let received: unknown = null;
+    const result = { txHash: '0xtx' as Hex, blockNumber: 100n, winSide: 'home' as const, receipt: {} as unknown as never };
+    const adapter = liveAdapterWith({
+      positions: {
+        settleSpeculation: (args) => {
+          received = args;
+          return Promise.resolve(result);
+        },
+      },
+    });
+    expect(await adapter.settleSpeculation({ speculationId: 7n })).toBe(result);
+    expect(received).toEqual({ speculationId: 7n });
+  });
+
+  it('claimPosition forwards { speculationId, positionType } to positions.claim', async () => {
+    let received: unknown = null;
+    const result = { txHash: '0xtx' as Hex, blockNumber: 100n, payoutWei6: 500_000n, payoutUSDC: 0.5, receipt: {} as unknown as never };
+    const adapter = liveAdapterWith({
+      positions: {
+        claim: (args) => {
+          received = args;
+          return Promise.resolve(result);
+        },
+      },
+    });
+    expect(await adapter.claimPosition({ speculationId: 7n, positionType: 0 })).toBe(result);
+    expect(received).toEqual({ speculationId: 7n, positionType: 0 });
+  });
+
+  it('claimAll forwards its optional args (including undefined) to positions.claimAll', async () => {
+    const received: unknown[] = [];
+    const result = {
+      address: '0x9999999999999999999999999999999999999999',
+      success: true,
+      entries: [],
+      totals: { claimed: 0, failed: 0, totalPayoutWei6: '0', totalPayoutUSDC: 0 },
+    };
+    const adapter = liveAdapterWith({
+      positions: {
+        claimAll: (args) => {
+          received.push(args);
+          return Promise.resolve(result);
+        },
+      },
+    });
+    expect(await adapter.claimAll()).toBe(result);
+    await adapter.claimAll({ opts: { dryRun: true } });
+    expect(received).toEqual([undefined, { opts: { dryRun: true } }]);
+  });
+});
+
 // ── readKeystoreAddress — cheap-path address read ────────────────────────────
 
 describe('readKeystoreAddress', () => {
@@ -552,5 +792,53 @@ describe('readKeystoreAddress', () => {
     const nonHex = join(dir, 'nonhex.json');
     writeFileSync(nonHex, JSON.stringify({ address: 'g'.repeat(40) }), 'utf8');
     expect(readKeystoreAddress(nonHex)).toBeNull();
+  });
+});
+
+// ── unlockKeystoreSigner — the real decrypt → Signer ─────────────────────────
+
+describe('unlockKeystoreSigner', () => {
+  // scrypt at ethers' default cost runs once per encrypt and once per decrypt
+  // (~hundreds of ms each) — generous headroom for slower / CI hosts.
+  const KDF_TIMEOUT_MS = 30_000;
+  const PASSPHRASE = 'correct horse battery staple';
+
+  let dir: string;
+  let keystorePath: string;
+  let expectedAddress: Hex;
+
+  beforeAll(async () => {
+    dir = mkdtempSync(join(tmpdir(), 'ospex-mm-unlock-'));
+    // Synthetic key generated at test time — never a real wallet (CLAUDE.md).
+    const syntheticPk = `0x${randomBytes(32).toString('hex')}` as Hex;
+    expectedAddress = await KeystoreSigner.fromPrivateKey(syntheticPk).getAddress();
+    keystorePath = join(dir, 'keystore.json');
+    writeFileSync(keystorePath, await KeystoreSigner.encrypt(syntheticPk, PASSPHRASE), 'utf8');
+  }, KDF_TIMEOUT_MS);
+
+  afterAll(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('decrypts a v3 keystore with the right passphrase and returns a Signer whose address matches', async () => {
+    const signer = await unlockKeystoreSigner(keystorePath, PASSPHRASE);
+    expect(await signer.getAddress()).toBe(expectedAddress);
+  }, KDF_TIMEOUT_MS);
+
+  it('rejects on a wrong passphrase', async () => {
+    await expect(unlockKeystoreSigner(keystorePath, 'wrong passphrase')).rejects.toThrow();
+  }, KDF_TIMEOUT_MS);
+
+  it('throws a clear error naming the path when the keystore file cannot be read', async () => {
+    const missing = join(dir, 'does-not-exist.json');
+    await expect(unlockKeystoreSigner(missing, PASSPHRASE)).rejects.toThrow(
+      /unlockKeystoreSigner: cannot read keystore file at .+does-not-exist\.json/,
+    );
+  });
+
+  it('rejects when the file is not valid keystore JSON', async () => {
+    const garbage = join(dir, 'garbage.json');
+    writeFileSync(garbage, 'definitely not json', 'utf8');
+    await expect(unlockKeystoreSigner(garbage, PASSPHRASE)).rejects.toThrow();
   });
 });

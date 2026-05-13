@@ -156,6 +156,7 @@ export async function runRun(opts: RunOpts, deps: RunDeps = {}): Promise<void> {
   // CLI prints it under "run failed: …").
   let adapter: OspexAdapter;
   let bootAddress: string;
+  let liveMakerAddress: Hex | null = null; // set in live mode (from `signer.getAddress()`) — passed to the Runner for fill detection + competitiveness self-exclusion
   if (opts.mode === 'live') {
     if (config.wallet.keystorePath === undefined) {
       throw new RunRefused(
@@ -179,7 +180,8 @@ export async function runRun(opts: RunOpts, deps: RunDeps = {}): Promise<void> {
     }
     const unlockSigner = deps.unlockSigner ?? unlockKeystoreSigner;
     const signer = await unlockSigner(config.wallet.keystorePath, passphrase); // a bad passphrase / malformed keystore throws a plain Error — the CLI surfaces it as "run failed: …"
-    bootAddress = await signer.getAddress();
+    liveMakerAddress = await signer.getAddress();
+    bootAddress = liveMakerAddress;
     adapter = (deps.createLiveAdapter ?? createLiveOspexAdapter)(config, signer);
   } else {
     adapter = (deps.createAdapter ?? createOspexAdapter)(config);
@@ -201,6 +203,7 @@ export async function runRun(opts: RunOpts, deps: RunDeps = {}): Promise<void> {
     stateStore,
     runId,
     ignoreMissingState: opts.ignoreMissingState,
+    ...(liveMakerAddress !== null ? { makerAddress: liveMakerAddress } : {}),
     ...(deps.maxTicks !== undefined ? { maxTicks: deps.maxTicks } : {}),
     ...(deps.runnerDeps !== undefined ? { deps: deps.runnerDeps } : {}),
   });

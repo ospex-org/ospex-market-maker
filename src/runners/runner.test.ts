@@ -76,7 +76,7 @@ const noopDeps: Partial<RunnerDeps> = {
   random: () => 0.5,
 };
 
-function makeRunner(opts: { config?: Config; adapter?: OspexAdapter; runId?: string; ignoreMissingState?: boolean; maxTicks?: number; deps?: Partial<RunnerDeps> } = {}): Runner {
+function makeRunner(opts: { config?: Config; adapter?: OspexAdapter; runId?: string; ignoreMissingState?: boolean; maxTicks?: number; deps?: Partial<RunnerDeps>; makerAddress?: Hex } = {}): Runner {
   const config = opts.config ?? cfg();
   let adapter = opts.adapter;
   if (adapter === undefined) {
@@ -89,6 +89,10 @@ function makeRunner(opts: { config?: Config; adapter?: OspexAdapter; runId?: str
     vi.spyOn(adapter, 'subscribeOdds').mockRejectedValue(new Error('makeRunner: subscribeOdds not stubbed — pass an `adapter` (see `spiedAdapter`) if your test exercises odds'));
     vi.spyOn(adapter, 'getSpeculation').mockRejectedValue(new Error('makeRunner: getSpeculation not stubbed — pass an `adapter` (see `spiedAdapter`) if your test exercises the reconcile'));
   }
+  // Default the maker address to the fake signer's address for any live-mode test that
+  // doesn't override it — keeps the live-execution tests (which all use the same fake
+  // signer via `liveSpiedAdapter`) from each having to plumb the same constant.
+  const makerAddress = opts.makerAddress ?? (adapter.isLive() ? (DEFAULT_FAKE_MAKER_ADDRESS as Hex) : undefined);
   const full: RunnerOptions = {
     config,
     adapter,
@@ -98,8 +102,12 @@ function makeRunner(opts: { config?: Config; adapter?: OspexAdapter; runId?: str
   };
   if (opts.ignoreMissingState !== undefined) full.ignoreMissingState = opts.ignoreMissingState;
   if (opts.maxTicks !== undefined) full.maxTicks = opts.maxTicks;
+  if (makerAddress !== undefined) full.makerAddress = makerAddress;
   return new Runner(full);
 }
+
+/** The fake signer's address used across the live-mode tests (`liveSpiedAdapter` → `fakeSigner` → this). Re-exported as `SIGNER_ADDRESS` inside the `live execution` describe for symmetry with earlier test additions. */
+const DEFAULT_FAKE_MAKER_ADDRESS = '0x9999999999999999999999999999999999999999';
 
 // ── discovery fixtures ───────────────────────────────────────────────────────
 
@@ -253,7 +261,10 @@ function submitRecorder(): { fn: (args: SubmitCommitmentArgs) => Promise<SubmitC
  * A *signed* adapter (`createLiveOspexAdapter`, so `isLive()` is true) with the same
  * reads spied as {@link spiedAdapter}, plus the live writes: `submitCommitment`
  * defaults to rejecting (a test that triggers a submit must stub it via `writes`),
- * `cancelCommitmentOffchain` defaults to a no-op success.
+ * `cancelCommitmentOffchain` defaults to a no-op success, `listOpenCommitments`
+ * defaults to `[]` and `getCommitment` defaults to rejecting (a test that exercises
+ * fill detection overrides both via `reads`) — every adapter method is spied so a
+ * live-mode test never makes a real network call.
  */
 function liveSpiedAdapter(
   config: Config,
@@ -268,6 +279,10 @@ function liveSpiedAdapter(
     subscribe?: (args: SubscribeOddsArgs, handlers: OddsSubscribeHandlersView) => Promise<Subscription>;
     getSpeculation?: (speculationId: string) => Promise<SpeculationView>;
   },
+  reads?: {
+    listOpenCommitments?: (maker: string, limit: number) => Promise<Commitment[]>;
+    getCommitment?: (hash: Hex) => Promise<Commitment>;
+  },
 ): OspexAdapter {
   const adapter = createLiveOspexAdapter(config, fakeSigner());
   vi.spyOn(adapter, 'listContests').mockImplementation(listContests);
@@ -277,6 +292,8 @@ function liveSpiedAdapter(
   vi.spyOn(adapter, 'getSpeculation').mockImplementation(odds?.getSpeculation ?? ((speculationId) => Promise.resolve(speculationView(speculationId))));
   vi.spyOn(adapter, 'submitCommitment').mockImplementation(writes?.submitCommitment ?? (() => Promise.reject(new Error('liveSpiedAdapter: submitCommitment not stubbed — pass `writes.submitCommitment`'))));
   vi.spyOn(adapter, 'cancelCommitmentOffchain').mockImplementation(writes?.cancelCommitmentOffchain ?? (() => Promise.resolve()));
+  vi.spyOn(adapter, 'listOpenCommitments').mockImplementation(reads?.listOpenCommitments ?? (() => Promise.resolve([])));
+  vi.spyOn(adapter, 'getCommitment').mockImplementation(reads?.getCommitment ?? (() => Promise.reject(new Error('liveSpiedAdapter: getCommitment not stubbed — pass `reads.getCommitment`'))));
   return adapter;
 }
 
@@ -1360,5 +1377,183 @@ describe('Runner — live execution', () => {
     expect(reloaded['0xstaleAway']?.lifecycle).toBe('visibleOpen'); // both incumbents still up — unchanged (only the original, never two)
     expect(reloaded['0xstaleHome']?.lifecycle).toBe('visibleOpen');
     expect(runner.trackedMarketView('1234')?.dirty).toBe(true); // never cleared — the reconcile kept returning transient-failure
+  });
+});
+
+// ── fill detection (live only, Phase 3 (c-i)) ────────────────────────────────
+//
+// `tick()`'s new step (between odds refresh and reconcile, live mode only) —
+// diffs `listOpenCommitments(maker)` against the local `visibleOpen`/`partiallyFilled`
+// set, classifies disappeared hashes via `getCommitment(hash).status`, bumps
+// still-listed commitments whose `filledRiskAmount` advanced, dirties the affected
+// market so the same tick's reconcile re-prices the imbalance, and emits `fill` /
+// `expire` events. `liveSpiedAdapter` defaults `listOpenCommitments → []` and
+// `getCommitment → reject`, so every fill-detection test stubs `reads` explicitly.
+// `DEFAULT_FAKE_MAKER_ADDRESS` (module scope, `0x9999…`) is the fake signer's
+// address — used as the `Commitment.maker` value when an API row is the MM's own.
+
+describe('Runner — fill detection', () => {
+  it('dry-run mode: the fill-detection step is skipped — `listOpenCommitments` is never called, even with local records', async () => {
+    const record = commitmentRecord({ hash: '0xtracked', makerSide: 'away', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 100 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xtracked': record } });
+    const config = cfg();
+    const adapter = createOspexAdapter(config);
+    vi.spyOn(adapter, 'listContests').mockResolvedValue([]);
+    vi.spyOn(adapter, 'getContest').mockRejectedValue(new Error('unused'));
+    vi.spyOn(adapter, 'getOddsSnapshot').mockRejectedValue(new Error('unused'));
+    vi.spyOn(adapter, 'subscribeOdds').mockRejectedValue(new Error('unused'));
+    vi.spyOn(adapter, 'getSpeculation').mockRejectedValue(new Error('unused'));
+    const listOpenSpy = vi.spyOn(adapter, 'listOpenCommitments').mockResolvedValue([]);
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    expect(listOpenSpy).not.toHaveBeenCalled();
+  });
+
+  it('a fully-filled commitment is reclassified `filled`, a position is created, the market is dirtied, and a `fill` event fires (partial:false)', async () => {
+    const record = commitmentRecord({ hash: '0xrealAway', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '250000', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 1 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xrealAway': record } });
+    const config = cfg({ mode: { dryRun: false } });
+    const apiFilled: Commitment = orderbookEntry({ commitmentHash: '0xrealAway', maker: DEFAULT_FAKE_MAKER_ADDRESS, contestId: '1234', positionType: 1, oddsTick: 200, riskAmount: '250000', filledRiskAmount: '250000', remainingRiskAmount: '0', status: 'filled', isLive: false });
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]), undefined, undefined, undefined,
+      { listOpenCommitments: () => Promise.resolve([]), getCommitment: (h) => h === '0xrealAway' ? Promise.resolve(apiFilled) : Promise.reject(new Error('unknown hash')) },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    const reloaded = StateStore.at(stateDir).load().state;
+    expect(reloaded.commitments['0xrealAway']?.lifecycle).toBe('filled');
+    expect(reloaded.commitments['0xrealAway']?.filledRiskWei6).toBe('250000');
+    expect(reloaded.positions['spec-1234:home']).toMatchObject({
+      speculationId: 'spec-1234', contestId: '1234', side: 'home',
+      riskAmountWei6: '250000',
+      // (oddsTick − 100) / 100 × risk = (200 − 100) / 100 × 250000 = 250000
+      counterpartyRiskWei6: '250000',
+      status: 'active',
+    });
+
+    const fills = readEvents().filter((e) => e.kind === 'fill');
+    expect(fills).toHaveLength(1);
+    expect(fills[0]).toMatchObject({
+      commitmentHash: '0xrealAway', speculationId: 'spec-1234', contestId: '1234',
+      takerSide: 'away', makerSide: 'home', positionType: 1, makerOddsTick: 200,
+      newFillWei6: '250000', filledRiskWei6: '250000', partial: false,
+    });
+  });
+
+  it('a partial-fill bump (still listed; `filledRiskAmount` advanced) → record reclassified `partiallyFilled`, position extended by the delta, market dirtied, `fill` event (partial:true)', async () => {
+    const record = commitmentRecord({ hash: '0xrealAway', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '500000', lifecycle: 'visibleOpen', filledRiskWei6: '100000', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 1 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xrealAway': record } });
+    const config = cfg({ mode: { dryRun: false } });
+    // Still listed; filledRiskAmount advanced 100000 → 300000 (delta 200000).
+    const apiPartial: Commitment = orderbookEntry({ commitmentHash: '0xrealAway', maker: DEFAULT_FAKE_MAKER_ADDRESS, contestId: '1234', positionType: 1, oddsTick: 200, riskAmount: '500000', filledRiskAmount: '300000', remainingRiskAmount: '200000', status: 'partially_filled', isLive: true });
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]), undefined, undefined, undefined,
+      { listOpenCommitments: () => Promise.resolve([apiPartial]) },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    const reloaded = StateStore.at(stateDir).load().state;
+    expect(reloaded.commitments['0xrealAway']?.lifecycle).toBe('partiallyFilled');
+    expect(reloaded.commitments['0xrealAway']?.filledRiskWei6).toBe('300000');
+    expect(reloaded.positions['spec-1234:home']?.riskAmountWei6).toBe('200000'); // delta only — counts the *new* fill
+    expect(reloaded.positions['spec-1234:home']?.counterpartyRiskWei6).toBe('200000'); // 200000 × (200 − 100) / 100
+
+    const fills = readEvents().filter((e) => e.kind === 'fill');
+    expect(fills).toHaveLength(1);
+    expect(fills[0]).toMatchObject({ partial: true, newFillWei6: '200000', filledRiskWei6: '300000' });
+  });
+
+  it('a disappeared commitment whose API status is `expired` → record reclassified `expired`, an `expire` event (no `fill`)', async () => {
+    const record = commitmentRecord({ hash: '0xexpiry', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 1 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xexpiry': record } });
+    const config = cfg({ mode: { dryRun: false } });
+    const apiExpired: Commitment = orderbookEntry({ commitmentHash: '0xexpiry', maker: DEFAULT_FAKE_MAKER_ADDRESS, status: 'expired', isLive: false });
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]), undefined, undefined, undefined,
+      { listOpenCommitments: () => Promise.resolve([]), getCommitment: () => Promise.resolve(apiExpired) },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    const reloaded = StateStore.at(stateDir).load().state;
+    expect(reloaded.commitments['0xexpiry']?.lifecycle).toBe('expired');
+    const events = readEvents();
+    expect(events.find((e) => e.kind === 'expire' && e.commitmentHash === '0xexpiry')).toBeDefined();
+    expect(events.some((e) => e.kind === 'fill')).toBe(false);
+  });
+
+  it('a disappeared commitment whose API status is `cancelled` → record reclassified `authoritativelyInvalidated`, no event', async () => {
+    const record = commitmentRecord({ hash: '0xcancelled', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 1 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xcancelled': record } });
+    const config = cfg({ mode: { dryRun: false } });
+    const apiCancelled: Commitment = orderbookEntry({ commitmentHash: '0xcancelled', maker: DEFAULT_FAKE_MAKER_ADDRESS, status: 'cancelled', isLive: false });
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]), undefined, undefined, undefined,
+      { listOpenCommitments: () => Promise.resolve([]), getCommitment: () => Promise.resolve(apiCancelled) },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    const reloaded = StateStore.at(stateDir).load().state;
+    expect(reloaded.commitments['0xcancelled']?.lifecycle).toBe('authoritativelyInvalidated');
+    expect(readEvents().some((e) => e.kind === 'fill' || e.kind === 'expire')).toBe(false);
+  });
+
+  it('a `listOpenCommitments` failure is logged (`error` phase fill-detection) and the tick continues; state unchanged', async () => {
+    const record = commitmentRecord({ hash: '0xtracked', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 1 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xtracked': record } });
+    const config = cfg({ mode: { dryRun: false } });
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]), undefined, undefined, undefined,
+      { listOpenCommitments: () => Promise.reject(new Error('API 503')) },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run(); // must not throw
+
+    expect(StateStore.at(stateDir).load().state.commitments['0xtracked']?.lifecycle).toBe('visibleOpen');
+    const events = readEvents();
+    expect(events.find((e) => e.kind === 'error' && e.phase === 'fill-detection')).toMatchObject({ detail: 'API 503' });
+    expect(events.some((e) => e.kind === 'fill')).toBe(false);
+  });
+
+  it('a per-hash `getCommitment` failure is logged (phase fill-detection-lookup) and other disappeared hashes are still processed', async () => {
+    const recordA = commitmentRecord({ hash: '0xfilled', speculationId: 'spec-A', contestId: 'A', makerSide: 'home', oddsTick: 200, riskAmountWei6: '250000', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 1 });
+    const recordB = commitmentRecord({ hash: '0xbroken', speculationId: 'spec-B', contestId: 'B', makerSide: 'home', oddsTick: 200, riskAmountWei6: '250000', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 1 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xfilled': recordA, '0xbroken': recordB } });
+    const config = cfg({ mode: { dryRun: false } });
+    const apiFilled: Commitment = orderbookEntry({ commitmentHash: '0xfilled', maker: DEFAULT_FAKE_MAKER_ADDRESS, contestId: 'A', positionType: 1, oddsTick: 200, riskAmount: '250000', filledRiskAmount: '250000', remainingRiskAmount: '0', status: 'filled', isLive: false });
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]), undefined, undefined, undefined,
+      { listOpenCommitments: () => Promise.resolve([]), getCommitment: (h) => h === '0xfilled' ? Promise.resolve(apiFilled) : Promise.reject(new Error('lookup failed')) },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    const reloaded = StateStore.at(stateDir).load().state;
+    expect(reloaded.commitments['0xfilled']?.lifecycle).toBe('filled'); // processed normally
+    expect(reloaded.commitments['0xbroken']?.lifecycle).toBe('visibleOpen'); // unchanged — the lookup error skipped it
+    const events = readEvents();
+    expect(events.find((e) => e.kind === 'error' && e.phase === 'fill-detection-lookup')).toMatchObject({ commitmentHash: '0xbroken', detail: 'lookup failed' });
+    expect(events.filter((e) => e.kind === 'fill')).toHaveLength(1);
+  });
+
+  it('the `assessCompetitiveness` orderbook excludes the MM\'s own commitments (`c.maker === this.makerAddress` filter)', async () => {
+    StateStore.at(stateDir).flush(emptyMakerState());
+    const config = cfg();
+    // One self-maker entry (positionType 0, the away-offer book) + one other-maker entry (positionType 1, the home-offer book).
+    // The home offer (taker side `home`, the MM as maker on `away`, positionType 0) competes with positionType-0 commitments —
+    // the only one (`0xself`) is filtered out → bookDepthOnSide 0. The away offer (taker side `away`, MM as maker on `home`,
+    // positionType 1) competes with positionType-1 — only `0xother` (not self) → bookDepthOnSide 1.
+    const book: Commitment[] = [
+      orderbookEntry({ commitmentHash: '0xself', maker: DEFAULT_FAKE_MAKER_ADDRESS, positionType: 0, oddsTick: 101 }),
+      orderbookEntry({ commitmentHash: '0xother', maker: '0xothermaker', positionType: 1, oddsTick: 200 }),
+    ];
+    const adapter = spiedAdapter(
+      config, () => Promise.resolve([contestView({ contestId: 'A' })]),
+      undefined, { getSpeculation: (id) => Promise.resolve(speculationView(id, true, book)) },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1, makerAddress: DEFAULT_FAKE_MAKER_ADDRESS as Hex }).run();
+
+    const comps = readEvents().filter((e) => e.kind === 'quote-competitiveness');
+    expect(comps).toHaveLength(2);
+    const homeOffer = comps.find((e) => e.takerSide === 'home');
+    expect(homeOffer).toMatchObject({ bookDepthOnSide: 0, bestBookTakerTick: null, atOrInsideBook: true });
+    const awayOffer = comps.find((e) => e.takerSide === 'away');
+    expect(awayOffer).toMatchObject({ bookDepthOnSide: 1, bestBookTakerTick: 200 });
   });
 });

@@ -2676,7 +2676,7 @@ describe('Runner — on-chain kill path / killCancelOnChain (Phase 3 e-ii)', () 
     return () => { checks += 1; return checks >= triggerAtCheck; };
   }
 
-  it('killCancelOnChain=false → no on-chain cancels (off-chain shutdown only); records stay at their current lifecycle', async () => {
+  it('killCancelOnChain=false (default soft stop) → no on-chain cancels, but the off-chain sweep still pulls every visibleOpen quote (reclassified softCancelled + `soft-cancel` `reason: shutdown` event) (Hermes review-PR29)', async () => {
     const cancel = cancelOnchainRecorder();
     StateStore.at(stateDir).flush({
       ...emptyMakerState(),
@@ -2688,9 +2688,11 @@ describe('Runner — on-chain kill path / killCancelOnChain (Phase 3 e-ii)', () 
     const adapter = liveSpiedAdapter(config, () => Promise.resolve([]), { cancelCommitmentOnchain: cancel.fn });
     await makeRunner({ config, adapter, maxTicks: 5, deps: { killFileExists: killFileAfterTick(2) } }).run();
 
-    expect(cancel.calls).toHaveLength(0);
+    expect(cancel.calls).toHaveLength(0); // on-chain sweep skipped (killCancelOnChain=false)
     expect(readEvents().some((e) => e.kind === 'onchain-cancel')).toBe(false);
-    expect(StateStore.at(stateDir).load().state.commitments['0xa']?.lifecycle).toBe('visibleOpen');
+    // Off-chain soft sweep ran (gasless, unconditional): record → softCancelled + `soft-cancel` `reason: shutdown` event.
+    expect(StateStore.at(stateDir).load().state.commitments['0xa']?.lifecycle).toBe('softCancelled');
+    expect(readEvents().find((e) => e.kind === 'soft-cancel')).toMatchObject({ reason: 'shutdown' });
   });
 
   it('killCancelOnChain=true + KILL file + non-terminal records → each is cancelOnchain\'d, stamped authoritativelyInvalidated, emits onchain-cancel, gas accumulated', async () => {
@@ -2770,13 +2772,16 @@ describe('Runner — on-chain kill path / killCancelOnChain (Phase 3 e-ii)', () 
     const adapter = liveSpiedAdapter(config, () => Promise.resolve([]), { cancelCommitmentOnchain: cancel.fn });
     await makeRunner({ config, adapter, maxTicks: 5, deps: { killFileExists: killFileAfterTick(2) } }).run();
 
-    expect(cancel.calls).toHaveLength(0); // gate fired before any write
+    expect(cancel.calls).toHaveLength(0); // on-chain gate fired before any write
     const candidates = readEvents().filter((e) => e.kind === 'candidate' && e.skipReason === 'gas-budget-blocks-onchain-cancel');
     expect(candidates).toHaveLength(1); // ONE candidate then break — not one per record
     expect(candidates[0]?.commitmentHash).toBeDefined();
+    // BUT the unconditional off-chain sweep still ran (gasless, runs before the on-chain gate),
+    // so both records moved to softCancelled. The on-chain authoritative kill is what was blocked.
     const reloaded = StateStore.at(stateDir).load().state;
-    expect(reloaded.commitments['0xa']?.lifecycle).toBe('visibleOpen'); // stays matchable
-    expect(reloaded.commitments['0xb']?.lifecycle).toBe('visibleOpen');
+    expect(reloaded.commitments['0xa']?.lifecycle).toBe('softCancelled');
+    expect(reloaded.commitments['0xb']?.lifecycle).toBe('softCancelled');
+    expect(readEvents().filter((e) => e.kind === 'soft-cancel' && e.reason === 'shutdown')).toHaveLength(2);
   });
 
   it('cancelCommitmentOnchain throws on one hash → logged as `error` `phase: onchain-cancel`, loop continues to the next record', async () => {
@@ -2803,7 +2808,59 @@ describe('Runner — on-chain kill path / killCancelOnChain (Phase 3 e-ii)', () 
     const events = readEvents();
     expect(events.find((e) => e.kind === 'error' && e.phase === 'onchain-cancel' && e.commitmentHash === '0xbad')).toMatchObject({ detail: 'NotCommitmentMaker' });
     const reloaded = StateStore.at(stateDir).load().state;
-    expect(reloaded.commitments['0xbad']?.lifecycle).toBe('visibleOpen'); // failed cancel — stayed visibleOpen
-    expect(reloaded.commitments['0xgood']?.lifecycle).toBe('authoritativelyInvalidated'); // succeeded
+    expect(reloaded.commitments['0xbad']?.lifecycle).toBe('softCancelled'); // off-chain pull succeeded; on-chain cancel failed → stayed softCancelled (not authoritativelyInvalidated)
+    expect(reloaded.commitments['0xgood']?.lifecycle).toBe('authoritativelyInvalidated'); // both sweeps succeeded
+  });
+
+  it('killCancelOnChain=false + visibleOpen + partiallyFilled + softCancelled + expired → off-chain sweep pulls visibleOpen + partiallyFilled (gasless), softCancelled is left alone (already pulled), expired untouched; no on-chain calls (Hermes review-PR29 — operator-doc safety contract)', async () => {
+    const cancel = cancelOnchainRecorder();
+    StateStore.at(stateDir).flush({
+      ...emptyMakerState(),
+      commitments: {
+        '0xvisible': commitmentRecord({ hash: '0xvisible', speculationId: 'spec-1', contestId: '1', makerSide: 'home', oddsTick: 200, riskAmountWei6: '250000', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000 }),
+        '0xpartial': commitmentRecord({ hash: '0xpartial', speculationId: 'spec-2', contestId: '2', makerSide: 'away', oddsTick: 220, riskAmountWei6: '400000', filledRiskWei6: '100000', lifecycle: 'partiallyFilled', expiryUnixSec: T0 + 1000 }),
+        '0xsoft': commitmentRecord({ hash: '0xsoft', speculationId: 'spec-3', contestId: '3', makerSide: 'home', oddsTick: 200, riskAmountWei6: '300000', lifecycle: 'softCancelled', expiryUnixSec: T0 + 1000 }),
+        '0xexpired': commitmentRecord({ hash: '0xexpired', speculationId: 'spec-4', contestId: '4', makerSide: 'home', oddsTick: 200, riskAmountWei6: '250000', lifecycle: 'expired', expiryUnixSec: T0 - 1 }),
+      },
+    });
+    const offchainCalls: Hex[] = [];
+    const config = cfg({ mode: { dryRun: false }, killCancelOnChain: false });
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]),
+      { cancelCommitmentOnchain: cancel.fn, cancelCommitmentOffchain: (hash) => { offchainCalls.push(hash); return Promise.resolve(); } },
+    );
+    await makeRunner({ config, adapter, maxTicks: 5, deps: { killFileExists: killFileAfterTick(2) } }).run();
+
+    expect(offchainCalls.sort()).toEqual(['0xpartial', '0xvisible']); // softCancelled (already pulled) + expired (terminal) both skipped
+    expect(cancel.calls).toHaveLength(0); // no on-chain calls — killCancelOnChain false
+    const reloaded = StateStore.at(stateDir).load().state;
+    expect(reloaded.commitments['0xvisible']?.lifecycle).toBe('softCancelled');
+    expect(reloaded.commitments['0xpartial']?.lifecycle).toBe('softCancelled');
+    expect(reloaded.commitments['0xsoft']?.lifecycle).toBe('softCancelled'); // unchanged
+    expect(reloaded.commitments['0xexpired']?.lifecycle).toBe('expired'); // unchanged
+    const softCancelEvents = readEvents().filter((e) => e.kind === 'soft-cancel' && e.reason === 'shutdown');
+    expect(softCancelEvents).toHaveLength(2); // one per record actually pulled
+  });
+
+  it('off-chain sweep failure on one hash is logged (`error` `phase: cancel`) and the loop continues — failed record stays at original lifecycle; the on-chain sweep (if enabled) may still authoritatively cancel it', async () => {
+    StateStore.at(stateDir).flush({
+      ...emptyMakerState(),
+      commitments: {
+        '0xbad': commitmentRecord({ hash: '0xbad', speculationId: 'spec-1', contestId: '1', makerSide: 'home', oddsTick: 200, riskAmountWei6: '250000', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000 }),
+        '0xok': commitmentRecord({ hash: '0xok', speculationId: 'spec-2', contestId: '2', makerSide: 'away', oddsTick: 220, riskAmountWei6: '300000', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000 }),
+      },
+    });
+    const config = cfg({ mode: { dryRun: false }, killCancelOnChain: false });
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]),
+      { cancelCommitmentOnchain: cancelOnchainRecorder().fn, cancelCommitmentOffchain: (hash) => hash === '0xbad' ? Promise.reject(new Error('API 503')) : Promise.resolve() },
+    );
+    await makeRunner({ config, adapter, maxTicks: 5, deps: { killFileExists: killFileAfterTick(2) } }).run();
+
+    const events = readEvents();
+    expect(events.find((e) => e.kind === 'error' && e.phase === 'cancel' && e.commitmentHash === '0xbad')).toMatchObject({ detail: 'API 503' });
+    const reloaded = StateStore.at(stateDir).load().state;
+    expect(reloaded.commitments['0xbad']?.lifecycle).toBe('visibleOpen'); // failed pull — original lifecycle
+    expect(reloaded.commitments['0xok']?.lifecycle).toBe('softCancelled'); // succeeded
   });
 });

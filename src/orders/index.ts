@@ -85,6 +85,7 @@ export type ReplaceReason =
 export type SoftCancelReason =
   | 'side-not-quoted' //   the desired quote has no `QuoteSide` for that side (no headroom, or the whole quote was refused)
   | 'duplicate' //         more than one API-visible commitment on a `(speculation, side)` — keep the newest, pull the rest (book hygiene, DESIGN §9)
+  | 'shutdown' //          the runner is shutting down — sweep every visible quote off-chain (gasless), regardless of `killCancelOnChain`; the latent (matchable until expiry) window stays until the on-chain kill path also fires (if `killCancelOnChain: true`) or natural expiry
   | ReplaceReason; //      a stale/mispriced quote we'd replace, but the open-commitment count budget is exhausted (or a `partiallyFilled` incumbent we don't refresh in place) — pull it; a fresh post follows only if there's count headroom
 
 /** A commitment to pull off-chain without re-posting. */

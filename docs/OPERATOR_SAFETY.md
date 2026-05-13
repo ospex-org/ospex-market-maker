@@ -57,8 +57,8 @@ So a pulled quote is *latent* exposure, not gone. The MM tracks this and counts 
 
 ## The kill switch
 
-- Drop a file at `killSwitchFile` (default `./KILL`), or send SIGTERM/SIGINT. The MM pulls all visible quotes, flushes state and telemetry, and exits cleanly.
-- **With `killCancelOnChain: false` (the default) this is a *soft* stop** — pulled quotes stay matchable until they expire (~2 min with the recommended config). For a *hard* stop (also raises on-chain nonce floors so nothing sub-floor can be matched), set `killCancelOnChain: true` — this costs gas, drawn from the emergency reserve.
+- Drop a file at `killSwitchFile` (default `./KILL`), or send SIGTERM/SIGINT. The MM pulls every visible quote off chain (gasless `cancelCommitmentOffchain` — emits `soft-cancel` `reason: 'shutdown'`, reclassifies the records to `softCancelled`), flushes state and telemetry, and exits cleanly.
+- **With `killCancelOnChain: false` (the default) this is a *soft* stop** — pulled quotes leave the book immediately, but a taker holding the signed payload can still match them on chain until they expire (~2 min with the recommended config). For a *hard* stop (also authoritatively cancels every non-terminal commitment on chain via `cancelCommitmentOnchain` per record — `MatchingModule.cancelCommitment` flips `s_cancelledCommitments[hash]` so subsequent `matchCommitment` calls revert), set `killCancelOnChain: true`. This costs gas — drawn from the emergency reserve via `canSpendGas` with `mayUseReserve: true`. (A future optimization may bulk-invalidate via `raiseMinNonce` per speculation; the current path is per-commitment for safety + simplicity.)
 
 ## State
 

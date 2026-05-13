@@ -4,9 +4,15 @@
  * tracking → per-market reconcile → age-out → terminal-record prune → state flush;
  * posts nothing). `--live` (Phase 3) is the same loop with the reconcile's writes
  * wired through the SDK — submits via `commitments.submitRaw`, off-chain cancels
- * via `commitments.cancel`. (Fill detection, gas budgeting in POL, auto-settle /
- * auto-claim, the kill switch's on-chain cancel, and `cancel-stale` / `status` are
- * still landing in later Phase-3 slices.) Either mode runs until a kill-switch
+ * via `commitments.cancel` — plus fill detection (the per-tick
+ * `listOpenCommitments` diff), the position-status poll (mirrors API buckets into
+ * the local `MakerPositionStatus`), boot-time auto-approve of the `PositionModule`
+ * USDC allowance (`mode: exact` raises to `min(risk-cap ceiling, current wallet
+ * USDC)`, deferred while the state-loss hold is active), and the daily POL
+ * gas-budget verdict (`canSpendGas` gates every on-chain write, denials emit
+ * `candidate` `gas-budget-blocks-reapproval`). Auto-settle / auto-claim, the kill
+ * switch's on-chain cancel / `raiseMinNonce` path, and `cancel-stale` / `status`
+ * are still landing in later Phase-3 slices. Either mode runs until a kill-switch
  * file appears or a SIGTERM / SIGINT arrives.
  *
  * The two-key model (DESIGN §8): live requires *both* `mode.dryRun: false` in the

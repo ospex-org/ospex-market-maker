@@ -245,4 +245,24 @@ describe('canSpendGas (Phase 3 d-ii)', () => {
     expect(v.allowed).toBe(false);
     if (!v.allowed) expect(v.reason).toMatch(/todayGasSpentPolWei.*>= 0/);
   });
+
+  it('mayUseReserve=true allows spend up to the FULL cap (the reserve is consumable for finalize-positions ops)', () => {
+    // todayGasSpent at 0.85 POL of a 1 POL cap, 0.2 POL reserve.
+    // Normal-mode check would deny (0.85 + 0.2 = 1.05 >= 1.0).
+    // mayUseReserve mode allows (0.85 < 1.0 — still has 0.15 POL to the cap).
+    const v = canSpendGas({ todayGasSpentPolWei: (POL * 85n) / 100n, maxDailyGasPolWei: POL, emergencyReservePolWei: POL / 5n, mayUseReserve: true });
+    expect(v).toEqual({ allowed: true });
+  });
+
+  it('mayUseReserve=true denies only when the FULL cap is reached', () => {
+    const v = canSpendGas({ todayGasSpentPolWei: POL, maxDailyGasPolWei: POL, emergencyReservePolWei: POL / 5n, mayUseReserve: true });
+    expect(v.allowed).toBe(false);
+    if (!v.allowed) expect(v.reason).toMatch(/reached the daily cap.*reserve already consumed/);
+  });
+
+  it('mayUseReserve=true tolerates the reserve>=cap operator-misconfig branch (the reserve is intended to be spent here)', () => {
+    // Reserve == cap. Normal mode denies on misconfig; mayUseReserve mode proceeds (the spendable target is the cap, not cap-reserve).
+    const v = canSpendGas({ todayGasSpentPolWei: 0n, maxDailyGasPolWei: POL, emergencyReservePolWei: POL, mayUseReserve: true });
+    expect(v).toEqual({ allowed: true });
+  });
 });

@@ -218,33 +218,43 @@ export function requiredPositionModuleAllowanceUSDC(caps: RiskCaps): number {
 /**
  * Verdict gate for an outgoing on-chain transaction (DESIGN §6). The MM has a
  * daily POL budget `maxDailyGasPolWei` with `emergencyReservePolWei` held back
- * at all times. The verdict allows spend as long as today's accumulated gas
- * leaves headroom above the reserve floor — i.e.
- * `todayGasSpentPolWei + emergencyReservePolWei < maxDailyGasPolWei`. A single
- * tx is NOT pre-estimated (Polygon gas is tiny + EIP-1559 makes a cheap
- * `estimateGas` awkward); the verdict refuses ONLY once today's spend has
- * already eaten into the reserve, which is enough granularity for v0 (boot-time
- * auto-approve runs once per boot, settle / claim land later as periodic ops).
- * Posting commitments and routine off-chain cancels are gasless and are NOT
- * gated by this verdict.
+ * at all times. A single tx is NOT pre-estimated (Polygon gas is tiny + EIP-1559
+ * makes a cheap `estimateGas` awkward); the verdict refuses ONLY once today's
+ * spend has crossed the relevant floor. Posting commitments and routine
+ * off-chain cancels are gasless and are NOT gated by this verdict.
+ *
+ * **Two modes**:
+ *   - `mayUseReserve = false` (default) — normal ops (e.g. boot-time auto-approve).
+ *     Allowed when `todayGasSpentPolWei + emergencyReservePolWei < maxDailyGasPolWei`,
+ *     i.e. there's headroom above the reserve floor.
+ *   - `mayUseReserve = true` — reserve-eligible ops (settle / claim with
+ *     `settlement.continueOnGasBudgetExhausted: true`, the on-chain kill path).
+ *     Allowed when `todayGasSpentPolWei < maxDailyGasPolWei`, i.e. there's any
+ *     headroom up to the full cap. The reserve is consumable for these
+ *     finalize-positions ops because forfeiting access to the maker's settled
+ *     payouts costs more than the gas does.
  *
  * All amounts are in **POL wei18** (POL has 18 decimals). The caller converts
  * float POL from config via `BigInt(Math.round(p * 1e18))`.
  *
  * Returns `{allowed: false, reason}` when:
- *   - `maxDailyGasPolWei <= 0n` (budget disabled / zero / negative)
- *   - `emergencyReservePolWei >= maxDailyGasPolWei` (operator misconfig — reserve
- *     equals or exceeds the cap, leaving zero spendable headroom)
- *   - `todayGasSpentPolWei + emergencyReservePolWei >= maxDailyGasPolWei`
- *     (today's spend has reached the reserve floor)
+ *   - `todayGasSpentPolWei < 0` (defense-in-depth — state corruption / caller bug)
+ *   - `maxDailyGasPolWei <= 0` (budget disabled / zero / negative)
+ *   - `emergencyReservePolWei < 0` (negative reserve)
+ *   - `emergencyReservePolWei >= maxDailyGasPolWei` AND `!mayUseReserve` (operator
+ *     misconfig — reserve equals or exceeds the cap, leaving zero spendable
+ *     headroom for normal ops; reserve-eligible ops can still spend up to the cap)
+ *   - the relevant floor is reached for the mode (see above)
  * Otherwise `{allowed: true}`.
  */
 export function canSpendGas(args: {
   todayGasSpentPolWei: bigint;
   maxDailyGasPolWei: bigint;
   emergencyReservePolWei: bigint;
+  /** Default `false` — opt-in for ops the operator considers more important than the daily cap (settle/claim when `continueOnGasBudgetExhausted: true`, the on-chain kill path). */
+  mayUseReserve?: boolean;
 }): { allowed: true } | { allowed: false; reason: string } {
-  const { todayGasSpentPolWei, maxDailyGasPolWei, emergencyReservePolWei } = args;
+  const { todayGasSpentPolWei, maxDailyGasPolWei, emergencyReservePolWei, mayUseReserve = false } = args;
   // Defense-in-depth — the state validator (`src/state/`) already rejects negative
   // decimal strings on load, but `canSpendGas` is the money/gas safety boundary
   // for the whole runner; refuse the call rather than silently allow when a caller
@@ -258,11 +268,17 @@ export function canSpendGas(args: {
   if (emergencyReservePolWei < 0n) {
     return { allowed: false, reason: `gas.emergencyReservePOL must be >= 0; got ${emergencyReservePolWei.toString()} wei` };
   }
-  if (emergencyReservePolWei >= maxDailyGasPolWei) {
-    return { allowed: false, reason: `gas.emergencyReservePOL (${emergencyReservePolWei.toString()} wei) >= gas.maxDailyGasPOL (${maxDailyGasPolWei.toString()} wei); no spendable headroom` };
+  if (!mayUseReserve && emergencyReservePolWei >= maxDailyGasPolWei) {
+    return { allowed: false, reason: `gas.emergencyReservePOL (${emergencyReservePolWei.toString()} wei) >= gas.maxDailyGasPOL (${maxDailyGasPolWei.toString()} wei); no spendable headroom for normal ops` };
   }
-  if (todayGasSpentPolWei + emergencyReservePolWei >= maxDailyGasPolWei) {
-    return { allowed: false, reason: `today's gas spend ${todayGasSpentPolWei.toString()} wei + reserve ${emergencyReservePolWei.toString()} wei has reached the daily cap ${maxDailyGasPolWei.toString()} wei` };
+  if (mayUseReserve) {
+    if (todayGasSpentPolWei >= maxDailyGasPolWei) {
+      return { allowed: false, reason: `today's gas spend ${todayGasSpentPolWei.toString()} wei has reached the daily cap ${maxDailyGasPolWei.toString()} wei (reserve already consumed)` };
+    }
+  } else {
+    if (todayGasSpentPolWei + emergencyReservePolWei >= maxDailyGasPolWei) {
+      return { allowed: false, reason: `today's gas spend ${todayGasSpentPolWei.toString()} wei + reserve ${emergencyReservePolWei.toString()} wei has reached the daily cap ${maxDailyGasPolWei.toString()} wei` };
+    }
   }
   return { allowed: true };
 }

@@ -70,15 +70,14 @@
  *
  * Still TODO follow-ups: P&L (realized over settled / claimed; unrealized over
  * active marked to fair — natural home is the `summary` aggregator that walks
- * `fill` / `position-transition` / `settle` / `claim` events), and auto-settle /
- * auto-claim (which will reuse the daily POL gas-budget verdict that auto-approve
- * already consumes — see `canSpendGas` + `state.dailyCounters.gasPolWei`). The
- * `getPositionStatus(maker)` poll backfills missing positions from
- * soft-cancelled-then-matched commitments, fails closed when it can't read while
- * any non-terminal `softCancelled` records exist, AND mirrors API bucket → local
- * `MakerPositionStatus` with a `position-transition` event on each forward step
- * (`active` → `pendingSettle` → `claimable`); `claimed` is stamped by the
- * auto-claim path.
+ * `fill` / `position-transition` / `settle` / `claim` events), and the on-chain
+ * authoritative cancel / `raiseMinNonce` paths used by the kill switch's
+ * `killCancelOnChain: true` mode and `cancel-stale --authoritative`. Auto-settle
+ * + auto-claim (`settlement.autoSettleOwn` / `autoClaimOwn`) are wired here —
+ * they walk `state.positions` each tick after the position poll, gas-gated by
+ * `canSpendGas` with `mayUseReserve = settlement.continueOnGasBudgetExhausted`,
+ * and emit `settle` / `claim` events; the `claim` path stamps the local
+ * `MakerPositionStatus` to `claimed` (no longer the poll's domain).
  *
  * No `@ospex/sdk` import — all chain/API access goes through the `OspexAdapter`. The
  * clock, sleep, kill-switch probe, OS-signal registration, and randomness are
@@ -518,10 +517,11 @@ export class Runner {
         if (!this.config.mode.dryRun) positionPollOk = await this.pollPositionStatus();
         const hasSoftCancelled = !this.config.mode.dryRun && Object.values(this.state.commitments).some((r) => r.lifecycle === 'softCancelled');
         if (positionPollOk || !hasSoftCancelled) {
+          if (!this.config.mode.dryRun) await this.settleAndClaim();
           await this.reconcileMarkets();
           this.ageOut();
         }
-        // else: live mode + getPositionStatus failed AND softCancelled records exist — skip reconcile + ageOut (fail-closed; markets stay dirty for next-tick retry).
+        // else: live mode + getPositionStatus failed AND softCancelled records exist — skip settleAndClaim + reconcile + ageOut (fail-closed; markets stay dirty for next-tick retry).
       }
       // else: live mode + listOpenCommitments failed — skip all state-mutating live steps this tick (fail-closed; the markets stay dirty for next-tick retry).
       this.pruneTerminalCommitments();
@@ -1800,14 +1800,9 @@ export class Runner {
     const gasPolWei = gasUsed * effectiveGasPrice;
 
     // Accumulate today's gas spend so the verdict honors it on subsequent ops
-    // (settle / claim / on-chain cancel — landing in (e) / (f)). Persisted across
-    // restarts via the per-tick state flush.
-    const existing = this.state.dailyCounters[today];
-    const prior = existing !== undefined ? BigInt(existing.gasPolWei) : 0n;
-    this.state.dailyCounters[today] = {
-      gasPolWei: (prior + gasPolWei).toString(),
-      feeUsdcWei6: existing !== undefined ? existing.feeUsdcWei6 : '0',
-    };
+    // (settle / claim — wired in (e-i); on-chain cancel / kill — landing in
+    // (e-ii) / (f)). Persisted across restarts via the per-tick state flush.
+    this.recordGasSpentToday(today, gasPolWei);
 
     const payload: Record<string, unknown> = {
       purpose: 'positionModule',
@@ -1820,6 +1815,162 @@ export class Runner {
     };
     if (walletUSDCWei6 !== undefined) payload.walletBalanceWei6 = walletUSDCWei6.toString();
     this.eventLog.emit('approval', payload);
+  }
+
+  /**
+   * Periodic auto-settle + auto-claim of the maker's own positions (DESIGN §6 / §11).
+   * Walks `state.positions` (the local mirror that `pollPositionStatus` keeps in sync
+   * with the API buckets):
+   *   - For each record at `status: 'pendingSettle'` with `settlement.autoSettleOwn`,
+   *     gas-verdict (`mayUseReserve = settlement.continueOnGasBudgetExhausted`) →
+   *     `adapter.settleSpeculation({ speculationId })` → emit `settle` carrying the
+   *     on-chain `winSide` + `txHash` + `gasPolWei`. No local status flip — the next
+   *     `pollPositionStatus` observes the bucket change to `claimable` and runs the
+   *     `position-transition` event through `syncPolledPosition`. The contract
+   *     reverts on already-settled, so an extra concurrent settle by another EOA
+   *     just shows up as `error` `phase: 'settle'` and the tick continues.
+   *   - For each record at `status: 'claimable'` with `settlement.autoClaimOwn`,
+   *     gas-verdict (same `mayUseReserve` rule) →
+   *     `adapter.claimPosition({ speculationId, positionType })` → emit `claim`
+   *     carrying the on-chain `payoutWei6` + `txHash` + `gasPolWei` → stamp the
+   *     record's `status = 'claimed'` so a later poll (with the position now
+   *     absent from the API) doesn't re-attempt the claim.
+   *
+   * Gas accumulates into `state.dailyCounters[YYYY-MM-DD].gasPolWei`; the
+   * `gas-budget-blocks-settlement` `candidate` skip fires when the verdict denies.
+   * Errors (adapter throws on `settleSpeculation` / `claim`) are logged + the
+   * tick continues — typically a reverted "already settled" / "no payout" /
+   * "already claimed" by another caller; the next poll re-reads chain state.
+   *
+   * Runs after `pollPositionStatus` and before `reconcileMarkets` so the
+   * post-claim risk-engine view sees `claimed` status (headroom recovered) on
+   * the same tick the claim landed. Gated by the same fail-closed
+   * `positionPollOk || !hasSoftCancelled` rule as `reconcileMarkets` /
+   * `ageOut` — if positions can't be verified and softCancelled commitments
+   * exist, we don't trigger on-chain settle/claim either.
+   */
+  private async settleAndClaim(): Promise<void> {
+    if (this.makerAddress === null) return; // live-mode invariant
+    const autoSettle = this.config.settlement.autoSettleOwn;
+    const autoClaim = this.config.settlement.autoClaimOwn;
+    if (!autoSettle && !autoClaim) return; // operator opted out of both
+
+    const continueOnGasBudgetExhausted = this.config.settlement.continueOnGasBudgetExhausted;
+    const maxDailyGasPolWei = polFloatToWei18(this.config.gas.maxDailyGasPOL);
+    const emergencyReservePolWei = polFloatToWei18(this.config.gas.emergencyReservePOL);
+
+    // Snapshot the records up front — `claimPosition` mutates `state.positions`
+    // (sets `status: 'claimed'`), and modifying an object while iterating its
+    // `Object.values()` is fragile.
+    const pendingSettleRecords = autoSettle
+      ? Object.values(this.state.positions).filter((r) => r.status === 'pendingSettle')
+      : [];
+    const claimableRecords = autoClaim
+      ? Object.values(this.state.positions).filter((r) => r.status === 'claimable')
+      : [];
+
+    // Settle first — pending speculations have to be settled on chain before any
+    // claim against them can succeed. The settle's tx doesn't flip the local
+    // status (that's the position poll's job on the next tick); but if another
+    // EOA settled the same speculation between this tick's poll and our settle
+    // call, the contract reverts and we log + continue.
+    for (const r of pendingSettleRecords) {
+      const today = todayUTCDateString(this.deps.now());
+      const todayGasSpentPolWei = BigInt(this.state.dailyCounters[today]?.gasPolWei ?? '0');
+      const verdict = canSpendGas({ todayGasSpentPolWei, maxDailyGasPolWei, emergencyReservePolWei, mayUseReserve: continueOnGasBudgetExhausted });
+      if (!verdict.allowed) {
+        this.eventLog.emit('candidate', {
+          skipReason: 'gas-budget-blocks-settlement',
+          purpose: 'settleSpeculation',
+          speculationId: r.speculationId,
+          contestId: r.contestId,
+          makerSide: r.side,
+          todayGasSpentPolWei: todayGasSpentPolWei.toString(),
+          maxDailyGasPolWei: maxDailyGasPolWei.toString(),
+          emergencyReservePolWei: emergencyReservePolWei.toString(),
+          mayUseReserve: continueOnGasBudgetExhausted,
+          detail: verdict.reason,
+        });
+        continue;
+      }
+
+      let result: Awaited<ReturnType<OspexAdapter['settleSpeculation']>>;
+      try {
+        result = await this.adapter.settleSpeculation({ speculationId: BigInt(r.speculationId) });
+      } catch (err) {
+        this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'settle', speculationId: r.speculationId });
+        continue;
+      }
+      const gasPolWei = BigInt(result.receipt.gasUsed) * BigInt(result.receipt.effectiveGasPrice);
+      this.recordGasSpentToday(today, gasPolWei);
+      this.eventLog.emit('settle', {
+        speculationId: r.speculationId,
+        contestId: r.contestId,
+        sport: r.sport,
+        awayTeam: r.awayTeam,
+        homeTeam: r.homeTeam,
+        makerSide: r.side,
+        winSide: result.winSide,
+        txHash: result.txHash,
+        gasPolWei: gasPolWei.toString(),
+      });
+    }
+
+    for (const r of claimableRecords) {
+      const today = todayUTCDateString(this.deps.now());
+      const todayGasSpentPolWei = BigInt(this.state.dailyCounters[today]?.gasPolWei ?? '0');
+      const verdict = canSpendGas({ todayGasSpentPolWei, maxDailyGasPolWei, emergencyReservePolWei, mayUseReserve: continueOnGasBudgetExhausted });
+      if (!verdict.allowed) {
+        this.eventLog.emit('candidate', {
+          skipReason: 'gas-budget-blocks-settlement',
+          purpose: 'claimPosition',
+          speculationId: r.speculationId,
+          contestId: r.contestId,
+          makerSide: r.side,
+          todayGasSpentPolWei: todayGasSpentPolWei.toString(),
+          maxDailyGasPolWei: maxDailyGasPolWei.toString(),
+          emergencyReservePolWei: emergencyReservePolWei.toString(),
+          mayUseReserve: continueOnGasBudgetExhausted,
+          detail: verdict.reason,
+        });
+        continue;
+      }
+
+      const positionType = r.side === 'away' ? 0 : 1;
+      let result: Awaited<ReturnType<OspexAdapter['claimPosition']>>;
+      try {
+        result = await this.adapter.claimPosition({ speculationId: BigInt(r.speculationId), positionType });
+      } catch (err) {
+        this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'claim', speculationId: r.speculationId });
+        continue;
+      }
+      const gasPolWei = BigInt(result.receipt.gasUsed) * BigInt(result.receipt.effectiveGasPrice);
+      this.recordGasSpentToday(today, gasPolWei);
+      r.status = 'claimed';
+      r.updatedAtUnixSec = this.deps.now();
+      this.eventLog.emit('claim', {
+        speculationId: r.speculationId,
+        contestId: r.contestId,
+        sport: r.sport,
+        awayTeam: r.awayTeam,
+        homeTeam: r.homeTeam,
+        makerSide: r.side,
+        positionType,
+        payoutWei6: result.payoutWei6.toString(),
+        txHash: result.txHash,
+        gasPolWei: gasPolWei.toString(),
+      });
+    }
+  }
+
+  /** Add `gasPolWei` to today's `state.dailyCounters` counter (additive; preserves `feeUsdcWei6`; lazy-creates the entry). Shared by `applyAutoApprovals` + `settleAndClaim`. */
+  private recordGasSpentToday(today: string, gasPolWei: bigint): void {
+    const existing = this.state.dailyCounters[today];
+    const prior = existing !== undefined ? BigInt(existing.gasPolWei) : 0n;
+    this.state.dailyCounters[today] = {
+      gasPolWei: (prior + gasPolWei).toString(),
+      feeUsdcWei6: existing !== undefined ? existing.feeUsdcWei6 : '0',
+    };
   }
 
   /** Ticks until the next discovery cycle: `discovery.everyNTicks` jittered by ±`discovery.jitterPct` (so multiple MMs don't all discover on the same tick). At least 1. */

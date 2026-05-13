@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  canSpendGas,
   headroomForSide,
   requiredPositionModuleAllowanceUSDC,
   teamExposureUSDC,
@@ -189,5 +190,53 @@ describe('runtime guards (the money-risk boundary — malformed input throws, ne
 
   it('rejects an invalid makerSide (defends against JS consumers)', () => {
     expect(() => headroomForSide(inventory([]), market(), 'sideways' as unknown as 'away', caps())).toThrow(/makerSide must be/);
+  });
+});
+
+describe('canSpendGas (Phase 3 d-ii)', () => {
+  const POL = 10n ** 18n; // 1 POL in wei18
+
+  it('allows when nothing spent today and the budget exceeds the reserve', () => {
+    const v = canSpendGas({ todayGasSpentPolWei: 0n, maxDailyGasPolWei: 1n * POL, emergencyReservePolWei: POL / 5n /* 0.2 POL */ });
+    expect(v).toEqual({ allowed: true });
+  });
+
+  it('allows when some spend has occurred but still leaves room above the reserve floor', () => {
+    // spent 0.5 POL of a 1 POL budget with 0.2 POL reserve → 0.5 + 0.2 = 0.7 < 1.0 → allowed
+    const v = canSpendGas({ todayGasSpentPolWei: POL / 2n, maxDailyGasPolWei: 1n * POL, emergencyReservePolWei: POL / 5n });
+    expect(v).toEqual({ allowed: true });
+  });
+
+  it('denies when today\'s spend plus the reserve has reached the daily cap', () => {
+    // spent 0.8 POL of a 1 POL budget with 0.2 POL reserve → 0.8 + 0.2 = 1.0 (= cap) → DENIED
+    const v = canSpendGas({ todayGasSpentPolWei: (POL * 8n) / 10n, maxDailyGasPolWei: 1n * POL, emergencyReservePolWei: POL / 5n });
+    expect(v.allowed).toBe(false);
+    if (!v.allowed) expect(v.reason).toMatch(/reached the daily cap/);
+  });
+
+  it('denies when today\'s spend exceeds the spendable headroom by overshooting', () => {
+    // spent 0.9 POL — past the 0.8 spendable headroom
+    const v = canSpendGas({ todayGasSpentPolWei: (POL * 9n) / 10n, maxDailyGasPolWei: 1n * POL, emergencyReservePolWei: POL / 5n });
+    expect(v.allowed).toBe(false);
+  });
+
+  it('denies on a zero or negative daily budget (no spend allowed at all)', () => {
+    const v0 = canSpendGas({ todayGasSpentPolWei: 0n, maxDailyGasPolWei: 0n, emergencyReservePolWei: 0n });
+    expect(v0.allowed).toBe(false);
+    if (!v0.allowed) expect(v0.reason).toMatch(/maxDailyGasPOL/);
+    const vNeg = canSpendGas({ todayGasSpentPolWei: 0n, maxDailyGasPolWei: -1n, emergencyReservePolWei: 0n });
+    expect(vNeg.allowed).toBe(false);
+  });
+
+  it('denies on an operator misconfig where the reserve equals or exceeds the daily cap (no spendable headroom)', () => {
+    const v = canSpendGas({ todayGasSpentPolWei: 0n, maxDailyGasPolWei: POL, emergencyReservePolWei: POL });
+    expect(v.allowed).toBe(false);
+    if (!v.allowed) expect(v.reason).toMatch(/no spendable headroom/);
+  });
+
+  it('denies on a negative reserve (operator misconfig)', () => {
+    const v = canSpendGas({ todayGasSpentPolWei: 0n, maxDailyGasPolWei: POL, emergencyReservePolWei: -1n });
+    expect(v.allowed).toBe(false);
+    if (!v.allowed) expect(v.reason).toMatch(/emergencyReservePOL/);
   });
 });

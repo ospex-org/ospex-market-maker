@@ -214,3 +214,48 @@ export function requiredPositionModuleAllowanceUSDC(caps: RiskCaps): number {
   validateCaps(caps);
   return Math.min(caps.maxOpenCommitments * caps.maxRiskPerCommitmentUSDC, bankrollCeilingUSDC(caps));
 }
+
+/**
+ * Verdict gate for an outgoing on-chain transaction (DESIGN §6). The MM has a
+ * daily POL budget `maxDailyGasPolWei` with `emergencyReservePolWei` held back
+ * at all times. The verdict allows spend as long as today's accumulated gas
+ * leaves headroom above the reserve floor — i.e.
+ * `todayGasSpentPolWei + emergencyReservePolWei < maxDailyGasPolWei`. A single
+ * tx is NOT pre-estimated (Polygon gas is tiny + EIP-1559 makes a cheap
+ * `estimateGas` awkward); the verdict refuses ONLY once today's spend has
+ * already eaten into the reserve, which is enough granularity for v0 (boot-time
+ * auto-approve runs once per boot, settle / claim land later as periodic ops).
+ * Posting commitments and routine off-chain cancels are gasless and are NOT
+ * gated by this verdict.
+ *
+ * All amounts are in **POL wei18** (POL has 18 decimals). The caller converts
+ * float POL from config via `BigInt(Math.round(p * 1e18))`.
+ *
+ * Returns `{allowed: false, reason}` when:
+ *   - `maxDailyGasPolWei <= 0n` (budget disabled / zero / negative)
+ *   - `emergencyReservePolWei >= maxDailyGasPolWei` (operator misconfig — reserve
+ *     equals or exceeds the cap, leaving zero spendable headroom)
+ *   - `todayGasSpentPolWei + emergencyReservePolWei >= maxDailyGasPolWei`
+ *     (today's spend has reached the reserve floor)
+ * Otherwise `{allowed: true}`.
+ */
+export function canSpendGas(args: {
+  todayGasSpentPolWei: bigint;
+  maxDailyGasPolWei: bigint;
+  emergencyReservePolWei: bigint;
+}): { allowed: true } | { allowed: false; reason: string } {
+  const { todayGasSpentPolWei, maxDailyGasPolWei, emergencyReservePolWei } = args;
+  if (maxDailyGasPolWei <= 0n) {
+    return { allowed: false, reason: `gas.maxDailyGasPOL must be > 0; got ${maxDailyGasPolWei.toString()} wei` };
+  }
+  if (emergencyReservePolWei < 0n) {
+    return { allowed: false, reason: `gas.emergencyReservePOL must be >= 0; got ${emergencyReservePolWei.toString()} wei` };
+  }
+  if (emergencyReservePolWei >= maxDailyGasPolWei) {
+    return { allowed: false, reason: `gas.emergencyReservePOL (${emergencyReservePolWei.toString()} wei) >= gas.maxDailyGasPOL (${maxDailyGasPolWei.toString()} wei); no spendable headroom` };
+  }
+  if (todayGasSpentPolWei + emergencyReservePolWei >= maxDailyGasPolWei) {
+    return { allowed: false, reason: `today's gas spend ${todayGasSpentPolWei.toString()} wei + reserve ${emergencyReservePolWei.toString()} wei has reached the daily cap ${maxDailyGasPolWei.toString()} wei` };
+  }
+  return { allowed: true };
+}

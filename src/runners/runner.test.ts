@@ -2284,3 +2284,109 @@ describe('Runner — boot-time auto-approve (Phase 3 d-i)', () => {
     expect(approval?.walletBalanceWei6).toBeUndefined();
   });
 });
+
+// ── gas-budget verdict (Phase 3 d-ii) ────────────────────────────────────────
+
+describe('Runner — gas-budget verdict gate (Phase 3 d-ii)', () => {
+  /** A successful `approveUSDC` stub whose receipt produces a known `gasPolWei`. */
+  function approveRecorderWithReceipt(gasUsed: bigint, effectiveGasPrice: bigint): { fn: (amount: ApproveUSDCAmount) => Promise<ApproveResult>; calls: ApproveUSDCAmount[] } {
+    const calls: ApproveUSDCAmount[] = [];
+    return {
+      calls,
+      fn: (amount) => {
+        calls.push(amount);
+        const receipt = { gasUsed, effectiveGasPrice } as unknown as ApproveResult['receipt'];
+        const onChainAmount = amount === 'max' ? 2n ** 256n - 1n : amount;
+        return Promise.resolve({ txHash: '0xtx', receipt, spender: '0xPositionModule' as Hex, token: '0xusdc' as Hex, amount: onChainAmount });
+      },
+    };
+  }
+
+  /** Today's UTC `YYYY-MM-DD` for the test fixture's pinned clock (`noopDeps.now() === T0`) — same derivation as the runner's internal `todayUTCDateString`. */
+  function todayUTC(): string {
+    const d = new Date(T0 * 1000);
+    return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+  }
+
+  it('budget already exhausted (today\'s gasPolWei + reserve >= maxDailyGasPOL) → skip the approve, emit `candidate` `gas-budget-blocks-reapproval`, no on-chain write', async () => {
+    const today = todayUTC();
+    // Pre-seed today's counter at 0.9 POL of a 1 POL cap with 0.2 POL reserve → 0.9 + 0.2 = 1.1 > 1.0 → DENIED.
+    const POL = 10n ** 18n;
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), dailyCounters: { [today]: { gasPolWei: ((POL * 9n) / 10n).toString(), feeUsdcWei6: '0' } } });
+    const approve = approveRecorderWithReceipt(50_000n, 30_000_000_000n);
+    const config = cfg({ mode: { dryRun: false }, approvals: { autoApprove: true, mode: 'exact' }, gas: { maxDailyGasPOL: 1, emergencyReservePOL: 0.2 } });
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]),
+      { approveUSDC: approve.fn },
+      undefined, undefined,
+      { readApprovals: () => Promise.resolve(approvalsSnapshotWith(0n)) }, // would need an approve if budget allowed
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    expect(approve.calls).toHaveLength(0); // gate fired BEFORE the write
+    const candidate = readEvents().find((e) => e.kind === 'candidate' && e.skipReason === 'gas-budget-blocks-reapproval');
+    expect(candidate).toMatchObject({ purpose: 'positionModule-approve' });
+    expect(typeof candidate?.detail).toBe('string');
+    expect(readEvents().some((e) => e.kind === 'approval')).toBe(false);
+    // Counter unchanged — no spend.
+    const reloaded = StateStore.at(stateDir).load().state;
+    expect(reloaded.dailyCounters[today]?.gasPolWei).toBe(((POL * 9n) / 10n).toString());
+  });
+
+  it('budget OK + auto-approve succeeds → state.dailyCounters[today].gasPolWei accumulates the approve\'s gas cost', async () => {
+    const approve = approveRecorderWithReceipt(50_000n, 30_000_000_000n); // 50k × 30 gwei = 1.5e15 wei = 0.0015 POL
+    const expectedGasCost = 50_000n * 30_000_000_000n;
+    const config = cfg({ mode: { dryRun: false }, approvals: { autoApprove: true, mode: 'exact' }, gas: { maxDailyGasPOL: 1, emergencyReservePOL: 0.2 } });
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]),
+      { approveUSDC: approve.fn },
+      undefined, undefined,
+      { readApprovals: () => Promise.resolve(approvalsSnapshotWith(0n)) },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    expect(approve.calls).toHaveLength(1);
+    const today = todayUTC();
+    const reloaded = StateStore.at(stateDir).load().state;
+    expect(reloaded.dailyCounters[today]?.gasPolWei).toBe(expectedGasCost.toString());
+    expect(reloaded.dailyCounters[today]?.feeUsdcWei6).toBe('0'); // not touched
+  });
+
+  it('budget OK + prior gas spent today + auto-approve succeeds → today\'s counter is prior + this approve\'s cost (additive, not replacing)', async () => {
+    const today = todayUTC();
+    const prior = 1_000_000_000_000_000n; // 0.001 POL prior spend
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), dailyCounters: { [today]: { gasPolWei: prior.toString(), feeUsdcWei6: '5000000' } } });
+    const approve = approveRecorderWithReceipt(50_000n, 30_000_000_000n);
+    const expectedGasCost = 50_000n * 30_000_000_000n;
+    const config = cfg({ mode: { dryRun: false }, approvals: { autoApprove: true, mode: 'exact' }, gas: { maxDailyGasPOL: 1, emergencyReservePOL: 0.2 } });
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]),
+      { approveUSDC: approve.fn },
+      undefined, undefined,
+      { readApprovals: () => Promise.resolve(approvalsSnapshotWith(0n)) },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    expect(approve.calls).toHaveLength(1);
+    const reloaded = StateStore.at(stateDir).load().state;
+    expect(reloaded.dailyCounters[today]?.gasPolWei).toBe((prior + expectedGasCost).toString());
+    expect(reloaded.dailyCounters[today]?.feeUsdcWei6).toBe('5000000'); // preserved
+  });
+
+  it('an operator misconfig (reserve >= cap) is caught by the verdict → skip the approve + emit `candidate` `gas-budget-blocks-reapproval`', async () => {
+    const approve = approveRecorderWithReceipt(50_000n, 30_000_000_000n);
+    const config = cfg({ mode: { dryRun: false }, approvals: { autoApprove: true, mode: 'exact' }, gas: { maxDailyGasPOL: 0.2, emergencyReservePOL: 0.2 } });
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]),
+      { approveUSDC: approve.fn },
+      undefined, undefined,
+      { readApprovals: () => Promise.resolve(approvalsSnapshotWith(0n)) },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    expect(approve.calls).toHaveLength(0);
+    const candidate = readEvents().find((e) => e.kind === 'candidate' && e.skipReason === 'gas-budget-blocks-reapproval');
+    expect(candidate).toBeDefined();
+    expect(candidate?.detail).toMatch(/no spendable headroom/);
+  });
+});

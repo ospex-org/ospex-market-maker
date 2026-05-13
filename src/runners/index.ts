@@ -105,7 +105,7 @@ import type {
   Subscription,
 } from '../ospex/index.js';
 import { decimalToTick, inverseOddsTick, isTickInRange, oppositeSide, positionTypeForSide, toProtocolQuote, type ProtocolQuote, type QuoteSide } from '../pricing/index.js';
-import { requiredPositionModuleAllowanceUSDC, type Market } from '../risk/index.js';
+import { canSpendGas, requiredPositionModuleAllowanceUSDC, type Market } from '../risk/index.js';
 import { assessStateLoss, type CommitmentLifecycle, type MakerCommitmentRecord, type MakerPositionRecord, type MakerPositionStatus, type MakerSide, type MakerState, type StateLossAssessment, type StateStore } from '../state/index.js';
 import { EventLog, eventLogsExist } from '../telemetry/index.js';
 
@@ -1760,6 +1760,30 @@ export class Runner {
       amount = target;
     }
 
+    // Gas-budget verdict (DESIGN §6): right before an on-chain write, confirm
+    // today's POL spend hasn't already eaten into the emergency reserve. If
+    // exhausted, emit `candidate` `gas-budget-blocks-reapproval` and skip the
+    // approve. Posting commitments + routine off-chain cancels are gasless and
+    // are NOT gated here. The daily counter (state.dailyCounters) persists
+    // across restarts so the same UTC day's spend is honored.
+    const today = todayUTCDateString(this.deps.now());
+    const todayCounter = this.state.dailyCounters[today];
+    const todayGasSpentPolWei = todayCounter !== undefined ? BigInt(todayCounter.gasPolWei) : 0n;
+    const maxDailyGasPolWei = polFloatToWei18(this.config.gas.maxDailyGasPOL);
+    const emergencyReservePolWei = polFloatToWei18(this.config.gas.emergencyReservePOL);
+    const verdict = canSpendGas({ todayGasSpentPolWei, maxDailyGasPolWei, emergencyReservePolWei });
+    if (!verdict.allowed) {
+      this.eventLog.emit('candidate', {
+        skipReason: 'gas-budget-blocks-reapproval',
+        purpose: 'positionModule-approve',
+        todayGasSpentPolWei: todayGasSpentPolWei.toString(),
+        maxDailyGasPolWei: maxDailyGasPolWei.toString(),
+        emergencyReservePolWei: emergencyReservePolWei.toString(),
+        detail: verdict.reason,
+      });
+      return;
+    }
+
     let result: ApproveResult;
     try {
       result = await this.adapter.approveUSDC(amount);
@@ -1771,7 +1795,17 @@ export class Runner {
     // The approve's POL cost — wei18. Exposed for (d-ii)'s daily-counter accumulator.
     const gasUsed = BigInt(result.receipt.gasUsed);
     const effectiveGasPrice = BigInt(result.receipt.effectiveGasPrice);
-    const gasPolWei = (gasUsed * effectiveGasPrice).toString();
+    const gasPolWei = gasUsed * effectiveGasPrice;
+
+    // Accumulate today's gas spend so the verdict honors it on subsequent ops
+    // (settle / claim / on-chain cancel — landing in (e) / (f)). Persisted across
+    // restarts via the per-tick state flush.
+    const existing = this.state.dailyCounters[today];
+    const prior = existing !== undefined ? BigInt(existing.gasPolWei) : 0n;
+    this.state.dailyCounters[today] = {
+      gasPolWei: (prior + gasPolWei).toString(),
+      feeUsdcWei6: existing !== undefined ? existing.feeUsdcWei6 : '0',
+    };
 
     const payload: Record<string, unknown> = {
       purpose: 'positionModule',
@@ -1780,7 +1814,7 @@ export class Runner {
       requiredAggregateAllowance: requiredCapWei6.toString(),
       amountSetTo: result.amount.toString(),
       txHash: result.txHash,
-      gasPolWei,
+      gasPolWei: gasPolWei.toString(),
     };
     if (walletUSDCWei6 !== undefined) payload.walletBalanceWei6 = walletUSDCWei6.toString();
     this.eventLog.emit('approval', payload);
@@ -1827,6 +1861,20 @@ function errClass(err: unknown): string {
 
 function errMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/** The UTC date `YYYY-MM-DD` for `unixSec` — the key into `state.dailyCounters`. UTC so a maker straddling midnight in any local timezone sees the same day boundary as another instance in another zone. */
+function todayUTCDateString(unixSec: number): string {
+  const d = new Date(unixSec * 1000);
+  const yyyy = d.getUTCFullYear();
+  const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const dd = String(d.getUTCDate()).padStart(2, '0');
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+/** Convert a config-supplied float POL value to wei18. POL has 18 decimals; budgets are typically << 1 POL so the `Number → BigInt` round-trip is exact for any realistic input. */
+function polFloatToWei18(p: number): bigint {
+  return BigInt(Math.round(p * 1e18));
 }
 
 /** Strict forward-only ordering of `MakerPositionStatus` — used by `pollPositionStatus` to reject a backwards transition (e.g. a `claimable` record reported back in `active`). */

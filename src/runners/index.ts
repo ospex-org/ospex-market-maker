@@ -444,9 +444,22 @@ export class Runner {
         // KILL file dropped pre-boot still aborts cleanly) but BEFORE the first
         // tick — so any allowance shortfall is closed before discovery / reconcile
         // would matter. Runs at most once per `run()` invocation; dry-run skips.
+        //
+        // ALSO gated on `!isHoldingQuoting()`: raising the PositionModule allowance
+        // while the state-loss hold (DESIGN §12) is active could re-activate latent
+        // soft-cancelled signed commitments the runner can't see — the same risk
+        // that holds quoting in the first place. When the hold lifts (elapsed
+        // fixed-seconds expiry, telemetry reconstruction, or `--ignore-missing-state`)
+        // the next tick's check will fire. The latch stays `false` while deferred
+        // so the retry happens; dry-run latches immediately (never approves).
         if (!bootApprovalsApplied) {
-          if (!this.config.mode.dryRun) await this.applyAutoApprovals();
-          bootApprovalsApplied = true;
+          if (this.config.mode.dryRun) {
+            bootApprovalsApplied = true;
+          } else if (!this.isHoldingQuoting()) {
+            await this.applyAutoApprovals();
+            bootApprovalsApplied = true;
+          }
+          // else: live + holding — leave the latch false, retry next tick.
         }
         ticks += 1;
         await this.tick(ticks);
@@ -1686,23 +1699,31 @@ export class Runner {
   /**
    * Boot-time auto-approve flow (DESIGN §6 / §13). In live mode, after the boot
    * fail-safe but before the first tick, reads the current `PositionModule`
-   * USDC allowance for the maker; if it's short of the aggregate cap ceiling
-   * `requiredPositionModuleAllowanceUSDC(caps)`, calls `approveUSDC` to bring
-   * it up and emits an `approval` event. `mode: 'exact'` sets the allowance to
-   * the required ceiling (the safer default — `approve(x)` *sets*, doesn't
-   * add); `mode: 'unlimited'` sets it to `MaxUint256` — operator-confirmed at
-   * the CLI via `--yes`, refused by `runRun` if missing. `autoApprove: false`
-   * skips the whole flow (the operator approves manually). A `readApprovals`
-   * or `approveUSDC` failure is logged (`error` `phase: 'approve'`) and the
-   * boot proceeds — the first failed match will surface the gap loudly, and
-   * the operator can retry. Idempotent: if the current allowance already
-   * meets the target the call is silent (no `approval` event, no on-chain
-   * write). `approve(x)` is the standard ERC-20 idiom — it sets the new
-   * allowance to `x`, never above the operator's intent.
+   * USDC allowance for the maker; if it's short of the documented target,
+   * calls `approveUSDC` to bring it up and emits an `approval` event.
    *
-   * The `approval` event payload carries `gasPolWei` (`gasUsed × effectiveGasPrice`)
-   * for the gas-budget tracker in (d-ii) to accumulate into `state.dailyCounters`;
-   * the per-day counter / verdict gate is wired next slice.
+   * **`mode: 'exact'`** — target = `min(requiredPositionModuleAllowanceUSDC(caps),
+   * walletUSDCBalance)`. Wallet-USDC-bounded per DESIGN §6: approving more than
+   * the wallet currently holds would over-state matchable risk and is the
+   * documented safety contract (Hermes review-PR25 §2). `readBalances` failure
+   * fails closed (the bound is meaningful — log + skip the approve).
+   * `approve(x)` *sets* the allowance, never adds; the check
+   * `currentAllowance >= target` is "raise-only" — already-sufficient
+   * allowances aren't downshifted (operator may have intended them).
+   *
+   * **`mode: 'unlimited'`** — sets `MaxUint256`. Skips the wallet-balance read
+   * (operator confirmed the unbounded path via `--yes`; bounding it would
+   * defeat the explicit opt-in). Idempotent: if `currentAllowance` is already
+   * `MaxUint256`, silent no-op.
+   *
+   * `autoApprove: false` skips the whole flow (the operator approves manually).
+   * A `readApprovals` or `approveUSDC` failure is logged (`error`
+   * `phase: 'approve'`) and the boot proceeds — the first failed match will
+   * surface the gap loudly, and the operator can retry.
+   *
+   * The `approval` event payload carries `walletBalanceWei6` (exact mode only),
+   * `txHash`, and `gasPolWei` (`gasUsed × effectiveGasPrice`); the gas-budget
+   * tracker in (d-ii) consumes the `gasPolWei` field without changing the shape.
    */
   private async applyAutoApprovals(): Promise<void> {
     if (this.makerAddress === null) return; // live-mode invariant — caller (`run()`) already gated on `!dryRun`
@@ -1718,10 +1739,27 @@ export class Runner {
     const positionModule = snapshot.usdc.allowances.positionModule;
     const currentAllowance = positionModule.raw;
     const requiredUSDC = requiredPositionModuleAllowanceUSDC(this.config.risk);
-    const requiredWei6 = BigInt(Math.ceil(requiredUSDC * 1_000_000));
-    if (currentAllowance >= requiredWei6) return; // already sufficient — silent
+    const requiredCapWei6 = BigInt(Math.ceil(requiredUSDC * 1_000_000));
 
-    const amount: ApproveUSDCAmount = this.config.approvals.mode === 'unlimited' ? 'max' : requiredWei6;
+    let amount: ApproveUSDCAmount;
+    let walletUSDCWei6: bigint | undefined;
+    if (this.config.approvals.mode === 'unlimited') {
+      const MAX_UINT256 = 2n ** 256n - 1n;
+      if (currentAllowance >= MAX_UINT256) return; // already at max — idempotent
+      amount = 'max';
+    } else {
+      // exact mode: bound the target by current wallet USDC balance.
+      try {
+        walletUSDCWei6 = (await this.adapter.readBalances(this.makerAddress)).usdc;
+      } catch (err) {
+        this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'approve' });
+        return; // fail closed — the wallet bound is part of the safety contract
+      }
+      const target = walletUSDCWei6 < requiredCapWei6 ? walletUSDCWei6 : requiredCapWei6;
+      if (currentAllowance >= target) return; // already sufficient — silent
+      amount = target;
+    }
+
     let result: ApproveResult;
     try {
       result = await this.adapter.approveUSDC(amount);
@@ -1735,15 +1773,17 @@ export class Runner {
     const effectiveGasPrice = BigInt(result.receipt.effectiveGasPrice);
     const gasPolWei = (gasUsed * effectiveGasPrice).toString();
 
-    this.eventLog.emit('approval', {
+    const payload: Record<string, unknown> = {
       purpose: 'positionModule',
       spender: positionModule.spender,
       currentAllowance: currentAllowance.toString(),
-      requiredAggregateAllowance: requiredWei6.toString(),
+      requiredAggregateAllowance: requiredCapWei6.toString(),
       amountSetTo: result.amount.toString(),
       txHash: result.txHash,
       gasPolWei,
-    });
+    };
+    if (walletUSDCWei6 !== undefined) payload.walletBalanceWei6 = walletUSDCWei6.toString();
+    this.eventLog.emit('approval', payload);
   }
 
   /** Ticks until the next discovery cycle: `discovery.everyNTicks` jittered by ±`discovery.jitterPct` (so multiple MMs don't all discover on the same tick). At least 1. */

@@ -2183,8 +2183,8 @@ function errMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-/** The UTC date `YYYY-MM-DD` for `unixSec` — the key into `state.dailyCounters`. UTC so a maker straddling midnight in any local timezone sees the same day boundary as another instance in another zone. */
-function todayUTCDateString(unixSec: number): string {
+/** The UTC date `YYYY-MM-DD` for `unixSec` — the key into `state.dailyCounters`. UTC so a maker straddling midnight in any local timezone sees the same day boundary as another instance in another zone. Exported for the one-shot CLIs (`cancel-stale`) which need to update the same counters. */
+export function todayUTCDateString(unixSec: number): string {
   const d = new Date(unixSec * 1000);
   const yyyy = d.getUTCFullYear();
   const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
@@ -2192,8 +2192,8 @@ function todayUTCDateString(unixSec: number): string {
   return `${yyyy}-${mm}-${dd}`;
 }
 
-/** Convert a config-supplied float POL value to wei18. POL has 18 decimals; budgets are typically << 1 POL so the `Number → BigInt` round-trip is exact for any realistic input. */
-function polFloatToWei18(p: number): bigint {
+/** Convert a config-supplied float POL value to wei18. POL has 18 decimals; budgets are typically << 1 POL so the `Number → BigInt` round-trip is exact for any realistic input. Exported for the one-shot CLIs (`cancel-stale`) which need to evaluate the same `canSpendGas` verdict. */
+export function polFloatToWei18(p: number): bigint {
   return BigInt(Math.round(p * 1e18));
 }
 
@@ -2236,8 +2236,8 @@ function isPricedLiveCommitment(c: Commitment): c is PricedLiveCommitment {
   return c.isLive && c.oddsTick !== null && c.positionType !== null && isTickInRange(c.oddsTick);
 }
 
-/** The `would-soft-cancel` event payload for a pulled commitment record — the protocol commitment params (`makerSide` / `makerOddsTick` / `positionType`) plus `takerSide` (the offer side it served, `oppositeSide(makerSide)`) and the pull reason. */
-function softCancelEventPayload(record: MakerCommitmentRecord, reason: SoftCancelReason): Record<string, unknown> {
+/** The `would-soft-cancel` event payload for a pulled commitment record — the protocol commitment params (`makerSide` / `makerOddsTick` / `positionType`) plus `takerSide` (the offer side it served, `oppositeSide(makerSide)`) and the pull reason. Exported for the one-shot CLIs (`cancel-stale`) which emit the same `soft-cancel` event shape. */
+export function softCancelEventPayload(record: MakerCommitmentRecord, reason: SoftCancelReason): Record<string, unknown> {
   return {
     commitmentHash: record.hash,
     speculationId: record.speculationId,

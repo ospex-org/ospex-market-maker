@@ -68,7 +68,7 @@ So a pulled quote is *latent* exposure, not gone. The MM tracks this and counts 
 
 1. Kill switch (drop the `KILL` file).
 2. `ospex-mm status` and the telemetry log under `telemetry.logDir` — what's open, what's filled, what errored.
-3. `ospex-mm cancel-stale` (off-chain) — or `ospex-mm cancel-stale --authoritative` (on-chain, costs gas) if you need quotes invalidated *now*.
+3. `ospex-mm cancel-stale` (off-chain) — or `ospex-mm cancel-stale --authoritative` (on-chain, costs gas) if you need quotes invalidated *now*. **Stop `run --live` first** — the JSON state file isn't multi-process safe, so a concurrent runner would race on the flush. The off-chain leg pulls every tracked commitment older than `orders.staleAfterSeconds` from the API book (gasless); `--authoritative` additionally calls `cancelCommitmentOnchain` per record (gas-gated with `mayUseReserve: true`, i.e. drawn from the emergency reserve — operator-explicit).
 4. If you're locked out of settle/claim because you're out of POL — top up the wallet, then `ospex-mm status` / claim again.
 
 ## Reporting issues

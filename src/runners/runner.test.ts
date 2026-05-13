@@ -1316,4 +1316,49 @@ describe('Runner — live execution', () => {
     expect(events.some((e) => e.kind === 'soft-cancel' || e.kind === 'would-soft-cancel')).toBe(false);
     expect(StateStore.at(stateDir).load().state.commitments['0xvisible']?.lifecycle).toBe('visibleOpen'); // still up — next pass retries the pull
   });
+
+  it('a dry-run state directory reused for live is rejected at construction (a `dry:` synthetic commitment)', () => {
+    const synthetic = commitmentRecord({ hash: 'dry:prior-run:1', speculationId: 'spec-1234', contestId: '1234', makerSide: 'away', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 100, postedAtUnixSec: T0 - 5, updatedAtUnixSec: T0 - 5 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { 'dry:prior-run:1': synthetic } });
+    const config = cfg({ mode: { dryRun: false } });
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([]));
+    expect(() => makeRunner({ config, adapter, maxTicks: 1 })).toThrow(/dry-run synthetic commitment/); // never gets near cancelCommitmentOffchain — the runner can't even construct
+  });
+
+  it('a prior live run\'s state (real `0x` commitment hashes) constructs fine — the dry-run guard does not false-positive', () => {
+    const live = commitmentRecord({ hash: '0xrealhash', speculationId: 'spec-1234', contestId: '1234', makerSide: 'away', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 100, postedAtUnixSec: T0 - 5, updatedAtUnixSec: T0 - 5 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xrealhash': live } });
+    const config = cfg({ mode: { dryRun: false } });
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([]));
+    expect(() => makeRunner({ config, adapter, maxTicks: 1 })).not.toThrow();
+  });
+
+  it('a failed replace-cancel does not post the replacement and re-reconciles next tick (retries the cancel) — DESIGN §9', async () => {
+    // Two stale incumbents (one per maker side) on spec-1234 → both are toReplace. With the cancel always failing,
+    // the replacements must NOT go up (a second visible quote on a side the MM can't pull would violate DESIGN §9 and
+    // wouldn't self-heal — needsReconcile would see a fresh two-sided quote and skip). Instead the market stays dirty
+    // and tick 2 retries the cancels.
+    const staleAway = commitmentRecord({ hash: '0xstaleAway', speculationId: 'spec-1234', contestId: '1234', makerSide: 'away', lifecycle: 'visibleOpen', oddsTick: 250, expiryUnixSec: T0 + 50, postedAtUnixSec: T0 - 200, updatedAtUnixSec: T0 - 200 });
+    const staleHome = commitmentRecord({ hash: '0xstaleHome', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', lifecycle: 'visibleOpen', oddsTick: 250, expiryUnixSec: T0 + 50, postedAtUnixSec: T0 - 200, updatedAtUnixSec: T0 - 200 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xstaleAway': staleAway, '0xstaleHome': staleHome } });
+    const config = cfg({ mode: { dryRun: false }, risk: { maxOpenCommitments: 8 } }); // count 2 < 8 → market 1234 allowed; default staleAfterSeconds 90 → posted 200s ago is stale
+    const submit = submitRecorder();
+    const cancels: string[] = [];
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([contestView({ contestId: '1234' })]), {
+      submitCommitment: submit.fn,
+      cancelCommitmentOffchain: (h) => { cancels.push(h); return Promise.reject(new Error('relay 500')); },
+    });
+    const runner = makeRunner({ config, adapter, maxTicks: 2 });
+    await runner.run();
+
+    const events = readEvents();
+    expect([...cancels].sort()).toEqual(['0xstaleAway', '0xstaleAway', '0xstaleHome', '0xstaleHome']); // both attempted on tick 1, both retried on tick 2 — a failed pull doesn't stop the next tick
+    expect(submit.calls).toHaveLength(0); // no replacement posted (and no fresh submit — both sides are occupied by their stale incumbents)
+    expect(events.filter((e) => e.kind === 'error' && e.phase === 'cancel')).toHaveLength(4);
+    expect(events.some((e) => e.kind === 'replace' || e.kind === 'submit')).toBe(false);
+    const reloaded = StateStore.at(stateDir).load().state.commitments;
+    expect(reloaded['0xstaleAway']?.lifecycle).toBe('visibleOpen'); // both incumbents still up — unchanged (only the original, never two)
+    expect(reloaded['0xstaleHome']?.lifecycle).toBe('visibleOpen');
+    expect(runner.trackedMarketView('1234')?.dirty).toBe(true); // never cleared — the reconcile kept returning transient-failure
+  });
 });

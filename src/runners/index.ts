@@ -319,6 +319,20 @@ export class Runner {
 
     const { state, status } = this.stateStore.load();
     this.state = state;
+    // Fail closed if a dry-run state directory was reused for live. A `dry:<runId>:<n>`
+    // synthetic hash can never be a real on-chain commitment — counting one toward
+    // exposure, or trying to off-chain-cancel it, corrupts live accounting and spams the
+    // relay with bad hashes. This is what makes the `… as Hex` casts at the off-chain-cancel
+    // call sites sound (every tracked record in a live run is a real `0x…`). Point
+    // `state.dir` at a fresh directory for live, or clear the dry-run state first.
+    if (!this.config.mode.dryRun) {
+      const synthetic = Object.values(this.state.commitments).find((r) => r.hash.startsWith('dry:'));
+      if (synthetic !== undefined) {
+        throw new Error(
+          `Runner: live mode but the loaded state contains a dry-run synthetic commitment ("${synthetic.hash}") — a dry-run state directory was reused. Point \`state.dir\` at a fresh directory for live, or clear the dry-run state first.`,
+        );
+      }
+    }
     this.bootAssessment = assessStateLoss(status, {
       hasPriorTelemetry,
       ignoreMissingStateOverride: opts.ignoreMissingState ?? false,
@@ -819,8 +833,10 @@ export class Runner {
    * `would-soft-cancel`s that pull any standing quote off an unwanted side. After the
    * plan is applied, `assessCompetitiveness` measures where each would-be quote sits
    * vs the visible orderbook on its side (the `getSpeculation` read above already
-   * fetched it). Returns `'applied'` whenever a reconcile decision (a gate-pull, or a
-   * plan) was applied.
+   * fetched it). Returns `'applied'` when the plan went through cleanly (or a gate
+   * pulled); `'transient-failure'` if a live write failed mid-plan (`applyReconcilePlan`
+   * already logged the `error`) — `reconcileMarkets` then leaves `dirty` /
+   * `lastReconciledAt` so the market re-reconciles next tick and retries the failed bit.
    */
   private async reconcileMarket(m: TrackedMarket, now: number): Promise<'applied' | 'transient-failure'> {
     // Gate: the game starts within one expiry window — stop quoting it (a fresh quote would still be matchable at game time / outlive the pre-game window), and pull whatever's still up.
@@ -878,9 +894,9 @@ export class Runner {
     });
     const recordsOnSpec = Object.values(this.state.commitments).filter((r) => r.speculationId === m.speculationId);
     const plan = reconcileBook(recordsOnSpec, desired, this.config, now, inventory.openCommitmentCount);
-    await this.applyReconcilePlan(m, plan, now);
+    const outcome = await this.applyReconcilePlan(m, plan, now);
     this.assessCompetitiveness(m, spec, desired);
-    return 'applied';
+    return outcome; // `'transient-failure'` if a live write failed mid-plan — `reconcileMarkets` then leaves `dirty` / `lastReconciledAt` so the market re-reconciles next tick
   }
 
   /** Pull (off-chain) every API-visible commitment of the maker's on `m.speculationId` — in live mode an actual `cancelCommitmentOffchain` per record (a failed one stays `visibleOpen` for the next pass), in dry-run a state-only simulation — then reclassify the pulled ones `softCancelled` and emit `would-soft-cancel` / `soft-cancel` (reason `side-not-quoted`: when a market is unquoteable, neither side is being quoted). Used by the unquoteable-market gates above — the visible book must never carry a quote the MM is no longer pricing (DESIGN §2.2 / §3). The pulled quote's signed payload stays matchable on chain until expiry, so the risk engine keeps counting it. */
@@ -895,28 +911,31 @@ export class Runner {
 
   /**
    * Pull a tracked commitment off the API book — in live mode a real off-chain
-   * cancel (`cancelCommitmentOffchain`; if it throws, log `error` `phase: 'cancel'`
-   * and leave the record `visibleOpen` so the next reconcile pass retries the pull),
-   * in dry-run a state-only no-op — then (on success) reclassify it `softCancelled`,
-   * stamp `updatedAtUnixSec`, and emit `soft-cancel` (live) / `would-soft-cancel`
-   * (dry-run). The off-chain cancel is visibility-only: the signed payload stays
-   * matchable on chain until expiry, so the risk engine keeps counting it.
+   * cancel (`cancelCommitmentOffchain`), in dry-run a state-only no-op — then (on
+   * success) reclassify it `softCancelled`, stamp `updatedAtUnixSec`, and emit
+   * `soft-cancel` (live) / `would-soft-cancel` (dry-run). Returns `true` if the
+   * record was pulled; `false` if a live cancel threw — then `error` `phase: 'cancel'`
+   * is logged and the record is left `visibleOpen` (the caller treats that as a
+   * `transient-failure` so the market re-reconciles and retries). The off-chain cancel
+   * is visibility-only: the signed payload stays matchable on chain until expiry, so
+   * the risk engine keeps counting it.
    */
-  private async softCancelRecord(record: MakerCommitmentRecord, reason: SoftCancelReason, now: number): Promise<void> {
+  private async softCancelRecord(record: MakerCommitmentRecord, reason: SoftCancelReason, now: number): Promise<boolean> {
     if (!this.config.mode.dryRun) {
       try {
-        // In live mode every tracked record's hash is a real EIP-712 hash (`0x…`) —
-        // it came from `submitCommitment` (or a prior live run's state). The `dry:` form
-        // only exists in dry-run, where this branch never runs.
+        // Every tracked record in a live run is a real EIP-712 hash (`0x…`): submits record
+        // `submitCommitment`'s real hash, and the Runner ctor refuses to boot live on a state
+        // file containing any `dry:` synthetic record. This branch never runs in dry-run.
         await this.adapter.cancelCommitmentOffchain(record.hash as Hex);
       } catch (err) {
         this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'cancel', contestId: record.contestId, commitmentHash: record.hash });
-        return; // still visible — the next reconcile pass will see it and retry the pull
+        return false; // still visible — the next reconcile pass will see it and retry the pull
       }
     }
     record.lifecycle = 'softCancelled';
     record.updatedAtUnixSec = now;
     this.eventLog.emit(this.config.mode.dryRun ? 'would-soft-cancel' : 'soft-cancel', softCancelEventPayload(record, reason));
+    return true;
   }
 
   /**
@@ -927,23 +946,30 @@ export class Runner {
    * `commitments.cancel` (the gasless off-chain pull). In dry-run nothing leaves the
    * process: a synthetic `dry:<runId>:<n>` hash is minted and the cancel is a no-op.
    * Either way the same state mutations and event stream — only the kind names differ
-   * (`submit` / `replace` / `soft-cancel` in live; `would-`-prefixed in dry-run). A
-   * live submit / cancel that throws is logged (`error`, `phase: 'submit'` /
-   * `'cancel'`) and the loop moves on — never crashes the tick; on a failed submit no
-   * record is created (and no `submit` / `replace` event); on a failed stale-pull the
-   * old quote stays `visibleOpen` (the replacement still goes up; the next pass pulls
-   * the stale one as a duplicate). A `cap-hit` candidate is emitted per deferred side
-   * in both modes. The pulled / replaced records stay `softCancelled`-not-expired, so
-   * their signed payloads keep counting toward exposure until expiry.
+   * (`submit` / `replace` / `soft-cancel` in live; `would-`-prefixed in dry-run) and
+   * a `cap-hit` candidate is emitted per deferred side.
+   *
+   * A live write that throws is logged (`error`, `phase: 'submit'` / `'cancel'`) and
+   * the loop moves on — never crashes the tick — but the plan is reported back as
+   * `'transient-failure'`, so the caller leaves the market `dirty` / un-throttled and
+   * it re-reconciles next tick (rather than waiting out `staleAfterSeconds`). On a
+   * failed submit no record is created (no `submit` / `replace` event); on a failed
+   * `toReplace` *stale-pull* the replacement is **not** posted either — posting it
+   * while the incumbent is still visible would surface two quotes on the side
+   * (DESIGN §9) — so the side keeps only the (now-known-stale) incumbent until the
+   * next-tick retry re-attempts the cancel. The pulled / replaced records that did
+   * get pulled stay `softCancelled`-not-expired, so their signed payloads keep
+   * counting toward exposure until expiry.
    */
-  private async applyReconcilePlan(m: TrackedMarket, plan: BookReconciliation, now: number): Promise<void> {
+  private async applyReconcilePlan(m: TrackedMarket, plan: BookReconciliation, now: number): Promise<'applied' | 'transient-failure'> {
     const expiryUnixSec = this.expiryForNewCommitment(m, now);
     const submitKind = this.config.mode.dryRun ? 'would-submit' : 'submit';
     const replaceKind = this.config.mode.dryRun ? 'would-replace' : 'replace';
+    let outcome: 'applied' | 'transient-failure' = 'applied';
 
     for (const qs of plan.toSubmit) {
       const record = await this.submitQuote(m, qs, now, expiryUnixSec);
-      if (record === null) continue; // live submit threw — `error` already emitted
+      if (record === null) { outcome = 'transient-failure'; continue; } // live submit threw — `error` already emitted; retry the now-empty side next tick
       this.eventLog.emit(submitKind, {
         ...this.commitmentEventPayload(record),
         takerOddsTick: qs.quoteTick,
@@ -952,24 +978,24 @@ export class Runner {
     }
 
     for (const rp of plan.toReplace) {
-      // Pull the incumbent first (a brief no-quote gap is safer than a brief stale double-quote),
-      // then post the replacement. In live mode a failed pull doesn't block the replacement — the
-      // stale one then surfaces as a duplicate next pass and gets pulled then.
-      let stalePulled = true;
+      // Pull the incumbent first (a brief no-quote gap beats a brief stale double-quote — we're
+      // replacing it because it's stale/mispriced). In live mode, if that pull fails, do NOT post
+      // the replacement: two visible quotes on the side would violate DESIGN §9 (and they wouldn't
+      // self-heal — `needsReconcile` sees a fresh two-sided quote and skips). Leave the stale one up
+      // and force a prompt retry; the next pass re-attempts the cancel.
       if (!this.config.mode.dryRun) {
         try {
           await this.adapter.cancelCommitmentOffchain(rp.stale.hash as Hex); // live: a real `0x…` hash (see softCancelRecord)
         } catch (err) {
           this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'cancel', contestId: m.contestId, commitmentHash: rp.stale.hash });
-          stalePulled = false;
+          outcome = 'transient-failure';
+          continue;
         }
       }
-      if (stalePulled) {
-        rp.stale.lifecycle = 'softCancelled';
-        rp.stale.updatedAtUnixSec = now;
-      }
+      rp.stale.lifecycle = 'softCancelled';
+      rp.stale.updatedAtUnixSec = now;
       const record = await this.submitQuote(m, rp.replacement, now, expiryUnixSec);
-      if (record === null) continue; // live submit threw — `error` already emitted; the stale's status is per `stalePulled`
+      if (record === null) { outcome = 'transient-failure'; continue; } // live submit threw — `error` already emitted; the stale is pulled, so the side is empty — re-quote it next tick
       this.eventLog.emit(replaceKind, {
         replacedCommitmentHash: rp.stale.hash,
         newCommitmentHash: record.hash,
@@ -991,10 +1017,13 @@ export class Runner {
       });
     }
 
-    for (const sc of plan.toSoftCancel) await this.softCancelRecord(sc.record, sc.reason, now);
+    for (const sc of plan.toSoftCancel) {
+      if (!(await this.softCancelRecord(sc.record, sc.reason, now))) outcome = 'transient-failure'; // live cancel threw — `error` already emitted; the quote's still up, retry next tick
+    }
     for (const offerSide of plan.deferredSides) {
       this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'cap-hit', takerSide: offerSide });
     }
+    return outcome;
   }
 
   /** A new commitment's expiry, unix seconds: `now + orders.expirySeconds` under `fixed-seconds` mode (the v0 default — short-lived, rolled forward), or the contest's match time under `match-time` mode (the quote lapses exactly at game start). */

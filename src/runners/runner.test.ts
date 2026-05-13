@@ -15,6 +15,7 @@ import {
   type ApprovalsSnapshot,
   type ApproveResult,
   type ApproveUSDCAmount,
+  type CancelOnchainResult,
   type ClaimPositionResult,
   type SettleSpeculationResult,
   type OddsSnapshotView,
@@ -281,6 +282,7 @@ function liveSpiedAdapter(
     approveUSDC?: (amount: ApproveUSDCAmount) => Promise<ApproveResult>;
     settleSpeculation?: OspexAdapter['settleSpeculation'];
     claimPosition?: OspexAdapter['claimPosition'];
+    cancelCommitmentOnchain?: OspexAdapter['cancelCommitmentOnchain'];
   },
   getContest?: (id: string) => Promise<ContestView>,
   odds?: {
@@ -307,6 +309,7 @@ function liveSpiedAdapter(
   vi.spyOn(adapter, 'approveUSDC').mockImplementation(writes?.approveUSDC ?? (() => Promise.reject(new Error('liveSpiedAdapter: approveUSDC not stubbed — pass `writes.approveUSDC`'))));
   vi.spyOn(adapter, 'settleSpeculation').mockImplementation(writes?.settleSpeculation ?? (() => Promise.reject(new Error('liveSpiedAdapter: settleSpeculation not stubbed — pass `writes.settleSpeculation`'))));
   vi.spyOn(adapter, 'claimPosition').mockImplementation(writes?.claimPosition ?? (() => Promise.reject(new Error('liveSpiedAdapter: claimPosition not stubbed — pass `writes.claimPosition`'))));
+  vi.spyOn(adapter, 'cancelCommitmentOnchain').mockImplementation(writes?.cancelCommitmentOnchain ?? (() => Promise.reject(new Error('liveSpiedAdapter: cancelCommitmentOnchain not stubbed — pass `writes.cancelCommitmentOnchain`'))));
   vi.spyOn(adapter, 'listOpenCommitments').mockImplementation(reads?.listOpenCommitments ?? (() => Promise.resolve([])));
   vi.spyOn(adapter, 'getCommitment').mockImplementation(reads?.getCommitment ?? (() => Promise.reject(new Error('liveSpiedAdapter: getCommitment not stubbed — pass `reads.getCommitment`'))));
   vi.spyOn(adapter, 'getPositionStatus').mockImplementation(reads?.getPositionStatus ?? (() => Promise.resolve(EMPTY_POSITION_STATUS)));
@@ -2642,5 +2645,165 @@ describe('Runner — auto-settle + auto-claim (Phase 3 e-i)', () => {
     expect(claim.calls.map((c) => c.speculationId)).toEqual([2n]);
     const reloaded = StateStore.at(stateDir).load().state;
     expect(reloaded.positions['3:home']?.status).toBe('active'); // untouched
+  });
+});
+
+// ── on-chain kill path (Phase 3 e-ii) ────────────────────────────────────────
+
+describe('Runner — on-chain kill path / killCancelOnChain (Phase 3 e-ii)', () => {
+  /** A `cancelCommitmentOnchain` recorder that returns a fake receipt with known gas. */
+  function cancelOnchainRecorder(gasUsed = 60_000n, effectiveGasPrice = 30_000_000_000n): { fn: OspexAdapter['cancelCommitmentOnchain']; calls: Hex[]; gasPolWeiPerCall: bigint } {
+    const calls: Hex[] = [];
+    return {
+      calls,
+      gasPolWeiPerCall: gasUsed * effectiveGasPrice,
+      fn: (hash: Hex) => {
+        calls.push(hash);
+        const receipt = { gasUsed, effectiveGasPrice } as unknown as CancelOnchainResult['receipt'];
+        return Promise.resolve({ txHash: '0xkilltx', receipt, commitmentHash: hash });
+      },
+    };
+  }
+
+  function todayUTC(): string {
+    const d = new Date(T0 * 1000);
+    return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+  }
+
+  /** Trigger an actual shutdown via a kill file appearing after the first tick. */
+  function killFileAfterTick(triggerAtCheck: number): () => boolean {
+    let checks = 0;
+    return () => { checks += 1; return checks >= triggerAtCheck; };
+  }
+
+  it('killCancelOnChain=false → no on-chain cancels (off-chain shutdown only); records stay at their current lifecycle', async () => {
+    const cancel = cancelOnchainRecorder();
+    StateStore.at(stateDir).flush({
+      ...emptyMakerState(),
+      commitments: {
+        '0xa': commitmentRecord({ hash: '0xa', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '250000', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000 }),
+      },
+    });
+    const config = cfg({ mode: { dryRun: false }, killCancelOnChain: false });
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([]), { cancelCommitmentOnchain: cancel.fn });
+    await makeRunner({ config, adapter, maxTicks: 5, deps: { killFileExists: killFileAfterTick(2) } }).run();
+
+    expect(cancel.calls).toHaveLength(0);
+    expect(readEvents().some((e) => e.kind === 'onchain-cancel')).toBe(false);
+    expect(StateStore.at(stateDir).load().state.commitments['0xa']?.lifecycle).toBe('visibleOpen');
+  });
+
+  it('killCancelOnChain=true + KILL file + non-terminal records → each is cancelOnchain\'d, stamped authoritativelyInvalidated, emits onchain-cancel, gas accumulated', async () => {
+    const cancel = cancelOnchainRecorder(60_000n, 30_000_000_000n);
+    const expectedGasPerCall = 60_000n * 30_000_000_000n;
+    StateStore.at(stateDir).flush({
+      ...emptyMakerState(),
+      commitments: {
+        '0xvisible': commitmentRecord({ hash: '0xvisible', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '250000', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000 }),
+        '0xsoft': commitmentRecord({ hash: '0xsoft', speculationId: 'spec-5678', contestId: '5678', makerSide: 'away', oddsTick: 220, riskAmountWei6: '300000', lifecycle: 'softCancelled', expiryUnixSec: T0 + 1000 }),
+        '0xpartial': commitmentRecord({ hash: '0xpartial', speculationId: 'spec-9', contestId: '9', makerSide: 'home', oddsTick: 250, riskAmountWei6: '400000', filledRiskWei6: '100000', lifecycle: 'partiallyFilled', expiryUnixSec: T0 + 1000 }),
+        '0xexpired': commitmentRecord({ hash: '0xexpired', speculationId: 'spec-11', contestId: '11', makerSide: 'home', oddsTick: 200, riskAmountWei6: '250000', lifecycle: 'expired', expiryUnixSec: T0 - 1 }), // terminal — not cancelled
+      },
+    });
+    const config = cfg({ mode: { dryRun: false }, killCancelOnChain: true });
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([]), { cancelCommitmentOnchain: cancel.fn });
+    await makeRunner({ config, adapter, maxTicks: 5, deps: { killFileExists: killFileAfterTick(2) } }).run();
+
+    expect(cancel.calls.sort()).toEqual(['0xpartial', '0xsoft', '0xvisible']); // terminal '0xexpired' skipped
+    const reloaded = StateStore.at(stateDir).load().state;
+    expect(reloaded.commitments['0xvisible']?.lifecycle).toBe('authoritativelyInvalidated');
+    expect(reloaded.commitments['0xsoft']?.lifecycle).toBe('authoritativelyInvalidated');
+    expect(reloaded.commitments['0xpartial']?.lifecycle).toBe('authoritativelyInvalidated');
+    expect(reloaded.commitments['0xexpired']?.lifecycle).toBe('expired'); // unchanged
+    expect(reloaded.dailyCounters[todayUTC()]?.gasPolWei).toBe((3n * expectedGasPerCall).toString());
+
+    const events = readEvents();
+    expect(events.filter((e) => e.kind === 'onchain-cancel')).toHaveLength(3);
+    expect(events.find((e) => e.kind === 'onchain-cancel' && e.commitmentHash === '0xvisible')).toMatchObject({ speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', txHash: '0xkilltx', gasPolWei: expectedGasPerCall.toString() });
+    expect(events.find((e) => e.kind === 'kill')?.reason).toBe('kill-file'); // kill event still fires AFTER on-chain cancels
+  });
+
+  it('dry-run mode: killCancelOnChain=true is IGNORED (dry-run never writes to chain)', async () => {
+    const cancel = cancelOnchainRecorder();
+    StateStore.at(stateDir).flush({
+      ...emptyMakerState(),
+      commitments: { '0xa': commitmentRecord({ hash: '0xa', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000 }) },
+    });
+    const config = cfg({ killCancelOnChain: true }); // dryRun:true (default)
+    // makeRunner's default uses a dry-run adapter; we don't need liveSpiedAdapter here.
+    await makeRunner({ config, maxTicks: 5, deps: { killFileExists: killFileAfterTick(2) } }).run();
+
+    expect(cancel.calls).toHaveLength(0); // never called — dry-run gated out
+    expect(readEvents().some((e) => e.kind === 'onchain-cancel')).toBe(false);
+    expect(StateStore.at(stateDir).load().state.commitments['0xa']?.lifecycle).toBe('visibleOpen');
+  });
+
+  it('killCancelOnChain=true + maxTicks reached (no shutdown signal, shutdownReason === null) → NO on-chain cancels (only fires on actual shutdown)', async () => {
+    const cancel = cancelOnchainRecorder();
+    StateStore.at(stateDir).flush({
+      ...emptyMakerState(),
+      commitments: { '0xa': commitmentRecord({ hash: '0xa', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '250000', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000 }) },
+    });
+    const config = cfg({ mode: { dryRun: false }, killCancelOnChain: true });
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([]), { cancelCommitmentOnchain: cancel.fn });
+    // No kill-file trigger; maxTicks=1 exits naturally.
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    expect(cancel.calls).toHaveLength(0);
+    expect(readEvents().some((e) => e.kind === 'onchain-cancel')).toBe(false);
+    expect(readEvents().some((e) => e.kind === 'kill')).toBe(false); // shutdownReason still null
+  });
+
+  it('gas budget exhausted (even the reserve) → emit `gas-budget-blocks-onchain-cancel`, break the loop, remaining records stay matchable', async () => {
+    const POL = 10n ** 18n;
+    const cancel = cancelOnchainRecorder();
+    // Pre-seed today's counter past the full cap → mayUseReserve=true can't help.
+    StateStore.at(stateDir).flush({
+      ...emptyMakerState(),
+      commitments: {
+        '0xa': commitmentRecord({ hash: '0xa', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '250000', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000 }),
+        '0xb': commitmentRecord({ hash: '0xb', speculationId: 'spec-5678', contestId: '5678', makerSide: 'away', oddsTick: 220, riskAmountWei6: '300000', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000 }),
+      },
+      dailyCounters: { [todayUTC()]: { gasPolWei: POL.toString(), feeUsdcWei6: '0' } }, // already at cap
+    });
+    const config = cfg({ mode: { dryRun: false }, killCancelOnChain: true, gas: { maxDailyGasPOL: 1, emergencyReservePOL: 0.2 } });
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([]), { cancelCommitmentOnchain: cancel.fn });
+    await makeRunner({ config, adapter, maxTicks: 5, deps: { killFileExists: killFileAfterTick(2) } }).run();
+
+    expect(cancel.calls).toHaveLength(0); // gate fired before any write
+    const candidates = readEvents().filter((e) => e.kind === 'candidate' && e.skipReason === 'gas-budget-blocks-onchain-cancel');
+    expect(candidates).toHaveLength(1); // ONE candidate then break — not one per record
+    expect(candidates[0]?.commitmentHash).toBeDefined();
+    const reloaded = StateStore.at(stateDir).load().state;
+    expect(reloaded.commitments['0xa']?.lifecycle).toBe('visibleOpen'); // stays matchable
+    expect(reloaded.commitments['0xb']?.lifecycle).toBe('visibleOpen');
+  });
+
+  it('cancelCommitmentOnchain throws on one hash → logged as `error` `phase: onchain-cancel`, loop continues to the next record', async () => {
+    let calls = 0;
+    StateStore.at(stateDir).flush({
+      ...emptyMakerState(),
+      commitments: {
+        '0xbad': commitmentRecord({ hash: '0xbad', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '250000', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000 }),
+        '0xgood': commitmentRecord({ hash: '0xgood', speculationId: 'spec-5678', contestId: '5678', makerSide: 'away', oddsTick: 220, riskAmountWei6: '300000', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000 }),
+      },
+    });
+    const config = cfg({ mode: { dryRun: false }, killCancelOnChain: true });
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([]), {
+      cancelCommitmentOnchain: (hash) => {
+        calls += 1;
+        if (hash === '0xbad') return Promise.reject(new Error('NotCommitmentMaker'));
+        const receipt = { gasUsed: 60_000n, effectiveGasPrice: 30_000_000_000n } as unknown as CancelOnchainResult['receipt'];
+        return Promise.resolve({ txHash: '0xtx', receipt, commitmentHash: hash });
+      },
+    });
+    await makeRunner({ config, adapter, maxTicks: 5, deps: { killFileExists: killFileAfterTick(2) } }).run();
+
+    expect(calls).toBe(2); // both attempted
+    const events = readEvents();
+    expect(events.find((e) => e.kind === 'error' && e.phase === 'onchain-cancel' && e.commitmentHash === '0xbad')).toMatchObject({ detail: 'NotCommitmentMaker' });
+    const reloaded = StateStore.at(stateDir).load().state;
+    expect(reloaded.commitments['0xbad']?.lifecycle).toBe('visibleOpen'); // failed cancel — stayed visibleOpen
+    expect(reloaded.commitments['0xgood']?.lifecycle).toBe('authoritativelyInvalidated'); // succeeded
   });
 });

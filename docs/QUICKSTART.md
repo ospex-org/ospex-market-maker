@@ -1,6 +1,6 @@
 # Quickstart
 
-> **v0 scaffold.** Working today: `doctor`, `quote --dry-run`, `run --dry-run` (the shadow loop — posts nothing), `run --live` (alpha — executes submits + off-chain cancels via the SDK + fill detection; gas budgeting in POL, settlement / claim, and the on-chain kill path are still landing), and `summary`. Still stubbed: `cancel-stale`, `status` — see the README's *[Current scaffold status](../README.md#current-scaffold-status)*. This is the intended flow plus pointers; it fills in as the implementation lands (Phase 1 → 4 — see [`DESIGN.md`](DESIGN.md) §14).
+> **v0 scaffold.** Working today: `doctor`, `quote --dry-run`, `run --dry-run` (the shadow loop — posts nothing), `run --live` (alpha — executes submits + off-chain cancels via the SDK, fill detection, position-status poll, boot-time auto-approve with a wallet-bounded target, and the daily POL gas-budget verdict; settlement / claim and the on-chain kill path are still landing), and `summary`. Still stubbed: `cancel-stale`, `status` — see the README's *[Current scaffold status](../README.md#current-scaffold-status)*. This is the intended flow plus pointers; it fills in as the implementation lands (Phase 1 → 4 — see [`DESIGN.md`](DESIGN.md) §14).
 
 ## 1. Prerequisites
 

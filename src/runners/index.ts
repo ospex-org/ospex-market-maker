@@ -49,21 +49,30 @@
  *     relative to the visible orderbook on its side (the `getSpeculation` above
  *     already fetched it — no extra read) and to the reference odds — a
  *     `quote-competitiveness` event per side, or one `competitiveness-unavailable`
- *     if that orderbook somehow isn't populated (in live mode the orderbook still
- *     includes the MM's own commitments — excluding `c.maker === <maker address>`
- *     rides along with the fill-detection slice that plumbs the maker address);
+ *     if that orderbook somehow isn't populated (the MM's own commitments are
+ *     filtered out by `c.maker === this.makerAddress`);
+ *   - **fill detection** (live only — DESIGN §10): each tick — before the reconcile so
+ *     a fill within this tick dirties the market and the same reconcile re-prices the
+ *     imbalance — diff `listOpenCommitments(maker)` against the local
+ *     `visibleOpen`/`partiallyFilled` set; per-disappeared-hash `getCommitment(hash)`
+ *     → reclassify (`filled` → create / extend a `MakerPositionRecord`, emit `fill`
+ *     `{partial:false}`; `expired` → emit `expire`; `cancelled` →
+ *     `authoritativelyInvalidated`, no event). A still-listed hash whose
+ *     `filledRiskAmount` advanced → bump `filledRiskWei6`, reclassify
+ *     `partiallyFilled`, extend the position by the delta, emit `fill`
+ *     `{partial:true}`. Bounded reads — one `listOpenCommitments` per tick, one
+ *     `getCommitment` per disappeared hash;
  *   - age-out of expired tracked commitments;
  *   - a prune of old terminal (`expired` / `filled` / `authoritativelyInvalidated`)
  *     commitment records, so a long shadow run's state file stays bounded;
  *   - the per-tick state flush;
  *   - an interruptible sleep clamped to the `pollIntervalMs` floor.
  *
- * Still TODO follow-ups: fill-detection (the live path's read side — diff the
- * maker's open commitments tick-over-tick, reclassify the disappeared ones), gas
- * budgeting in POL, and auto-settle / auto-claim. Note: the `run --live` *on-switch*
- * lives upstream in `cli/run.ts` — until that lands, the only way a `Runner` runs in
- * live mode (`config.mode.dryRun === false`) is a test passing a signed adapter; a
- * live-mode `Runner` with a read-only adapter is rejected at construction.
+ * Still TODO follow-ups: periodic `getPositionStatus(maker)` polling + P&L
+ * (realized over settled / claimed; unrealized over active marked to fair), gas
+ * budgeting in POL, and auto-settle / auto-claim. Until the `--live` on-switch was
+ * wired (the previous Phase-3 slice), the only way a `Runner` could run in live
+ * mode was a test passing a signed adapter; in production `runRun` does it.
  *
  * No `@ospex/sdk` import — all chain/API access goes through the `OspexAdapter`. The
  * clock, sleep, kill-switch probe, OS-signal registration, and randomness are
@@ -89,7 +98,7 @@ import type {
 } from '../ospex/index.js';
 import { decimalToTick, inverseOddsTick, isTickInRange, oppositeSide, positionTypeForSide, toProtocolQuote, type ProtocolQuote, type QuoteSide } from '../pricing/index.js';
 import type { Market } from '../risk/index.js';
-import { assessStateLoss, type MakerCommitmentRecord, type MakerSide, type MakerState, type StateLossAssessment, type StateStore } from '../state/index.js';
+import { assessStateLoss, type MakerCommitmentRecord, type MakerPositionRecord, type MakerSide, type MakerState, type StateLossAssessment, type StateStore } from '../state/index.js';
 import { EventLog, eventLogsExist } from '../telemetry/index.js';
 
 // ── injectable seams (the defaults are the real impls; tests override) ───────
@@ -132,6 +141,15 @@ export interface RunnerOptions {
    * setting it lifts the boot-time hold (DESIGN §12).
    */
   ignoreMissingState?: boolean;
+  /**
+   * The maker wallet (live mode only) — the signer's address, resolved by `runRun`
+   * via `await signer.getAddress()` before the Runner is constructed. **Required in
+   * live mode** (`config.mode.dryRun: false`); the ctor refuses a missing value
+   * since fill detection (`listOpenCommitments(maker, …)`) and the competitiveness
+   * self-exclusion (`c.maker !== maker`) both need it. Absent in dry-run (the
+   * shadow loop reads no live commitments and exposes no self-maker on the book).
+   */
+  makerAddress?: Hex;
   /** Run at most this many ticks, then return (for tests). Default: undefined — run until killed. */
   maxTicks?: number;
   /** Override any of the injectable seams; the rest use the real impls. */
@@ -261,6 +279,14 @@ export class Runner {
   private readonly deps: RunnerDeps;
   /** The chain's moneyline scorer module address — every commitment the MM posts (live) / would post (dry-run) points at it (v0 quotes moneyline only). Cached at boot from `adapter.addresses()`. */
   private readonly moneylineScorer: Hex;
+  /**
+   * The maker wallet — lowercased `Hex`. Set in live mode (from `RunnerOptions.makerAddress`,
+   * which `runRun` derives from `signer.getAddress()`); `null` in dry-run. Used by fill detection
+   * (`listOpenCommitments(maker, …)`) and by the competitiveness check to exclude the MM's own
+   * orderbook entries when comparing against the rest of the book. Always lowercased so
+   * comparisons with the SDK's `Commitment.maker` are case-insensitive without a per-call dance.
+   */
+  private readonly makerAddress: Hex | null;
   /** Monotonic suffix for the synthetic commitment hashes the dry-run reconcile mints (`dry:<runId>:<n>`) — unique within a run; a run's id makes them unique across runs, so a restart's loaded state can't collide. */
   private syntheticCommitmentSeq = 0;
 
@@ -294,6 +320,14 @@ export class Runner {
         'Runner: live mode (config.mode.dryRun=false) requires a signed adapter — build it with createLiveOspexAdapter(config, signer), not createOspexAdapter(config)',
       );
     }
+    // Live mode needs the maker address (fill detection + competitiveness self-exclusion).
+    // `runRun` resolves it from `signer.getAddress()` before constructing the Runner.
+    if (!this.config.mode.dryRun && opts.makerAddress === undefined) {
+      throw new Error(
+        'Runner: live mode (config.mode.dryRun=false) requires `makerAddress` (the signer\'s wallet) — `runRun` passes it from `signer.getAddress()`.',
+      );
+    }
+    this.makerAddress = opts.makerAddress === undefined ? null : (opts.makerAddress.toLowerCase() as Hex);
     this.moneylineScorer = this.adapter.addresses().scorers.moneyline;
     this.stateStore = opts.stateStore;
     this.maxTicks = opts.maxTicks;
@@ -413,7 +447,7 @@ export class Runner {
     }
   }
 
-  /** One iteration: discovery → reference-odds refresh → per-market reconcile → age-out → terminal-record prune → flush. (Fill-detection — Phase 3 — comes between the reconcile and age-out; nothing real is posted in dry-run, so there's nothing to detect yet.) */
+  /** One iteration: discovery → reference-odds refresh → fill detection (live only) → per-market reconcile → age-out → terminal-record prune → flush. Fill detection runs *before* the reconcile so a fill within this tick (a `partiallyFilled` bump, or a `visibleOpen` that disappeared into a fill) dirties the market and the same tick's reconcile re-prices the now-imbalanced book. */
   private async tick(tick: number): Promise<void> {
     this.eventLog.emit('tick-start', { tick });
     try {
@@ -423,8 +457,8 @@ export class Runner {
         this.nextDiscoveryAtTick = tick + this.jitteredDiscoveryInterval();
       }
       await this.refreshTrackedOdds({ ranDiscovery });
+      if (!this.config.mode.dryRun) await this.detectFills(); // live only — dry-run's synthetic commitments aren't on chain
       await this.reconcileMarkets();
-      // TODO(Phase 3): fill-detection — adapter.listOpenCommitments(maker, maxOpen+buffer); diff against last tick's visibleOpen hash set; by-hash lookup of disappeared hashes → reclassify (filled / cancelled / expired); periodically adapter.getPositionStatus(maker). Lives next to the live write path — in dry-run nothing real was posted, so there's nothing of the MM's to detect.
       this.ageOut();
       this.pruneTerminalCommitments();
     } catch (err) {
@@ -1135,8 +1169,10 @@ export class Runner {
    * always populates it), it's a degraded read → one `competitiveness-unavailable`.
    *
    * In dry-run the orderbook is purely other makers' (the MM's own synthetic `dry:`
-   * commitments are never on chain); the Phase-3 live path should exclude
-   * `c.maker === <maker address>` once the runner has it.
+   * commitments are never on chain). In live mode the MM's own commitments do
+   * appear on the book — they're filtered out by `c.maker === this.makerAddress`
+   * (both lowercased — the SDK's `Commitment.maker` is the indexer-stored address,
+   * conventionally lowercased; the ctor lowercased `this.makerAddress`).
    */
   private assessCompetitiveness(m: TrackedMarket, spec: SpeculationView, desired: DesiredQuote): void {
     const offers: QuoteSide[] = [];
@@ -1150,7 +1186,10 @@ export class Runner {
       this.eventLog.emit('competitiveness-unavailable', { contestId: m.contestId, speculationId: m.speculationId, reason: 'orderbook-not-populated' });
       return;
     }
-    const live = orderbook.filter(isPricedLiveCommitment);
+    const selfMaker = this.makerAddress; // null in dry-run; lowercased Hex in live
+    const live = orderbook
+      .filter(isPricedLiveCommitment) // keep the type narrowing
+      .filter((c) => selfMaker === null || c.maker.toLowerCase() !== selfMaker);
     for (const qs of offers) {
       const proto = toProtocolQuote({ side: qs.takerSide, oddsTick: qs.quoteTick }); // the MM's commitment for this offer: maker on the opposite side, at the inverse tick
       let bookDepthOnSide = 0;
@@ -1179,6 +1218,173 @@ export class Runner {
         bestBookTakerTick,
         atOrInsideBook: bestBookTakerTick === null || qs.quoteTick >= bestBookTakerTick, // at least as good for the taker as the best existing offer on this side
       });
+    }
+  }
+
+  /**
+   * Live-mode fill detection (DESIGN §10, §14). Each tick — *before* the per-market
+   * reconcile so a fill detected here dirties the market and the same tick's
+   * reconcile re-prices the now-imbalanced book — list the maker's open commitments
+   * via `commitments.list({maker, status:[open,partially_filled]})`, diff against
+   * the local `visibleOpen`/`partiallyFilled` set, and:
+   *
+   *   - **Still listed, `filledRiskAmount` advanced** → partial-fill bump: extend the
+   *     record's `filledRiskWei6`, reclassify `partiallyFilled` (if it was
+   *     `visibleOpen`), extend the position by the delta, dirty the market, emit
+   *     `fill` `{ partial: true, newFillWei6, filledRiskWei6, … }`.
+   *   - **Disappeared, `getCommitment(hash).status === 'filled'`** → terminal fill:
+   *     extend the record's `filledRiskWei6` to the API's cumulative, reclassify
+   *     `filled`, extend the position by the delta, dirty the market, emit `fill`
+   *     `{ partial: false, … }`.
+   *   - **Disappeared, `status === 'expired'`** → reclassify `expired`, emit `expire`
+   *     (matching `ageOut`'s payload — `ageOut` will skip the now-`expired` record next tick).
+   *   - **Disappeared, `status === 'cancelled'`** → reclassify
+   *     `authoritativelyInvalidated`; no event (v0's MM doesn't on-chain-cancel its
+   *     own commitments — this signals manual cancel between runs / outside the MM,
+   *     which the operator already knows about).
+   *
+   * Bounded reads (DESIGN §10): one `listOpenCommitments` per tick at
+   * `max(maxOpenCommitments × 2, 50)`; one `getCommitment` per disappeared hash
+   * (bounded by `maxOpenCommitments`). A `listOpenCommitments` throw is logged + the
+   * tick continues (retry next tick); a per-hash `getCommitment` throw is logged +
+   * the other disappearances are still processed.
+   *
+   * Soft-cancelled records are NOT tracked here (they're API-hidden, so they
+   * can't appear in `listOpenCommitments`). The known gap — a taker matching a
+   * soft-cancelled commitment via the stale signed payload — will be caught via
+   * `getPositionStatus(maker)` polling in the next Phase-3 slice.
+   */
+  private async detectFills(): Promise<void> {
+    if (this.makerAddress === null) return; // dry-run path — defensive (the caller skips, but belt-and-suspenders)
+    const now = this.deps.now();
+    const localOpen = new Map<string, MakerCommitmentRecord>();
+    for (const r of Object.values(this.state.commitments)) {
+      if (r.lifecycle !== 'visibleOpen' && r.lifecycle !== 'partiallyFilled') continue;
+      if (r.expiryUnixSec <= now) continue; // ageOut handles past-expiry — don't double-process
+      localOpen.set(r.hash, r);
+    }
+    if (localOpen.size === 0) return; // nothing tracked → nothing to detect
+
+    const listLimit = Math.max(this.config.risk.maxOpenCommitments * 2, 50);
+    let apiList: Commitment[];
+    try {
+      apiList = await this.adapter.listOpenCommitments(this.makerAddress, listLimit);
+    } catch (err) {
+      this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'fill-detection' });
+      return; // transient — retry next tick
+    }
+    const apiByHash = new Map<string, Commitment>();
+    for (const c of apiList) apiByHash.set(c.commitmentHash, c);
+
+    // Partial-fill bumps (commitment still listed; filledRiskAmount advanced).
+    for (const [hash, record] of localOpen) {
+      const apiCommitment = apiByHash.get(hash);
+      if (apiCommitment === undefined) continue; // disappeared — handled below
+      const apiFilled = BigInt(apiCommitment.filledRiskAmount);
+      const localFilled = BigInt(record.filledRiskWei6);
+      if (apiFilled <= localFilled) continue; // no new fill (or somehow regressed — ignore)
+      this.applyFill(record, apiFilled - localFilled, now, /* terminal */ false);
+    }
+
+    // Disappeared hashes → per-hash terminal classification via `getCommitment`.
+    for (const [hash, record] of localOpen) {
+      if (apiByHash.has(hash)) continue;
+      let apiCommitment: Commitment;
+      try {
+        apiCommitment = await this.adapter.getCommitment(hash as Hex);
+      } catch (err) {
+        this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'fill-detection-lookup', commitmentHash: hash });
+        continue; // skip this hash, retry next tick
+      }
+      switch (apiCommitment.status) {
+        case 'filled': {
+          const apiFilled = BigInt(apiCommitment.filledRiskAmount);
+          const localFilled = BigInt(record.filledRiskWei6);
+          const delta = apiFilled > localFilled ? apiFilled - localFilled : 0n;
+          this.applyFill(record, delta, now, /* terminal */ true);
+          break;
+        }
+        case 'expired': {
+          record.lifecycle = 'expired';
+          record.updatedAtUnixSec = now;
+          this.eventLog.emit('expire', {
+            commitmentHash: record.hash,
+            speculationId: record.speculationId,
+            contestId: record.contestId,
+            makerSide: record.makerSide,
+            oddsTick: record.oddsTick,
+          });
+          break;
+        }
+        case 'cancelled': {
+          record.lifecycle = 'authoritativelyInvalidated';
+          record.updatedAtUnixSec = now;
+          break;
+        }
+        default: {
+          // 'open' / 'partially_filled' shouldn't disappear from the listing — log defensively, don't touch state.
+          this.eventLog.emit('error', { class: 'UnexpectedFillStatus', detail: `disappeared commitment ${hash} has status "${apiCommitment.status}"`, phase: 'fill-detection', commitmentHash: hash });
+          break;
+        }
+      }
+    }
+  }
+
+  /** Apply a fill delta to the commitment record + extend the corresponding position; dirty the tracked market (if any); emit `fill`. `terminal: true` for a full fill (reclassify `filled`), false for a partial bump (reclassify `partiallyFilled`). */
+  private applyFill(record: MakerCommitmentRecord, deltaWei6: bigint, now: number, terminal: boolean): void {
+    record.filledRiskWei6 = (BigInt(record.filledRiskWei6) + deltaWei6).toString();
+    record.lifecycle = terminal ? 'filled' : 'partiallyFilled';
+    record.updatedAtUnixSec = now;
+    if (deltaWei6 > 0n) this.updatePosition(record, deltaWei6, now);
+    const m = this.trackedMarkets.get(record.contestId);
+    if (m !== undefined) m.dirty = true; // the book on this side just changed — re-price next reconcile (same tick — `detectFills` runs before `reconcileMarkets`)
+    this.eventLog.emit('fill', {
+      commitmentHash: record.hash,
+      speculationId: record.speculationId,
+      contestId: record.contestId,
+      sport: record.sport,
+      awayTeam: record.awayTeam,
+      homeTeam: record.homeTeam,
+      takerSide: oppositeSide(record.makerSide),
+      makerSide: record.makerSide,
+      positionType: positionTypeForSide(record.makerSide),
+      makerOddsTick: record.oddsTick,
+      newFillWei6: deltaWei6.toString(),
+      filledRiskWei6: record.filledRiskWei6,
+      partial: !terminal,
+    });
+  }
+
+  /**
+   * Create or extend a `MakerPositionRecord` for `(speculationId, makerSide)` by
+   * `deltaWei6` of the maker's filled risk. Counterparty risk derives from the
+   * commitment's `oddsTick` (the maker's decimal × 100): `delta × (oddsTick − 100) / 100`
+   * — the taker's stake on the other side of the matched pair, the maker's
+   * winnings if their side wins. Multiple fills on different commitments at
+   * different ticks accumulate per-fill; the totals on the record stay consistent
+   * with the on-chain `s_positions[speculationId][maker][positionType]`.
+   */
+  private updatePosition(record: MakerCommitmentRecord, deltaWei6: bigint, now: number): void {
+    const key = `${record.speculationId}:${record.makerSide}`;
+    const counterpartyDelta = (deltaWei6 * BigInt(record.oddsTick - 100)) / 100n;
+    const existing: MakerPositionRecord | undefined = this.state.positions[key];
+    if (existing === undefined) {
+      this.state.positions[key] = {
+        speculationId: record.speculationId,
+        contestId: record.contestId,
+        sport: record.sport,
+        awayTeam: record.awayTeam,
+        homeTeam: record.homeTeam,
+        side: record.makerSide,
+        riskAmountWei6: deltaWei6.toString(),
+        counterpartyRiskWei6: counterpartyDelta.toString(),
+        status: 'active',
+        updatedAtUnixSec: now,
+      };
+    } else {
+      existing.riskAmountWei6 = (BigInt(existing.riskAmountWei6) + deltaWei6).toString();
+      existing.counterpartyRiskWei6 = (BigInt(existing.counterpartyRiskWei6) + counterpartyDelta).toString();
+      existing.updatedAtUnixSec = now;
     }
   }
 

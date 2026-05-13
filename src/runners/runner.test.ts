@@ -1563,7 +1563,7 @@ describe('Runner — fill detection', () => {
     expect(events.some((e) => e.kind === 'fill')).toBe(false);
   });
 
-  it('a per-hash `getCommitment` failure is logged (phase fill-detection-lookup) and other disappeared hashes are still processed', async () => {
+  it('a per-hash `getCommitment` failure on a FUTURE-expiry record is logged (phase fill-detection-lookup) and other disappeared hashes are still processed — detectFills still returns true (the record stays live + counted, next tick retries)', async () => {
     const recordA = commitmentRecord({ hash: '0xfilled', speculationId: 'spec-A', contestId: 'A', makerSide: 'home', oddsTick: 200, riskAmountWei6: '250000', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 1 });
     const recordB = commitmentRecord({ hash: '0xbroken', speculationId: 'spec-B', contestId: 'B', makerSide: 'home', oddsTick: 200, riskAmountWei6: '250000', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 1 });
     StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xfilled': recordA, '0xbroken': recordB } });
@@ -1581,6 +1581,64 @@ describe('Runner — fill detection', () => {
     const events = readEvents();
     expect(events.find((e) => e.kind === 'error' && e.phase === 'fill-detection-lookup')).toMatchObject({ commitmentHash: '0xbroken', detail: 'lookup failed' });
     expect(events.filter((e) => e.kind === 'fill')).toHaveLength(1);
+  });
+
+  it('a per-hash `getCommitment` failure on a PAST-expiry disappeared record → detectFills fails closed (no reconcile, no ageOut); record stays visibleOpen for next-tick retry (Hermes review-PR23-late)', async () => {
+    // The sharp case: without the per-hash status we can't tell if the disappeared
+    // record filled-then-expired, expired cleanly, or was cancelled. ageOut would
+    // otherwise terminalize it to `expired` and release its headroom, and the
+    // reconcile would submit replacements on exposure that may have just filled.
+    // Future-expiry lookup failures stay non-fatal (covered by the test above);
+    // only past-expiry trips the gate.
+    // (Numeric contestId so live `submitCommitment`'s `BigInt(contestId)` doesn't throw — the
+    // absence of a submit must prove the fail-closed gate worked, not a downstream BigInt error.)
+    const record = commitmentRecord({ hash: '0xpastExpiry', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '250000', lifecycle: 'visibleOpen', expiryUnixSec: T0 - 1, postedAtUnixSec: T0 - 200 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xpastExpiry': record } });
+    const config = cfg({ mode: { dryRun: false } });
+    const submit = submitRecorder();
+    const adapter = liveSpiedAdapter(
+      config,
+      () => Promise.resolve([contestView({ contestId: '1234' })]),
+      { submitCommitment: submit.fn },
+      undefined,
+      undefined,
+      { listOpenCommitments: () => Promise.resolve([]), getCommitment: () => Promise.reject(new Error('lookup 503')) },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    const events = readEvents();
+    expect(events.find((e) => e.kind === 'error' && e.phase === 'fill-detection-lookup')).toMatchObject({ commitmentHash: '0xpastExpiry', detail: 'lookup 503' });
+    expect(submit.calls).toHaveLength(0); // reconcile skipped
+    expect(events.some((e) => e.kind === 'submit' || e.kind === 'replace' || e.kind === 'soft-cancel')).toBe(false);
+    expect(events.some((e) => e.kind === 'quote-intent')).toBe(false); // reconcileMarkets never ran
+    expect(events.some((e) => e.kind === 'expire')).toBe(false); // ageOut skipped — record NOT terminalized
+    expect(StateStore.at(stateDir).load().state.commitments['0xpastExpiry']?.lifecycle).toBe('visibleOpen'); // unchanged
+  });
+
+  it('mixed past-expiry + future-expiry getCommitment failures → still fails closed (the past-expiry one is enough)', async () => {
+    // If ANY past-expiry lookup fails, the tick fails closed even if other lookups succeed.
+    const past = commitmentRecord({ hash: '0xpast', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '250000', lifecycle: 'visibleOpen', expiryUnixSec: T0 - 1, postedAtUnixSec: T0 - 200 });
+    const future = commitmentRecord({ hash: '0xfuture', speculationId: 'spec-5678', contestId: '5678', makerSide: 'away', oddsTick: 200, riskAmountWei6: '250000', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 1 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xpast': past, '0xfuture': future } });
+    const config = cfg({ mode: { dryRun: false } });
+    const submit = submitRecorder();
+    const adapter = liveSpiedAdapter(
+      config,
+      () => Promise.resolve([contestView({ contestId: '1234' })]),
+      { submitCommitment: submit.fn },
+      undefined,
+      undefined,
+      { listOpenCommitments: () => Promise.resolve([]), getCommitment: () => Promise.reject(new Error('lookup down')) },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    expect(submit.calls).toHaveLength(0); // reconcile skipped — the past-expiry failure trumped the future-expiry one
+    const events = readEvents();
+    expect(events.filter((e) => e.kind === 'error' && e.phase === 'fill-detection-lookup')).toHaveLength(2); // both logged
+    expect(events.some((e) => e.kind === 'expire')).toBe(false); // ageOut skipped, both records intact
+    const reloaded = StateStore.at(stateDir).load().state;
+    expect(reloaded.commitments['0xpast']?.lifecycle).toBe('visibleOpen');
+    expect(reloaded.commitments['0xfuture']?.lifecycle).toBe('visibleOpen');
   });
 
   it('the `assessCompetitiveness` orderbook excludes the MM\'s own commitments (`c.maker === this.makerAddress` filter)', async () => {

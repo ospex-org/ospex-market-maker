@@ -74,7 +74,7 @@ import type {
   SpeculationView,
   Subscription,
 } from '../ospex/index.js';
-import { decimalToTick, type QuoteSide } from '../pricing/index.js';
+import { decimalToTick, inverseOddsTick, isTickInRange, oppositeSide, positionTypeForSide, toProtocolQuote, type QuoteSide } from '../pricing/index.js';
 import type { Market } from '../risk/index.js';
 import { assessStateLoss, type MakerCommitmentRecord, type MakerSide, type MakerState, type StateLossAssessment, type StateStore } from '../state/index.js';
 import { EventLog, eventLogsExist } from '../telemetry/index.js';
@@ -886,7 +886,11 @@ export class Runner {
     for (const qs of plan.toSubmit) {
       const record = this.mintSyntheticCommitment(m, qs, now, expiryUnixSec);
       this.state.commitments[record.hash] = record;
-      this.eventLog.emit('would-submit', this.commitmentEventPayload(record));
+      this.eventLog.emit('would-submit', {
+        ...this.commitmentEventPayload(record),
+        takerOddsTick: qs.quoteTick,
+        takerImpliedProb: qs.quoteProb,
+      });
     }
     for (const rp of plan.toReplace) {
       rp.stale.lifecycle = 'softCancelled';
@@ -901,17 +905,21 @@ export class Runner {
         sport: m.sport,
         awayTeam: m.awayTeam,
         homeTeam: m.homeTeam,
-        makerSide: rp.replacement.side,
+        takerSide: rp.replacement.takerSide,
+        makerSide: record.makerSide,
+        positionType: positionTypeForSide(record.makerSide),
         reason: rp.reason,
-        fromOddsTick: rp.stale.oddsTick,
-        toOddsTick: rp.replacement.quoteTick,
+        fromMakerOddsTick: rp.stale.oddsTick,
+        toMakerOddsTick: record.oddsTick,
+        fromTakerOddsTick: inverseOddsTick(rp.stale.oddsTick), // ≈ the incumbent's taker tick (a double-rounding round-trip — display only)
+        toTakerOddsTick: rp.replacement.quoteTick,
         riskAmountWei6: record.riskAmountWei6,
         expiryUnixSec,
       });
     }
     for (const sc of plan.toSoftCancel) this.softCancelRecord(sc.record, sc.reason, now);
-    for (const side of plan.deferredSides) {
-      this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'cap-hit', side });
+    for (const offerSide of plan.deferredSides) {
+      this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'cap-hit', takerSide: offerSide });
     }
   }
 
@@ -920,9 +928,19 @@ export class Runner {
     return this.config.orders.expiryMode === 'match-time' ? m.matchTimeSec : now + this.config.orders.expirySeconds;
   }
 
-  /** Mint a `visibleOpen` `MakerCommitmentRecord` for a `QuoteSide` the dry-run reconcile would post — a synthetic EIP-712 hash (`dry:<runId>:<n>`, unique within / across runs), the quote's tick + size, the contest / speculation metadata. (Live mode posts the real commitment and records its real hash; this is the hypothetical-inventory equivalent.) */
+  /**
+   * Mint a `visibleOpen` `MakerCommitmentRecord` for a `QuoteSide` (a taker offer)
+   * the dry-run reconcile would post — a synthetic EIP-712 hash (`dry:<runId>:<n>`,
+   * unique within / across runs), the contest / speculation metadata, and the
+   * **protocol commitment** parameters (`toProtocolQuote`: offering a taker the away
+   * side ⇒ the maker is on `home` at `inverseOddsTick(quoteTick)`). Live mode posts
+   * the real commitment and records its real hash; this is the hypothetical-inventory
+   * equivalent — same `makerSide` / `oddsTick` shape, so the risk engine sees the
+   * same exposure.
+   */
   private mintSyntheticCommitment(m: TrackedMarket, qs: QuoteSide, now: number, expiryUnixSec: number): MakerCommitmentRecord {
     this.syntheticCommitmentSeq += 1;
+    const proto = toProtocolQuote({ side: qs.takerSide, oddsTick: qs.quoteTick });
     return {
       hash: `dry:${this.eventLog.runId}:${this.syntheticCommitmentSeq}`,
       speculationId: m.speculationId,
@@ -931,8 +949,8 @@ export class Runner {
       awayTeam: m.awayTeam,
       homeTeam: m.homeTeam,
       scorer: this.moneylineScorer,
-      makerSide: qs.side,
-      oddsTick: qs.quoteTick,
+      makerSide: proto.makerSide,
+      oddsTick: proto.makerOddsTick,
       riskAmountWei6: String(qs.sizeWei6),
       filledRiskWei6: '0',
       lifecycle: 'visibleOpen',
@@ -942,6 +960,7 @@ export class Runner {
     };
   }
 
+  /** The protocol-side fields of a tracked commitment record, for an event payload. `takerSide` = the offer side a taker would back by matching it (`oppositeSide(makerSide)`); `makerSide` / `makerOddsTick` / `positionType` are what's on chain. */
   private commitmentEventPayload(record: MakerCommitmentRecord): Record<string, unknown> {
     return {
       commitmentHash: record.hash,
@@ -950,27 +969,29 @@ export class Runner {
       sport: record.sport,
       awayTeam: record.awayTeam,
       homeTeam: record.homeTeam,
+      takerSide: oppositeSide(record.makerSide),
       makerSide: record.makerSide,
-      oddsTick: record.oddsTick,
+      positionType: positionTypeForSide(record.makerSide),
+      makerOddsTick: record.oddsTick,
       riskAmountWei6: record.riskAmountWei6,
       expiryUnixSec: record.expiryUnixSec,
     };
   }
 
   /**
-   * Measure how competitive each would-be quote is (DESIGN §8) — for each side the
-   * desired quote has a `QuoteSide` for: where its `quoteTick` sits relative to the
-   * *visible orderbook on that side* (the open/partial commitments at the same
-   * `positionType` — `Upper`/`0` for away, `Lower`/`1` for home — across every maker)
-   * and to the reference odds. `oddsTick` is the *maker's* odds; a taker matching a
-   * commitment gets the *inverse* side at `inverseOddsTick(oddsTick) ≈
-   * round(100·oddsTick / (oddsTick − 100))`, which *falls* as the maker tick rises
-   * (maker 150 → taker 300; maker 200 → taker 200; maker 300 → taker 150 — see the
-   * SDK's `buildMatchPreview`). So among commitments on the same side, the one with
-   * the *lowest* `oddsTick` is the one a taker reaches for first (longest payout on
-   * the inverse side) — that's `bestBookTick` — and the would-be quote is "at or
-   * inside the book" iff its tick is at least that low (`quoteTick <= bestBookTick`),
-   * or that side is empty. Emits a `quote-competitiveness` per assessed side.
+   * Measure how competitive each would-be quote is (DESIGN §8). The desired quote's
+   * `QuoteSide`s are *taker offers* — "we'd let a taker back the away/home side at
+   * this price"; the on-chain commitment that serves an away offer is maker-on-*home*
+   * at `inverseOddsTick(quoteTick)` (`toProtocolQuote`). Other makers offering takers
+   * the same side post commitments at that same `positionType`; among them the one a
+   * taker reaches for first gives the *highest* taker-perspective payout —
+   * `inverseOddsTick(c.oddsTick)` (which is *highest* when the maker tick `c.oddsTick`
+   * is *lowest*). So `bestBookTakerTick` = the max of `inverseOddsTick(c.oddsTick)`
+   * over the same-`positionType` commitments, and the would-be offer is "at or inside
+   * the book" iff its `takerOddsTick` is at least that high (`takerOddsTick >=
+   * bestBookTakerTick`), or no one else is offering that side. Emits a
+   * `quote-competitiveness` per assessed side, carrying both the taker-facing fields
+   * and the protocol commitment params.
    *
    * Reuses the orderbook the per-market reconcile's `getSpeculation` already fetched —
    * no extra read; only runs for markets that passed the risk engine and only when
@@ -985,10 +1006,10 @@ export class Runner {
    * `c.maker === <maker address>` once the runner has it.
    */
   private assessCompetitiveness(m: TrackedMarket, spec: SpeculationView, desired: DesiredQuote): void {
-    const sides: QuoteSide[] = [];
-    if (desired.result.away !== null) sides.push(desired.result.away);
-    if (desired.result.home !== null) sides.push(desired.result.home);
-    if (sides.length === 0) return; // the quote was refused — nothing to assess (the `quote-intent` already records the refusal)
+    const offers: QuoteSide[] = [];
+    if (desired.result.away !== null) offers.push(desired.result.away);
+    if (desired.result.home !== null) offers.push(desired.result.home);
+    if (offers.length === 0) return; // the quote was refused — nothing to assess (the `quote-intent` already records the refusal)
     const ref = desired.referenceOdds;
     if (ref === null) return; // a non-null QuoteSide implies non-null referenceOdds, but narrow for the type checker
     const orderbook = spec.orderbook;
@@ -997,29 +1018,33 @@ export class Runner {
       return;
     }
     const live = orderbook.filter(isPricedLiveCommitment);
-    for (const qs of sides) {
-      const positionType = qs.side === 'away' ? 0 : 1; // Upper(0) = away/over, Lower(1) = home/under
+    for (const qs of offers) {
+      const proto = toProtocolQuote({ side: qs.takerSide, oddsTick: qs.quoteTick }); // the MM's commitment for this offer: maker on the opposite side, at the inverse tick
       let bookDepthOnSide = 0;
-      let bestBookTick: number | null = null; // the *lowest* same-side maker tick — the inverse-side payout it offers a taker is the longest, so it's the offer takers reach for first
+      let bestBookTakerTick: number | null = null; // the highest taker-perspective tick among the commitments offering this same side
       for (const c of live) {
-        if (c.positionType !== positionType) continue;
+        if (c.positionType !== proto.positionType) continue;
         bookDepthOnSide += 1;
-        if (bestBookTick === null || c.oddsTick < bestBookTick) bestBookTick = c.oddsTick;
+        const takerTick = inverseOddsTick(c.oddsTick);
+        if (bestBookTakerTick === null || takerTick > bestBookTakerTick) bestBookTakerTick = takerTick;
       }
-      const referenceTick = decimalToTick(qs.side === 'away' ? ref.awayDecimal : ref.homeDecimal);
-      const referenceProb = qs.side === 'away' ? ref.awayImpliedProb : ref.homeImpliedProb;
+      const referenceTakerTick = decimalToTick(qs.takerSide === 'away' ? ref.awayDecimal : ref.homeDecimal);
+      const referenceImpliedProb = qs.takerSide === 'away' ? ref.awayImpliedProb : ref.homeImpliedProb;
       this.eventLog.emit('quote-competitiveness', {
         contestId: m.contestId,
         speculationId: m.speculationId,
-        side: qs.side,
-        quoteTick: qs.quoteTick,
-        quoteProb: qs.quoteProb,
-        referenceTick,
-        referenceProb,
-        vsReferenceTicks: qs.quoteTick - referenceTick,
+        takerSide: qs.takerSide,
+        takerOddsTick: qs.quoteTick,
+        takerImpliedProb: qs.quoteProb,
+        makerSide: proto.makerSide,
+        makerOddsTick: proto.makerOddsTick,
+        positionType: proto.positionType,
+        referenceTakerTick,
+        referenceImpliedProb,
+        vsReferenceTicks: qs.quoteTick - referenceTakerTick,
         bookDepthOnSide,
-        bestBookTick,
-        atOrInsideBook: bestBookTick === null || qs.quoteTick <= bestBookTick, // at least as low (= at least as attractive to takers) as the best same-side offer
+        bestBookTakerTick,
+        atOrInsideBook: bestBookTakerTick === null || qs.quoteTick >= bestBookTakerTick, // at least as good for the taker as the best existing offer on this side
       });
     }
   }
@@ -1067,18 +1092,36 @@ function errMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-/** Compact a `QuoteSide` (or `null`) for the `quote-intent` event payload — the odds tick + the quoted size (USDC, and wei6 as a decimal string). */
-function quoteSideSummary(qs: QuoteSide | null): { oddsTick: number; sizeUSDC: number; sizeWei6: string } | null {
-  return qs === null ? null : { oddsTick: qs.quoteTick, sizeUSDC: qs.sizeUSDC, sizeWei6: String(qs.sizeWei6) };
+/** Compact a `QuoteSide` (a taker offer) for the `quote-intent` event payload — the taker-facing price (tick + implied prob) and size, plus the protocol commitment params it converts to (`toProtocolQuote`: `makerSide` / `makerOddsTick` / `positionType`). `null` for a side the desired quote pulled / refused. */
+function quoteSideSummary(qs: QuoteSide | null): {
+  takerOddsTick: number;
+  takerImpliedProb: number;
+  makerSide: MakerSide;
+  makerOddsTick: number;
+  positionType: 0 | 1;
+  sizeUSDC: number;
+  sizeWei6: string;
+} | null {
+  if (qs === null) return null;
+  const proto = toProtocolQuote({ side: qs.takerSide, oddsTick: qs.quoteTick });
+  return {
+    takerOddsTick: qs.quoteTick,
+    takerImpliedProb: qs.quoteProb,
+    makerSide: proto.makerSide,
+    makerOddsTick: proto.makerOddsTick,
+    positionType: proto.positionType,
+    sizeUSDC: qs.sizeUSDC,
+    sizeWei6: String(qs.sizeWei6),
+  };
 }
 
-/** An orderbook `Commitment` that's still matchable (`isLive`) and carries the fields the competitiveness check needs (`oddsTick` + `positionType`). Legacy / partially-decoded rows can have either as `null` — those are skipped. */
+/** An orderbook `Commitment` that's still matchable (`isLive`), carries the fields the competitiveness check needs (`oddsTick` + `positionType`), and has an in-range `oddsTick` (so `inverseOddsTick` can convert it). Legacy / partially-decoded / out-of-range rows are skipped — they can't be valid matchable commitments anyway. */
 type PricedLiveCommitment = Commitment & { oddsTick: number; positionType: 0 | 1 };
 function isPricedLiveCommitment(c: Commitment): c is PricedLiveCommitment {
-  return c.isLive && c.oddsTick !== null && c.positionType !== null;
+  return c.isLive && c.oddsTick !== null && c.positionType !== null && isTickInRange(c.oddsTick);
 }
 
-/** The `would-soft-cancel` event payload for a pulled commitment record. */
+/** The `would-soft-cancel` event payload for a pulled commitment record — the protocol commitment params (`makerSide` / `makerOddsTick` / `positionType`) plus `takerSide` (the offer side it served, `oppositeSide(makerSide)`) and the pull reason. */
 function softCancelEventPayload(record: MakerCommitmentRecord, reason: SoftCancelReason): Record<string, unknown> {
   return {
     commitmentHash: record.hash,
@@ -1087,8 +1130,10 @@ function softCancelEventPayload(record: MakerCommitmentRecord, reason: SoftCance
     sport: record.sport,
     awayTeam: record.awayTeam,
     homeTeam: record.homeTeam,
+    takerSide: oppositeSide(record.makerSide),
     makerSide: record.makerSide,
-    oddsTick: record.oddsTick,
+    positionType: positionTypeForSide(record.makerSide),
+    makerOddsTick: record.oddsTick,
     reason,
   };
 }

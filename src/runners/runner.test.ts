@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { parseConfig, type Config } from '../config/index.js';
+import { inverseOddsTick } from '../pricing/index.js';
 import {
   createOspexAdapter,
   type Commitment,
@@ -788,15 +789,22 @@ describe('Runner — per-market reconcile', () => {
 
     const events = readEvents();
     const submits = events.filter((e) => e.kind === 'would-submit');
-    expect(submits.map((e) => e.makerSide).sort()).toEqual(['away', 'home']);
+    expect(submits.map((e) => e.takerSide).sort()).toEqual(['away', 'home']); // a quote per taker-offer side
+    expect(submits.map((e) => e.makerSide).sort()).toEqual(['away', 'home']); // ...which on chain are maker-on-home (away offer) + maker-on-away (home offer)
     for (const e of submits) {
       expect(e).toMatchObject({ contestId: 'A', speculationId: 'spec-A', sport: 'mlb', riskAmountWei6: '250000', expiryUnixSec: T0 + 120 });
+      // The conversion happened at the boundary: makerSide is the opposite of takerSide; makerOddsTick is inverseOddsTick of takerOddsTick; positionType matches makerSide (away → 0, home → 1).
+      expect(e.makerSide).toBe(e.takerSide === 'away' ? 'home' : 'away');
+      expect(e.makerOddsTick).toBe(inverseOddsTick(e.takerOddsTick as number));
+      expect(e.positionType).toBe(e.makerSide === 'away' ? 0 : 1);
+      expect(typeof e.takerImpliedProb).toBe('number');
     }
     expect(events.find((e) => e.kind === 'quote-intent')).toMatchObject({ contestId: 'A', speculationId: 'spec-A', canQuote: true });
 
     const records = Object.values(StateStore.at(stateDir).load().state.commitments);
     expect(records).toHaveLength(2);
     expect(records.map((r) => r.makerSide).sort()).toEqual(['away', 'home']);
+    // Each synthetic record carries the *protocol* commitment params it would post — and matches its would-submit event.
     for (const r of records) {
       expect(r.lifecycle).toBe('visibleOpen');
       expect(r.speculationId).toBe('spec-A');
@@ -809,6 +817,8 @@ describe('Runner — per-market reconcile', () => {
       expect(r.scorer).toBe(adapter.addresses().scorers.moneyline);
       expect(r.oddsTick).toBeGreaterThanOrEqual(101);
       expect(r.oddsTick).toBeLessThanOrEqual(10100);
+      const matchingSubmit = submits.find((e) => e.makerSide === r.makerSide);
+      expect(matchingSubmit?.makerOddsTick).toBe(r.oddsTick);
     }
     expect(runner.trackedMarketView('A')).toMatchObject({ dirty: false, lastReconciledAt: T0 }); // the reconcile consumed the dirty flag
   });
@@ -832,8 +842,9 @@ describe('Runner — per-market reconcile', () => {
     await makeRunner({ config, adapter, maxTicks: 1 }).run();
 
     const events = readEvents();
-    expect(events.find((e) => e.kind === 'would-replace')).toMatchObject({ replacedCommitmentHash: '0xstaleAway', makerSide: 'away', reason: 'stale', speculationId: 'spec-A' });
-    expect(events.find((e) => e.kind === 'would-submit')).toMatchObject({ makerSide: 'home', speculationId: 'spec-A' });
+    // `0xstaleAway` is `makerSide: 'away'` → a quote on the *home offer*; its replacement is the home offer's quote (also maker-on-away). The other (away) offer has no incumbent → fresh submit (a maker-on-home commitment).
+    expect(events.find((e) => e.kind === 'would-replace')).toMatchObject({ replacedCommitmentHash: '0xstaleAway', takerSide: 'home', makerSide: 'away', reason: 'stale', speculationId: 'spec-A' });
+    expect(events.find((e) => e.kind === 'would-submit')).toMatchObject({ takerSide: 'away', makerSide: 'home', speculationId: 'spec-A' });
 
     const reloaded = StateStore.at(stateDir).load().state.commitments;
     expect(reloaded['0xstaleAway']?.lifecycle).toBe('softCancelled'); // pulled, but still counted (matchable on chain)
@@ -852,7 +863,7 @@ describe('Runner — per-market reconcile', () => {
 
     const events = readEvents();
     expect(events.find((e) => e.kind === 'quote-intent')).toMatchObject({ contestId: 'A', canQuote: false });
-    expect(events.find((e) => e.kind === 'would-soft-cancel')).toMatchObject({ commitmentHash: '0xaWay', makerSide: 'away', reason: 'side-not-quoted' });
+    expect(events.find((e) => e.kind === 'would-soft-cancel')).toMatchObject({ commitmentHash: '0xaWay', takerSide: 'home', makerSide: 'away', reason: 'side-not-quoted' }); // makerSide:'away' → a quote on the home offer
     expect(events.some((e) => e.kind === 'would-submit' || e.kind === 'would-replace')).toBe(false);
     expect(events.some((e) => e.kind === 'quote-competitiveness' || e.kind === 'competitiveness-unavailable')).toBe(false); // a refused quote has nothing to assess
     expect(StateStore.at(stateDir).load().state.commitments['0xaWay']?.lifecycle).toBe('softCancelled');
@@ -870,25 +881,31 @@ describe('Runner — per-market reconcile', () => {
     const capHit = events.filter((e) => e.kind === 'candidate' && e.skipReason === 'cap-hit');
     expect(capHit).toHaveLength(1);
     expect(capHit[0]).toMatchObject({ contestId: 'A' });
-    expect(['away', 'home']).toContain(capHit[0]?.side);
+    expect(['away', 'home']).toContain(capHit[0]?.takerSide);
     expect(events.filter((e) => e.kind === 'quote-competitiveness')).toHaveLength(2); // both sides' would-be prices are assessed — including the cap-deferred one
   });
 
-  it('a quoted market emits a quote-competitiveness event per side — book depth, best on-side tick, vs the reference, at/inside the book', async () => {
+  it('a quoted market emits a quote-competitiveness event per side — book depth, best taker-perspective tick, vs the reference, at/inside the book', async () => {
     StateStore.at(stateDir).flush(emptyMakerState());
     const config = cfg();
-    // The MM's quote ticks for a -110 / -110 reference land near 200 (a roughly even line, clamped into [101, 10100]).
-    // `oddsTick` is the maker's odds; a taker matching gets the inverse side at inverseOddsTick = ~100·tick/(tick−100), which FALLS as the maker tick rises.
-    // Away (Upper = positionType 0): two live offers at maker ticks 101 & 102 — those give the inverse-side taker a huge payout (~10100 / ~5100), so takers reach for them first → the MM's ~200 is BEHIND them → not at/inside (bestBookTick = the lowest, 101).
-    // Home (Lower = positionType 1): one live offer at maker tick 10100 — that gives the inverse-side taker the worst possible payout (~101), so the MM's ~200 is AHEAD of it → at/inside.
-    // The non-live entry, and the null-tick / null-positionType ones, are skipped (don't count toward bookDepthOnSide).
+    // The MM's offer ticks for a -110 / -110 reference land near 200 (a roughly even line, well inside [101, 10100]).
+    // An *away offer* on chain is a maker-on-home (positionType 1) commitment, so it competes with the book's positionType-1
+    // commitments; a *home offer* is a maker-on-away (positionType 0) commitment. The taker-perspective tick of a competing
+    // commitment is inverseOddsTick(c.oddsTick), and a higher one is better for the taker — so `bestBookTakerTick` is the *max*
+    // of those over the same-positionType commitments, and the MM's offer is at/inside iff its takerOddsTick is at least that high.
+    //   Away offer (vs positionType-1): one competitor at maker tick 10100 → taker tick inverseOddsTick(10100) = 101 → the MM's
+    //     ~200 is well ahead → at/inside; bookDepthOnSide 1, bestBookTakerTick 101.
+    //   Home offer (vs positionType-0): two competitors at maker ticks 101 & 102 → taker ticks 10100 & 5100 → the MM's ~200 is
+    //     far behind → not at/inside; bookDepthOnSide 2, bestBookTakerTick 10100.
+    //   The non-live entry, and the null-positionType / null-tick (and out-of-range) ones, are skipped.
     const book: Commitment[] = [
-      orderbookEntry({ commitmentHash: '0xob-a1', positionType: 0, oddsTick: 101 }),
-      orderbookEntry({ commitmentHash: '0xob-a2', positionType: 0, oddsTick: 102 }),
-      orderbookEntry({ commitmentHash: '0xob-h1', positionType: 1, oddsTick: 10100 }),
-      orderbookEntry({ commitmentHash: '0xob-dead', positionType: 0, oddsTick: 100, isLive: false }), // not matchable (and oddsTick below the protocol min — irrelevant since it's filtered out)
+      orderbookEntry({ commitmentHash: '0xob-pt0-1', positionType: 0, oddsTick: 101 }),
+      orderbookEntry({ commitmentHash: '0xob-pt0-2', positionType: 0, oddsTick: 102 }),
+      orderbookEntry({ commitmentHash: '0xob-pt1', positionType: 1, oddsTick: 10100 }),
+      orderbookEntry({ commitmentHash: '0xob-dead', positionType: 0, oddsTick: 200, isLive: false }), // not matchable
       orderbookEntry({ commitmentHash: '0xob-np', positionType: null, oddsTick: 5000 }), // legacy: no position type
       orderbookEntry({ commitmentHash: '0xob-nt', positionType: 0, oddsTick: null }), // legacy: no tick
+      orderbookEntry({ commitmentHash: '0xob-oor', positionType: 0, oddsTick: 100 }), // out of [101, 10100] — can't be a valid commitment; skipped
     ];
     const adapter = spiedAdapter(config, () => Promise.resolve([contestView({ contestId: 'A' })]), undefined, {
       getSpeculation: (specId) => Promise.resolve({ ...speculationView(specId), orderbook: book }),
@@ -896,19 +913,20 @@ describe('Runner — per-market reconcile', () => {
     await makeRunner({ config, adapter, maxTicks: 1 }).run();
 
     const comps = readEvents().filter((e) => e.kind === 'quote-competitiveness');
-    expect(comps.map((e) => e.side).sort()).toEqual(['away', 'home']);
-    const away = comps.find((e) => e.side === 'away');
-    const home = comps.find((e) => e.side === 'home');
-    expect(away).toMatchObject({ contestId: 'A', speculationId: 'spec-A', side: 'away', bookDepthOnSide: 2, bestBookTick: 101, atOrInsideBook: false });
-    expect(home).toMatchObject({ contestId: 'A', speculationId: 'spec-A', side: 'home', bookDepthOnSide: 1, bestBookTick: 10100, atOrInsideBook: true });
+    expect(comps.map((e) => e.takerSide).sort()).toEqual(['away', 'home']);
+    const away = comps.find((e) => e.takerSide === 'away');
+    const home = comps.find((e) => e.takerSide === 'home');
+    expect(away).toMatchObject({ contestId: 'A', speculationId: 'spec-A', takerSide: 'away', makerSide: 'home', positionType: 1, bookDepthOnSide: 1, bestBookTakerTick: 101, atOrInsideBook: true });
+    expect(home).toMatchObject({ contestId: 'A', speculationId: 'spec-A', takerSide: 'home', makerSide: 'away', positionType: 0, bookDepthOnSide: 2, bestBookTakerTick: 10100, atOrInsideBook: false });
     // The rest of the payload is present and well-formed.
     for (const c of comps) {
-      expect(typeof c.quoteTick).toBe('number');
-      expect((c.quoteTick as number) >= 101 && (c.quoteTick as number) <= 10100).toBe(true);
-      expect(typeof c.quoteProb).toBe('number');
-      expect(typeof c.referenceTick).toBe('number');
-      expect(typeof c.referenceProb).toBe('number');
-      expect(c.vsReferenceTicks).toBe((c.quoteTick as number) - (c.referenceTick as number));
+      expect(typeof c.takerOddsTick).toBe('number');
+      expect((c.takerOddsTick as number) >= 101 && (c.takerOddsTick as number) <= 10100).toBe(true);
+      expect(typeof c.takerImpliedProb).toBe('number');
+      expect(typeof c.makerOddsTick).toBe('number');
+      expect(typeof c.referenceTakerTick).toBe('number');
+      expect(typeof c.referenceImpliedProb).toBe('number');
+      expect(c.vsReferenceTicks).toBe((c.takerOddsTick as number) - (c.referenceTakerTick as number));
     }
   });
 

@@ -31,6 +31,8 @@ import {
   americanToDecimal,
   computeQuote,
   decimalToImpliedProb,
+  inverseOddsTick,
+  oppositeSide,
   tickToDecimal,
   wei6ToUSDC,
   type QuoteInputs,
@@ -54,10 +56,16 @@ export interface ReferenceOddsBreakdown {
   overround: number;
 }
 
-/** What `buildDesiredQuote` produces: the reference-odds breakdown (`null` when the upstream odds were out of range — see `result.notes`), the per-side exposure headroom it priced against, and the `computeQuote` result. */
+/** What `buildDesiredQuote` produces: the reference-odds breakdown (`null` when the upstream odds were out of range — see `result.notes`), the per-**offer**-side exposure headroom it priced against, and the `computeQuote` result. */
 export interface DesiredQuote {
   referenceOdds: ReferenceOddsBreakdown | null;
-  /** Max additional at-risk USDC on each side without breaching a per-{commitment,contest,team,sport} or bankroll cap (`src/risk/headroomForSide`, given the inventory passed in). Always populated, even on a refusal. */
+  /**
+   * Max additional at-risk USDC each **taker offer** can carry without breaching a
+   * per-{commitment,contest,team,sport} or bankroll cap. `away` is the headroom for
+   * the *away offer* — which becomes a maker-on-*home* commitment, so it's the
+   * risk engine's maker-on-home headroom (`headroomForSide(..., 'home', ...)`), and
+   * vice versa. Always populated, even on a refusal.
+   */
   headroomUSDC: { away: number; home: number };
   result: QuoteResult;
 }
@@ -108,6 +116,7 @@ export interface BookReconciliation {
   toSubmit: QuoteSide[];
   toReplace: ReplacePlan[];
   toSoftCancel: SoftCancelPlan[];
+  /** Taker-offer sides (`'away'` / `'home'`) the plan wanted to (re)post but couldn't this tick — the open-commitment count budget was exhausted; the runner records a `cap-hit` candidate and retries. */
   deferredSides: MakerSide[];
 }
 
@@ -139,9 +148,12 @@ export function buildDesiredQuote(
   inventory: Inventory,
 ): DesiredQuote {
   const caps = toRiskCaps(config);
+  // Headroom per *taker offer*: the away offer becomes a maker-on-home commitment
+  // (it loses if away wins, counts toward the home-team cap), so it's sized by the
+  // maker-on-home headroom — and vice versa. See `toProtocolQuote` / DESIGN §5–§6.
   const headroomUSDC = {
-    away: headroomForSide(inventory, market, 'away', caps),
-    home: headroomForSide(inventory, market, 'home', caps),
+    away: headroomForSide(inventory, market, 'home', caps),
+    home: headroomForSide(inventory, market, 'away', caps),
   };
   const referenceOdds = tryBreakdownReferenceOdds(refOdds);
 
@@ -282,9 +294,17 @@ type SideAction =
  * an unwanted quote must not stay on the visible book. A wanted side with no visible
  * / partial record gets a fresh submit.
  *
- * **v0 caveat:** the `mispriced` test compares the *posted quote tick* to the
- * *desired quote tick* — a proxy for "fair value has moved", since the quote tick =
- * fair + (roughly constant) half-spread, so the two move together.
+ * **Taker vs maker sides:** `desired.result.away` / `.home` are *taker offers* —
+ * the side a taker would back by matching the resulting commitment. The commitment
+ * that serves the away offer is maker-on-*home* (the maker loses if away wins), so
+ * the reconciler matches the away offer against the maker's `makerSide: 'home'`
+ * records (and vice versa), and the `mispriced` check converts the desired
+ * (taker-facing) `quoteTick` to its maker tick via `inverseOddsTick` before
+ * comparing it to the incumbent's (maker-space) `oddsTick`. See `toProtocolQuote`.
+ *
+ * **v0 caveat:** the `mispriced` test compares the *incumbent's tick* to the
+ * *desired tick* (both in maker space) — a proxy for "fair value has moved", since
+ * a quote tick = fair + (roughly constant) half-spread, so the two move together.
  *
  * Pure — no SDK, no state mutation; the runner executes / logs the plan.
  */
@@ -303,23 +323,25 @@ export function reconcileBook(
   const live = currentRecords.filter((r) => r.expiryUnixSec > nowUnixSec); // expired records are dead on chain — the runner ages them out
   const actions = new Map<MakerSide, SideAction>();
 
-  // Pass 1 — per side: emit the soft-cancels (unwanted side / book-hygiene duplicates) and classify what (if anything) we want to post.
-  for (const side of SIDES) {
-    const desiredSide: QuoteSide | null = side === 'away' ? desired.result.away : desired.result.home;
-    const onSide = live.filter((r) => r.makerSide === side);
+  // Pass 1 — per taker-offer side: emit the soft-cancels (unwanted side / book-hygiene duplicates) and classify what (if anything) we want to post.
+  for (const offerSide of SIDES) {
+    const desiredSide: QuoteSide | null = offerSide === 'away' ? desired.result.away : desired.result.home;
+    // The commitment that serves the away offer is maker-on-*home* (it loses if away wins), so the
+    // away offer's records are the maker's `makerSide: 'home'` ones — and vice versa.
+    const onSide = live.filter((r) => r.makerSide === oppositeSide(offerSide));
     const visibleOpen = onSide.filter((r) => r.lifecycle === 'visibleOpen').sort(newestFirst);
     const partiallyFilled = onSide.filter((r) => r.lifecycle === 'partiallyFilled').sort(newestFirst);
 
     if (desiredSide === null) {
       for (const r of visibleOpen) toSoftCancel.push({ record: r, reason: 'side-not-quoted' });
       for (const r of partiallyFilled) toSoftCancel.push({ record: r, reason: 'side-not-quoted' });
-      actions.set(side, { kind: 'noop' });
+      actions.set(offerSide, { kind: 'noop' });
       continue;
     }
 
     const incumbent = visibleOpen[0] ?? partiallyFilled[0]; // prefer a fresh `visibleOpen`; else the (matchable) partial remainder
     if (incumbent === undefined) {
-      actions.set(side, { kind: 'submit', quoteSide: desiredSide });
+      actions.set(offerSide, { kind: 'submit', quoteSide: desiredSide });
       continue;
     }
     // Book hygiene (DESIGN §9): exactly one visible quote per (speculation, side) — pull the rest.
@@ -328,15 +350,17 @@ export function reconcileBook(
     }
 
     const stale = nowUnixSec - incumbent.postedAtUnixSec > config.orders.staleAfterSeconds;
-    const mispriced = oddsMovedTooFar(incumbent.oddsTick, desiredSide.quoteTick, config.orders.replaceOnOddsMoveBps);
+    // Compare in the protocol's *maker* space: the incumbent stores a maker tick; convert the
+    // desired (taker-facing) `quoteTick` to its maker tick — one `inverseOddsTick` hop, no round-trip.
+    const mispriced = oddsMovedTooFar(incumbent.oddsTick, inverseOddsTick(desiredSide.quoteTick), config.orders.replaceOnOddsMoveBps);
     if (!stale && !mispriced) {
-      actions.set(side, { kind: 'noop' }); // incumbent is fresh and correctly priced — leave it
+      actions.set(offerSide, { kind: 'noop' }); // incumbent is fresh and correctly priced — leave it
     } else if (incumbent.lifecycle === 'visibleOpen') {
-      actions.set(side, { kind: 'replace', stale: incumbent, reason: stale ? 'stale' : 'mispriced', replacement: desiredSide });
+      actions.set(offerSide, { kind: 'replace', stale: incumbent, reason: stale ? 'stale' : 'mispriced', replacement: desiredSide });
     } else {
       // a stale/mispriced `partiallyFilled` incumbent — v0 pulls it and posts a fresh full quote in its place
       toSoftCancel.push({ record: incumbent, reason: stale ? 'stale' : 'mispriced' });
-      actions.set(side, { kind: 'submit', quoteSide: desiredSide });
+      actions.set(offerSide, { kind: 'submit', quoteSide: desiredSide });
     }
   }
 
@@ -371,7 +395,7 @@ function newestFirst(a: MakerCommitmentRecord, b: MakerCommitmentRecord): number
   return b.postedAtUnixSec - a.postedAtUnixSec;
 }
 
-/** Has the quoted tick moved more than `thresholdBps` basis points (of implied probability) from `fromTick` to `toTick`? */
+/** Have the odds moved more than `thresholdBps` basis points (of implied probability) from `fromTick` to `toTick`? Both are protocol *maker* ticks — the caller converts a taker-facing quote tick via `inverseOddsTick` before passing it here, so the comparison is apples-to-apples. */
 function oddsMovedTooFar(fromTick: number, toTick: number, thresholdBps: number): boolean {
   return Math.abs(tickImpliedProb(fromTick) - tickImpliedProb(toTick)) * 10_000 > thresholdBps;
 }

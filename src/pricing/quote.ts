@@ -95,10 +95,10 @@ function sizeSide(perQuoteCap: number, headroomUSDC: number): { sizeUSDC: number
   return { sizeUSDC: wei6ToUSDC(sizeWei6), sizeWei6 };
 }
 
-function buildSide(side: 'away' | 'home', quoteProb: number, sizeUSDC: number, sizeWei6: number): QuoteSide {
+function buildSide(takerSide: 'away' | 'home', quoteProb: number, sizeUSDC: number, sizeWei6: number): QuoteSide {
   const quoteDecimal = 1 / quoteProb;
   return {
-    side,
+    takerSide,
     quoteProb,
     quoteDecimal,
     quoteAmerican: decimalToAmerican(quoteDecimal),

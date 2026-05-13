@@ -61,6 +61,8 @@ export interface RunOpts {
   address?: Hex;
   /** `--ignore-missing-state` — the operator attests no prior run left a still-matchable commitment; lifts the boot-time state-loss hold (DESIGN §12). */
   ignoreMissingState: boolean;
+  /** `--yes` — operator confirmation for dangerous defaults (currently: `approvals.mode: 'unlimited'` while `--live` and `autoApprove`). No effect otherwise. */
+  confirmUnlimited: boolean;
 }
 
 /** Injectable seams so `runRun` can be exercised without a TTY / live RPC / real scrypt. */
@@ -126,6 +128,16 @@ export async function runRun(opts: RunOpts, deps: RunDeps = {}): Promise<void> {
   if (opts.mode === 'live' && opts.config.mode.dryRun) {
     throw new RunRefused(
       'refusing to run live: --live passed but config has mode.dryRun=true. The two-key model (DESIGN §8) requires BOTH the --live flag AND mode.dryRun=false in the config — set mode.dryRun=false in your config to opt in.',
+    );
+  }
+  // `approvals.mode: 'unlimited'` + `autoApprove: true` + `--live` would set the
+  // `PositionModule` USDC allowance to `MaxUint256` at boot. Rarely desirable
+  // (any future bug or compromised key could pull arbitrary USDC); demand explicit
+  // operator confirmation via `--yes`. `autoApprove: false` skips the whole
+  // auto-approve flow, so `mode: unlimited` is inert there — no refusal.
+  if (opts.mode === 'live' && opts.config.approvals.autoApprove && opts.config.approvals.mode === 'unlimited' && !opts.confirmUnlimited) {
+    throw new RunRefused(
+      "refusing to run live: approvals.autoApprove=true with approvals.mode=unlimited would set the PositionModule USDC allowance to MaxUint256. Pass --yes to confirm, or set approvals.mode=exact in your config (recommended — sets the allowance to the aggregate cap ceiling instead).",
     );
   }
   // `--address` is for read-only contexts (`doctor` / dry-run banners). In live

@@ -12,6 +12,9 @@ import {
   type ContestView,
   type Hex,
   type MoneylineOdds,
+  type ApprovalsSnapshot,
+  type ApproveResult,
+  type ApproveUSDCAmount,
   type OddsSnapshotView,
   type OddsSubscribeHandlersView,
   type OddsUpdateView,
@@ -273,6 +276,7 @@ function liveSpiedAdapter(
   writes?: {
     submitCommitment?: (args: SubmitCommitmentArgs) => Promise<SubmitCommitmentResult>;
     cancelCommitmentOffchain?: (hash: Hex) => Promise<void>;
+    approveUSDC?: (amount: ApproveUSDCAmount) => Promise<ApproveResult>;
   },
   getContest?: (id: string) => Promise<ContestView>,
   odds?: {
@@ -284,6 +288,7 @@ function liveSpiedAdapter(
     listOpenCommitments?: (maker: string, limit: number) => Promise<Commitment[]>;
     getCommitment?: (hash: Hex) => Promise<Commitment>;
     getPositionStatus?: (owner: string) => Promise<PositionStatus>;
+    readApprovals?: (owner: Hex) => Promise<ApprovalsSnapshot>;
   },
 ): OspexAdapter {
   const adapter = createLiveOspexAdapter(config, fakeSigner());
@@ -294,10 +299,37 @@ function liveSpiedAdapter(
   vi.spyOn(adapter, 'getSpeculation').mockImplementation(odds?.getSpeculation ?? ((speculationId) => Promise.resolve(speculationView(speculationId))));
   vi.spyOn(adapter, 'submitCommitment').mockImplementation(writes?.submitCommitment ?? (() => Promise.reject(new Error('liveSpiedAdapter: submitCommitment not stubbed — pass `writes.submitCommitment`'))));
   vi.spyOn(adapter, 'cancelCommitmentOffchain').mockImplementation(writes?.cancelCommitmentOffchain ?? (() => Promise.resolve()));
+  vi.spyOn(adapter, 'approveUSDC').mockImplementation(writes?.approveUSDC ?? (() => Promise.reject(new Error('liveSpiedAdapter: approveUSDC not stubbed — pass `writes.approveUSDC`'))));
   vi.spyOn(adapter, 'listOpenCommitments').mockImplementation(reads?.listOpenCommitments ?? (() => Promise.resolve([])));
   vi.spyOn(adapter, 'getCommitment').mockImplementation(reads?.getCommitment ?? (() => Promise.reject(new Error('liveSpiedAdapter: getCommitment not stubbed — pass `reads.getCommitment`'))));
   vi.spyOn(adapter, 'getPositionStatus').mockImplementation(reads?.getPositionStatus ?? (() => Promise.resolve(EMPTY_POSITION_STATUS)));
+  // Default `readApprovals` returns a saturated allowance — keeps existing tests (`autoApprove: false` by config default)
+  // a no-op even if `applyAutoApprovals` is reached, and lets new auto-approve tests opt in by providing their own stub.
+  vi.spyOn(adapter, 'readApprovals').mockImplementation(reads?.readApprovals ?? (() => Promise.resolve(approvalsSnapshotWith(2n ** 255n))));
   return adapter;
+}
+
+/** Build an `ApprovalsSnapshot` with the given `PositionModule` USDC raw allowance — every other field is filled with a safe non-zero placeholder. */
+function approvalsSnapshotWith(positionModuleRaw: bigint): ApprovalsSnapshot {
+  return {
+    owner: '0xowner' as Hex,
+    chainId: 137,
+    usdc: {
+      address: '0xusdc' as Hex,
+      decimals: 6,
+      allowances: {
+        positionModule: { spender: '0xPositionModule' as Hex, spenderModule: 'positionModule', raw: positionModuleRaw },
+        treasuryModule: { spender: '0xTreasuryModule' as Hex, spenderModule: 'treasuryModule', raw: 0n },
+      },
+    },
+    link: {
+      address: '0xlink' as Hex,
+      decimals: 18,
+      allowances: {
+        oracleModule: { spender: '0xOracleModule' as Hex, spenderModule: 'oracleModule', raw: 0n },
+      },
+    },
+  };
 }
 
 /** Empty `PositionStatus` — `liveSpiedAdapter`'s default `getPositionStatus` return so the position poll is a no-op unless a test overrides it. */
@@ -2021,5 +2053,145 @@ describe('Runner — position-status transitions (Phase 3 c-ii)', () => {
     const transitions = events.filter((e) => e.kind === 'position-transition');
     expect(transitions).toHaveLength(1);
     expect(transitions[0]).toMatchObject({ fromStatus: 'active', toStatus: 'pendingSettle', contestId: '1234', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD' }); // context from the existing record
+  });
+});
+
+// ── boot-time auto-approve (Phase 3 d-i) ─────────────────────────────────────
+
+describe('Runner — boot-time auto-approve (Phase 3 d-i)', () => {
+  /** A successful `approveUSDC` stub with a recorder. The receipt's gas fields are real bigints so the `gasPolWei` derivation runs through. */
+  function approveRecorder(): { fn: (amount: ApproveUSDCAmount) => Promise<ApproveResult>; calls: ApproveUSDCAmount[] } {
+    const calls: ApproveUSDCAmount[] = [];
+    return {
+      calls,
+      fn: (amount) => {
+        calls.push(amount);
+        // `viem`'s `TransactionReceipt` is wider than we touch — cast to the few fields `applyAutoApprovals` reads.
+        const receipt = { gasUsed: 50_000n, effectiveGasPrice: 30_000_000_000n } as unknown as ApproveResult['receipt'];
+        const onChainAmount = amount === 'max' ? 2n ** 256n - 1n : amount;
+        return Promise.resolve({ txHash: '0xtx', receipt, spender: '0xPositionModule' as Hex, token: '0xusdc' as Hex, amount: onChainAmount });
+      },
+    };
+  }
+
+  it('dry-run skips the auto-approve flow entirely — no readApprovals call, no approveUSDC call, no `approval` event', async () => {
+    const readApprovals = vi.fn(() => Promise.resolve(approvalsSnapshotWith(0n)));
+    const approve = approveRecorder();
+    // Dry-run uses the dry-run adapter (`makeRunner` default) — readApprovals isn't even on it. Just assert the events.
+    await makeRunner({ config: cfg({ mode: { dryRun: true }, approvals: { autoApprove: true, mode: 'exact' } }), maxTicks: 1 }).run();
+    expect(readApprovals).not.toHaveBeenCalled();
+    expect(approve.calls).toHaveLength(0);
+    expect(readEvents().some((e) => e.kind === 'approval')).toBe(false);
+  });
+
+  it('live + approvals.autoApprove=false skips the flow — no readApprovals call, no approveUSDC call, no `approval` event', async () => {
+    const readApprovals = vi.fn(() => Promise.resolve(approvalsSnapshotWith(0n)));
+    const approve = approveRecorder();
+    const config = cfg({ mode: { dryRun: false }, approvals: { autoApprove: false, mode: 'exact' } });
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]),
+      { approveUSDC: approve.fn },
+      undefined, undefined,
+      { readApprovals },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    expect(readApprovals).not.toHaveBeenCalled();
+    expect(approve.calls).toHaveLength(0);
+    expect(readEvents().some((e) => e.kind === 'approval')).toBe(false);
+  });
+
+  it('live + autoApprove=true + current allowance already meets the required ceiling → silent no-op (readApprovals called, no approveUSDC, no `approval` event)', async () => {
+    const approve = approveRecorder();
+    const config = cfg({ mode: { dryRun: false }, approvals: { autoApprove: true, mode: 'exact' } });
+    // Default `liveSpiedAdapter.readApprovals` returns a saturated allowance (`2^255`) — well above any required ceiling.
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([]), { approveUSDC: approve.fn });
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    expect(approve.calls).toHaveLength(0);
+    expect(readEvents().some((e) => e.kind === 'approval')).toBe(false);
+  });
+
+  it('live + autoApprove=true + mode=exact + zero current allowance → approveUSDC(requiredWei6) + `approval` event with the wei6 ceiling, tx hash, and gasPolWei', async () => {
+    const approve = approveRecorder();
+    const config = cfg({ mode: { dryRun: false }, approvals: { autoApprove: true, mode: 'exact' } });
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]),
+      { approveUSDC: approve.fn },
+      undefined, undefined,
+      { readApprovals: () => Promise.resolve(approvalsSnapshotWith(0n)) },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    expect(approve.calls).toHaveLength(1);
+    expect(typeof approve.calls[0]).toBe('bigint'); // not 'max' — `mode:exact` sends a precise wei6 ceiling
+    const approval = readEvents().find((e) => e.kind === 'approval');
+    expect(approval).toMatchObject({
+      purpose: 'positionModule', spender: '0xPositionModule', currentAllowance: '0', txHash: '0xtx',
+      gasPolWei: (50_000n * 30_000_000_000n).toString(), // gasUsed * effectiveGasPrice
+    });
+    expect(typeof approval?.requiredAggregateAllowance).toBe('string');
+    expect(BigInt(approval?.requiredAggregateAllowance as string) > 0n).toBe(true);
+    expect(approval?.amountSetTo).toBe(approval?.requiredAggregateAllowance); // SDK echoes back what was set in exact mode
+  });
+
+  it('live + autoApprove=true + mode=exact + partial current allowance (< required) → approveUSDC(requiredWei6) — `approve(x)` SETS, doesn\'t add', async () => {
+    const approve = approveRecorder();
+    const config = cfg({ mode: { dryRun: false }, approvals: { autoApprove: true, mode: 'exact' } });
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]),
+      { approveUSDC: approve.fn },
+      undefined, undefined,
+      { readApprovals: () => Promise.resolve(approvalsSnapshotWith(1_000_000n)) }, // 1 USDC — almost certainly below the cap-ceiling
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    expect(approve.calls).toHaveLength(1);
+    expect(typeof approve.calls[0]).toBe('bigint');
+    expect(approve.calls[0]).not.toBe(1_000_000n); // does NOT match the current allowance — sends the full required ceiling
+  });
+
+  it('live + autoApprove=true + mode=unlimited → approveUSDC(\'max\') + `approval` event with amountSetTo = MaxUint256', async () => {
+    const approve = approveRecorder();
+    const config = cfg({ mode: { dryRun: false }, approvals: { autoApprove: true, mode: 'unlimited' } });
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]),
+      { approveUSDC: approve.fn },
+      undefined, undefined,
+      { readApprovals: () => Promise.resolve(approvalsSnapshotWith(0n)) },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    expect(approve.calls).toEqual(['max']);
+    const approval = readEvents().find((e) => e.kind === 'approval');
+    expect(approval?.amountSetTo).toBe((2n ** 256n - 1n).toString());
+  });
+
+  it('readApprovals throws → `error` event phase \'approve\' is logged, the tick continues, no approveUSDC call', async () => {
+    const approve = approveRecorder();
+    const config = cfg({ mode: { dryRun: false }, approvals: { autoApprove: true, mode: 'exact' } });
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]),
+      { approveUSDC: approve.fn },
+      undefined, undefined,
+      { readApprovals: () => Promise.reject(new Error('rpc 503')) },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    expect(approve.calls).toHaveLength(0);
+    const events = readEvents();
+    expect(events.find((e) => e.kind === 'error' && e.phase === 'approve')).toMatchObject({ detail: 'rpc 503' });
+    expect(events.filter((e) => e.kind === 'tick-start')).toHaveLength(1); // tick still ran
+    expect(events.some((e) => e.kind === 'approval')).toBe(false);
+  });
+
+  it('approveUSDC throws → `error` event phase \'approve\' is logged, the tick continues, no `approval` event', async () => {
+    const config = cfg({ mode: { dryRun: false }, approvals: { autoApprove: true, mode: 'exact' } });
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]),
+      { approveUSDC: () => Promise.reject(new Error('insufficient POL')) },
+      undefined, undefined,
+      { readApprovals: () => Promise.resolve(approvalsSnapshotWith(0n)) },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    const events = readEvents();
+    expect(events.find((e) => e.kind === 'error' && e.phase === 'approve')).toMatchObject({ detail: 'insufficient POL' });
+    expect(events.filter((e) => e.kind === 'tick-start')).toHaveLength(1);
+    expect(events.some((e) => e.kind === 'approval')).toBe(false);
   });
 });

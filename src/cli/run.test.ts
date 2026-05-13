@@ -62,7 +62,7 @@ describe('runRun — mode gating', () => {
     const cap = captureLog();
     const runnerLog = captureLog();
     await runRun(
-      { config: cfg({ mode: { dryRun: false } }), mode: 'dry-run', ignoreMissingState: false },
+      { config: cfg({ mode: { dryRun: false } }), mode: 'dry-run', ignoreMissingState: false, confirmUnlimited: false },
       { createAdapter: discoveryFindsNothing, makeRunId: () => 'test-run', runnerDeps: { ...noopRunnerDeps, log: runnerLog.log }, maxTicks: 1, log: cap.log },
     );
     expect(cap.lines().some((l) => /config has mode\.dryRun=false/.test(l))).toBe(true);
@@ -80,7 +80,7 @@ describe('runRun — dry-run shadow loop wiring', () => {
     const cap = captureLog();
     const config = cfg();
     await runRun(
-      { config, mode: 'dry-run', ignoreMissingState: false },
+      { config, mode: 'dry-run', ignoreMissingState: false, confirmUnlimited: false },
       { createAdapter, makeRunId, runnerDeps: noopRunnerDeps, maxTicks: 2, log: cap.log },
     );
     expect(createAdapter).toHaveBeenCalledWith(config);
@@ -99,7 +99,7 @@ describe('runRun — dry-run shadow loop wiring', () => {
     const cap = captureLog();
     const addr = '0xabc0000000000000000000000000000000000abc' as Hex;
     await runRun(
-      { config: cfg(), mode: 'dry-run', address: addr, ignoreMissingState: false },
+      { config: cfg(), mode: 'dry-run', address: addr, ignoreMissingState: false, confirmUnlimited: false },
       { createAdapter: discoveryFindsNothing, makeRunId: () => 'r', runnerDeps: noopRunnerDeps, maxTicks: 1, log: cap.log },
     );
     expect(cap.lines().some((l) => l.includes(addr))).toBe(true);
@@ -110,7 +110,7 @@ describe('runRun — dry-run shadow loop wiring', () => {
     writeFileSync(keystorePath, JSON.stringify({ address: 'ABC0000000000000000000000000000000000ABC', crypto: {} }), 'utf8');
     const cap = captureLog();
     await runRun(
-      { config: cfg({ wallet: { keystorePath } }), mode: 'dry-run', ignoreMissingState: false },
+      { config: cfg({ wallet: { keystorePath } }), mode: 'dry-run', ignoreMissingState: false, confirmUnlimited: false },
       { createAdapter: discoveryFindsNothing, makeRunId: () => 'r', runnerDeps: noopRunnerDeps, maxTicks: 1, log: cap.log },
     );
     expect(cap.lines().some((l) => l.includes('0xabc0000000000000000000000000000000000abc'))).toBe(true);
@@ -135,6 +135,15 @@ describe('runRun — live mode wiring', () => {
   function liveDiscoveryFindsNothing(config: Config, signer: Signer): OspexAdapter {
     const adapter = createLiveOspexAdapter(config, signer);
     vi.spyOn(adapter, 'listContests').mockResolvedValue([]);
+    // The runner's boot-time auto-approve (Phase 3 d-i) reads the maker's PositionModule allowance —
+    // default the stub to a saturated allowance so no `approveUSDC` is needed, and stub `approveUSDC`
+    // to reject loudly in case a test inadvertently lands on the write path.
+    vi.spyOn(adapter, 'readApprovals').mockResolvedValue({
+      owner: '0xowner' as Hex, chainId: 137,
+      usdc: { address: '0xusdc' as Hex, decimals: 6, allowances: { positionModule: { spender: '0xpm' as Hex, spenderModule: 'positionModule', raw: 2n ** 255n }, treasuryModule: { spender: '0xtm' as Hex, spenderModule: 'treasuryModule', raw: 0n } } },
+      link: { address: '0xlink' as Hex, decimals: 18, allowances: { oracleModule: { spender: '0xom' as Hex, spenderModule: 'oracleModule', raw: 0n } } },
+    });
+    vi.spyOn(adapter, 'approveUSDC').mockRejectedValue(new Error('liveDiscoveryFindsNothing: approveUSDC not stubbed'));
     return adapter;
   }
 
@@ -151,7 +160,7 @@ describe('runRun — live mode wiring', () => {
     const cap = captureLog();
     const config = liveConfig();
     await runRun(
-      { config, mode: 'live', ignoreMissingState: false },
+      { config, mode: 'live', ignoreMissingState: false, confirmUnlimited: false },
       { createLiveAdapter, unlockSigner, promptPassphrase, env: { OSPEX_KEYSTORE_PASSPHRASE: 'pw-from-env' }, makeRunId: () => 'live-run', runnerDeps: noopRunnerDeps, maxTicks: 1, log: cap.log },
     );
     expect(unlockSigner).toHaveBeenCalledWith(config.wallet.keystorePath, 'pw-from-env');
@@ -166,7 +175,7 @@ describe('runRun — live mode wiring', () => {
     const unlockSigner = vi.fn((_path: string, _pw: string) => Promise.resolve(fakeSigner()));
     const promptPassphrase = vi.fn(() => Promise.resolve('pw-from-prompt'));
     await runRun(
-      { config: liveConfig(), mode: 'live', ignoreMissingState: false },
+      { config: liveConfig(), mode: 'live', ignoreMissingState: false, confirmUnlimited: false },
       { createLiveAdapter: liveDiscoveryFindsNothing, unlockSigner, promptPassphrase, env: {}, makeRunId: () => 'r', runnerDeps: noopRunnerDeps, maxTicks: 1, log: () => {} },
     );
     expect(promptPassphrase).toHaveBeenCalledTimes(1);
@@ -177,7 +186,7 @@ describe('runRun — live mode wiring', () => {
     const unlockSigner = vi.fn();
     const promptPassphrase = vi.fn(() => Promise.reject(new Error('stdin is not a TTY')));
     await expect(runRun(
-      { config: liveConfig(), mode: 'live', ignoreMissingState: false },
+      { config: liveConfig(), mode: 'live', ignoreMissingState: false, confirmUnlimited: false },
       { createLiveAdapter: liveDiscoveryFindsNothing, unlockSigner, promptPassphrase, env: {}, log: () => {} },
     )).rejects.toMatchObject({ name: 'RunRefused', message: expect.stringMatching(/OSPEX_KEYSTORE_PASSPHRASE/) as unknown });
     expect(unlockSigner).not.toHaveBeenCalled();
@@ -186,7 +195,7 @@ describe('runRun — live mode wiring', () => {
   it('--live + config.mode.dryRun:true → RunRefused (the two-key model — both keys must agree), no signer unlock attempted', async () => {
     const unlockSigner = vi.fn();
     await expect(runRun(
-      { config: cfg({ mode: { dryRun: true } }), mode: 'live', ignoreMissingState: false },
+      { config: cfg({ mode: { dryRun: true } }), mode: 'live', ignoreMissingState: false, confirmUnlimited: false },
       { unlockSigner, env: { OSPEX_KEYSTORE_PASSPHRASE: 'pw' }, log: () => {} },
     )).rejects.toMatchObject({ name: 'RunRefused', message: expect.stringMatching(/mode\.dryRun=true/) as unknown });
     expect(unlockSigner).not.toHaveBeenCalled();
@@ -195,7 +204,7 @@ describe('runRun — live mode wiring', () => {
   it('--live without wallet.keystorePath → RunRefused', async () => {
     const unlockSigner = vi.fn();
     await expect(runRun(
-      { config: cfg({ mode: { dryRun: false } }), mode: 'live', ignoreMissingState: false }, // no wallet.keystorePath
+      { config: cfg({ mode: { dryRun: false } }), mode: 'live', ignoreMissingState: false, confirmUnlimited: false }, // no wallet.keystorePath
       { unlockSigner, env: { OSPEX_KEYSTORE_PASSPHRASE: 'pw' }, log: () => {} },
     )).rejects.toMatchObject({ name: 'RunRefused', message: expect.stringMatching(/keystorePath/) as unknown });
     expect(unlockSigner).not.toHaveBeenCalled();
@@ -204,7 +213,7 @@ describe('runRun — live mode wiring', () => {
   it('--live with --address → RunRefused (the maker address comes from the signer in live mode)', async () => {
     const unlockSigner = vi.fn();
     await expect(runRun(
-      { config: liveConfig(), mode: 'live', address: '0xabc0000000000000000000000000000000000abc' as Hex, ignoreMissingState: false },
+      { config: liveConfig(), mode: 'live', address: '0xabc0000000000000000000000000000000000abc' as Hex, ignoreMissingState: false, confirmUnlimited: false },
       { unlockSigner, env: { OSPEX_KEYSTORE_PASSPHRASE: 'pw' }, log: () => {} },
     )).rejects.toMatchObject({ name: 'RunRefused', message: expect.stringMatching(/--address is incompatible with --live/) as unknown });
     expect(unlockSigner).not.toHaveBeenCalled();
@@ -213,13 +222,43 @@ describe('runRun — live mode wiring', () => {
   it('unlockSigner throws (bad passphrase / malformed keystore) → propagates a plain Error (the CLI prints "run failed: …")', async () => {
     const unlockSigner = vi.fn(() => Promise.reject(new Error('invalid password')));
     await expect(runRun(
-      { config: liveConfig(), mode: 'live', ignoreMissingState: false },
+      { config: liveConfig(), mode: 'live', ignoreMissingState: false, confirmUnlimited: false },
       { createLiveAdapter: liveDiscoveryFindsNothing, unlockSigner, env: { OSPEX_KEYSTORE_PASSPHRASE: 'wrong' }, log: () => {} },
     )).rejects.toThrow(/invalid password/);
     // Not a RunRefused — a bad passphrase is an operational failure, not a "refused mode".
     await expect(runRun(
-      { config: liveConfig(), mode: 'live', ignoreMissingState: false },
+      { config: liveConfig(), mode: 'live', ignoreMissingState: false, confirmUnlimited: false },
       { createLiveAdapter: liveDiscoveryFindsNothing, unlockSigner, env: { OSPEX_KEYSTORE_PASSPHRASE: 'wrong' }, log: () => {} },
     )).rejects.not.toBeInstanceOf(RunRefused);
+  });
+
+  it('--live + approvals.autoApprove=true + approvals.mode=unlimited + no --yes → RunRefused (must explicitly confirm a MaxUint256 USDC approval), no signer unlock attempted', async () => {
+    const unlockSigner = vi.fn();
+    const unlimitedConfig = { ...liveConfig(), approvals: { autoApprove: true, mode: 'unlimited' as const } };
+    await expect(runRun(
+      { config: unlimitedConfig, mode: 'live', ignoreMissingState: false, confirmUnlimited: false },
+      { unlockSigner, env: { OSPEX_KEYSTORE_PASSPHRASE: 'pw' }, log: () => {} },
+    )).rejects.toMatchObject({ name: 'RunRefused', message: expect.stringMatching(/MaxUint256.*--yes/) as unknown });
+    expect(unlockSigner).not.toHaveBeenCalled();
+  });
+
+  it('--live + approvals.autoApprove=true + approvals.mode=unlimited + --yes → unlock proceeds (confirmation accepted)', async () => {
+    const unlockSigner = vi.fn(() => Promise.resolve(fakeSigner()));
+    const unlimitedConfig = { ...liveConfig(), approvals: { autoApprove: true, mode: 'unlimited' as const } };
+    await runRun(
+      { config: unlimitedConfig, mode: 'live', ignoreMissingState: false, confirmUnlimited: true },
+      { createLiveAdapter: liveDiscoveryFindsNothing, unlockSigner, env: { OSPEX_KEYSTORE_PASSPHRASE: 'pw' }, makeRunId: () => 'r', runnerDeps: noopRunnerDeps, maxTicks: 1, log: () => {} },
+    );
+    expect(unlockSigner).toHaveBeenCalledTimes(1);
+  });
+
+  it('--live + approvals.autoApprove=false + approvals.mode=unlimited + no --yes → runs (the unlimited mode is inert without autoApprove, so the gate doesn\'t fire)', async () => {
+    const unlockSigner = vi.fn(() => Promise.resolve(fakeSigner()));
+    const inertConfig = { ...liveConfig(), approvals: { autoApprove: false, mode: 'unlimited' as const } };
+    await runRun(
+      { config: inertConfig, mode: 'live', ignoreMissingState: false, confirmUnlimited: false },
+      { createLiveAdapter: liveDiscoveryFindsNothing, unlockSigner, env: { OSPEX_KEYSTORE_PASSPHRASE: 'pw' }, makeRunId: () => 'r', runnerDeps: noopRunnerDeps, maxTicks: 1, log: () => {} },
+    );
+    expect(unlockSigner).toHaveBeenCalledTimes(1);
   });
 });

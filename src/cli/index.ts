@@ -119,7 +119,8 @@ program
   .option('-a, --address <addr>', 'maker wallet address (dry-run only; in live mode the address is the signer\'s — passing it with --live is refused)')
   .option('-k, --keystore <path>', 'path to a v3 keystore — overrides config wallet.keystorePath / OSPEX_KEYSTORE_PATH')
   .option('--ignore-missing-state', 'proceed even if the persisted state is missing/corrupt — attests no prior run left a still-matchable commitment (DESIGN §12)')
-  .action(async (opts: { config: string; dryRun?: boolean; live?: boolean; address?: string; keystore?: string; ignoreMissingState?: boolean }) => {
+  .option('--yes', 'confirm dangerous defaults — currently: approvals.mode=unlimited under --live with autoApprove=true (sets the PositionModule USDC allowance to MaxUint256). No effect otherwise')
+  .action(async (opts: { config: string; dryRun?: boolean; live?: boolean; address?: string; keystore?: string; ignoreMissingState?: boolean; yes?: boolean }) => {
     const wantDry = opts.dryRun === true;
     const wantLive = opts.live === true;
     if (wantDry && wantLive) fail('pass exactly one of --dry-run / --live, not both');
@@ -132,6 +133,7 @@ program
       mode: wantLive ? 'live' : 'dry-run',
       ...(address !== undefined ? { address } : {}),
       ignoreMissingState: opts.ignoreMissingState === true,
+      confirmUnlimited: opts.yes === true,
     }).catch((e: unknown): never => {
       if (e instanceof RunRefused) return fail(e.message);
       return fail(`run failed: ${(e as Error).message}`);

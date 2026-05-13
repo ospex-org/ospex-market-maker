@@ -1,6 +1,6 @@
 # Quickstart
 
-> **v0 scaffold.** Working today: `doctor`, `quote --dry-run`, `run --dry-run` (the shadow loop — posts nothing), and `summary`. Still landing: `run --live`, `cancel-stale`, `status` — see the README's *[Current scaffold status](../README.md#current-scaffold-status)*. This is the intended flow plus pointers; it fills in as the implementation lands (Phase 1 → 4 — see [`DESIGN.md`](DESIGN.md) §14).
+> **v0 scaffold.** Working today: `doctor`, `quote --dry-run`, `run --dry-run` (the shadow loop — posts nothing), `run --live` (alpha — executes submits + off-chain cancels via the SDK; fill detection, gas budgeting in POL, settlement / claim, and the on-chain kill path are still landing), and `summary`. Still stubbed: `cancel-stale`, `status` — see the README's *[Current scaffold status](../README.md#current-scaffold-status)*. This is the intended flow plus pointers; it fills in as the implementation lands (Phase 1 → 4 — see [`DESIGN.md`](DESIGN.md) §14).
 
 ## 1. Prerequisites
 
@@ -57,7 +57,7 @@ yarn mm run --dry-run    # the full loop, posting nothing — Ctrl-C (or a KILL 
 
 Runs the real event loop — discovery → reference-odds tracking (a Supabase Realtime channel per market by default; bounded snapshot polling if you set `odds.subscribe: false`) → the per-market reconcile (price → plan → log → assess competitiveness) → age-out → terminal-record prune → state flush, every `pollIntervalMs` (≥ 30 s) — but instead of submitting it logs `quote-intent` / `quote-competitiveness` / `would-submit` / `would-replace` / `would-soft-cancel` / `candidate` / `expire` / `degraded` events to the NDJSON file under `telemetry.logDir`, and tracks a *hypothetical* inventory (so cap enforcement, including the latent-exposure bucket, is exercised for real). It boots through the state-loss fail-safe first (a missing/corrupt state file plus prior telemetry holds quoting — pass `--ignore-missing-state` only after confirming no prior commitment is still matchable). To stop: drop a `KILL` file (path = `killSwitchFile` in your config) or send SIGTERM/SIGINT. Let it run for a meaningful window, then read the aggregated metrics with `yarn mm summary` (§7) before going live. `--address` / `--keystore <path>` are accepted but not required in dry-run.
 
-> `run --live` isn't implemented yet — it exits `not yet implemented`. The two-key model in §8 is the Phase-3 design.
+> `run --live` is implemented for the reconcile's write path (submits + off-chain cancels). Fill detection, gas budgeting in POL, auto-settle / auto-claim, and the on-chain kill path are still landing in later Phase-3 slices — keep an eye on the telemetry log and start tiny.
 
 ## 7. Read the run metrics — `yarn mm summary`
 
@@ -67,15 +67,16 @@ yarn mm summary --since 2026-05-12T14:00:00Z # window it to events at/after a ti
 yarn mm summary --json                       # a { schemaVersion: 1, summary: … } envelope
 ```
 
-Aggregates the NDJSON event logs into the §2.3 run metrics: ticks, the candidate-skip and event-kind histograms, quote-intent counts, the would-be submit / replace / soft-cancel / expire tallies, the **quote-competitiveness** rate (how often a would-be quote sat at/inside the visible book on its side, plus the vs-reference tick spread), the **quote-age** distribution (p50 / p90 / max seconds a quote stayed up), the **latent-exposure peak**, stale-quote incidents, and the error counts — plus the run window, the run-ids, and the shutdown reason if the log has a `kill` event. Read this after a dry-run window to gauge whether your pricing config is competitive and your caps are sensible *before* you flip to live. (The live-mode metrics — fill rate, P&L, gas, fees, settlements — land in Phase 3, when `run --live` and its events exist; for now they show up as zeros in the event-kind histogram.)
+Aggregates the NDJSON event logs into the §2.3 run metrics: ticks, the candidate-skip and event-kind histograms, quote-intent counts, the would-be submit / replace / soft-cancel / expire tallies, the **quote-competitiveness** rate (how often a would-be quote sat at/inside the visible book on its side, plus the vs-reference tick spread), the **quote-age** distribution (p50 / p90 / max seconds a quote stayed up), the **latent-exposure peak**, stale-quote incidents, and the error counts — plus the run window, the run-ids, and the shutdown reason if the log has a `kill` event. Read this after a dry-run window to gauge whether your pricing config is competitive and your caps are sensible *before* you flip to live. (The live-mode metrics — fill rate, P&L, gas, fees, settlements — land later in Phase 3 as fill detection / gas budgeting / settlement land; for now `submit` / `replace` / `soft-cancel` events are recorded but the derived metrics show up as zeros in the event-kind histogram.)
 
-## 8. Going live (the two-key model) *(Phase 3 target)*
+## 8. Going live (the two-key model)
 
-Live requires **both**: `mode.dryRun: false` in your config **and** the `--live` flag on the command. Either one alone runs dry (in v0, `--live` simply isn't implemented yet — it exits `not yet implemented`). `--dry-run` always forces dry-run.
+Live requires **both**: `mode.dryRun: false` in your config **and** the `--live` flag on the command. `--live` without the config flag is refused; `--dry-run` always forces dry-run. The keystore passphrase comes from `OSPEX_KEYSTORE_PASSPHRASE` (preferred for non-interactive runs), else a no-echo TTY prompt; `--address` with `--live` is refused (the signer determines the maker wallet). Use a *fresh* `state.dir` for live — a directory polluted with prior dry-run synthetic commitments is refused at boot.
 
 ```bash
-# after setting mode.dryRun: false in ospex-mm.yaml:
-yarn mm run --live
+# after setting mode.dryRun: false in ospex-mm.yaml, with a fresh state.dir:
+OSPEX_KEYSTORE_PASSPHRASE='…' yarn mm run --live
+# or, on a TTY, omit the env var and you'll be prompted (no-echo)
 ```
 
 Start with tiny caps. Watch `yarn mm summary` (and `yarn mm status` once it lands — Phase 3) and the telemetry log. Keep gas (POL) and USDC topped up. To stop: drop a `KILL` file (path = `killSwitchFile` in your config) or send SIGTERM/SIGINT — note that with `killCancelOnChain: false` this is a *soft* stop (pulled quotes stay matchable until they expire, ≈2 min by default; set `killCancelOnChain: true` for a hard, gas-spending stop).

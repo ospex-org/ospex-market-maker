@@ -428,13 +428,19 @@ export class Runner {
 
   /**
    * The event loop: `{ kill-check → tick → stop-check → sleep }` until killed or
-   * `maxTicks` is reached. On shutdown (kill-switch file or SIGTERM/SIGINT) emits a
-   * `kill` event and does a final state flush (unless a boot-time state-loss hold is
-   * still active — see `tick()`). (In dry-run there's nothing posted to pull on
-   * shutdown; live mode's `killCancelOnChain` path is Phase 3.) Single-use — call
-   * once. The kill *file* is checked at the top of each iteration, so it's acted on
-   * within one poll interval; a *signal* aborts the in-flight sleep, so it's acted
-   * on after the current tick.
+   * `maxTicks` is reached. On shutdown (kill-switch file or SIGTERM/SIGINT) the
+   * live runner first sweeps every visible quote off chain via
+   * `offchainKillCancel` (gasless soft stop; always runs), then — if
+   * `killCancelOnChain: true` — calls `onchainKillCancel` to authoritatively
+   * cancel every non-terminal commitment on chain (gas-gated with
+   * `mayUseReserve: true`). Finally emits a `kill` event and does a final
+   * state flush (unless a boot-time state-loss hold is still active — see
+   * `tick()`). Dry-run skips both sweeps; a clean `maxTicks` exit (no
+   * `shutdownReason`) skips them too — there's no operator intent to "kill"
+   * latent exposure on a bounded run. Single-use — call once. The kill *file*
+   * is checked at the top of each iteration, so it's acted on within one poll
+   * interval; a *signal* aborts the in-flight sleep, so it's acted on after
+   * the current tick.
    */
   async run(): Promise<void> {
     const unregister = this.deps.registerShutdownSignals(() => this.requestShutdown('signal'));
@@ -475,13 +481,19 @@ export class Runner {
       }
     } finally {
       unregister();
-      // On-chain kill cancel runs BEFORE the `kill` event so the event's
-      // emission is the last word — telemetry replay sees the final state of
-      // every commitment (`authoritativelyInvalidated` if it was on-chain-
-      // cancelled). Operator-explicit + live-only + actual shutdown (not a
-      // `maxTicks`-triggered exit, which has `shutdownReason === null`).
-      if (this.shutdownReason !== null && this.config.killCancelOnChain && !this.config.mode.dryRun) {
-        await this.onchainKillCancel();
+      // Shutdown sweep — on EVERY actual operator-triggered shutdown
+      // (`shutdownReason !== null`, live mode), pull every visible quote off
+      // chain (gasless `cancelCommitmentOffchain`). This is the soft-stop
+      // default: visible quotes leave the book immediately, the latent
+      // (matchable-via-stale-signed-payload) window stays open until natural
+      // expiry — or until the on-chain authoritative-cancel sweep below
+      // closes it for good when `killCancelOnChain: true` (DESIGN §6 kill
+      // switch; Hermes review-PR29). Maxticks exits and dry-run skip.
+      if (this.shutdownReason !== null && !this.config.mode.dryRun) {
+        await this.offchainKillCancel();
+        if (this.config.killCancelOnChain) {
+          await this.onchainKillCancel();
+        }
       }
       if (this.shutdownReason !== null) this.eventLog.emit('kill', { reason: this.shutdownReason, ticks });
       // Each non-held tick already flushes; this final flush only matters when a
@@ -2014,12 +2026,50 @@ export class Runner {
   }
 
   /**
+   * Shutdown-time off-chain "soft stop" sweep (DESIGN §6 — kill switch).
+   * Runs on every actual operator-triggered shutdown (`shutdownReason !== null`)
+   * regardless of `killCancelOnChain`. For every `visibleOpen` and
+   * `partiallyFilled` commitment, calls `adapter.cancelCommitmentOffchain`
+   * (gasless API DELETE) to pull the quote from the book and then reclassifies
+   * the record to `softCancelled` + emits `soft-cancel` `reason: 'shutdown'`.
+   * The signed payload stays matchable on chain until natural expiry — the
+   * authoritative `onchainKillCancel` below closes that window if
+   * `killCancelOnChain: true`.
+   *
+   * Per-record failures are logged (`error` `phase: 'cancel'`) and the loop
+   * continues — pulling one record doesn't depend on another.
+   */
+  private async offchainKillCancel(): Promise<void> {
+    if (this.makerAddress === null) return; // live-mode invariant (caller already gated on `!dryRun`)
+    const records = Object.values(this.state.commitments).filter(
+      (r) => r.lifecycle === 'visibleOpen' || r.lifecycle === 'partiallyFilled',
+    );
+    if (records.length === 0) return;
+
+    const now = this.deps.now();
+    for (const r of records) {
+      try {
+        await this.adapter.cancelCommitmentOffchain(r.hash as Hex);
+      } catch (err) {
+        this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'cancel', commitmentHash: r.hash });
+        continue; // failed pull stays at original lifecycle; the on-chain sweep below (if enabled) may still authoritatively cancel it
+      }
+      r.lifecycle = 'softCancelled';
+      r.updatedAtUnixSec = now;
+      this.eventLog.emit('soft-cancel', softCancelEventPayload(r, 'shutdown'));
+    }
+  }
+
+  /**
    * Shutdown-time on-chain authoritative kill (DESIGN §6 / §13 — "hard stop"
    * mode). Triggered when `config.killCancelOnChain: true` AND the runner is
    * exiting via an actual operator-triggered shutdown (kill file or
-   * SIGTERM/SIGINT — `shutdownReason !== null`). Iterates every non-terminal
-   * tracked commitment (`visibleOpen` / `softCancelled` / `partiallyFilled`)
-   * and calls `adapter.cancelCommitmentOnchain(hash)` for each — the
+   * SIGTERM/SIGINT — `shutdownReason !== null`). Runs AFTER the unconditional
+   * off-chain sweep above so the soft-cancelled records (the on-chain
+   * sweep's input set includes them via the `softCancelled` lifecycle) are
+   * also authoritatively cancelled. Iterates every non-terminal tracked
+   * commitment (`visibleOpen` / `softCancelled` / `partiallyFilled`) and
+   * calls `adapter.cancelCommitmentOnchain(hash)` for each — the
    * authoritative cancel (`MatchingModule.cancelCommitment`) sets
    * `s_cancelledCommitments[hash]` on chain, after which `matchCommitment`
    * reverts. Without this, a taker holding the signed payload can still match

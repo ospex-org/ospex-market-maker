@@ -484,11 +484,18 @@ export class Runner {
    * prune → flush. Fill detection runs *before* the reconcile so a fill within this
    * tick dirties the market and the same reconcile re-prices the now-imbalanced book.
    *
-   * **Fail-closed on lost fill visibility (live mode).** Two gates, same outcome
+   * **Fail-closed on lost fill visibility (live mode).** Three gates, same outcome
    * (skip reconcile + ageOut, markets stay dirty, next tick retries):
    *   1. `detectFills` can't read the maker's open commitments
    *      (`listOpenCommitments` threw) → also skips the position poll.
-   *   2. `pollPositionStatus` can't read the maker's positions
+   *   2. `detectFills` saw a *past-expiry* tracked commitment disappear from
+   *      the open-commitments listing but the per-hash `getCommitment` lookup
+   *      threw — the past-expiry-and-disappeared combo is the sharp case
+   *      because `ageOut` would otherwise terminalize the record and release
+   *      its headroom without knowing whether a late fill landed. Future-expiry
+   *      lookup failures stay non-fatal: the record stays live + counted, the
+   *      next tick retries (Hermes review-PR23-late).
+   *   3. `pollPositionStatus` can't read the maker's positions
    *      (`getPositionStatus` threw) AND any non-terminal `softCancelled`
    *      commitment exists in local state. Soft-cancelled commitments are
    *      API-hidden from `listOpenCommitments`, so a stale-signed-payload
@@ -1313,12 +1320,21 @@ export class Runner {
    * `getCommitment` it would terminalize a record whose actual on-chain status is
    * `filled`, silently losing the position.
    *
-   * **Fail closed.** Returns `false` if `listOpenCommitments` threw — the runner has
-   * no visibility into which commitments filled / expired / were cancelled, so the
-   * caller MUST skip the position poll, the reconcile (no live writes on unverified
-   * fill state), and `ageOut` (don't terminalize a record that might have filled
-   * just before expiry). Per-hash `getCommitment` failures are scoped: the other
-   * disappearances classify normally; only the failing hash retries next tick.
+   * **Fail closed.** Returns `false` in two cases:
+   *   1. `listOpenCommitments` threw — the runner has no visibility into which
+   *      commitments filled / expired / were cancelled.
+   *   2. The per-hash `getCommitment` lookup threw for a *past-expiry* tracked
+   *      commitment that had disappeared from the listing. Without the lookup
+   *      we can't tell if it filled, expired, or was cancelled before vanishing,
+   *      and `ageOut` (running after this step in the same tick) would otherwise
+   *      terminalize the record on local time alone — releasing headroom + the
+   *      reconcile then submitting replacements on possibly-already-matched
+   *      exposure. Future-expiry lookup failures stay non-fatal (the record
+   *      stays live + counted; the next tick retries) — only the past-expiry
+   *      combo trips the gate (Hermes review-PR23-late).
+   * Either way the caller MUST skip the position poll, the reconcile, and
+   * `ageOut`. The other disappearances in the same tick still classify normally;
+   * only the failing past-expiry hash escalates to a tick-wide fail-closed.
    *
    * Bounded reads (DESIGN §10): one `listOpenCommitments` per tick at
    * `max(maxOpenCommitments × 2, 50)`; one `getCommitment` per disappeared hash
@@ -1367,6 +1383,16 @@ export class Runner {
     }
 
     // Disappeared hashes → per-hash terminal classification via `getCommitment`.
+    // **Fail-closed on past-expiry lookup failure.** A future-expiry record whose
+    // lookup fails stays live + counted toward exposure; next tick retries — safe.
+    // But a *past-expiry* record whose lookup fails is the sharp case: `ageOut`
+    // would otherwise terminalize it to `expired` and release its headroom, and
+    // the reconcile would submit replacements against exposure that may have just
+    // filled. Track whether any such failure occurred and signal `tick()` to
+    // skip reconcile + ageOut for the tick (the markets stay dirty for next-tick
+    // retry, the record's lifecycle stays at its current value). Hermes
+    // review-PR23-late.
+    let pastExpiryLookupFailed = false;
     for (const [hash, record] of localOpen) {
       if (apiByHash.has(hash)) continue;
       let apiCommitment: Commitment;
@@ -1374,7 +1400,8 @@ export class Runner {
         apiCommitment = await this.adapter.getCommitment(hash as Hex);
       } catch (err) {
         this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'fill-detection-lookup', commitmentHash: hash });
-        continue; // skip this hash, retry next tick
+        if (record.expiryUnixSec <= now) pastExpiryLookupFailed = true;
+        continue; // skip this hash; other hashes still processed
       }
       // For every terminal status, first compute and apply any unobserved fill delta —
       // a commitment can have partially filled and then expired / been cancelled
@@ -1410,7 +1437,7 @@ export class Runner {
         }
       }
     }
-    return true;
+    return !pastExpiryLookupFailed;
   }
 
   /**

@@ -1994,4 +1994,32 @@ describe('Runner — position-status transitions (Phase 3 c-ii)', () => {
     expect(transitions).toHaveLength(1);
     expect(transitions[0]).toMatchObject({ fromStatus: 'active', toStatus: 'pendingSettle' });
   });
+
+  it('an existing position whose source commitment was pruned (long-running game) still transitions — context comes from the position record\'s own denormalized fields (Hermes review-PR24)', async () => {
+    // The realistic case: maker fills a commitment at T=0; the commitment becomes `filled`;
+    // `pruneTerminalCommitments` deletes the filled record after ~1h; the game scores T+hours
+    // later and the API moves the position from `active` to `pendingSettle`. Requiring a
+    // still-retained source commitment would strand the position in stale `active` status.
+    StateStore.at(stateDir).flush({
+      ...emptyMakerState(),
+      // No commitments — the source commitment was pruned post-fill.
+      positions: {
+        'spec-1234:home': { speculationId: 'spec-1234', contestId: '1234', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', side: 'home', riskAmountWei6: '250000', counterpartyRiskWei6: '250000', status: 'active', updatedAtUnixSec: T0 - 7200 },
+      },
+    });
+    const config = cfg({ mode: { dryRun: false } });
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]), undefined, undefined, undefined,
+      { getPositionStatus: () => Promise.resolve(withPendingSettlePosition('spec-1234', 1, 0.25, 0.25, 'won', 'home')) },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    const reloaded = StateStore.at(stateDir).load().state;
+    expect(reloaded.positions['spec-1234:home']?.status).toBe('pendingSettle');
+    const events = readEvents();
+    expect(events.some((e) => e.kind === 'error' && e.class === 'PositionWithoutCommitment')).toBe(false); // no false alarm
+    const transitions = events.filter((e) => e.kind === 'position-transition');
+    expect(transitions).toHaveLength(1);
+    expect(transitions[0]).toMatchObject({ fromStatus: 'active', toStatus: 'pendingSettle', contestId: '1234', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD' }); // context from the existing record
+  });
 });

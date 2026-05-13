@@ -1470,12 +1470,20 @@ export class Runner {
    * dirty the corresponding tracked market (a new on-chain fill changes the book
    * imbalance), and emit `fill` `{ source: 'position-poll', … }`.
    *
-   * The position record's contest / sport / team context is copied from any local
-   * commitment record on `(speculationId, makerSide)` — there's always one (the
-   * MM only has positions for speculations it submitted commitments on). If none is
-   * found (e.g. the operator pre-seeded the state, or a long-running discrepancy):
-   * log `error` `phase: 'position-poll'` and skip — we don't create incomplete
-   * position records that would corrupt the risk engine's per-team / per-sport caps.
+   * The position record's contest / sport / team context comes from two
+   * sources: an *existing* `MakerPositionRecord` carries its own denormalized
+   * context (copied at birth from the commitment that originated it), so an
+   * extend / transition uses the record's own fields — important because
+   * `pruneTerminalCommitments` deletes filled commitments after about an hour
+   * while a position can stay `active` for hours/days until the game scores,
+   * so requiring a still-retained source commitment would strand long-running
+   * positions in stale status (Hermes review-PR24). A *brand-new* record
+   * (`existing === undefined`) does look up a local commitment record on
+   * `(speculationId, makerSide)` — we wouldn't have a position without
+   * having submitted some commitment on that speculation. If none is found
+   * there: log `error` `phase: 'position-poll'` and skip rather than create
+   * incomplete records that would corrupt the risk engine's per-team /
+   * per-sport caps.
    *
    * **Status transitions** (DESIGN §10). The API's three buckets — `active`,
    * `pendingSettle`, `claimable` — map 1:1 to the local `MakerPositionStatus`.
@@ -1558,26 +1566,10 @@ export class Runner {
     if (existing !== undefined && !riskGrew && !statusChanged) return; // already caught up — idempotent on no-change
     if (existing === undefined && !riskGrew) return; // never seen + zero risk — nothing to record
 
-    // Source-context lookup: copy contest / sport / teams from any local commitment
-    // record on this `(speculationId, makerSide)`. We always have one (we wouldn't
-    // have a position without having submitted a commitment); a miss signals state
-    // pre-seeding / external corruption — skip + log rather than create incomplete.
-    const sourceCommitment = Object.values(this.state.commitments).find(
-      (r) => r.speculationId === p.speculationId && r.makerSide === side,
-    );
-    if (sourceCommitment === undefined) {
-      this.eventLog.emit('error', {
-        class: 'PositionWithoutCommitment',
-        detail: `getPositionStatus reports a position on (${p.speculationId}, ${side}) but no local commitment with that (speculationId, makerSide) is present — refusing to create an incomplete MakerPositionRecord`,
-        phase: 'position-poll',
-        speculationId: p.speculationId,
-      });
-      return;
-    }
-
-    // Backwards-transition guard: forward-only. A non-existent reversal —
-    // claimed disappears from the API, so we'd never see it; a settled
-    // speculation can't un-settle on chain — signals state corruption.
+    // Backwards-transition guard runs before the context lookup — it doesn't need it,
+    // and a corrupted state shouldn't trigger a spurious `PositionWithoutCommitment`.
+    // Forward-only: claimed disappears from the API; a settled speculation can't
+    // un-settle on chain — a reversal signals state corruption.
     if (existing !== undefined && statusChanged && positionStatusRank(apiStatus) < positionStatusRank(existing.status)) {
       this.eventLog.emit('error', {
         class: 'BackwardsPositionTransition',
@@ -1588,6 +1580,33 @@ export class Runner {
       return;
     }
 
+    // Context lookup: contest / sport / teams. When the position exists locally we
+    // use its own denormalized fields (carried over from the commitment that birthed
+    // it) — this is the long-running case where the source commitment has since
+    // been pruned (`pruneTerminalCommitments` deletes filled records after about an
+    // hour, while a position can stay `active` for hours/days until the game scores).
+    // Only a brand-new record needs to look up a source commitment, and a miss there
+    // signals state corruption (the operator can't have positions on a speculation
+    // they never quoted on) — log + skip rather than create incomplete records.
+    let context: { contestId: string; sport: string; awayTeam: string; homeTeam: string };
+    if (existing !== undefined) {
+      context = { contestId: existing.contestId, sport: existing.sport, awayTeam: existing.awayTeam, homeTeam: existing.homeTeam };
+    } else {
+      const sourceCommitment = Object.values(this.state.commitments).find(
+        (r) => r.speculationId === p.speculationId && r.makerSide === side,
+      );
+      if (sourceCommitment === undefined) {
+        this.eventLog.emit('error', {
+          class: 'PositionWithoutCommitment',
+          detail: `getPositionStatus reports a position on (${p.speculationId}, ${side}) but no local commitment with that (speculationId, makerSide) is present — refusing to create an incomplete MakerPositionRecord`,
+          phase: 'position-poll',
+          speculationId: p.speculationId,
+        });
+        return;
+      }
+      context = { contestId: sourceCommitment.contestId, sport: sourceCommitment.sport, awayTeam: sourceCommitment.awayTeam, homeTeam: sourceCommitment.homeTeam };
+    }
+
     const delta = riskGrew ? apiRiskWei6 - localRiskWei6 : 0n;
     const counterpartyDelta = existing !== undefined ? apiCounterpartyWei6 - BigInt(existing.counterpartyRiskWei6) : apiCounterpartyWei6;
     const fromStatus: MakerPositionStatus | undefined = existing?.status;
@@ -1595,10 +1614,10 @@ export class Runner {
     if (existing === undefined) {
       this.state.positions[key] = {
         speculationId: p.speculationId,
-        contestId: sourceCommitment.contestId,
-        sport: sourceCommitment.sport,
-        awayTeam: sourceCommitment.awayTeam,
-        homeTeam: sourceCommitment.homeTeam,
+        contestId: context.contestId,
+        sport: context.sport,
+        awayTeam: context.awayTeam,
+        homeTeam: context.homeTeam,
         side,
         riskAmountWei6: delta.toString(),
         counterpartyRiskWei6: counterpartyDelta > 0n ? counterpartyDelta.toString() : '0',
@@ -1617,16 +1636,16 @@ export class Runner {
     }
 
     if (riskGrew) {
-      const m = this.trackedMarkets.get(sourceCommitment.contestId);
+      const m = this.trackedMarkets.get(context.contestId);
       if (m !== undefined) m.dirty = true; // a new fill changes the book imbalance; a status-only transition does not
       this.eventLog.emit('fill', {
         source: 'position-poll',
         positionId: p.positionId,
         speculationId: p.speculationId,
-        contestId: sourceCommitment.contestId,
-        sport: sourceCommitment.sport,
-        awayTeam: sourceCommitment.awayTeam,
-        homeTeam: sourceCommitment.homeTeam,
+        contestId: context.contestId,
+        sport: context.sport,
+        awayTeam: context.awayTeam,
+        homeTeam: context.homeTeam,
         makerSide: side,
         positionType: p.positionType,
         newFillWei6: delta.toString(),
@@ -1637,10 +1656,10 @@ export class Runner {
       const payload: Record<string, unknown> = {
         positionId: p.positionId,
         speculationId: p.speculationId,
-        contestId: sourceCommitment.contestId,
-        sport: sourceCommitment.sport,
-        awayTeam: sourceCommitment.awayTeam,
-        homeTeam: sourceCommitment.homeTeam,
+        contestId: context.contestId,
+        sport: context.sport,
+        awayTeam: context.awayTeam,
+        homeTeam: context.homeTeam,
         makerSide: side,
         positionType: p.positionType,
         fromStatus,

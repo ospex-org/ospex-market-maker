@@ -65,6 +65,7 @@ export const CANDIDATE_SKIP_REASONS = [
   'refused-pricing',
   'tracking-cap-reached',
   'gas-budget-blocks-reapproval',
+  'gas-budget-blocks-settlement', // on-chain settleSpeculation / claimPosition denied by canSpendGas (mayUseReserve = settlement.continueOnGasBudgetExhausted); `purpose` distinguishes `settleSpeculation` vs `claimPosition`
 ] as const;
 export type CandidateSkipReason = (typeof CANDIDATE_SKIP_REASONS)[number];
 

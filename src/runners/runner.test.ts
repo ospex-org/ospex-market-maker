@@ -15,6 +15,8 @@ import {
   type ApprovalsSnapshot,
   type ApproveResult,
   type ApproveUSDCAmount,
+  type ClaimPositionResult,
+  type SettleSpeculationResult,
   type OddsSnapshotView,
   type OddsSubscribeHandlersView,
   type OddsUpdateView,
@@ -27,7 +29,7 @@ import {
   type SubscribeOddsArgs,
   type Subscription,
 } from '../ospex/index.js';
-import { StateStore, emptyMakerState, type MakerCommitmentRecord, type MakerState } from '../state/index.js';
+import { StateStore, emptyMakerState, type MakerCommitmentRecord, type MakerSide, type MakerState } from '../state/index.js';
 import { Runner, interruptibleSleep, type RunnerDeps, type RunnerOptions } from './index.js';
 
 // ── harness ──────────────────────────────────────────────────────────────────
@@ -277,6 +279,8 @@ function liveSpiedAdapter(
     submitCommitment?: (args: SubmitCommitmentArgs) => Promise<SubmitCommitmentResult>;
     cancelCommitmentOffchain?: (hash: Hex) => Promise<void>;
     approveUSDC?: (amount: ApproveUSDCAmount) => Promise<ApproveResult>;
+    settleSpeculation?: OspexAdapter['settleSpeculation'];
+    claimPosition?: OspexAdapter['claimPosition'];
   },
   getContest?: (id: string) => Promise<ContestView>,
   odds?: {
@@ -301,6 +305,8 @@ function liveSpiedAdapter(
   vi.spyOn(adapter, 'submitCommitment').mockImplementation(writes?.submitCommitment ?? (() => Promise.reject(new Error('liveSpiedAdapter: submitCommitment not stubbed — pass `writes.submitCommitment`'))));
   vi.spyOn(adapter, 'cancelCommitmentOffchain').mockImplementation(writes?.cancelCommitmentOffchain ?? (() => Promise.resolve()));
   vi.spyOn(adapter, 'approveUSDC').mockImplementation(writes?.approveUSDC ?? (() => Promise.reject(new Error('liveSpiedAdapter: approveUSDC not stubbed — pass `writes.approveUSDC`'))));
+  vi.spyOn(adapter, 'settleSpeculation').mockImplementation(writes?.settleSpeculation ?? (() => Promise.reject(new Error('liveSpiedAdapter: settleSpeculation not stubbed — pass `writes.settleSpeculation`'))));
+  vi.spyOn(adapter, 'claimPosition').mockImplementation(writes?.claimPosition ?? (() => Promise.reject(new Error('liveSpiedAdapter: claimPosition not stubbed — pass `writes.claimPosition`'))));
   vi.spyOn(adapter, 'listOpenCommitments').mockImplementation(reads?.listOpenCommitments ?? (() => Promise.resolve([])));
   vi.spyOn(adapter, 'getCommitment').mockImplementation(reads?.getCommitment ?? (() => Promise.reject(new Error('liveSpiedAdapter: getCommitment not stubbed — pass `reads.getCommitment`'))));
   vi.spyOn(adapter, 'getPositionStatus').mockImplementation(reads?.getPositionStatus ?? (() => Promise.resolve(EMPTY_POSITION_STATUS)));
@@ -2388,5 +2394,195 @@ describe('Runner — gas-budget verdict gate (Phase 3 d-ii)', () => {
     const candidate = readEvents().find((e) => e.kind === 'candidate' && e.skipReason === 'gas-budget-blocks-reapproval');
     expect(candidate).toBeDefined();
     expect(candidate?.detail).toMatch(/no spendable headroom/);
+  });
+});
+
+// ── auto-settle + auto-claim (Phase 3 e-i) ───────────────────────────────────
+
+describe('Runner — auto-settle + auto-claim (Phase 3 e-i)', () => {
+  /** A stub `settleSpeculation` that records each call. The receipt's `gasUsed × effectiveGasPrice` produces a known `gasPolWei`. */
+  function settleRecorder(gasUsed = 80_000n, effectiveGasPrice = 30_000_000_000n, winSide: SettleSpeculationResult['winSide'] = 'home'): { fn: OspexAdapter['settleSpeculation']; calls: bigint[]; gasPolWeiPerCall: bigint } {
+    const calls: bigint[] = [];
+    return {
+      calls,
+      gasPolWeiPerCall: gasUsed * effectiveGasPrice,
+      fn: (args) => {
+        calls.push(args.speculationId);
+        const receipt = { gasUsed, effectiveGasPrice } as unknown as SettleSpeculationResult['receipt'];
+        return Promise.resolve({ txHash: '0xsettletx', blockNumber: 1n, winSide, receipt });
+      },
+    };
+  }
+
+  /** A stub `claimPosition` that records each call + a payout. */
+  function claimRecorder(gasUsed = 70_000n, effectiveGasPrice = 30_000_000_000n, payoutWei6 = 500_000n): { fn: OspexAdapter['claimPosition']; calls: { speculationId: bigint; positionType: 0 | 1 }[]; gasPolWeiPerCall: bigint } {
+    const calls: { speculationId: bigint; positionType: 0 | 1 }[] = [];
+    return {
+      calls,
+      gasPolWeiPerCall: gasUsed * effectiveGasPrice,
+      fn: (args) => {
+        calls.push({ speculationId: args.speculationId, positionType: args.positionType });
+        const receipt = { gasUsed, effectiveGasPrice } as unknown as ClaimPositionResult['receipt'];
+        return Promise.resolve({ txHash: '0xclaimtx' as Hex, blockNumber: 1n, payoutWei6, payoutUSDC: Number(payoutWei6) / 1_000_000, receipt });
+      },
+    };
+  }
+
+  function todayUTC(): string {
+    const d = new Date(T0 * 1000);
+    return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+  }
+
+  /** A `pendingSettle` position record on `(speculationId, makerSide)`. The position-poll's `syncPolledPosition` puts records here when the API reports them in the `pendingSettle` bucket. */
+  function pendingSettleRecord(speculationId: string, contestId: string, side: MakerSide = 'home'): MakerState['positions'][string] {
+    return { speculationId, contestId, sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', side, riskAmountWei6: '250000', counterpartyRiskWei6: '250000', status: 'pendingSettle', updatedAtUnixSec: T0 - 60 };
+  }
+
+  function claimableRecord(speculationId: string, contestId: string, side: MakerSide = 'home'): MakerState['positions'][string] {
+    return { speculationId, contestId, sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', side, riskAmountWei6: '250000', counterpartyRiskWei6: '250000', status: 'claimable', updatedAtUnixSec: T0 - 60 };
+  }
+
+  it('autoSettleOwn=false and autoClaimOwn=false → no settle / claim calls, no telemetry (operator opted out)', async () => {
+    const settle = settleRecorder();
+    const claim = claimRecorder();
+    StateStore.at(stateDir).flush({
+      ...emptyMakerState(),
+      positions: { '1234:home': pendingSettleRecord('1234', '1234'), '5678:home': claimableRecord('5678', '5678') },
+    });
+    const config = cfg({ mode: { dryRun: false }, settlement: { autoSettleOwn: false, autoClaimOwn: false, continueOnGasBudgetExhausted: false } });
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([]), { settleSpeculation: settle.fn, claimPosition: claim.fn });
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    expect(settle.calls).toHaveLength(0);
+    expect(claim.calls).toHaveLength(0);
+    const events = readEvents();
+    expect(events.some((e) => e.kind === 'settle' || e.kind === 'claim')).toBe(false);
+  });
+
+  it('autoSettleOwn=true + a pendingSettle position → `settleSpeculation` is called with BigInt(speculationId); `settle` event carries winSide / txHash / gasPolWei; gas accumulates into today\'s counter', async () => {
+    const settle = settleRecorder(80_000n, 30_000_000_000n, 'home');
+    const claim = claimRecorder();
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), positions: { '1234:home': pendingSettleRecord('1234', '1234') } });
+    const config = cfg({ mode: { dryRun: false }, settlement: { autoSettleOwn: true, autoClaimOwn: false, continueOnGasBudgetExhausted: false } });
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([]), { settleSpeculation: settle.fn, claimPosition: claim.fn });
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    expect(settle.calls).toEqual([1234n]); // BigInt converted from string speculationId
+    expect(claim.calls).toHaveLength(0);
+    const event = readEvents().find((e) => e.kind === 'settle');
+    expect(event).toMatchObject({ speculationId: '1234', contestId: '1234', makerSide: 'home', winSide: 'home', txHash: '0xsettletx', gasPolWei: settle.gasPolWeiPerCall.toString() });
+    // Status is NOT flipped — that's the position poll's job on the next tick.
+    expect(StateStore.at(stateDir).load().state.positions['1234:home']?.status).toBe('pendingSettle');
+    expect(StateStore.at(stateDir).load().state.dailyCounters[todayUTC()]?.gasPolWei).toBe(settle.gasPolWeiPerCall.toString());
+  });
+
+  it('autoClaimOwn=true + a claimable position → `claimPosition` is called with positionType (home=1) + BigInt(speculationId); `claim` event carries payoutWei6 / txHash / gasPolWei; local status is stamped `claimed`; gas accumulates', async () => {
+    const settle = settleRecorder();
+    const claim = claimRecorder(70_000n, 30_000_000_000n, 500_000n);
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), positions: { '5678:home': claimableRecord('5678', '5678', 'home') } });
+    const config = cfg({ mode: { dryRun: false }, settlement: { autoSettleOwn: false, autoClaimOwn: true, continueOnGasBudgetExhausted: false } });
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([]), { settleSpeculation: settle.fn, claimPosition: claim.fn });
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    expect(settle.calls).toHaveLength(0);
+    expect(claim.calls).toEqual([{ speculationId: 5678n, positionType: 1 }]); // home → 1
+    const event = readEvents().find((e) => e.kind === 'claim');
+    expect(event).toMatchObject({ speculationId: '5678', contestId: '5678', makerSide: 'home', positionType: 1, payoutWei6: '500000', txHash: '0xclaimtx', gasPolWei: claim.gasPolWeiPerCall.toString() });
+    const reloaded = StateStore.at(stateDir).load().state;
+    expect(reloaded.positions['5678:home']?.status).toBe('claimed'); // stamped locally
+    expect(reloaded.dailyCounters[todayUTC()]?.gasPolWei).toBe(claim.gasPolWeiPerCall.toString());
+  });
+
+  it('positionType derivation: away-side claimable record → claimPosition called with positionType: 0', async () => {
+    const claim = claimRecorder();
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), positions: { '9:away': claimableRecord('9', '9', 'away') } });
+    const config = cfg({ mode: { dryRun: false }, settlement: { autoSettleOwn: false, autoClaimOwn: true, continueOnGasBudgetExhausted: false } });
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([]), { settleSpeculation: settleRecorder().fn, claimPosition: claim.fn });
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    expect(claim.calls).toEqual([{ speculationId: 9n, positionType: 0 }]); // away → 0
+  });
+
+  it('budget already exhausted (no reserve allowance) + continueOnGasBudgetExhausted=false → settle is denied with `candidate` `gas-budget-blocks-settlement` `purpose: settleSpeculation`; no on-chain write', async () => {
+    const POL = 10n ** 18n;
+    const settle = settleRecorder();
+    // Pre-seed today's counter at 0.9 POL of a 1 POL cap with 0.2 POL reserve → mayUseReserve=false denies (0.9 + 0.2 >= 1.0).
+    StateStore.at(stateDir).flush({
+      ...emptyMakerState(),
+      positions: { '1234:home': pendingSettleRecord('1234', '1234') },
+      dailyCounters: { [todayUTC()]: { gasPolWei: ((POL * 9n) / 10n).toString(), feeUsdcWei6: '0' } },
+    });
+    const config = cfg({ mode: { dryRun: false }, settlement: { autoSettleOwn: true, autoClaimOwn: true, continueOnGasBudgetExhausted: false }, gas: { maxDailyGasPOL: 1, emergencyReservePOL: 0.2 } });
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([]), { settleSpeculation: settle.fn, claimPosition: claimRecorder().fn });
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    expect(settle.calls).toHaveLength(0);
+    const candidate = readEvents().find((e) => e.kind === 'candidate' && e.skipReason === 'gas-budget-blocks-settlement');
+    expect(candidate).toMatchObject({ purpose: 'settleSpeculation', speculationId: '1234', mayUseReserve: false });
+  });
+
+  it('budget exhausted into the reserve + continueOnGasBudgetExhausted=true → settle proceeds (mayUseReserve unlocks the reserve)', async () => {
+    const POL = 10n ** 18n;
+    const settle = settleRecorder(80_000n, 30_000_000_000n);
+    // Pre-seed at 0.9 POL — normal mode would deny, mayUseReserve mode allows (still 0.1 POL to the cap).
+    StateStore.at(stateDir).flush({
+      ...emptyMakerState(),
+      positions: { '1234:home': pendingSettleRecord('1234', '1234') },
+      dailyCounters: { [todayUTC()]: { gasPolWei: ((POL * 9n) / 10n).toString(), feeUsdcWei6: '0' } },
+    });
+    const config = cfg({ mode: { dryRun: false }, settlement: { autoSettleOwn: true, autoClaimOwn: false, continueOnGasBudgetExhausted: true }, gas: { maxDailyGasPOL: 1, emergencyReservePOL: 0.2 } });
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([]), { settleSpeculation: settle.fn, claimPosition: claimRecorder().fn });
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    expect(settle.calls).toEqual([1234n]); // ran despite normal-mode budget exhaustion
+    expect(readEvents().some((e) => e.kind === 'settle')).toBe(true);
+  });
+
+  it('settleSpeculation throws (e.g. another EOA settled the same speculation concurrently) → `error` `phase: \'settle\'` is logged, tick continues; the local record stays `pendingSettle` for the next poll to reconcile', async () => {
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), positions: { '1234:home': pendingSettleRecord('1234', '1234') } });
+    const config = cfg({ mode: { dryRun: false }, settlement: { autoSettleOwn: true, autoClaimOwn: false, continueOnGasBudgetExhausted: false } });
+    const adapter = liveSpiedAdapter(
+      config,
+      () => Promise.resolve([]),
+      { settleSpeculation: () => Promise.reject(new Error('already settled')), claimPosition: claimRecorder().fn },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    const events = readEvents();
+    expect(events.find((e) => e.kind === 'error' && e.phase === 'settle')).toMatchObject({ speculationId: '1234', detail: 'already settled' });
+    expect(events.filter((e) => e.kind === 'tick-start')).toHaveLength(1); // tick continued
+    expect(StateStore.at(stateDir).load().state.positions['1234:home']?.status).toBe('pendingSettle'); // unchanged
+  });
+
+  it('claimPosition throws (e.g. already claimed by another script) → `error` `phase: \'claim\'` is logged, tick continues; the local record stays `claimable` (next poll will detect the position is gone and either trigger a backwards-transition guard or just stop reporting it)', async () => {
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), positions: { '9:home': claimableRecord('9', '9') } });
+    const config = cfg({ mode: { dryRun: false }, settlement: { autoSettleOwn: false, autoClaimOwn: true, continueOnGasBudgetExhausted: false } });
+    const adapter = liveSpiedAdapter(
+      config,
+      () => Promise.resolve([]),
+      { settleSpeculation: settleRecorder().fn, claimPosition: () => Promise.reject(new Error('already claimed')) },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    const events = readEvents();
+    expect(events.find((e) => e.kind === 'error' && e.phase === 'claim')).toMatchObject({ speculationId: '9', detail: 'already claimed' });
+    expect(StateStore.at(stateDir).load().state.positions['9:home']?.status).toBe('claimable'); // unchanged
+  });
+
+  it('mixed batch: pendingSettle + claimable + active records → only the pendingSettle is settled and only the claimable is claimed; `active` is left alone', async () => {
+    const settle = settleRecorder();
+    const claim = claimRecorder();
+    StateStore.at(stateDir).flush({
+      ...emptyMakerState(),
+      positions: {
+        '1:home': pendingSettleRecord('1', '1'),
+        '2:home': claimableRecord('2', '2'),
+        '3:home': { speculationId: '3', contestId: '3', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', side: 'home', riskAmountWei6: '250000', counterpartyRiskWei6: '250000', status: 'active', updatedAtUnixSec: T0 - 60 },
+      },
+    });
+    const config = cfg({ mode: { dryRun: false }, settlement: { autoSettleOwn: true, autoClaimOwn: true, continueOnGasBudgetExhausted: false } });
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([]), { settleSpeculation: settle.fn, claimPosition: claim.fn });
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    expect(settle.calls).toEqual([1n]);
+    expect(claim.calls.map((c) => c.speculationId)).toEqual([2n]);
+    const reloaded = StateStore.at(stateDir).load().state;
+    expect(reloaded.positions['3:home']?.status).toBe('active'); // untouched
   });
 });

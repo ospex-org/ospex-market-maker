@@ -137,7 +137,7 @@ export async function runRun(opts: RunOpts, deps: RunDeps = {}): Promise<void> {
   // auto-approve flow, so `mode: unlimited` is inert there — no refusal.
   if (opts.mode === 'live' && opts.config.approvals.autoApprove && opts.config.approvals.mode === 'unlimited' && !opts.confirmUnlimited) {
     throw new RunRefused(
-      "refusing to run live: approvals.autoApprove=true with approvals.mode=unlimited would set the PositionModule USDC allowance to MaxUint256. Pass --yes to confirm, or set approvals.mode=exact in your config (recommended — sets the allowance to the aggregate cap ceiling instead).",
+      "refusing to run live: approvals.autoApprove=true with approvals.mode=unlimited would set the PositionModule USDC allowance to MaxUint256. Pass --yes to confirm, or set approvals.mode=exact in your config (recommended — raises only to min(risk-cap ceiling, current wallet USDC) instead).",
     );
   }
   // `--address` is for read-only contexts (`doctor` / dry-run banners). In live

@@ -455,10 +455,11 @@ export class OspexAdapter {
   /**
    * Set the maker's USDC allowance for `PositionModule` (costs POL) — the maker's
    * `riskAmount` is pulled from this at match time (`PositionModule.recordFill`).
-   * `approve()` *sets* (not adds), so pass the aggregate cap ceiling; `'max'` only
-   * with explicit operator opt-in (DESIGN A6 — never unlimited by default). The
-   * lazy-creation-fee allowance (`TreasuryModule`) is intentionally not wrapped —
-   * v0 quotes only existing open speculations, so it's never pulled.
+   * `approve()` *sets* (not adds), so the caller passes the absolute target — in
+   * `mode: exact` this is `min(risk-cap ceiling, current wallet USDC)` (DESIGN §6);
+   * `'max'` only with explicit operator opt-in (DESIGN §6 — never unlimited by
+   * default). The lazy-creation-fee allowance (`TreasuryModule`) is intentionally
+   * not wrapped — v0 quotes only existing open speculations, so it's never pulled.
    */
   async approveUSDC(amount: ApproveUSDCAmount): Promise<ApproveResult> {
     return this.client.commitments.approve(amount);

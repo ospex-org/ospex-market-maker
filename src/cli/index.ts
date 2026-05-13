@@ -7,10 +7,12 @@
  * `run --dry-run` (the shadow loop — posts nothing) + `run --live` (executes the
  * reconcile's submits / off-chain cancels on chain — the two-key model from
  * DESIGN §8 gates it — plus fill detection, the position-status poll, boot-time
- * auto-approve with a wallet-bounded target, and the daily POL gas-budget
- * verdict; auto-settle / auto-claim and the on-chain kill / `raiseMinNonce`
- * paths are later Phase-3 slices), and `summary` (the NDJSON-log aggregator).
- * `cancel-stale` / `status` still exit 1 with "not yet implemented".
+ * auto-approve with a wallet-bounded target, the daily POL gas-budget verdict,
+ * auto-settle / auto-claim, and the on-chain kill path on shutdown when
+ * `killCancelOnChain: true`), `cancel-stale [--authoritative]` (the one-shot
+ * operator cleanup — off-chain by default, on-chain per record with the flag),
+ * and `summary` (the NDJSON-log aggregator). `status` still exits 1 with "not
+ * yet implemented" (next Phase-3 slice).
  *
  * CLI conventions (mirroring the SDK's AGENT_CONTRACT):
  *   - `--json` prints a `{ schemaVersion: 1, … }` envelope on stdout; everything
@@ -30,6 +32,7 @@ import { Command } from 'commander';
 
 import { loadConfig, type Config } from '../config/index.js';
 import { createOspexAdapter, type Hex } from '../ospex/index.js';
+import { CancelStaleRefused, cancelStaleExitCode, renderCancelStaleReportJson, renderCancelStaleReportText, runCancelStale } from './cancel-stale.js';
 import { doctorExitCode, renderDoctorReportJson, renderDoctorReportText, runDoctor } from './doctor.js';
 import { quoteExitCode, renderQuoteReportJson, renderQuoteReportText, runQuote } from './quote.js';
 import { RunRefused, runRun } from './run.js';
@@ -163,10 +166,31 @@ program
     process.exit(summaryExitCode(summary));
   });
 
+program
+  .command('cancel-stale')
+  .description('One-shot operator command: pull every tracked commitment whose age exceeds orders.staleAfterSeconds. Off-chain (gasless) DELETE by default; --authoritative also runs an on-chain cancelCommitment per record (costs POL gas, drawn from the emergency reserve via mayUseReserve:true). STOP `run --live` FIRST — the JSON state file is not multi-process safe (DESIGN §12). Requires mode.dryRun:false in the config (the two-key principle from `run --live`); reads the keystore passphrase from OSPEX_KEYSTORE_PASSPHRASE, else prompts on a TTY.')
+  .option('-c, --config <path>', 'path to the config YAML', DEFAULT_CONFIG_PATH)
+  .option('--authoritative', 'also call cancelCommitment on chain per record — gas-gated with mayUseReserve:true (operator-explicit, like the shutdown kill path). Without this, only the gasless off-chain DELETE runs and the signed payload stays matchable on chain until natural expiry.')
+  .option('-k, --keystore <path>', 'path to a v3 keystore — overrides config wallet.keystorePath / OSPEX_KEYSTORE_PATH')
+  .option('--json', 'emit a JSON envelope { schemaVersion: 1, cancelStale: … } on stdout')
+  .action(async (opts: { config: string; authoritative?: boolean; keystore?: string; json?: boolean }) => {
+    let config = loadConfigOrExit(opts.config);
+    if (opts.keystore !== undefined) config = { ...config, wallet: { ...config.wallet, keystorePath: opts.keystore } };
+    const report = await runCancelStale({
+      config,
+      authoritative: opts.authoritative === true,
+    }).catch((e: unknown): never => {
+      if (e instanceof CancelStaleRefused) return fail(e.message);
+      return fail(`cancel-stale failed: ${(e as Error).message}`);
+    });
+    if (opts.json === true) renderCancelStaleReportJson(report, stdout);
+    else renderCancelStaleReportText(report, stdout);
+    process.exit(cancelStaleExitCode(report));
+  });
+
 // ── Phase 3+ stubs — present so `--help` lists them and a stray invocation fails clearly ──
 
 const STUBS: ReadonlyArray<readonly [name: string, note: string]> = [
-  ['cancel-stale', 'Phase 3'],
   ['status', 'Phase 3'],
 ];
 for (const [name, note] of STUBS) {

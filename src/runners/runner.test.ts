@@ -289,6 +289,7 @@ function liveSpiedAdapter(
     getCommitment?: (hash: Hex) => Promise<Commitment>;
     getPositionStatus?: (owner: string) => Promise<PositionStatus>;
     readApprovals?: (owner: Hex) => Promise<ApprovalsSnapshot>;
+    readBalances?: (owner: Hex) => Promise<{ owner: Hex; chainId: number; native: bigint; usdc: bigint; link: bigint; usdcAddress: Hex; linkAddress: Hex }>;
   },
 ): OspexAdapter {
   const adapter = createLiveOspexAdapter(config, fakeSigner());
@@ -306,6 +307,9 @@ function liveSpiedAdapter(
   // Default `readApprovals` returns a saturated allowance — keeps existing tests (`autoApprove: false` by config default)
   // a no-op even if `applyAutoApprovals` is reached, and lets new auto-approve tests opt in by providing their own stub.
   vi.spyOn(adapter, 'readApprovals').mockImplementation(reads?.readApprovals ?? (() => Promise.resolve(approvalsSnapshotWith(2n ** 255n))));
+  // Default `readBalances` returns saturated USDC so exact-mode auto-approve isn't wallet-bound below the cap ceiling
+  // unless a test explicitly underfunds the wallet. Other balances are non-zero placeholders.
+  vi.spyOn(adapter, 'readBalances').mockImplementation(reads?.readBalances ?? ((owner: Hex) => Promise.resolve({ owner, chainId: 137, native: 1_000_000_000_000_000_000n, usdc: 2n ** 255n, link: 0n, usdcAddress: '0xusdc' as Hex, linkAddress: '0xlink' as Hex })));
   return adapter;
 }
 
@@ -2193,5 +2197,90 @@ describe('Runner — boot-time auto-approve (Phase 3 d-i)', () => {
     expect(events.find((e) => e.kind === 'error' && e.phase === 'approve')).toMatchObject({ detail: 'insufficient POL' });
     expect(events.filter((e) => e.kind === 'tick-start')).toHaveLength(1);
     expect(events.some((e) => e.kind === 'approval')).toBe(false);
+  });
+
+  it('live + autoApprove=true + boot-time state-loss hold ACTIVE → auto-approve is deferred (no readApprovals, no approveUSDC) — raising the allowance would risk re-activating latent soft-cancelled commitments (Hermes review-PR25 §1)', async () => {
+    // Seed prior telemetry but no state file → constructor's boot fail-safe holds quoting.
+    writeFileSync(join(logDir, 'run-prior.ndjson'), '{"ts":"x","runId":"prior","kind":"tick-start","tick":1}\n', 'utf8');
+    const readApprovals = vi.fn(() => Promise.resolve(approvalsSnapshotWith(0n)));
+    const readBalances = vi.fn(() => Promise.resolve({ owner: '0xowner' as Hex, chainId: 137, native: 10n ** 18n, usdc: 2n ** 255n, link: 0n, usdcAddress: '0xusdc' as Hex, linkAddress: '0xlink' as Hex }));
+    const approve = approveRecorder();
+    const config = cfg({ mode: { dryRun: false }, approvals: { autoApprove: true, mode: 'exact' } });
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]),
+      { approveUSDC: approve.fn },
+      undefined, undefined,
+      { readApprovals, readBalances },
+    );
+    const runner = makeRunner({ config, adapter, maxTicks: 1 });
+    expect(runner.isHoldingQuoting()).toBe(true);
+    await runner.run();
+    expect(readApprovals).not.toHaveBeenCalled();
+    expect(readBalances).not.toHaveBeenCalled();
+    expect(approve.calls).toHaveLength(0);
+    expect(readEvents().some((e) => e.kind === 'approval')).toBe(false);
+  });
+
+  it('live + autoApprove=true + mode=exact + wallet USDC < required ceiling → approveUSDC called with the wallet balance (wallet-bounded target per DESIGN §6); `approval` event carries walletBalanceWei6 (Hermes review-PR25 §2)', async () => {
+    const approve = approveRecorder();
+    const config = cfg({ mode: { dryRun: false }, approvals: { autoApprove: true, mode: 'exact' } });
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]),
+      { approveUSDC: approve.fn },
+      undefined, undefined,
+      {
+        readApprovals: () => Promise.resolve(approvalsSnapshotWith(0n)),
+        // Underfund the wallet: 1 USDC vs whatever the default risk-cap ceiling computes to (much larger).
+        readBalances: (owner: Hex) => Promise.resolve({ owner, chainId: 137, native: 10n ** 18n, usdc: 1_000_000n, link: 0n, usdcAddress: '0xusdc' as Hex, linkAddress: '0xlink' as Hex }),
+      },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    expect(approve.calls).toHaveLength(1);
+    expect(approve.calls[0]).toBe(1_000_000n); // target = min(ceiling, walletBalance) — bounded by the wallet
+    const approval = readEvents().find((e) => e.kind === 'approval');
+    expect(approval).toMatchObject({
+      currentAllowance: '0',
+      walletBalanceWei6: '1000000',
+      amountSetTo: '1000000', // SDK echoes back what we sent
+    });
+    // requiredAggregateAllowance is the aspirational ceiling (uncapped), > the wallet bound:
+    expect(BigInt(approval?.requiredAggregateAllowance as string) > 1_000_000n).toBe(true);
+  });
+
+  it('live + autoApprove=true + mode=exact + readBalances throws → fail closed (no approveUSDC, `error` phase \'approve\') — wallet bound is part of the safety contract (Hermes review-PR25 §2)', async () => {
+    const approve = approveRecorder();
+    const config = cfg({ mode: { dryRun: false }, approvals: { autoApprove: true, mode: 'exact' } });
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]),
+      { approveUSDC: approve.fn },
+      undefined, undefined,
+      {
+        readApprovals: () => Promise.resolve(approvalsSnapshotWith(0n)),
+        readBalances: () => Promise.reject(new Error('rpc 503')),
+      },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    expect(approve.calls).toHaveLength(0);
+    const events = readEvents();
+    expect(events.find((e) => e.kind === 'error' && e.phase === 'approve')).toMatchObject({ detail: 'rpc 503' });
+    expect(events.some((e) => e.kind === 'approval')).toBe(false);
+  });
+
+  it('live + autoApprove=true + mode=unlimited → skips the wallet-balance read (operator confirmed via --yes) — approveUSDC(\'max\') still fires, `approval` event has NO walletBalanceWei6 field', async () => {
+    const approve = approveRecorder();
+    const readBalances = vi.fn(); // never called
+    const config = cfg({ mode: { dryRun: false }, approvals: { autoApprove: true, mode: 'unlimited' } });
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]),
+      { approveUSDC: approve.fn },
+      undefined, undefined,
+      { readApprovals: () => Promise.resolve(approvalsSnapshotWith(0n)), readBalances },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    expect(approve.calls).toEqual(['max']);
+    expect(readBalances).not.toHaveBeenCalled();
+    const approval = readEvents().find((e) => e.kind === 'approval');
+    expect(approval?.walletBalanceWei6).toBeUndefined();
   });
 });

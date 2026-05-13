@@ -144,6 +144,8 @@ describe('runRun — live mode wiring', () => {
       link: { address: '0xlink' as Hex, decimals: 18, allowances: { oracleModule: { spender: '0xom' as Hex, spenderModule: 'oracleModule', raw: 0n } } },
     });
     vi.spyOn(adapter, 'approveUSDC').mockRejectedValue(new Error('liveDiscoveryFindsNothing: approveUSDC not stubbed'));
+    // Wallet balance is read in exact-mode auto-approve; default to saturated USDC so the bound never bites these tests.
+    vi.spyOn(adapter, 'readBalances').mockResolvedValue({ owner: '0xowner' as Hex, chainId: 137, native: 10n ** 18n, usdc: 2n ** 255n, link: 0n, usdcAddress: '0xusdc' as Hex, linkAddress: '0xlink' as Hex });
     return adapter;
   }
 

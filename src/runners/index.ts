@@ -70,14 +70,19 @@
  *
  * Still TODO follow-ups: P&L (realized over settled / claimed; unrealized over
  * active marked to fair — natural home is the `summary` aggregator that walks
- * `fill` / `position-transition` / `settle` / `claim` events), and the on-chain
- * authoritative cancel / `raiseMinNonce` paths used by the kill switch's
- * `killCancelOnChain: true` mode and `cancel-stale --authoritative`. Auto-settle
- * + auto-claim (`settlement.autoSettleOwn` / `autoClaimOwn`) are wired here —
- * they walk `state.positions` each tick after the position poll, gas-gated by
+ * `fill` / `position-transition` / `settle` / `claim` events), the on-chain
+ * authoritative cancel path for `cancel-stale --authoritative` (and the
+ * `raiseMinNonce` per-speculation invalidation), and the `cancel-stale` /
+ * `status` CLI commands. Auto-settle + auto-claim are wired here — they walk
+ * `state.positions` each tick after the position poll, gas-gated by
  * `canSpendGas` with `mayUseReserve = settlement.continueOnGasBudgetExhausted`,
  * and emit `settle` / `claim` events; the `claim` path stamps the local
- * `MakerPositionStatus` to `claimed` (no longer the poll's domain).
+ * `MakerPositionStatus` to `claimed`. The kill switch's on-chain path
+ * (`killCancelOnChain: true`) is wired too: on actual shutdown
+ * (`shutdownReason !== null`), `onchainKillCancel` iterates every non-terminal
+ * commitment and calls `cancelCommitmentOnchain` (gas-gated with
+ * `mayUseReserve: true` — operator-explicit "burn the reserve"), stamping
+ * each cancelled record `authoritativelyInvalidated`.
  *
  * No `@ospex/sdk` import — all chain/API access goes through the `OspexAdapter`. The
  * clock, sleep, kill-switch probe, OS-signal registration, and randomness are
@@ -470,6 +475,14 @@ export class Runner {
       }
     } finally {
       unregister();
+      // On-chain kill cancel runs BEFORE the `kill` event so the event's
+      // emission is the last word — telemetry replay sees the final state of
+      // every commitment (`authoritativelyInvalidated` if it was on-chain-
+      // cancelled). Operator-explicit + live-only + actual shutdown (not a
+      // `maxTicks`-triggered exit, which has `shutdownReason === null`).
+      if (this.shutdownReason !== null && this.config.killCancelOnChain && !this.config.mode.dryRun) {
+        await this.onchainKillCancel();
+      }
       if (this.shutdownReason !== null) this.eventLog.emit('kill', { reason: this.shutdownReason, ticks });
       // Each non-held tick already flushes; this final flush only matters when a
       // shutdown fires before the first such tick. Skipped while a state-loss hold is
@@ -1990,7 +2003,7 @@ export class Runner {
     }
   }
 
-  /** Add `gasPolWei` to today's `state.dailyCounters` counter (additive; preserves `feeUsdcWei6`; lazy-creates the entry). Shared by `applyAutoApprovals` + `settleAndClaim`. */
+  /** Add `gasPolWei` to today's `state.dailyCounters` counter (additive; preserves `feeUsdcWei6`; lazy-creates the entry). Shared by `applyAutoApprovals` + `settleAndClaim` + `onchainKillCancel`. */
   private recordGasSpentToday(today: string, gasPolWei: bigint): void {
     const existing = this.state.dailyCounters[today];
     const prior = existing !== undefined ? BigInt(existing.gasPolWei) : 0n;
@@ -1998,6 +2011,83 @@ export class Runner {
       gasPolWei: (prior + gasPolWei).toString(),
       feeUsdcWei6: existing !== undefined ? existing.feeUsdcWei6 : '0',
     };
+  }
+
+  /**
+   * Shutdown-time on-chain authoritative kill (DESIGN §6 / §13 — "hard stop"
+   * mode). Triggered when `config.killCancelOnChain: true` AND the runner is
+   * exiting via an actual operator-triggered shutdown (kill file or
+   * SIGTERM/SIGINT — `shutdownReason !== null`). Iterates every non-terminal
+   * tracked commitment (`visibleOpen` / `softCancelled` / `partiallyFilled`)
+   * and calls `adapter.cancelCommitmentOnchain(hash)` for each — the
+   * authoritative cancel (`MatchingModule.cancelCommitment`) sets
+   * `s_cancelledCommitments[hash]` on chain, after which `matchCommitment`
+   * reverts. Without this, a taker holding the signed payload can still match
+   * the commitment until its expiry — the off-chain DELETE only stops the
+   * relay from rebroadcasting.
+   *
+   * Gas-gated via `canSpendGas` with `mayUseReserve: true` — `killCancelOnChain`
+   * is operator-explicit "burn the reserve to make sure latent exposure is
+   * killed". A verdict denial emits `candidate` `gas-budget-blocks-onchain-cancel`
+   * and BREAKS the loop (subsequent cancels would deny the same way), so any
+   * remaining commitments stay matchable; the operator should top up POL +
+   * restart, or live with the latent window until natural expiry. An adapter
+   * throw on a single hash logs `error` `phase: 'onchain-cancel'` and the loop
+   * continues to the next record. Successful cancels stamp the local record
+   * to `authoritativelyInvalidated` so the next boot's risk engine doesn't
+   * count it.
+   */
+  private async onchainKillCancel(): Promise<void> {
+    if (this.makerAddress === null) return; // live-mode invariant (caller already gated on `!dryRun`)
+    const records = Object.values(this.state.commitments).filter(
+      (r) => r.lifecycle === 'visibleOpen' || r.lifecycle === 'softCancelled' || r.lifecycle === 'partiallyFilled',
+    );
+    if (records.length === 0) return;
+
+    const maxDailyGasPolWei = polFloatToWei18(this.config.gas.maxDailyGasPOL);
+    const emergencyReservePolWei = polFloatToWei18(this.config.gas.emergencyReservePOL);
+
+    for (const r of records) {
+      const now = this.deps.now();
+      const today = todayUTCDateString(now);
+      const todayGasSpentPolWei = BigInt(this.state.dailyCounters[today]?.gasPolWei ?? '0');
+      const verdict = canSpendGas({ todayGasSpentPolWei, maxDailyGasPolWei, emergencyReservePolWei, mayUseReserve: true });
+      if (!verdict.allowed) {
+        this.eventLog.emit('candidate', {
+          skipReason: 'gas-budget-blocks-onchain-cancel',
+          commitmentHash: r.hash,
+          speculationId: r.speculationId,
+          makerSide: r.makerSide,
+          todayGasSpentPolWei: todayGasSpentPolWei.toString(),
+          maxDailyGasPolWei: maxDailyGasPolWei.toString(),
+          emergencyReservePolWei: emergencyReservePolWei.toString(),
+          detail: verdict.reason,
+        });
+        // Subsequent cancels would deny the same way (today's spend only grows). Break — remaining commitments
+        // stay matchable, the operator must top up POL + restart, or wait for natural expiry.
+        break;
+      }
+
+      let result: Awaited<ReturnType<OspexAdapter['cancelCommitmentOnchain']>>;
+      try {
+        result = await this.adapter.cancelCommitmentOnchain(r.hash as Hex);
+      } catch (err) {
+        this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'onchain-cancel', commitmentHash: r.hash });
+        continue;
+      }
+      const gasPolWei = BigInt(result.receipt.gasUsed) * BigInt(result.receipt.effectiveGasPrice);
+      this.recordGasSpentToday(today, gasPolWei);
+      r.lifecycle = 'authoritativelyInvalidated';
+      r.updatedAtUnixSec = now;
+      this.eventLog.emit('onchain-cancel', {
+        commitmentHash: r.hash,
+        speculationId: r.speculationId,
+        contestId: r.contestId,
+        makerSide: r.makerSide,
+        txHash: result.txHash,
+        gasPolWei: gasPolWei.toString(),
+      });
+    }
   }
 
   /** Ticks until the next discovery cycle: `discovery.everyNTicks` jittered by ±`discovery.jitterPct` (so multiple MMs don't all discover on the same tick). At least 1. */

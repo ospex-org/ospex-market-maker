@@ -66,6 +66,7 @@ export const CANDIDATE_SKIP_REASONS = [
   'tracking-cap-reached',
   'gas-budget-blocks-reapproval',
   'gas-budget-blocks-settlement', // on-chain settleSpeculation / claimPosition denied by canSpendGas (mayUseReserve = settlement.continueOnGasBudgetExhausted); `purpose` distinguishes `settleSpeculation` vs `claimPosition`
+  'gas-budget-blocks-onchain-cancel', // shutdown-time on-chain cancelCommitment denied by canSpendGas (with mayUseReserve: true since `killCancelOnChain: true` is operator-explicit); the candidate's `commitmentHash` identifies the record that couldn't be cancelled
 ] as const;
 export type CandidateSkipReason = (typeof CANDIDATE_SKIP_REASONS)[number];
 

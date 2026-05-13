@@ -1753,7 +1753,7 @@ describe('Runner — position-status poll (review-PR23 B4)', () => {
     expect(events.some((e) => e.kind === 'fill')).toBe(false);
   });
 
-  it('a `getPositionStatus` failure is logged (`error` phase position-poll) and the tick continues normally — reconcile still runs', async () => {
+  it('a `getPositionStatus` failure with NO softCancelled records is logged (`error` phase position-poll) and the tick continues normally — reconcile still runs (detectFills already covered the maker\'s posted commitments)', async () => {
     StateStore.at(stateDir).flush(emptyMakerState());
     const config = cfg({ mode: { dryRun: false } });
     const submit = submitRecorder();
@@ -1768,6 +1768,36 @@ describe('Runner — position-status poll (review-PR23 B4)', () => {
     await makeRunner({ config, adapter, maxTicks: 1 }).run();
     const events = readEvents();
     expect(events.find((e) => e.kind === 'error' && e.phase === 'position-poll')).toMatchObject({ detail: 'positions API 500' });
-    expect(submit.calls.length).toBeGreaterThan(0); // reconcile still ran (position poll failure is best-effort, not fail-closed)
+    expect(submit.calls.length).toBeGreaterThan(0); // reconcile still ran — no softCancelled records, so the position poll failure isn't a lost-fill risk
+  });
+
+  it('a `getPositionStatus` failure WITH a non-terminal softCancelled record fails closed — reconcile + ageOut skipped, markets stay dirty for next-tick retry (review-PR23 round 2)', async () => {
+    // Setup: a softCancelled commitment whose stale signed payload could have been
+    // matched on chain at any point before expiry. The commitment-list diff (detectFills)
+    // can't see soft-cancelled commitments — the position poll is the ONLY way to learn
+    // about that match. If the poll fails, we MUST NOT (a) submit replacement quotes on
+    // exposure we may already have, or (b) terminalize the record via ageOut while a
+    // taker may have just filled it. Even a past-local-expiry record stays softCancelled
+    // this tick — next tick retries the poll.
+    const stale = commitmentRecord({ hash: '0xstaleSignedPayload', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '250000', lifecycle: 'softCancelled', expiryUnixSec: T0 - 1, postedAtUnixSec: T0 - 100, updatedAtUnixSec: T0 - 100 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xstaleSignedPayload': stale } });
+    const config = cfg({ mode: { dryRun: false } });
+    const submit = submitRecorder();
+    const adapter = liveSpiedAdapter(
+      config,
+      () => Promise.resolve([contestView({ contestId: '1234' })]),
+      { submitCommitment: submit.fn },
+      undefined,
+      undefined,
+      { getPositionStatus: () => Promise.reject(new Error('positions API 500')) },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    const events = readEvents();
+    expect(events.find((e) => e.kind === 'error' && e.phase === 'position-poll')).toMatchObject({ detail: 'positions API 500' });
+    expect(submit.calls).toHaveLength(0); // reconcile skipped — no replacement quotes posted on unverified exposure
+    const reloaded = StateStore.at(stateDir).load().state;
+    expect(reloaded.commitments['0xstaleSignedPayload']?.lifecycle).toBe('softCancelled'); // ageOut skipped — record NOT terminalized to `expired`
+    expect(events.some((e) => e.kind === 'expire')).toBe(false);
   });
 });

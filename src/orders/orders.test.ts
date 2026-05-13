@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { parseConfig, type Config } from '../config/index.js';
-import { decimalToAmerican, decimalToImpliedProb, tickToDecimal, type QuoteSide } from '../pricing/index.js';
+import { decimalToAmerican, decimalToImpliedProb, tickToDecimal, toProtocolQuote, type QuoteSide } from '../pricing/index.js';
 import type { ExposureItem, Inventory, Market } from '../risk/index.js';
 import { emptyMakerState, type MakerCommitmentRecord, type MakerPositionRecord, type MakerState } from '../state/index.js';
 import { breakdownReferenceOdds, buildDesiredQuote, inventoryFromState, reconcileBook, toRiskCaps, type BookReconciliation, type DesiredQuote } from './index.js';
@@ -59,10 +59,11 @@ function stateWith(partial: Partial<MakerState> = {}): MakerState {
   return { ...emptyMakerState(), ...partial };
 }
 
-function quoteSide(side: 'away' | 'home', quoteTick: number, sizeWei6 = 250_000): QuoteSide {
+/** A taker-offer `QuoteSide` for `takerSide` at taker tick `quoteTick`. */
+function quoteSide(takerSide: 'away' | 'home', quoteTick: number, sizeWei6 = 250_000): QuoteSide {
   const quoteDecimal = tickToDecimal(quoteTick);
   return {
-    side,
+    takerSide,
     quoteProb: decimalToImpliedProb(quoteDecimal),
     quoteDecimal,
     quoteAmerican: decimalToAmerican(quoteDecimal),
@@ -70,6 +71,12 @@ function quoteSide(side: 'away' | 'home', quoteTick: number, sizeWei6 = 250_000)
     sizeUSDC: sizeWei6 / 1_000_000,
     sizeWei6,
   };
+}
+
+/** A `visibleOpen` commitment record that *correctly* serves `offer` — `makerSide` / `oddsTick` are `toProtocolQuote` of the offer (the maker takes the opposite side, at the inverse tick), so it's the on-tick incumbent for that taker offer. */
+function incumbentFor(offer: QuoteSide, overrides: Partial<MakerCommitmentRecord> = {}): MakerCommitmentRecord {
+  const proto = toProtocolQuote({ side: offer.takerSide, oddsTick: offer.quoteTick });
+  return commitmentRecord({ makerSide: proto.makerSide, oddsTick: proto.makerOddsTick, lifecycle: 'visibleOpen', ...overrides });
 }
 
 /** A minimal `DesiredQuote` for `reconcileBook` — which only reads `result.away` / `result.home`. */
@@ -140,28 +147,31 @@ describe('buildDesiredQuote', () => {
     expect(d.result.spread).not.toBeNull();
   });
 
-  it('reduces headroom on a side that already carries exposure on that contest', () => {
-    // An away-side item of 0.9 USDC on C1 → loses if home wins → "currentLossInThatBucket" for adding more to away is 0.9.
-    // away headroom = min(perCommitment 0.25, perContest 1 - 0.9 ≈ 0.1, perTeam 2 - 0.9, perSport 5 - 0.9, bankroll 25 - 0.9) ≈ 0.1.
-    // home headroom = min(0.25, 1 - 0, 2 - 0, 5 - 0, 25 - 0.9) = 0.25.
-    const inv = inventoryWith([{ contestId: 'C1', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', makerSide: 'away', riskAmountUSDC: 0.9 }]);
+  it('reduces headroom on the offer whose protocol side already carries exposure on that contest', () => {
+    // A maker-on-*home* item of 0.9 USDC on C1 → loses if away wins; it also counts toward LAD's team
+    // exposure. The *away offer* becomes a maker-on-home commitment, so it draws on exactly that bucket
+    // (`headroomForSide(..., 'home', ...)`): away-offer headroom = min(perCommitment 0.25, perContest
+    // 1 - 0.9 ≈ 0.1, perTeam(LAD) 2 - 0.9, perSport 5 - 0.9, bankroll 25 - 0.9) ≈ 0.1. The home offer
+    // (a maker-on-away commitment) is untouched: home-offer headroom = min(0.25, 1 - 0, 2 - 0, ...) = 0.25.
+    const inv = inventoryWith([{ contestId: 'C1', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', makerSide: 'home', riskAmountUSDC: 0.9 }]);
     const d = buildDesiredQuote(cfg(), MARKET, { away: 150, home: -180 }, inv);
     expect(d.headroomUSDC.away).toBeCloseTo(0.1, 6);
     expect(d.headroomUSDC.home).toBeCloseTo(0.25, 9);
-    // Both sides still quoted, but the away quote is the smaller one (its headroom is the binding cap, ≈ 0.1, vs the home side's 0.25).
+    // Both offers still quoted, but the away offer is the smaller one (its headroom ≈ 0.1 binds, vs the home offer's 0.25).
     expect(d.result.away).not.toBeNull();
     expect(d.result.home).not.toBeNull();
     expect(d.result.away?.sizeWei6 ?? 0).toBeLessThan(d.result.home?.sizeWei6 ?? 0);
     expect(d.result.away?.sizeUSDC ?? 0).toBeLessThan(0.25);
   });
 
-  it('pulls a side whose headroom has been exhausted (clamps to 0)', () => {
-    // 1.5 USDC of away-side exposure on C1 → over the per-contest cap of 1 → away headroom clamps to 0.
-    const inv = inventoryWith([{ contestId: 'C1', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', makerSide: 'away', riskAmountUSDC: 1.5 }]);
+  it('pulls an offer whose headroom has been exhausted (clamps to 0)', () => {
+    // 1.5 USDC of maker-on-home exposure on C1 → over the per-contest cap of 1 in the "away wins" bucket
+    // → the away offer (a maker-on-home commitment) has 0 headroom and is pulled. The home offer is fine.
+    const inv = inventoryWith([{ contestId: 'C1', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', makerSide: 'home', riskAmountUSDC: 1.5 }]);
     const d = buildDesiredQuote(cfg(), MARKET, { away: 150, home: -180 }, inv);
     expect(d.headroomUSDC.away).toBe(0);
     expect(d.result.away).toBeNull();
-    // home still has headroom
+    // home offer still has headroom
     expect(d.result.home).not.toBeNull();
   });
 
@@ -283,42 +293,47 @@ describe('reconcileBook', () => {
   const OPEN_COUNT_OK = 0; // plenty of count headroom (risk.maxOpenCommitments defaults to 10)
   const NOTHING: BookReconciliation = { toSubmit: [], toReplace: [], toSoftCancel: [], deferredSides: [] };
 
+  // Reminder of the side mapping: a desired offer with `takerSide: 'away'` is served on chain by a
+  // maker-on-*home* commitment (so `makerSide: 'home'`, `oddsTick: inverseOddsTick(quoteTick)` — that's
+  // exactly what `incumbentFor` builds), and vice versa. `commitmentRecord({ makerSide: 'away' })` is
+  // therefore a quote on the *home* offer.
+
   it('submits a fresh quote on every wanted side when the maker holds nothing on the speculation', () => {
-    const r = reconcileBook([], desiredWith(quoteSide('away', 250), quoteSide('home', 165)), cfg(), NOW, OPEN_COUNT_OK);
-    expect(r.toSubmit.map((q) => q.side).sort()).toEqual(['away', 'home']);
+    const r = reconcileBook([], desiredWith(quoteSide('away', 200), quoteSide('home', 200)), cfg(), NOW, OPEN_COUNT_OK);
+    expect(r.toSubmit.map((q) => q.takerSide).sort()).toEqual(['away', 'home']);
     expect(r.toReplace).toEqual([]);
     expect(r.toSoftCancel).toEqual([]);
     expect(r.deferredSides).toEqual([]);
   });
 
-  it('soft-cancels a visibleOpen on a side the quote no longer wants, and submits the wanted side', () => {
-    const homeRec = commitmentRecord({ hash: '0xh', makerSide: 'home', lifecycle: 'visibleOpen' });
-    const r = reconcileBook([homeRec], desiredWith(quoteSide('away', 250), null), cfg(), NOW, OPEN_COUNT_OK);
-    expect(r.toSubmit.map((q) => q.side)).toEqual(['away']);
-    expect(r.toSoftCancel).toEqual([{ record: homeRec, reason: 'side-not-quoted' }]);
+  it('soft-cancels a visibleOpen on a no-longer-wanted offer side, and submits the wanted side', () => {
+    const homeOfferRec = commitmentRecord({ hash: '0xh', makerSide: 'away', lifecycle: 'visibleOpen' }); // a quote on the (now-unwanted) home offer
+    const r = reconcileBook([homeOfferRec], desiredWith(quoteSide('away', 200), null), cfg(), NOW, OPEN_COUNT_OK);
+    expect(r.toSubmit.map((q) => q.takerSide)).toEqual(['away']);
+    expect(r.toSoftCancel).toEqual([{ record: homeOfferRec, reason: 'side-not-quoted' }]);
     expect(r.toReplace).toEqual([]);
   });
 
-  it('soft-cancels a non-expired partiallyFilled remainder on a no-longer-quoted side (not just visibleOpen ones)', () => {
-    const partialHome = commitmentRecord({ hash: '0xph', makerSide: 'home', lifecycle: 'partiallyFilled', riskAmountWei6: '500000', filledRiskWei6: '200000' });
-    const visibleHome = commitmentRecord({ hash: '0xvh', makerSide: 'home', lifecycle: 'visibleOpen' });
-    const r = reconcileBook([partialHome, visibleHome], desiredWith(quoteSide('away', 250), null), cfg(), NOW, OPEN_COUNT_OK);
-    expect(r.toSubmit.map((q) => q.side)).toEqual(['away']);
+  it('soft-cancels a non-expired partiallyFilled remainder on a no-longer-quoted offer side (not just visibleOpen ones)', () => {
+    const partialHomeOffer = commitmentRecord({ hash: '0xph', makerSide: 'away', lifecycle: 'partiallyFilled', riskAmountWei6: '500000', filledRiskWei6: '200000' });
+    const visibleHomeOffer = commitmentRecord({ hash: '0xvh', makerSide: 'away', lifecycle: 'visibleOpen' });
+    const r = reconcileBook([partialHomeOffer, visibleHomeOffer], desiredWith(quoteSide('away', 200), null), cfg(), NOW, OPEN_COUNT_OK);
+    expect(r.toSubmit.map((q) => q.takerSide)).toEqual(['away']);
     expect(r.toSoftCancel).toEqual([
-      { record: visibleHome, reason: 'side-not-quoted' },
-      { record: partialHome, reason: 'side-not-quoted' },
+      { record: visibleHomeOffer, reason: 'side-not-quoted' },
+      { record: partialHomeOffer, reason: 'side-not-quoted' },
     ]);
     expect(r.toReplace).toEqual([]);
   });
 
   it('leaves a fresh, correctly-priced visibleOpen alone (no submit / replace / cancel)', () => {
-    const awayRec = commitmentRecord({ hash: '0xa', makerSide: 'away', lifecycle: 'visibleOpen', oddsTick: 250, postedAtUnixSec: NOW - 30 });
-    expect(reconcileBook([awayRec], desiredWith(quoteSide('away', 250), null), cfg(), NOW, OPEN_COUNT_OK)).toEqual(NOTHING);
+    const incumbent = incumbentFor(quoteSide('away', 200), { hash: '0xi', postedAtUnixSec: NOW - 30 });
+    expect(reconcileBook([incumbent], desiredWith(quoteSide('away', 200), null), cfg(), NOW, OPEN_COUNT_OK)).toEqual(NOTHING);
   });
 
   it('replaces a stale visibleOpen (reason "stale") on a wanted side', () => {
-    const stale = commitmentRecord({ hash: '0xa', makerSide: 'away', lifecycle: 'visibleOpen', oddsTick: 250, postedAtUnixSec: NOW - 200 }); // > staleAfterSeconds (90)
-    const replacement = quoteSide('away', 250);
+    const stale = incumbentFor(quoteSide('away', 200), { hash: '0xa', postedAtUnixSec: NOW - 200 }); // > staleAfterSeconds (90)
+    const replacement = quoteSide('away', 200);
     const r = reconcileBook([stale], desiredWith(replacement, null), cfg(), NOW, OPEN_COUNT_OK);
     expect(r.toReplace).toEqual([{ stale, reason: 'stale', replacement }]);
     expect(r.toSubmit).toEqual([]);
@@ -326,35 +341,36 @@ describe('reconcileBook', () => {
     expect(r.deferredSides).toEqual([]);
   });
 
-  it('replaces a mispriced visibleOpen (reason "mispriced"), but leaves one whose tick moved within the threshold', () => {
+  it('replaces a mispriced visibleOpen (reason "mispriced"), but leaves one whose price moved within the threshold', () => {
     const conf = cfg(); // orders.replaceOnOddsMoveBps defaults to 50
 
-    // tick 250 → implied 0.4000; tick 200 → implied 0.5000 → ~1000 bps move → mispriced.
-    const recA = commitmentRecord({ hash: '0xa', makerSide: 'away', lifecycle: 'visibleOpen', oddsTick: 250, postedAtUnixSec: NOW - 5 });
-    const repl = quoteSide('away', 200);
+    // incumbent priced for the taker-200 offer (maker tick 200, implied 0.50); the new desired is the
+    // taker-150 offer → maker tick inverseOddsTick(150) = 300 (implied 0.333) → ~1667 bps move → mispriced.
+    const recA = incumbentFor(quoteSide('away', 200), { hash: '0xa', postedAtUnixSec: NOW - 5 });
+    const repl = quoteSide('away', 150);
     let r = reconcileBook([recA], desiredWith(repl, null), conf, NOW, OPEN_COUNT_OK);
     expect(r.toReplace).toEqual([{ stale: recA, reason: 'mispriced', replacement: repl }]);
     expect(r.toSubmit).toEqual([]);
 
-    // tick 250 → implied 0.4000; tick 253 → implied ~0.39526 → ~47 bps move < 50 → not mispriced.
-    const recB = commitmentRecord({ hash: '0xb', makerSide: 'away', lifecycle: 'visibleOpen', oddsTick: 250, postedAtUnixSec: NOW - 5 });
-    r = reconcileBook([recB], desiredWith(quoteSide('away', 253), null), conf, NOW, OPEN_COUNT_OK);
+    // incumbent maker tick 200; the new desired (taker-199) → maker tick inverseOddsTick(199) = 201 → ~25 bps < 50 → not mispriced.
+    const recB = incumbentFor(quoteSide('away', 200), { hash: '0xb', postedAtUnixSec: NOW - 5 });
+    r = reconcileBook([recB], desiredWith(quoteSide('away', 199), null), conf, NOW, OPEN_COUNT_OK);
     expect(r).toEqual(NOTHING);
   });
 
   it('keeps the newest visibleOpen on a side and soft-cancels older ones as "duplicate" (book hygiene)', () => {
-    const newer = commitmentRecord({ hash: '0xnew', makerSide: 'away', lifecycle: 'visibleOpen', oddsTick: 250, postedAtUnixSec: NOW - 10 });
-    const older = commitmentRecord({ hash: '0xold', makerSide: 'away', lifecycle: 'visibleOpen', oddsTick: 250, postedAtUnixSec: NOW - 60 });
+    const newer = incumbentFor(quoteSide('away', 200), { hash: '0xnew', postedAtUnixSec: NOW - 10 });
+    const older = incumbentFor(quoteSide('away', 200), { hash: '0xold', postedAtUnixSec: NOW - 60 });
     // passed in reverse posting order — reconcileBook sorts newest-first internally.
-    let r = reconcileBook([older, newer], desiredWith(quoteSide('away', 250), null), cfg(), NOW, OPEN_COUNT_OK);
+    let r = reconcileBook([older, newer], desiredWith(quoteSide('away', 200), null), cfg(), NOW, OPEN_COUNT_OK);
     expect(r.toSoftCancel).toEqual([{ record: older, reason: 'duplicate' }]);
     expect(r.toReplace).toEqual([]); // the kept (newer) one is fresh + on-tick
     expect(r.toSubmit).toEqual([]);
 
     // if the kept one is also stale: it gets replaced, the older is still a duplicate.
-    const newerStale = commitmentRecord({ hash: '0xns', makerSide: 'away', lifecycle: 'visibleOpen', oddsTick: 250, postedAtUnixSec: NOW - 100 });
-    const olderStale = commitmentRecord({ hash: '0xos', makerSide: 'away', lifecycle: 'visibleOpen', oddsTick: 250, postedAtUnixSec: NOW - 200 });
-    const repl = quoteSide('away', 250);
+    const newerStale = incumbentFor(quoteSide('away', 200), { hash: '0xns', postedAtUnixSec: NOW - 100 });
+    const olderStale = incumbentFor(quoteSide('away', 200), { hash: '0xos', postedAtUnixSec: NOW - 200 });
+    const repl = quoteSide('away', 200);
     r = reconcileBook([olderStale, newerStale], desiredWith(repl, null), cfg(), NOW, OPEN_COUNT_OK);
     expect(r.toReplace).toEqual([{ stale: newerStale, reason: 'stale', replacement: repl }]);
     expect(r.toSoftCancel).toEqual([{ record: olderStale, reason: 'duplicate' }]);
@@ -362,12 +378,12 @@ describe('reconcileBook', () => {
   });
 
   it('soft-cancels every visibleOpen when the quote was refused (canQuote === false ⇒ both sides null)', () => {
-    const awayRec = commitmentRecord({ hash: '0xa', makerSide: 'away', lifecycle: 'visibleOpen' });
-    const homeRec = commitmentRecord({ hash: '0xh', makerSide: 'home', lifecycle: 'visibleOpen' });
-    const r = reconcileBook([awayRec, homeRec], desiredWith(null, null), cfg(), NOW, OPEN_COUNT_OK);
+    const awayOfferRec = commitmentRecord({ hash: '0xao', makerSide: 'home', lifecycle: 'visibleOpen' }); // a quote on the away offer
+    const homeOfferRec = commitmentRecord({ hash: '0xho', makerSide: 'away', lifecycle: 'visibleOpen' }); // a quote on the home offer
+    const r = reconcileBook([awayOfferRec, homeOfferRec], desiredWith(null, null), cfg(), NOW, OPEN_COUNT_OK);
     expect(r.toSoftCancel).toEqual([
-      { record: awayRec, reason: 'side-not-quoted' },
-      { record: homeRec, reason: 'side-not-quoted' },
+      { record: awayOfferRec, reason: 'side-not-quoted' }, // the away offer is processed first
+      { record: homeOfferRec, reason: 'side-not-quoted' },
     ]);
     expect(r.toSubmit).toEqual([]);
     expect(r.toReplace).toEqual([]);
@@ -375,31 +391,32 @@ describe('reconcileBook', () => {
   });
 
   it('ignores softCancelled / filled records and expired visibleOpen ones — they are not the visible book', () => {
-    const softCancelled = commitmentRecord({ hash: '0xsc', makerSide: 'away', lifecycle: 'softCancelled', postedAtUnixSec: NOW - 200 });
-    const filled = commitmentRecord({ hash: '0xf', makerSide: 'away', lifecycle: 'filled' });
-    const expiredVisible = commitmentRecord({ hash: '0xev', makerSide: 'home', lifecycle: 'visibleOpen', expiryUnixSec: NOW - 1, postedAtUnixSec: NOW - 200 });
-    const r = reconcileBook([softCancelled, filled, expiredVisible], desiredWith(quoteSide('away', 250), quoteSide('home', 165)), cfg(), NOW, OPEN_COUNT_OK);
-    expect(r.toSubmit.map((q) => q.side).sort()).toEqual(['away', 'home']); // both fresh-submitted; none of those records occupied a side
+    const softCancelled = commitmentRecord({ hash: '0xsc', makerSide: 'home', lifecycle: 'softCancelled', postedAtUnixSec: NOW - 200 });
+    const filled = commitmentRecord({ hash: '0xf', makerSide: 'home', lifecycle: 'filled' });
+    const expiredVisible = commitmentRecord({ hash: '0xev', makerSide: 'away', lifecycle: 'visibleOpen', expiryUnixSec: NOW - 1, postedAtUnixSec: NOW - 200 });
+    const r = reconcileBook([softCancelled, filled, expiredVisible], desiredWith(quoteSide('away', 200), quoteSide('home', 200)), cfg(), NOW, OPEN_COUNT_OK);
+    expect(r.toSubmit.map((q) => q.takerSide).sort()).toEqual(['away', 'home']); // both fresh-submitted; none of those records occupied an offer side
     expect(r.toSoftCancel).toEqual([]); // an expired visibleOpen is dead on chain — not soft-cancelled
     expect(r.toReplace).toEqual([]);
   });
 
   it('does not double-post over a fresh, correctly-priced partiallyFilled remainder on a wanted side (an expired one does not suppress)', () => {
-    const partial = commitmentRecord({ hash: '0xpf', makerSide: 'away', lifecycle: 'partiallyFilled', oddsTick: 250, riskAmountWei6: '500000', filledRiskWei6: '200000', postedAtUnixSec: NOW - 10 });
-    const d = desiredWith(quoteSide('away', 250), quoteSide('home', 165));
+    // a maker-on-home partial occupies the *away* offer; on-tick for the taker-200 offer (maker tick 200).
+    const partial = commitmentRecord({ hash: '0xpf', makerSide: 'home', lifecycle: 'partiallyFilled', oddsTick: 200, riskAmountWei6: '500000', filledRiskWei6: '200000', postedAtUnixSec: NOW - 10 });
+    const d = desiredWith(quoteSide('away', 200), quoteSide('home', 200));
     let r = reconcileBook([partial], d, cfg(), NOW, OPEN_COUNT_OK);
-    expect(r.toSubmit.map((q) => q.side)).toEqual(['home']); // away occupied by the (fresh, on-tick) partial
+    expect(r.toSubmit.map((q) => q.takerSide)).toEqual(['home']); // the away offer is occupied by the (fresh, on-tick) partial
     expect(r.toReplace).toEqual([]);
     expect(r.toSoftCancel).toEqual([]);
 
-    const expiredPartial = commitmentRecord({ hash: '0xep', makerSide: 'away', lifecycle: 'partiallyFilled', riskAmountWei6: '500000', filledRiskWei6: '200000', expiryUnixSec: NOW - 1 });
+    const expiredPartial = commitmentRecord({ hash: '0xep', makerSide: 'home', lifecycle: 'partiallyFilled', riskAmountWei6: '500000', filledRiskWei6: '200000', expiryUnixSec: NOW - 1 });
     r = reconcileBook([expiredPartial], d, cfg(), NOW, OPEN_COUNT_OK);
-    expect(r.toSubmit.map((q) => q.side).sort()).toEqual(['away', 'home']); // the expired partial doesn't occupy the side
+    expect(r.toSubmit.map((q) => q.takerSide).sort()).toEqual(['away', 'home']); // the expired partial doesn't occupy the offer
   });
 
   it('pulls a stale partiallyFilled incumbent and posts a fresh full quote in its place (v0 doesn\'t refresh a partial in place)', () => {
-    const stalePartial = commitmentRecord({ hash: '0xsp', makerSide: 'away', lifecycle: 'partiallyFilled', oddsTick: 250, riskAmountWei6: '500000', filledRiskWei6: '200000', postedAtUnixSec: NOW - 200 }); // > staleAfterSeconds
-    const fresh = quoteSide('away', 250);
+    const stalePartial = commitmentRecord({ hash: '0xsp', makerSide: 'home', lifecycle: 'partiallyFilled', oddsTick: 200, riskAmountWei6: '500000', filledRiskWei6: '200000', postedAtUnixSec: NOW - 200 }); // > staleAfterSeconds
+    const fresh = quoteSide('away', 200);
     const r = reconcileBook([stalePartial], desiredWith(fresh, null), cfg(), NOW, OPEN_COUNT_OK);
     expect(r.toSoftCancel).toEqual([{ record: stalePartial, reason: 'stale' }]);
     expect(r.toSubmit).toEqual([fresh]);
@@ -410,20 +427,20 @@ describe('reconcileBook', () => {
 
   it('defers fresh submits when the count budget is exhausted; one slot ⇒ exactly one side posts', () => {
     // maxOpenCommitments defaults to 10. Current count 10 ⇒ budget 0 ⇒ neither side can be posted.
-    let r = reconcileBook([], desiredWith(quoteSide('away', 250), quoteSide('home', 165)), cfg(), NOW, 10);
+    let r = reconcileBook([], desiredWith(quoteSide('away', 200), quoteSide('home', 200)), cfg(), NOW, 10);
     expect(r.toSubmit).toEqual([]);
     expect(r.deferredSides).toEqual(['away', 'home']);
 
     // Current count 9 ⇒ budget 1 ⇒ exactly one side posts (away — deterministic order), the other defers.
-    r = reconcileBook([], desiredWith(quoteSide('away', 250), quoteSide('home', 165)), cfg(), NOW, 9);
-    expect(r.toSubmit.map((q) => q.side)).toEqual(['away']);
+    r = reconcileBook([], desiredWith(quoteSide('away', 200), quoteSide('home', 200)), cfg(), NOW, 9);
+    expect(r.toSubmit.map((q) => q.takerSide)).toEqual(['away']);
     expect(r.deferredSides).toEqual(['home']);
   });
 
   it('degrades a stale-quote replacement to a plain soft-cancel when the count budget is exhausted', () => {
-    const stale = commitmentRecord({ hash: '0xa', makerSide: 'away', lifecycle: 'visibleOpen', oddsTick: 250, postedAtUnixSec: NOW - 200 });
+    const stale = incumbentFor(quoteSide('away', 200), { hash: '0xa', postedAtUnixSec: NOW - 200 });
     // Current count 10 (includes the stale one) ⇒ budget 0 ⇒ can't afford the +1 replacement post.
-    const r = reconcileBook([stale], desiredWith(quoteSide('away', 250), null), cfg(), NOW, 10);
+    const r = reconcileBook([stale], desiredWith(quoteSide('away', 200), null), cfg(), NOW, 10);
     expect(r.toReplace).toEqual([]);
     expect(r.toSoftCancel).toEqual([{ record: stale, reason: 'stale' }]); // pulled anyway — must not stay visibly stale
     expect(r.deferredSides).toEqual(['away']);
@@ -431,10 +448,10 @@ describe('reconcileBook', () => {
   });
 
   it('prioritizes a replace over a fresh submit when only one slot remains', () => {
-    const staleAway = commitmentRecord({ hash: '0xa', makerSide: 'away', lifecycle: 'visibleOpen', oddsTick: 250, postedAtUnixSec: NOW - 200 });
-    const replAway = quoteSide('away', 250);
-    // away wants a replace (+1), home wants a fresh submit (+1); budget 1 ⇒ the replace wins, home defers.
-    const r = reconcileBook([staleAway], desiredWith(replAway, quoteSide('home', 165)), cfg(), NOW, 9);
+    const staleAway = incumbentFor(quoteSide('away', 200), { hash: '0xa', postedAtUnixSec: NOW - 200 });
+    const replAway = quoteSide('away', 200);
+    // the away offer wants a replace (+1), the home offer wants a fresh submit (+1); budget 1 ⇒ the replace wins, home defers.
+    const r = reconcileBook([staleAway], desiredWith(replAway, quoteSide('home', 200)), cfg(), NOW, 9);
     expect(r.toReplace).toEqual([{ stale: staleAway, reason: 'stale', replacement: replAway }]);
     expect(r.toSubmit).toEqual([]);
     expect(r.deferredSides).toEqual(['home']);

@@ -1,3 +1,4 @@
+import type { Side } from './protocol.js';
 import type { FairOdds } from './vig.js';
 
 export type SpreadMode = 'economics' | 'direct';
@@ -43,9 +44,14 @@ export interface QuoteCommonInputs {
   /** Whether to quote both sides. v0 supports only `true`. */
   quoteBothSides: boolean;
   /**
-   * Headroom (USDC) for *additional* risk on each side of this market — computed
-   * by the risk engine from the worst-case-by-outcome caps (DESIGN §6). Tests and
-   * direct callers pass the available headroom on each side directly.
+   * Headroom (USDC) for *additional* risk on each **taker offer** side of this
+   * market — i.e. `awayHeadroomUSDC` caps the size of the *away offer* (the
+   * `QuoteSide` with `takerSide: 'away'`). Because offering a taker the away side
+   * means the maker takes the *home* side (see `toProtocolQuote`), the caller
+   * derives this from the maker-on-*home* headroom in the risk engine's
+   * worst-case-by-outcome accounting (DESIGN §5–§6) — `buildDesiredQuote` does
+   * exactly that flip. Tests / direct callers pass whatever per-offer headroom
+   * they want.
    */
   awayHeadroomUSDC: number;
   homeHeadroomUSDC: number;
@@ -54,16 +60,25 @@ export interface QuoteCommonInputs {
 /** Full input to `computeQuote` for a single moneyline market. */
 export type QuoteInputs = QuoteCommonInputs & SpreadConfig;
 
-/** A quoted side of a market. */
+/**
+ * One quoted side of a market — **taker-facing**. `takerSide` is the side a taker
+ * would be backing by matching the commitment this becomes; `quoteProb` /
+ * `quoteDecimal` / `quoteAmerican` / `quoteTick` are the price *that taker*
+ * receives — fair value with the half-spread baked in, so the taker gets
+ * slightly-worse-than-fair odds and the maker (who takes the opposite side) holds
+ * the edge. `toProtocolQuote` converts this to the on-chain commitment's
+ * maker-side `positionType` + odds tick (the *inverse* of `quoteTick`).
+ */
 export interface QuoteSide {
-  side: 'away' | 'home';
-  /** The probability we're quoting (fair + half-spread). */
+  /** The side a taker backs by matching the resulting commitment (the offer side). */
+  takerSide: Side;
+  /** The implied probability the taker faces (fair + half-spread). */
   quoteProb: number;
-  /** Decimal odds (`1 / quoteProb`). */
+  /** Decimal odds the taker receives (`1 / quoteProb`). */
   quoteDecimal: number;
-  /** American odds. */
+  /** American odds the taker receives. */
   quoteAmerican: number;
-  /** uint16 odds tick (`round(quoteDecimal × 100)`). */
+  /** uint16 odds tick the taker receives (`round(quoteDecimal × 100)`). The maker's commitment tick is `inverseOddsTick(quoteTick)`. */
   quoteTick: number;
   /** Quoted size, USDC — the quantized amount actually quoted. */
   sizeUSDC: number;
@@ -75,9 +90,9 @@ export interface QuoteSide {
 export interface QuoteResult {
   /** True if at least one side has a quote. */
   canQuote: boolean;
-  /** The away-side quote, or `null` if that side is pulled / the quote was refused. */
+  /** The away-offer quote (`takerSide: 'away'`), or `null` if that side is pulled / the quote was refused. */
   away: QuoteSide | null;
-  /** The home-side quote, or `null` if that side is pulled / the quote was refused. */
+  /** The home-offer quote (`takerSide: 'home'`), or `null` if that side is pulled / the quote was refused. */
   home: QuoteSide | null;
   /** Fair (vig-stripped) odds, or `null` if the reference odds were rejected. */
   fair: FairOdds | null;

@@ -6,9 +6,11 @@
  * `summary`. Wired so far: `doctor` + `quote --dry-run` (strictly read-only),
  * `run --dry-run` (the shadow loop — posts nothing) + `run --live` (executes the
  * reconcile's submits / off-chain cancels on chain — the two-key model from
- * DESIGN §8 gates it; later Phase-3 slices add fill detection, gas budgeting,
- * auto-settle / auto-claim, the on-chain kill path), and `summary` (the NDJSON-log
- * aggregator). `cancel-stale` / `status` still exit 1 with "not yet implemented".
+ * DESIGN §8 gates it — plus fill detection, the position-status poll, boot-time
+ * auto-approve with a wallet-bounded target, and the daily POL gas-budget
+ * verdict; auto-settle / auto-claim and the on-chain kill / `raiseMinNonce`
+ * paths are later Phase-3 slices), and `summary` (the NDJSON-log aggregator).
+ * `cancel-stale` / `status` still exit 1 with "not yet implemented".
  *
  * CLI conventions (mirroring the SDK's AGENT_CONTRACT):
  *   - `--json` prints a `{ schemaVersion: 1, … }` envelope on stdout; everything

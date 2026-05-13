@@ -70,13 +70,15 @@
  *
  * Still TODO follow-ups: P&L (realized over settled / claimed; unrealized over
  * active marked to fair — natural home is the `summary` aggregator that walks
- * `fill` / `position-transition` / `settle` / `claim` events), gas budgeting
- * in POL, and auto-settle / auto-claim. The `getPositionStatus(maker)` poll
- * backfills missing positions from soft-cancelled-then-matched commitments,
- * fails closed when it can't read while any non-terminal `softCancelled`
- * records exist, AND mirrors API bucket → local `MakerPositionStatus` with a
- * `position-transition` event on each forward step (`active` →
- * `pendingSettle` → `claimable`); `claimed` is stamped by the auto-claim path.
+ * `fill` / `position-transition` / `settle` / `claim` events), and auto-settle /
+ * auto-claim (which will reuse the daily POL gas-budget verdict that auto-approve
+ * already consumes — see `canSpendGas` + `state.dailyCounters.gasPolWei`). The
+ * `getPositionStatus(maker)` poll backfills missing positions from
+ * soft-cancelled-then-matched commitments, fails closed when it can't read while
+ * any non-terminal `softCancelled` records exist, AND mirrors API bucket → local
+ * `MakerPositionStatus` with a `position-transition` event on each forward step
+ * (`active` → `pendingSettle` → `claimable`); `claimed` is stamped by the
+ * auto-claim path.
  *
  * No `@ospex/sdk` import — all chain/API access goes through the `OspexAdapter`. The
  * clock, sleep, kill-switch probe, OS-signal registration, and randomness are

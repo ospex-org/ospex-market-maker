@@ -68,11 +68,12 @@
  *   - the per-tick state flush;
  *   - an interruptible sleep clamped to the `pollIntervalMs` floor.
  *
- * Still TODO follow-ups: periodic `getPositionStatus(maker)` polling + P&L
- * (realized over settled / claimed; unrealized over active marked to fair), gas
- * budgeting in POL, and auto-settle / auto-claim. Until the `--live` on-switch was
- * wired (the previous Phase-3 slice), the only way a `Runner` could run in live
- * mode was a test passing a signed adapter; in production `runRun` does it.
+ * Still TODO follow-ups: P&L (realized over settled / claimed; unrealized over
+ * active marked to fair), gas budgeting in POL, and auto-settle / auto-claim.
+ * The `getPositionStatus(maker)` poll is wired (it backfills missing positions
+ * from soft-cancelled-then-matched commitments); status transitions
+ * (`active` → `pendingSettle` → `claimable` → `claimed`) and the P&L computation
+ * are the next slice.
  *
  * No `@ospex/sdk` import — all chain/API access goes through the `OspexAdapter`. The
  * clock, sleep, kill-switch probe, OS-signal registration, and randomness are
@@ -93,12 +94,13 @@ import type {
   OddsSnapshotView,
   OddsSubscribeHandlersView,
   OspexAdapter,
+  PositionStatus,
   SpeculationView,
   Subscription,
 } from '../ospex/index.js';
 import { decimalToTick, inverseOddsTick, isTickInRange, oppositeSide, positionTypeForSide, toProtocolQuote, type ProtocolQuote, type QuoteSide } from '../pricing/index.js';
 import type { Market } from '../risk/index.js';
-import { assessStateLoss, type MakerCommitmentRecord, type MakerPositionRecord, type MakerSide, type MakerState, type StateLossAssessment, type StateStore } from '../state/index.js';
+import { assessStateLoss, type CommitmentLifecycle, type MakerCommitmentRecord, type MakerPositionRecord, type MakerSide, type MakerState, type StateLossAssessment, type StateStore } from '../state/index.js';
 import { EventLog, eventLogsExist } from '../telemetry/index.js';
 
 // ── injectable seams (the defaults are the real impls; tests override) ───────
@@ -447,7 +449,20 @@ export class Runner {
     }
   }
 
-  /** One iteration: discovery → reference-odds refresh → fill detection (live only) → per-market reconcile → age-out → terminal-record prune → flush. Fill detection runs *before* the reconcile so a fill within this tick (a `partiallyFilled` bump, or a `visibleOpen` that disappeared into a fill) dirties the market and the same tick's reconcile re-prices the now-imbalanced book. */
+  /**
+   * One iteration: discovery → reference-odds refresh → fill detection (live) →
+   * position-status poll (live) → per-market reconcile → age-out → terminal-record
+   * prune → flush. Fill detection runs *before* the reconcile so a fill within this
+   * tick dirties the market and the same reconcile re-prices the now-imbalanced book.
+   *
+   * **Fail-closed on lost fill visibility (live mode).** If `detectFills` can't read
+   * the maker's open commitments (`listOpenCommitments` threw), the tick skips the
+   * position poll, the reconcile (no submit / replace / soft-cancel based on
+   * unverified fill state), AND `ageOut` (don't terminalize a record that might
+   * have filled just before expiry). The markets stay `dirty`; next tick retries.
+   * `pruneTerminalCommitments` still runs (it only touches already-terminal
+   * records, which are safe).
+   */
   private async tick(tick: number): Promise<void> {
     this.eventLog.emit('tick-start', { tick });
     try {
@@ -457,9 +472,14 @@ export class Runner {
         this.nextDiscoveryAtTick = tick + this.jitteredDiscoveryInterval();
       }
       await this.refreshTrackedOdds({ ranDiscovery });
-      if (!this.config.mode.dryRun) await this.detectFills(); // live only — dry-run's synthetic commitments aren't on chain
-      await this.reconcileMarkets();
-      this.ageOut();
+      let liveStateReadOk = true;
+      if (!this.config.mode.dryRun) liveStateReadOk = await this.detectFills();
+      if (liveStateReadOk) {
+        if (!this.config.mode.dryRun) await this.pollPositionStatus(); // best-effort: failure is logged but doesn't block reconcile (detectFills already covered the maker's own commitments)
+        await this.reconcileMarkets();
+        this.ageOut();
+      }
+      // else: live mode + listOpenCommitments failed — skip all state-mutating live steps this tick (fail-closed; the markets stay dirty for next-tick retry).
       this.pruneTerminalCommitments();
     } catch (err) {
       this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'tick' });
@@ -1229,41 +1249,54 @@ export class Runner {
    * the local `visibleOpen`/`partiallyFilled` set, and:
    *
    *   - **Still listed, `filledRiskAmount` advanced** → partial-fill bump: extend the
-   *     record's `filledRiskWei6`, reclassify `partiallyFilled` (if it was
-   *     `visibleOpen`), extend the position by the delta, dirty the market, emit
-   *     `fill` `{ partial: true, newFillWei6, filledRiskWei6, … }`.
-   *   - **Disappeared, `getCommitment(hash).status === 'filled'`** → terminal fill:
-   *     extend the record's `filledRiskWei6` to the API's cumulative, reclassify
-   *     `filled`, extend the position by the delta, dirty the market, emit `fill`
-   *     `{ partial: false, … }`.
-   *   - **Disappeared, `status === 'expired'`** → reclassify `expired`, emit `expire`
-   *     (matching `ageOut`'s payload — `ageOut` will skip the now-`expired` record next tick).
-   *   - **Disappeared, `status === 'cancelled'`** → reclassify
-   *     `authoritativelyInvalidated`; no event (v0's MM doesn't on-chain-cancel its
-   *     own commitments — this signals manual cancel between runs / outside the MM,
-   *     which the operator already knows about).
+   *     record's `filledRiskWei6`, reclassify `partiallyFilled`, extend the position
+   *     by the delta, dirty the market, emit `fill` `{ partial: true, source:
+   *     'commitment-diff', newFillWei6, filledRiskWei6, … }`.
+   *   - **Disappeared** → per-hash `getCommitment(hash)` classifies, **applying any
+   *     unobserved fill delta first** (a commitment can have partially filled and
+   *     then expired / been cancelled between polls; the delta `apiFilledRiskAmount −
+   *     localFilledRiskWei6` is real on-chain risk and must enter the position):
+   *     - `filled` → record `'filled'`, fill delta applied, `fill` `{ partial: false }`.
+   *     - `expired` → fill delta applied (if any), record `'expired'`, then `expire`
+   *       (matches `ageOut`'s payload). `ageOut` skips already-`expired` records next tick.
+   *     - `cancelled` → fill delta applied (if any), record `'authoritativelyInvalidated'`.
+   *       No `expire` (v0's MM doesn't on-chain-cancel its own commitments — manual
+   *       cancel between runs / outside the MM, which the operator already knows about).
+   *
+   * Local **past-local-expiry** records are INCLUDED in the diff: the chain commitment
+   * may have filled just before expiry, and `ageOut` (which runs after this step in
+   * the same tick) reclassifies on local time alone — without this step's per-hash
+   * `getCommitment` it would terminalize a record whose actual on-chain status is
+   * `filled`, silently losing the position.
+   *
+   * **Fail closed.** Returns `false` if `listOpenCommitments` threw — the runner has
+   * no visibility into which commitments filled / expired / were cancelled, so the
+   * caller MUST skip the position poll, the reconcile (no live writes on unverified
+   * fill state), and `ageOut` (don't terminalize a record that might have filled
+   * just before expiry). Per-hash `getCommitment` failures are scoped: the other
+   * disappearances classify normally; only the failing hash retries next tick.
    *
    * Bounded reads (DESIGN §10): one `listOpenCommitments` per tick at
    * `max(maxOpenCommitments × 2, 50)`; one `getCommitment` per disappeared hash
-   * (bounded by `maxOpenCommitments`). A `listOpenCommitments` throw is logged + the
-   * tick continues (retry next tick); a per-hash `getCommitment` throw is logged +
-   * the other disappearances are still processed.
+   * (bounded by `maxOpenCommitments` plus the small expired-but-not-yet-classified
+   * backlog).
    *
-   * Soft-cancelled records are NOT tracked here (they're API-hidden, so they
-   * can't appear in `listOpenCommitments`). The known gap — a taker matching a
-   * soft-cancelled commitment via the stale signed payload — will be caught via
-   * `getPositionStatus(maker)` polling in the next Phase-3 slice.
+   * Soft-cancelled records are NOT tracked here (they're API-hidden from
+   * `listOpenCommitments`, so a per-hash poll would be O(softCancelled count)
+   * forever). A taker matching a soft-cancelled commitment via the stale signed
+   * payload is caught by `pollPositionStatus` (one aggregate call) below.
    */
-  private async detectFills(): Promise<void> {
-    if (this.makerAddress === null) return; // dry-run path — defensive (the caller skips, but belt-and-suspenders)
+  private async detectFills(): Promise<boolean> {
+    if (this.makerAddress === null) return true; // dry-run path — defensive (the caller skips); treat as ok so the rest of the tick proceeds
     const now = this.deps.now();
     const localOpen = new Map<string, MakerCommitmentRecord>();
     for (const r of Object.values(this.state.commitments)) {
       if (r.lifecycle !== 'visibleOpen' && r.lifecycle !== 'partiallyFilled') continue;
-      if (r.expiryUnixSec <= now) continue; // ageOut handles past-expiry — don't double-process
+      // Past-local-expiry records ARE included — see the doc above (a fill that landed
+      // just before expiry must be classified before `ageOut` terminalizes the record).
       localOpen.set(r.hash, r);
     }
-    if (localOpen.size === 0) return; // nothing tracked → nothing to detect
+    if (localOpen.size === 0) return true; // nothing tracked → nothing to detect
 
     const listLimit = Math.max(this.config.risk.maxOpenCommitments * 2, 50);
     let apiList: Commitment[];
@@ -1271,19 +1304,19 @@ export class Runner {
       apiList = await this.adapter.listOpenCommitments(this.makerAddress, listLimit);
     } catch (err) {
       this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'fill-detection' });
-      return; // transient — retry next tick
+      return false; // fail closed — the caller skips live writes + ageOut this tick
     }
     const apiByHash = new Map<string, Commitment>();
     for (const c of apiList) apiByHash.set(c.commitmentHash, c);
 
     // Partial-fill bumps (commitment still listed; filledRiskAmount advanced).
-    for (const [hash, record] of localOpen) {
-      const apiCommitment = apiByHash.get(hash);
+    for (const [, record] of localOpen) {
+      const apiCommitment = apiByHash.get(record.hash);
       if (apiCommitment === undefined) continue; // disappeared — handled below
       const apiFilled = BigInt(apiCommitment.filledRiskAmount);
       const localFilled = BigInt(record.filledRiskWei6);
       if (apiFilled <= localFilled) continue; // no new fill (or somehow regressed — ignore)
-      this.applyFill(record, apiFilled - localFilled, now, /* terminal */ false);
+      this.applyFill(record, apiFilled - localFilled, now, 'partiallyFilled');
     }
 
     // Disappeared hashes → per-hash terminal classification via `getCommitment`.
@@ -1296,17 +1329,20 @@ export class Runner {
         this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'fill-detection-lookup', commitmentHash: hash });
         continue; // skip this hash, retry next tick
       }
+      // For every terminal status, first compute and apply any unobserved fill delta —
+      // a commitment can have partially filled and then expired / been cancelled
+      // between polls; that delta is real on-chain risk and must enter the position
+      // before the commitment is terminalized.
+      const apiFilled = BigInt(apiCommitment.filledRiskAmount);
+      const localFilled = BigInt(record.filledRiskWei6);
+      const delta = apiFilled > localFilled ? apiFilled - localFilled : 0n;
       switch (apiCommitment.status) {
         case 'filled': {
-          const apiFilled = BigInt(apiCommitment.filledRiskAmount);
-          const localFilled = BigInt(record.filledRiskWei6);
-          const delta = apiFilled > localFilled ? apiFilled - localFilled : 0n;
-          this.applyFill(record, delta, now, /* terminal */ true);
+          this.applyFill(record, delta, now, 'filled');
           break;
         }
         case 'expired': {
-          record.lifecycle = 'expired';
-          record.updatedAtUnixSec = now;
+          this.applyFill(record, delta, now, 'expired');
           this.eventLog.emit('expire', {
             commitmentHash: record.hash,
             speculationId: record.speculationId,
@@ -1317,8 +1353,7 @@ export class Runner {
           break;
         }
         case 'cancelled': {
-          record.lifecycle = 'authoritativelyInvalidated';
-          record.updatedAtUnixSec = now;
+          this.applyFill(record, delta, now, 'authoritativelyInvalidated');
           break;
         }
         default: {
@@ -1328,31 +1363,47 @@ export class Runner {
         }
       }
     }
+    return true;
   }
 
-  /** Apply a fill delta to the commitment record + extend the corresponding position; dirty the tracked market (if any); emit `fill`. `terminal: true` for a full fill (reclassify `filled`), false for a partial bump (reclassify `partiallyFilled`). */
-  private applyFill(record: MakerCommitmentRecord, deltaWei6: bigint, now: number, terminal: boolean): void {
-    record.filledRiskWei6 = (BigInt(record.filledRiskWei6) + deltaWei6).toString();
-    record.lifecycle = terminal ? 'filled' : 'partiallyFilled';
-    record.updatedAtUnixSec = now;
-    if (deltaWei6 > 0n) this.updatePosition(record, deltaWei6, now);
-    const m = this.trackedMarkets.get(record.contestId);
-    if (m !== undefined) m.dirty = true; // the book on this side just changed — re-price next reconcile (same tick — `detectFills` runs before `reconcileMarkets`)
-    this.eventLog.emit('fill', {
-      commitmentHash: record.hash,
-      speculationId: record.speculationId,
-      contestId: record.contestId,
-      sport: record.sport,
-      awayTeam: record.awayTeam,
-      homeTeam: record.homeTeam,
-      takerSide: oppositeSide(record.makerSide),
-      makerSide: record.makerSide,
-      positionType: positionTypeForSide(record.makerSide),
-      makerOddsTick: record.oddsTick,
-      newFillWei6: deltaWei6.toString(),
-      filledRiskWei6: record.filledRiskWei6,
-      partial: !terminal,
-    });
+  /**
+   * Apply a fill delta to a commitment record and extend the matching position.
+   * Pure fill mechanics — sets `filledRiskWei6 += deltaWei6` (skipping the position
+   * update + `fill` event when `delta === 0`, which the terminal-no-fill case
+   * exercises), reclassifies the lifecycle, dirties the tracked market (so the
+   * same tick's reconcile re-prices the imbalance — `detectFills` runs first).
+   * `finalLifecycle` controls the reclassification: `'partiallyFilled'` for a
+   * still-listed bump, `'filled'` / `'expired'` / `'authoritativelyInvalidated'`
+   * for the corresponding terminal classifications. The `fill` event's `partial`
+   * field is `true` iff the final lifecycle is `'partiallyFilled'`.
+   */
+  private applyFill(record: MakerCommitmentRecord, deltaWei6: bigint, now: number, finalLifecycle: CommitmentLifecycle): void {
+    if (deltaWei6 > 0n) {
+      record.filledRiskWei6 = (BigInt(record.filledRiskWei6) + deltaWei6).toString();
+      this.updatePosition(record, deltaWei6, now);
+      const m = this.trackedMarkets.get(record.contestId);
+      if (m !== undefined) m.dirty = true; // the book on this side just changed — re-price next reconcile (same tick — `detectFills` runs before `reconcileMarkets`)
+      this.eventLog.emit('fill', {
+        source: 'commitment-diff',
+        commitmentHash: record.hash,
+        speculationId: record.speculationId,
+        contestId: record.contestId,
+        sport: record.sport,
+        awayTeam: record.awayTeam,
+        homeTeam: record.homeTeam,
+        takerSide: oppositeSide(record.makerSide),
+        makerSide: record.makerSide,
+        positionType: positionTypeForSide(record.makerSide),
+        makerOddsTick: record.oddsTick,
+        newFillWei6: deltaWei6.toString(),
+        filledRiskWei6: record.filledRiskWei6,
+        partial: finalLifecycle === 'partiallyFilled',
+      });
+    }
+    if (record.lifecycle !== finalLifecycle) {
+      record.lifecycle = finalLifecycle;
+      record.updatedAtUnixSec = now;
+    }
   }
 
   /**
@@ -1385,6 +1436,110 @@ export class Runner {
       existing.riskAmountWei6 = (BigInt(existing.riskAmountWei6) + deltaWei6).toString();
       existing.counterpartyRiskWei6 = (BigInt(existing.counterpartyRiskWei6) + counterpartyDelta).toString();
       existing.updatedAtUnixSec = now;
+    }
+  }
+
+  /**
+   * Live-mode position-status poll (DESIGN §10). One aggregate `getPositionStatus(maker)`
+   * call per tick — closes the soft-cancelled-then-matched gap that `detectFills`'s
+   * commitment-list diff can't see (a soft-cancelled commitment is API-hidden, so its
+   * stale-signed-payload match isn't visible until the indexer publishes the
+   * resulting position). For each position the API reports (`active`, `pendingSettle`,
+   * `claimable`) on `(speculationId, positionType)`, if the local
+   * `MakerPositionRecord.riskAmountWei6` is short, create / extend it by the delta,
+   * dirty the corresponding tracked market (a new on-chain fill changes the book
+   * imbalance), and emit `fill` `{ source: 'position-poll', … }`.
+   *
+   * The position record's contest / sport / team context is copied from any local
+   * commitment record on `(speculationId, makerSide)` — there's always one (the
+   * MM only has positions for speculations it submitted commitments on). If none is
+   * found (e.g. the operator pre-seeded the state, or a long-running discrepancy):
+   * log `error` `phase: 'position-poll'` and skip — we don't create incomplete
+   * position records that would corrupt the risk engine's per-team / per-sport caps.
+   *
+   * Status transitions (`active` → `pendingSettle` → `claimable` → `claimed`) and
+   * P&L computation are deferred to the next slice; this method only ever creates
+   * or extends positions to backfill missing fills, never updates statuses. A
+   * `getPositionStatus` throw is logged + the tick continues — fill detection for
+   * the maker's own posted commitments already covered the common case, and the
+   * runner stays open to a next-tick retry. (Hermes review-PR23 §4.)
+   */
+  private async pollPositionStatus(): Promise<void> {
+    if (this.makerAddress === null) return; // dry-run path — defensive (the caller skips)
+    const now = this.deps.now();
+    let status: PositionStatus;
+    try {
+      status = await this.adapter.getPositionStatus(this.makerAddress);
+    } catch (err) {
+      this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'position-poll' });
+      return; // best-effort; detectFills already handled the maker's own posted commitments
+    }
+    const apiPositions = [...status.active, ...status.pendingSettle, ...status.claimable];
+    for (const p of apiPositions) {
+      // Convert USDC float → wei6 integer. `Math.round` accepts the loss; for v0
+      // amounts (well within 2^53) this is exact for whole-cent values and at
+      // worst off-by-one wei for sub-cent fractions — acceptable when the goal
+      // is "detect a missing position" rather than penny-perfect accounting.
+      const apiRiskWei6 = BigInt(Math.round(p.riskAmountUSDC * 1_000_000));
+      const apiCounterpartyWei6 = BigInt(Math.round(p.profitAmountUSDC * 1_000_000));
+      const side: MakerSide = p.positionType === 0 ? 'away' : 'home';
+      const key = `${p.speculationId}:${side}`;
+      const existing = this.state.positions[key];
+      const localRiskWei6 = existing !== undefined ? BigInt(existing.riskAmountWei6) : 0n;
+      if (apiRiskWei6 <= localRiskWei6) continue; // already caught up — idempotent on no-change
+      const delta = apiRiskWei6 - localRiskWei6;
+      const counterpartyDelta = existing !== undefined ? apiCounterpartyWei6 - BigInt(existing.counterpartyRiskWei6) : apiCounterpartyWei6;
+      // Source-context lookup: copy contest / sport / teams from any local commitment
+      // record on this `(speculationId, makerSide)`. We always have one (we wouldn't
+      // have a position without having submitted a commitment); a miss signals state
+      // pre-seeding / external corruption — skip + log rather than create incomplete.
+      const sourceCommitment = Object.values(this.state.commitments).find(
+        (r) => r.speculationId === p.speculationId && r.makerSide === side,
+      );
+      if (sourceCommitment === undefined) {
+        this.eventLog.emit('error', {
+          class: 'PositionWithoutCommitment',
+          detail: `getPositionStatus reports a position on (${p.speculationId}, ${side}) but no local commitment with that (speculationId, makerSide) is present — refusing to create an incomplete MakerPositionRecord`,
+          phase: 'position-poll',
+          speculationId: p.speculationId,
+        });
+        continue;
+      }
+      if (existing === undefined) {
+        this.state.positions[key] = {
+          speculationId: p.speculationId,
+          contestId: sourceCommitment.contestId,
+          sport: sourceCommitment.sport,
+          awayTeam: sourceCommitment.awayTeam,
+          homeTeam: sourceCommitment.homeTeam,
+          side,
+          riskAmountWei6: delta.toString(),
+          counterpartyRiskWei6: counterpartyDelta > 0n ? counterpartyDelta.toString() : '0',
+          status: 'active',
+          updatedAtUnixSec: now,
+        };
+      } else {
+        existing.riskAmountWei6 = (BigInt(existing.riskAmountWei6) + delta).toString();
+        if (counterpartyDelta > 0n) {
+          existing.counterpartyRiskWei6 = (BigInt(existing.counterpartyRiskWei6) + counterpartyDelta).toString();
+        }
+        existing.updatedAtUnixSec = now;
+      }
+      const m = this.trackedMarkets.get(sourceCommitment.contestId);
+      if (m !== undefined) m.dirty = true;
+      this.eventLog.emit('fill', {
+        source: 'position-poll',
+        positionId: p.positionId,
+        speculationId: p.speculationId,
+        contestId: sourceCommitment.contestId,
+        sport: sourceCommitment.sport,
+        awayTeam: sourceCommitment.awayTeam,
+        homeTeam: sourceCommitment.homeTeam,
+        makerSide: side,
+        positionType: p.positionType,
+        newFillWei6: delta.toString(),
+        cumulativeRiskWei6: (localRiskWei6 + delta).toString(),
+      });
     }
   }
 

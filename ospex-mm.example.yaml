@@ -67,8 +67,9 @@ gas:
 
 approvals:
   autoApprove: false                # the MM will NOT approve USDC on its own unless this is true
-  mode: exact                       # "exact" = set PositionModule allowance to the aggregate cap ceiling (see DESIGN §6).
-                                    #   "unlimited" = MaxUint256 (requires --yes). Discouraged.
+  mode: exact                       # "exact" = raise PositionModule allowance to min(risk-cap ceiling, current wallet USDC) — see DESIGN §6.
+                                    #   Deferred while the boot-time state-loss hold is active (§12); raise-only.
+                                    #   "unlimited" = MaxUint256 (requires --yes; skips the wallet bound). Discouraged.
 
 orders:
   expiryMode: fixed-seconds         # RECOMMENDED. "fixed-seconds" = short expiry, MM rolls quotes forward.

@@ -91,6 +91,9 @@ import { existsSync } from 'node:fs';
 import { POLL_INTERVAL_FLOOR_MS, type Config } from '../config/index.js';
 import { buildDesiredQuote, inventoryFromState, reconcileBook, type BookReconciliation, type DesiredQuote, type SoftCancelReason } from '../orders/index.js';
 import type {
+  ApproveResult,
+  ApproveUSDCAmount,
+  ApprovalsSnapshot,
   Commitment,
   ContestView,
   Hex,
@@ -102,7 +105,7 @@ import type {
   Subscription,
 } from '../ospex/index.js';
 import { decimalToTick, inverseOddsTick, isTickInRange, oppositeSide, positionTypeForSide, toProtocolQuote, type ProtocolQuote, type QuoteSide } from '../pricing/index.js';
-import type { Market } from '../risk/index.js';
+import { requiredPositionModuleAllowanceUSDC, type Market } from '../risk/index.js';
 import { assessStateLoss, type CommitmentLifecycle, type MakerCommitmentRecord, type MakerPositionRecord, type MakerPositionStatus, type MakerSide, type MakerState, type StateLossAssessment, type StateStore } from '../state/index.js';
 import { EventLog, eventLogsExist } from '../telemetry/index.js';
 
@@ -430,11 +433,20 @@ export class Runner {
   async run(): Promise<void> {
     const unregister = this.deps.registerShutdownSignals(() => this.requestShutdown('signal'));
     let ticks = 0;
+    let bootApprovalsApplied = false;
     try {
       while (!this.stopRequested) {
         if (this.deps.killFileExists()) {
           this.requestShutdown('kill-file');
           break;
+        }
+        // Boot-time auto-approve runs INSIDE the loop (after the kill check so a
+        // KILL file dropped pre-boot still aborts cleanly) but BEFORE the first
+        // tick — so any allowance shortfall is closed before discovery / reconcile
+        // would matter. Runs at most once per `run()` invocation; dry-run skips.
+        if (!bootApprovalsApplied) {
+          if (!this.config.mode.dryRun) await this.applyAutoApprovals();
+          bootApprovalsApplied = true;
         }
         ticks += 1;
         await this.tick(ticks);
@@ -1669,6 +1681,69 @@ export class Runner {
       if (predictedWinSide !== undefined) payload.predictedWinSide = predictedWinSide;
       this.eventLog.emit('position-transition', payload);
     }
+  }
+
+  /**
+   * Boot-time auto-approve flow (DESIGN §6 / §13). In live mode, after the boot
+   * fail-safe but before the first tick, reads the current `PositionModule`
+   * USDC allowance for the maker; if it's short of the aggregate cap ceiling
+   * `requiredPositionModuleAllowanceUSDC(caps)`, calls `approveUSDC` to bring
+   * it up and emits an `approval` event. `mode: 'exact'` sets the allowance to
+   * the required ceiling (the safer default — `approve(x)` *sets*, doesn't
+   * add); `mode: 'unlimited'` sets it to `MaxUint256` — operator-confirmed at
+   * the CLI via `--yes`, refused by `runRun` if missing. `autoApprove: false`
+   * skips the whole flow (the operator approves manually). A `readApprovals`
+   * or `approveUSDC` failure is logged (`error` `phase: 'approve'`) and the
+   * boot proceeds — the first failed match will surface the gap loudly, and
+   * the operator can retry. Idempotent: if the current allowance already
+   * meets the target the call is silent (no `approval` event, no on-chain
+   * write). `approve(x)` is the standard ERC-20 idiom — it sets the new
+   * allowance to `x`, never above the operator's intent.
+   *
+   * The `approval` event payload carries `gasPolWei` (`gasUsed × effectiveGasPrice`)
+   * for the gas-budget tracker in (d-ii) to accumulate into `state.dailyCounters`;
+   * the per-day counter / verdict gate is wired next slice.
+   */
+  private async applyAutoApprovals(): Promise<void> {
+    if (this.makerAddress === null) return; // live-mode invariant — caller (`run()`) already gated on `!dryRun`
+    if (!this.config.approvals.autoApprove) return; // operator opted out — leave allowances as-is
+
+    let snapshot: ApprovalsSnapshot;
+    try {
+      snapshot = await this.adapter.readApprovals(this.makerAddress);
+    } catch (err) {
+      this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'approve' });
+      return;
+    }
+    const positionModule = snapshot.usdc.allowances.positionModule;
+    const currentAllowance = positionModule.raw;
+    const requiredUSDC = requiredPositionModuleAllowanceUSDC(this.config.risk);
+    const requiredWei6 = BigInt(Math.ceil(requiredUSDC * 1_000_000));
+    if (currentAllowance >= requiredWei6) return; // already sufficient — silent
+
+    const amount: ApproveUSDCAmount = this.config.approvals.mode === 'unlimited' ? 'max' : requiredWei6;
+    let result: ApproveResult;
+    try {
+      result = await this.adapter.approveUSDC(amount);
+    } catch (err) {
+      this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'approve' });
+      return;
+    }
+
+    // The approve's POL cost — wei18. Exposed for (d-ii)'s daily-counter accumulator.
+    const gasUsed = BigInt(result.receipt.gasUsed);
+    const effectiveGasPrice = BigInt(result.receipt.effectiveGasPrice);
+    const gasPolWei = (gasUsed * effectiveGasPrice).toString();
+
+    this.eventLog.emit('approval', {
+      purpose: 'positionModule',
+      spender: positionModule.spender,
+      currentAllowance: currentAllowance.toString(),
+      requiredAggregateAllowance: requiredWei6.toString(),
+      amountSetTo: result.amount.toString(),
+      txHash: result.txHash,
+      gasPolWei,
+    });
   }
 
   /** Ticks until the next discovery cycle: `discovery.everyNTicks` jittered by ±`discovery.jitterPct` (so multiple MMs don't all discover on the same tick). At least 1. */

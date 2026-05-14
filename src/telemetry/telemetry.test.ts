@@ -509,6 +509,86 @@ describe('summarize', () => {
         expect(r.netUsdcWei6).toBe('0');
       });
 
+      // ── claim.result enrichment (Phase 3 g-iii-a) ────────────────────────────
+
+      it('claim.result=push classifies as push EVEN WHEN settle.winSide is missing from the window (--since clipped the settle; closes Hermes review-PR33 follow-up note)', () => {
+        // The previously-documented limitation: a --since window catching
+        // the claim (with payout=stake refund) but clipping the settle event.
+        // Before claim.result, this counted as `won-with-zero-profit`. The
+        // runner-emitted claim.result is now authoritative.
+        const path = writeLog('run-claim-result-push.ndjson', [
+          { kind: 'fill', source: 'commitment-diff', commitmentHash: '0xa', speculationId: 'spec-A', contestId: 'A', makerSide: 'away', newFillWei6: '500000' },
+          // NO settle event in this window.
+          { kind: 'claim', speculationId: 'spec-A', contestId: 'A', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', makerSide: 'away', positionType: 0, payoutWei6: '500000', txHash: '0xtxC', result: 'push' },
+        ]);
+        const r = summarize([path]).liveMetrics.realizedPnl;
+        expect(r.pushCount).toBe(1);
+        expect(r.wonCount).toBe(0);
+        expect(r.claimedProfitUsdcWei6).toBe('0');
+        expect(r.netUsdcWei6).toBe('0');
+      });
+
+      it('claim.result=void same posture as push (refund), without settle in the window', () => {
+        const path = writeLog('run-claim-result-void.ndjson', [
+          { kind: 'fill', source: 'commitment-diff', commitmentHash: '0xa', speculationId: 'spec-A', contestId: 'A', makerSide: 'away', newFillWei6: '500000' },
+          { kind: 'claim', speculationId: 'spec-A', contestId: 'A', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', makerSide: 'away', positionType: 0, payoutWei6: '500000', txHash: '0xtxC', result: 'void' },
+        ]);
+        const r = summarize([path]).liveMetrics.realizedPnl;
+        expect(r.pushCount).toBe(1);
+        expect(r.wonCount).toBe(0);
+      });
+
+      it('claim.result=won classifies as won (authoritative; doesn\'t need settle in the window)', () => {
+        const path = writeLog('run-claim-result-won.ndjson', [
+          { kind: 'fill', source: 'commitment-diff', commitmentHash: '0xa', speculationId: 'spec-A', contestId: 'A', makerSide: 'home', newFillWei6: '500000' },
+          { kind: 'claim', speculationId: 'spec-A', contestId: 'A', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', makerSide: 'home', positionType: 1, payoutWei6: '900000', txHash: '0xtxC', result: 'won' },
+        ]);
+        const r = summarize([path]).liveMetrics.realizedPnl;
+        expect(r.wonCount).toBe(1);
+        expect(r.pushCount).toBe(0);
+        expect(r.claimedProfitUsdcWei6).toBe('400000'); // 0.9 − 0.5 = 0.4
+        expect(r.netUsdcWei6).toBe('400000');
+      });
+
+      it('older log without claim.result + settle in window → falls back to settle-based classification (push)', () => {
+        // Regression of the existing g-ii push-with-claim behaviour: when the
+        // runner-emitted result field is absent (a log written before
+        // (g-iii-a)), the classifier still gets it right via settle.winSide.
+        const path = writeLog('run-no-claim-result.ndjson', [
+          { kind: 'fill', source: 'commitment-diff', commitmentHash: '0xa', speculationId: 'spec-A', contestId: 'A', makerSide: 'away', newFillWei6: '500000' },
+          { kind: 'settle', speculationId: 'spec-A', contestId: 'A', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', makerSide: 'away', winSide: 'push', txHash: '0xtxS' },
+          { kind: 'claim', speculationId: 'spec-A', contestId: 'A', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', makerSide: 'away', positionType: 0, payoutWei6: '500000', txHash: '0xtxC' }, // no `result` field
+        ]);
+        const r = summarize([path]).liveMetrics.realizedPnl;
+        expect(r.pushCount).toBe(1);
+        expect(r.wonCount).toBe(0);
+      });
+
+      it('claim.result=push overrides settle.winSide=won (extremely unlikely edge — but documents that the runner-emitted result is the source of truth)', () => {
+        // This isn't expected to happen in real telemetry — the runner sets
+        // result from the same API observation that produced the settle event
+        // — but covers the contract: when both are present, claim.result wins.
+        const path = writeLog('run-result-precedence.ndjson', [
+          { kind: 'fill', source: 'commitment-diff', commitmentHash: '0xa', speculationId: 'spec-A', contestId: 'A', makerSide: 'away', newFillWei6: '500000' },
+          { kind: 'settle', speculationId: 'spec-A', contestId: 'A', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', makerSide: 'away', winSide: 'away', txHash: '0xtxS' }, // "settle says we won"
+          { kind: 'claim', speculationId: 'spec-A', contestId: 'A', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', makerSide: 'away', positionType: 0, payoutWei6: '500000', txHash: '0xtxC', result: 'push' }, // "claim says push"
+        ]);
+        const r = summarize([path]).liveMetrics.realizedPnl;
+        expect(r.pushCount).toBe(1);
+        expect(r.wonCount).toBe(0);
+      });
+
+      it('malformed claim.result value is dropped (forward-compat: a future result value doesn\'t corrupt classification — falls back to settle.winSide)', () => {
+        const path = writeLog('run-malformed-result.ndjson', [
+          { kind: 'fill', source: 'commitment-diff', commitmentHash: '0xa', speculationId: 'spec-A', contestId: 'A', makerSide: 'home', newFillWei6: '500000' },
+          { kind: 'settle', speculationId: 'spec-A', contestId: 'A', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', makerSide: 'home', winSide: 'home', txHash: '0xtxS' },
+          { kind: 'claim', speculationId: 'spec-A', contestId: 'A', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', makerSide: 'home', positionType: 1, payoutWei6: '900000', txHash: '0xtxC', result: 'mystery-future-value' },
+        ]);
+        const r = summarize([path]).liveMetrics.realizedPnl;
+        expect(r.wonCount).toBe(1); // falls back to settle.winSide === makerSide
+        expect(r.claimedProfitUsdcWei6).toBe('400000');
+      });
+
       it('wonUnclaimed — settle.winSide=makerSide but no claim in the window → count incremented, NO net P&L contribution (payout unknown until claim fires)', () => {
         const path = writeLog('run-paper.ndjson', [
           { kind: 'fill', source: 'commitment-diff', commitmentHash: '0xa', speculationId: 'spec-A', contestId: 'A', makerSide: 'home', newFillWei6: '500000' },

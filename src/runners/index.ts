@@ -1693,7 +1693,7 @@ export class Runner {
     const fromStatus: MakerPositionStatus | undefined = existing?.status;
 
     if (existing === undefined) {
-      this.state.positions[key] = {
+      const fresh: MakerPositionRecord = {
         speculationId: p.speculationId,
         contestId: context.contestId,
         sport: context.sport,
@@ -1705,6 +1705,12 @@ export class Runner {
         status: apiStatus,
         updatedAtUnixSec: now,
       };
+      // Settled outcome (`won` / `push` / `void`) becomes known when the API
+      // view advances to `pendingSettle` / `claimable`. Store it so the
+      // auto-claim emit can carry it (closes the realized-P&L window-clip
+      // loophole from Hermes review-PR33).
+      if (result !== undefined) fresh.result = result;
+      this.state.positions[key] = fresh;
     } else {
       if (riskGrew) {
         existing.riskAmountWei6 = (BigInt(existing.riskAmountWei6) + delta).toString();
@@ -1713,6 +1719,11 @@ export class Runner {
         }
       }
       if (statusChanged) existing.status = apiStatus;
+      // Always refresh `result` from the latest API view. The field stays
+      // undefined while the speculation is still `active` and gets a value
+      // the moment it advances to `pendingSettle` / `claimable`; we don't
+      // unset it later (settled outcomes don't un-settle).
+      if (result !== undefined) existing.result = result;
       existing.updatedAtUnixSec = now;
     }
 
@@ -2002,7 +2013,7 @@ export class Runner {
       this.recordGasSpentToday(today, gasPolWei);
       r.status = 'claimed';
       r.updatedAtUnixSec = this.deps.now();
-      this.eventLog.emit('claim', {
+      const claimPayload: Record<string, unknown> = {
         speculationId: r.speculationId,
         contestId: r.contestId,
         sport: r.sport,
@@ -2013,7 +2024,14 @@ export class Runner {
         payoutWei6: result.payoutWei6.toString(),
         txHash: result.txHash,
         gasPolWei: gasPolWei.toString(),
-      });
+      };
+      // Settled outcome from the API's ClaimablePositionView.result (captured
+      // during the position-status poll, stored on r.result). Lets the summary
+      // walker classify the position as push/void without depending on a
+      // `settle` event being in the same `--since` window (closes Hermes
+      // review-PR33's documented limitation).
+      if (r.result !== undefined) claimPayload.result = r.result;
+      this.eventLog.emit('claim', claimPayload);
     }
   }
 

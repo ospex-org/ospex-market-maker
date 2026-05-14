@@ -139,11 +139,12 @@ function adapterWithLivePositionsThrowing(err: Error): OspexAdapter {
   return new OspexAdapter(client, { chainId: 137, apiUrl: 'https://api.test' });
 }
 
-/** Default deps — no keystore plaintext address, fixed clock at T0. */
+/** Default deps — no keystore plaintext address, no prior telemetry (genuine first run), fixed clock at T0. */
 function defaultDeps(overrides: StatusDeps = {}, loadResult: StateLoadResult = { state: emptyMakerState(), status: { kind: 'fresh' } }): StatusDeps {
   return {
     makeStateStore: () => fakeStateStore(loadResult) as unknown as ReturnType<NonNullable<StatusDeps['makeStateStore']>>,
     readKeystoreAddress: () => null,
+    hasPriorTelemetry: () => false,
     now: () => T0,
     ...overrides,
   };
@@ -162,21 +163,36 @@ function collect(): { sink: { write(s: string): void }; text: () => string } {
 
 // ── state-integrity scenarios ────────────────────────────────────────────────
 
-describe('runStatus — state-file integrity', () => {
-  it('fresh state (no file) → integrity:"fresh", lastFlushedAt:null, all counts zero', async () => {
+describe('runStatus — state-file integrity + state-loss assessment', () => {
+  it('fresh state + no prior telemetry → integrity:"fresh", stateLossAssessment.holdQuoting:false (genuine first run, nothing to under-count)', async () => {
     const adapter = adapterWithLivePositions(zeroTotals);
     const report = await runStatus(
       { config: cfg(), configPath: '/c.yaml', adapter },
-      defaultDeps({}, { state: emptyMakerState(), status: { kind: 'fresh' } }),
+      defaultDeps({ hasPriorTelemetry: () => false }, { state: emptyMakerState(), status: { kind: 'fresh' } }),
     );
     expect(report.stateIntegrity).toBe('fresh');
-    expect(report.stateLostReason).toBeNull();
+    expect(report.stateLossAssessment.holdQuoting).toBe(false);
+    expect(report.stateLossAssessment.reason).toMatch(/genuine first run/);
     expect(report.lastFlushedAt).toBeNull();
     expect(report.commitments.total).toBe(0);
     expect(report.positions.total).toBe(0);
   });
 
-  it('loaded state → integrity:"loaded", lastFlushedAt + lastRunId surfaced', async () => {
+  it('fresh state + PRIOR TELEMETRY → integrity:"fresh" BUT stateLossAssessment.holdQuoting:true with the "soft-cancelled set is gone" diagnostic (Hermes review-PR31 blocker)', async () => {
+    const adapter = adapterWithLivePositions(zeroTotals);
+    const report = await runStatus(
+      { config: cfg(), configPath: '/c.yaml', adapter },
+      defaultDeps({ hasPriorTelemetry: () => true }, { state: emptyMakerState(), status: { kind: 'fresh' } }),
+    );
+    expect(report.stateIntegrity).toBe('fresh');
+    expect(report.stateLossAssessment.holdQuoting).toBe(true);
+    expect(report.stateLossAssessment.reason).toMatch(/soft-cancelled set is gone/);
+    expect(report.stateLossAssessment.suggestedWaitSeconds).toBe(120); // default orders.expirySeconds
+    // Crucial — status REPORTS the loss; it doesn't refuse. Exit code stays 0; the diagnostic is the report itself.
+    expect(statusExitCode(report)).toBe(0);
+  });
+
+  it('loaded state → integrity:"loaded", stateLossAssessment.holdQuoting:false ("state loaded cleanly"); lastFlushedAt + lastRunId surfaced', async () => {
     const state: MakerState = {
       ...emptyMakerState(),
       lastFlushedAt: '2026-05-13T19:00:00.000Z',
@@ -185,15 +201,16 @@ describe('runStatus — state-file integrity', () => {
     const adapter = adapterWithLivePositions(zeroTotals);
     const report = await runStatus(
       { config: cfg(), configPath: '/c.yaml', adapter },
-      defaultDeps({}, { state, status: { kind: 'loaded' } }),
+      defaultDeps({ hasPriorTelemetry: () => true }, { state, status: { kind: 'loaded' } }), // prior telemetry exists; doesn't matter when loaded
     );
     expect(report.stateIntegrity).toBe('loaded');
-    expect(report.stateLostReason).toBeNull();
+    expect(report.stateLossAssessment.holdQuoting).toBe(false);
+    expect(report.stateLossAssessment.reason).toMatch(/loaded cleanly/);
     expect(report.lastFlushedAt).toBe('2026-05-13T19:00:00.000Z');
     expect(report.lastRunId).toBe('run-xyz');
   });
 
-  it('lost state → integrity:"lost", reason surfaced (no refusal — status reports state-loss, it does not refuse)', async () => {
+  it('lost state → integrity:"lost", stateLossAssessment.holdQuoting:true with the load-time reason (no refusal — status reports state-loss, it does not refuse)', async () => {
     const lost: StateLoadStatus = { kind: 'lost', reason: 'state file failed validation: bad version' };
     const adapter = adapterWithLivePositions(zeroTotals);
     const report = await runStatus(
@@ -201,8 +218,8 @@ describe('runStatus — state-file integrity', () => {
       defaultDeps({}, { state: emptyMakerState(), status: lost }),
     );
     expect(report.stateIntegrity).toBe('lost');
-    expect(report.stateLostReason).toMatch(/bad version/);
-    // Exit code is still 0 — status is a snapshot, not a check (the integrity field in the JSON is the diagnostic).
+    expect(report.stateLossAssessment.holdQuoting).toBe(true);
+    expect(report.stateLossAssessment.reason).toMatch(/bad version/);
     expect(statusExitCode(report)).toBe(0);
   });
 });
@@ -405,7 +422,7 @@ describe('runStatus — renderers', () => {
       configPath: '/c.yaml',
       statePath: '/state/maker-state.json',
       stateIntegrity: 'loaded',
-      stateLostReason: null,
+      stateLossAssessment: { holdQuoting: false, reason: 'state loaded cleanly' },
       lastFlushedAt: '2026-05-13T19:00:00.000Z',
       lastRunId: 'run-xyz',
       commitments: {
@@ -466,13 +483,27 @@ describe('runStatus — renderers', () => {
     expect(out).toMatch(/active\s+1$/m);
   });
 
-  it('text renderer flags a lost state with the reason in-line', () => {
+  it('text renderer flags a lost state with the assessment reason on its own line', () => {
     const c = collect();
     renderStatusReportText(buildSampleReport({
       stateIntegrity: 'lost',
-      stateLostReason: 'state file failed validation: bad version',
+      stateLossAssessment: { holdQuoting: true, reason: 'state was lost (state file failed validation: bad version) — must not resume quoting on a blank slate' },
     }), c.sink);
-    expect(c.text()).toMatch(/state file:.*lost.*bad version/);
+    const out = c.text();
+    expect(out).toMatch(/state file:.*lost/);
+    expect(out).toMatch(/state-loss:.*bad version/);
+  });
+
+  it('text renderer flags a fresh-with-prior-telemetry state-loss (Hermes review-PR31 blocker — without this, a deleted state file looks like a clean fresh snapshot)', () => {
+    const c = collect();
+    renderStatusReportText(buildSampleReport({
+      stateIntegrity: 'fresh',
+      stateLossAssessment: { holdQuoting: true, reason: 'the state file is missing but prior telemetry shows a prior run — its soft-cancelled set is gone — must not resume quoting on a blank slate', suggestedWaitSeconds: 120 },
+    }), c.sink);
+    const out = c.text();
+    expect(out).toMatch(/state file:.*fresh/);
+    expect(out).toMatch(/state-loss:.*soft-cancelled set is gone/);
+    expect(out).toMatch(/wait 120s under fixed-seconds expiry/);
   });
 
   it('text renderer prints the skip reason when live read was skipped', () => {

@@ -17,12 +17,17 @@
  * the live position read is skipped (with a clear reason) unless `--address`
  * is passed. The skip is informational, not an error.
  *
- * State-loss posture: this command **reports** state-loss situations (fresh +
- * prior telemetry, or a corrupt state file), it does NOT refuse on them. The
- * whole point of `status` is to tell the operator what's going on — refusing
- * on the broken state would hide the diagnostic. The integrity field in the
- * report makes the loss explicit; `run --live` / `cancel-stale` are the
- * commands that fail-closed on the same conditions.
+ * State-loss posture: this command **reports** state-loss situations (fresh
+ * state + prior telemetry, or a corrupt state file), it does NOT refuse on
+ * them. The whole point of `status` is to tell the operator what's going on
+ * — refusing on the broken state would hide the diagnostic. The report uses
+ * the canonical `assessStateLoss` from `src/state/` (the same helper the
+ * runner and `doctor` use), so all three speak the same vocabulary. The
+ * `stateLossAssessment` field carries the verdict: `holdQuoting` is `true`
+ * for `fresh + prior telemetry` ("the prior soft-cancelled set is gone") AND
+ * for `lost` ("state was lost"); the human-readable `reason` distinguishes
+ * them. `run --live` / `cancel-stale` are the commands that fail-closed on
+ * the same conditions.
  *
  * Exit code: always `0`. Operational failures during the optional live read
  * are surfaced in `livePositionsSkipReason` (still exit 0). Genuine throws
@@ -40,13 +45,16 @@ import {
   type PositionStatus,
 } from '../ospex/index.js';
 import {
+  assessStateLoss,
   type CommitmentLifecycle,
   type MakerPositionStatus,
   type MakerState,
   type PnlSnapshot,
   type StateLoadResult,
+  type StateLossAssessment,
   StateStore,
 } from '../state/index.js';
+import { eventLogsExist as eventLogsExistImpl } from '../telemetry/index.js';
 
 // ── report shape ─────────────────────────────────────────────────────────────
 
@@ -99,10 +107,17 @@ export interface StatusReport {
   configPath: string;
   /** Absolute(-ish) path of the state file (informational). */
   statePath: string;
-  /** State-file integrity — `'loaded'` (file present + valid), `'fresh'` (no file), or `'lost'` (file present but unreadable / corrupt). Same vocabulary the runner's fail-safe uses. */
+  /** State-file integrity — `'loaded'` (file present + valid), `'fresh'` (no file), or `'lost'` (file present but unreadable / corrupt). The integrity alone doesn't capture state-loss — see {@link stateLossAssessment} for the full diagnostic (a `fresh` integrity with prior telemetry is also a loss). */
   stateIntegrity: 'loaded' | 'fresh' | 'lost';
-  /** Present when `stateIntegrity === 'lost'` — the load-time reason. */
-  stateLostReason: string | null;
+  /**
+   * Result of the canonical {@link assessStateLoss} verdict (the same helper
+   * the runner and `doctor` use). `holdQuoting` is `true` for `lost` AND for
+   * `fresh + prior telemetry` (the prior `softCancelled` set is gone, a
+   * subsequent `run --live` boot would hold or refuse). `reason` carries a
+   * human-readable diagnosis; `suggestedWaitSeconds` is set when the
+   * simplest mitigation is to wait one expiry window.
+   */
+  stateLossAssessment: StateLossAssessment;
   /** When the state was last flushed (ISO-8601), or `null` for a never-flushed state. */
   lastFlushedAt: string | null;
   /** The `runId` of the run that last wrote this state — `null` for a fresh state. */
@@ -139,6 +154,8 @@ export interface StatusDeps {
   makeStateStore?: (dir: string) => StateStore;
   /** Read the keystore's plaintext `address` field without decryption (a v3 / ethers-style keystore convenience). Default: {@link readKeystoreAddressImpl}. */
   readKeystoreAddress?: (path: string) => Hex | null;
+  /** Does `telemetry.logDir` hold any prior `run-*.ndjson` file? Default: {@link eventLogsExistImpl}. Drives the `fresh + prior telemetry` arm of {@link assessStateLoss} — distinguishes a genuine first run (no prior evidence) from state loss (prior telemetry exists but the state file is missing). */
+  hasPriorTelemetry?: (logDir: string) => boolean;
   /** Wall clock — unix seconds. Default: `Math.floor(Date.now() / 1000)`. Used to key today's `dailyCounters` entry. */
   now?: () => number;
 }
@@ -156,11 +173,23 @@ export interface StatusDeps {
 export async function runStatus(opts: StatusOpts, deps: StatusDeps = {}): Promise<StatusReport> {
   const makeStateStore = deps.makeStateStore ?? ((dir: string): StateStore => StateStore.at(dir));
   const readKeystoreAddress = deps.readKeystoreAddress ?? readKeystoreAddressImpl;
+  const hasPriorTelemetry = deps.hasPriorTelemetry ?? eventLogsExistImpl;
   const now = deps.now ?? ((): number => Math.floor(Date.now() / 1000));
 
   const stateStore = makeStateStore(opts.config.state.dir);
   const loadResult: StateLoadResult = stateStore.load();
   const state = loadResult.state;
+
+  // Run the canonical state-loss assessment — the same one the runner / doctor
+  // use. Distinguishes a genuine first run (`fresh + no telemetry`) from state
+  // loss (`fresh + prior telemetry`) and a corrupt file (`lost`). `status`
+  // never sets the override — that's an operator action; this is just a
+  // diagnostic.
+  const stateLossAssessment = assessStateLoss(loadResult.status, {
+    hasPriorTelemetry: hasPriorTelemetry(opts.config.telemetry.logDir),
+    ignoreMissingStateOverride: false,
+    expirySeconds: opts.config.orders.expirySeconds,
+  });
 
   // Resolve the maker address read-only. `--address` wins; else try the
   // keystore's plaintext `address` field (Foundry-style keystores omit it,
@@ -209,7 +238,7 @@ export async function runStatus(opts: StatusOpts, deps: StatusDeps = {}): Promis
     configPath: opts.configPath,
     statePath: stateStore.statePath,
     stateIntegrity: loadResult.status.kind,
-    stateLostReason: loadResult.status.kind === 'lost' ? loadResult.status.reason : null,
+    stateLossAssessment,
     lastFlushedAt: state.lastFlushedAt,
     lastRunId: state.lastRunId,
     commitments,
@@ -313,7 +342,13 @@ export function renderStatusReportJson(report: StatusReport, out: { write(s: str
 export function renderStatusReportText(report: StatusReport, out: { write(s: string): void }): void {
   out.write(`ospex-mm status\n\n`);
   out.write(`config:           ${report.configPath}\n`);
-  out.write(`state file:       ${report.statePath} (${report.stateIntegrity}${report.stateLostReason ? ` — ${report.stateLostReason}` : ''})\n`);
+  out.write(`state file:       ${report.statePath} (${report.stateIntegrity})\n`);
+  if (report.stateLossAssessment.holdQuoting) {
+    out.write(`state-loss:       ${report.stateLossAssessment.reason}\n`);
+    if (report.stateLossAssessment.suggestedWaitSeconds !== undefined) {
+      out.write(`                  (simplest mitigation: wait ${report.stateLossAssessment.suggestedWaitSeconds}s under fixed-seconds expiry, or pass --ignore-missing-state to run --live / cancel-stale)\n`);
+    }
+  }
   out.write(`last flushed:     ${report.lastFlushedAt ?? '(never)'}\n`);
   out.write(`last run id:      ${report.lastRunId ?? '(none)'}\n`);
   out.write(`wallet:           ${report.makerAddress ?? '(unresolved)'}${report.makerAddress !== null ? ` (${report.makerAddressSource})` : ''}\n\n`);

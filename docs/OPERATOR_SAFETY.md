@@ -17,7 +17,7 @@ Read this before running the market maker against real funds. It is the safe-ope
 ## Funding
 
 - The MM needs **USDC** (for stakes) and **POL/MATIC** (for gas: approvals, on-chain cancels, settle, claim). It does **not** need LINK.
-- Keep both topped up. `ospex-mm doctor` and `ospex-mm status` flag low balances. If you run out of POL while you have winning positions, you won't be able to claim them until you refuel — your funds aren't lost, but they're stuck.
+- Keep both topped up. `ospex-mm doctor` flags low wallet balances; `ospex-mm status` reports today's accumulated POL gas spend + the live `positions.status` totals (claimable payout sums) so you can see at a glance whether you have unclaimed winnings sitting on chain. If you run out of POL while you have winning positions, you won't be able to claim them until you refuel — your funds aren't lost, but they're stuck.
 - The MM approves USDC only to `PositionModule`. It will **not** approve on its own unless you set `approvals.autoApprove: true`. Even then, `mode: exact` (the default) raises the allowance only to `min(risk-cap ceiling, current wallet USDC balance)` — a finite, wallet-bounded amount — and is **raise-only** (an existing higher allowance is left alone). The auto-approve is **deferred while the boot-time state-loss hold is active** (a missing/corrupt state file with prior telemetry): raising the allowance during that window could re-activate latent soft-cancelled signed commitments, so the MM waits for the hold to lift before approving. An unlimited approval (`MaxUint256`) only happens if you explicitly set `approvals.mode: unlimited` *and* confirm with `--yes` on the CLI. Audit your approvals with `ospex approvals show`; revoke ones you don't need.
 
 ## Dry-run first

@@ -11,8 +11,10 @@
  * auto-settle / auto-claim, and the on-chain kill path on shutdown when
  * `killCancelOnChain: true`), `cancel-stale [--authoritative]` (the one-shot
  * operator cleanup — off-chain by default, on-chain per record with the flag),
- * and `summary` (the NDJSON-log aggregator). `status` still exits 1 with "not
- * yet implemented" (next Phase-3 slice).
+ * `status` (read-only state snapshot + optional live `positions.status(maker)`
+ * totals), and `summary` (the NDJSON-log aggregator). The full command surface
+ * is now wired; the remaining Phase-3 work is the live-mode `summary` metrics
+ * + P&L and the `raiseMinNonce` bulk-invalidate optimization (see DESIGN §14).
  *
  * CLI conventions (mirroring the SDK's AGENT_CONTRACT):
  *   - `--json` prints a `{ schemaVersion: 1, … }` envelope on stdout; everything
@@ -36,6 +38,7 @@ import { CancelStaleRefused, cancelStaleExitCode, renderCancelStaleReportJson, r
 import { doctorExitCode, renderDoctorReportJson, renderDoctorReportText, runDoctor } from './doctor.js';
 import { quoteExitCode, renderQuoteReportJson, renderQuoteReportText, runQuote } from './quote.js';
 import { RunRefused, runRun } from './run.js';
+import { renderStatusReportJson, renderStatusReportText, runStatus, statusExitCode } from './status.js';
 import { renderSummaryReportJson, renderSummaryReportText, runSummary, summaryExitCode, type RunSummary } from './summary.js';
 
 const DEFAULT_CONFIG_PATH = './ospex-mm.yaml';
@@ -190,22 +193,26 @@ program
     process.exit(cancelStaleExitCode(report));
   });
 
-// ── Phase 3+ stubs — present so `--help` lists them and a stray invocation fails clearly ──
-
-const STUBS: ReadonlyArray<readonly [name: string, note: string]> = [
-  ['status', 'Phase 3'],
-];
-for (const [name, note] of STUBS) {
-  program
-    .command(name)
-    .description(`(not yet implemented — ${note})`)
-    .allowUnknownOption(true)
-    .allowExcessArguments(true)
-    .action(() => {
-      process.stderr.write(`ospex-mm ${name}: not yet implemented (${note}) — see docs/DESIGN.md §14\n`);
-      process.exit(1);
-    });
-}
+program
+  .command('status')
+  .description('Read-only snapshot of the persisted state: commitments by lifecycle, positions by status (with USDC sums), today + lifetime gas / fees, the PnL snapshot, and the last run id — plus, when a maker address can be resolved without decrypting the keystore (--address, or a v3 keystore with a plaintext `address` field), the SDK\'s `positions.status(maker)` totals from the API. No keystore unlock; no writes; always exits 0.')
+  .option('-c, --config <path>', 'path to the config YAML', DEFAULT_CONFIG_PATH)
+  .option('-a, --address <addr>', 'maker wallet address (read-only override — keeps the call signer-free; lets the live position read run without an ethers-style keystore)')
+  .option('--json', 'emit a JSON envelope { schemaVersion: 1, status: … } on stdout')
+  .action(async (opts: { config: string; address?: string; json?: boolean }) => {
+    const config = loadConfigOrExit(opts.config);
+    const address = parseAddressOrExit(opts.address);
+    const adapter = createOspexAdapter(config);
+    const report = await runStatus({
+      config,
+      configPath: opts.config,
+      adapter,
+      ...(address !== undefined ? { address } : {}),
+    }).catch((e: unknown): never => fail(`status failed: ${(e as Error).message}`));
+    if (opts.json === true) renderStatusReportJson(report, stdout);
+    else renderStatusReportText(report, stdout);
+    process.exit(statusExitCode(report));
+  });
 
 program.parseAsync(process.argv).catch((e: unknown) => {
   process.stderr.write(`ospex-mm: ${(e as Error).message}\n`);

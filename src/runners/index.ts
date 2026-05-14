@@ -1644,7 +1644,15 @@ export class Runner {
     const localRiskWei6 = existing !== undefined ? BigInt(existing.riskAmountWei6) : 0n;
     const riskGrew = apiRiskWei6 > localRiskWei6;
     const statusChanged = existing !== undefined && existing.status !== apiStatus;
-    if (existing !== undefined && !riskGrew && !statusChanged) return; // already caught up — idempotent on no-change
+    // `resultChanged` covers the upgrade path: a position record persisted
+    // before PR (g-iii-a) sits in the same bucket with `result: undefined`;
+    // a fresh API poll now carries `result` (`'won' | 'push' | 'void'`).
+    // Without this, the early-return below skips the result-refresh path —
+    // the runner would never stamp the field and the subsequent auto-claim
+    // would emit a `claim` event without `result`, re-opening the realized-P&L
+    // window-clip loophole this PR is meant to close (Hermes review-PR34).
+    const resultChanged = existing !== undefined && result !== undefined && existing.result !== result;
+    if (existing !== undefined && !riskGrew && !statusChanged && !resultChanged) return; // already caught up — idempotent on no-change
     if (existing === undefined && !riskGrew) return; // never seen + zero risk — nothing to record
 
     // Backwards-transition guard runs before the context lookup — it doesn't need it,

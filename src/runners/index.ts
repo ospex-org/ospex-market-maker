@@ -70,10 +70,12 @@
  *
  * Still TODO follow-ups: P&L (realized over settled / claimed; unrealized over
  * active marked to fair — natural home is the `summary` aggregator that walks
- * `fill` / `position-transition` / `settle` / `claim` events), the on-chain
- * authoritative cancel path for `cancel-stale --authoritative` (and the
- * `raiseMinNonce` per-speculation invalidation), and the `cancel-stale` /
- * `status` CLI commands. Auto-settle + auto-claim are wired here — they walk
+ * `fill` / `position-transition` / `settle` / `claim` events), the
+ * `raiseMinNonce` per-speculation invalidation optimization (both for the
+ * on-chain kill path here and `cancel-stale --authoritative` — both currently
+ * per-commitment), and the `status` CLI command. (`cancel-stale` is a separate
+ * one-shot CLI under `src/cli/cancel-stale.ts` — already wired.) Auto-settle +
+ * auto-claim are wired here — they walk
  * `state.positions` each tick after the position poll, gas-gated by
  * `canSpendGas` with `mayUseReserve = settlement.continueOnGasBudgetExhausted`,
  * and emit `settle` / `claim` events; the `claim` path stamps the local

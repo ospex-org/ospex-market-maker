@@ -2597,6 +2597,43 @@ describe('Runner — auto-settle + auto-claim (Phase 3 e-i)', () => {
     expect((event as { result?: string }).result).toBeUndefined();
   });
 
+  it('upgrade path: a pre-(g-iii-a) claimable record (status:claimable, result:undefined) gets `result` stamped when a fresh position-poll carries it, even though risk + status are unchanged — then auto-claim emits claim.result (Hermes review-PR34 blocker)', async () => {
+    // Reproduces Hermes' upgrade-path repro: persisted state has a claimable
+    // record from before this PR (no result field); the position-poll observes
+    // it again with API result:'push'. The early-return gate must NOT short-
+    // circuit on `!riskGrew && !statusChanged` alone — a result delta is also a
+    // state change. Without the fix the runner returns early, never stamps
+    // result, and auto-claim emits claim WITHOUT result.
+    StateStore.at(stateDir).flush({
+      ...emptyMakerState(),
+      positions: { '5678:home': claimableRecord('5678', '5678', 'home') }, // result: undefined
+    });
+    const claim = claimRecorder(70_000n, 30_000_000_000n, 250_000n); // payout=stake (refund)
+    // The API poll returns the same claimable bucket + risk, plus result:'push'.
+    // The view shape matches `ClaimablePositionView`: positionType 1 = home.
+    const pollResponse: PositionStatus = {
+      active: [],
+      pendingSettle: [],
+      claimable: [{ positionId: '0xp', speculationId: '5678', positionType: 1, team: 'X', opponent: 'Y', market: 'moneyline', oddsDecimal: null, riskAmountUSDC: 0.25, profitAmountUSDC: 0.25, result: 'push', estimatedPayoutUSDC: 0.25, estimatedPayoutWei6: '250000' }],
+      totals: { activeCount: 0, pendingSettleCount: 0, claimableCount: 1, estimatedPayoutUSDC: 0.25, estimatedPayoutWei6: '250000', pendingSettlePayoutUSDC: 0, pendingSettlePayoutWei6: '0' },
+    };
+    const config = cfg({ mode: { dryRun: false }, settlement: { autoSettleOwn: false, autoClaimOwn: true, continueOnGasBudgetExhausted: false } });
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]),
+      { settleSpeculation: settleRecorder().fn, claimPosition: claim.fn },
+      undefined, undefined,
+      { getPositionStatus: () => Promise.resolve(pollResponse) },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    // The position record now has the API's result stamped.
+    const reloaded = StateStore.at(stateDir).load().state;
+    expect(reloaded.positions['5678:home']?.result).toBe('push');
+    // And the auto-claim emit carries it, closing the realized-P&L loophole.
+    const event = readEvents().find((e) => e.kind === 'claim');
+    expect(event).toMatchObject({ speculationId: '5678', makerSide: 'home', result: 'push' });
+  });
+
   it('budget already exhausted (no reserve allowance) + continueOnGasBudgetExhausted=false → settle is denied with `candidate` `gas-budget-blocks-settlement` `purpose: settleSpeculation`; no on-chain write', async () => {
     const POL = 10n ** 18n;
     const settle = settleRecorder();

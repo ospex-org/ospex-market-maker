@@ -465,16 +465,47 @@ describe('summarize', () => {
         expect(r.claimedProfitUsdcWei6).toBe('0');
       });
 
-      it('push — settle.winSide=push → P&L 0; stake refunded (no claim emitted, but stake is also not counted as loss)', () => {
-        const path = writeLog('run-push.ndjson', [
+      it('push (realistic — auto-claim emits a claim event with payout=stake; classifier must NOT treat that as won) — Hermes review-PR33 blocker', () => {
+        // The SDK's ClaimablePositionView.result is 'won' | 'push' | 'void';
+        // the runner's auto-claim path claims every `claimable` record
+        // regardless of outcome (a push refunds the stake). So a push position
+        // emits: fill → settle(winSide=push) → claim(payoutWei6=stake). Without
+        // the outcome-first classification, the classifier would miscount this
+        // as wonCount=1.
+        const path = writeLog('run-push-claim.ndjson', [
           { kind: 'fill', source: 'commitment-diff', commitmentHash: '0xa', speculationId: 'spec-A', contestId: 'A', makerSide: 'away', newFillWei6: '500000' },
-          { kind: 'settle', speculationId: 'spec-A', contestId: 'A', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', makerSide: 'away', winSide: 'push', txHash: '0xtx' },
+          { kind: 'settle', speculationId: 'spec-A', contestId: 'A', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', makerSide: 'away', winSide: 'push', txHash: '0xtxS' },
+          { kind: 'claim', speculationId: 'spec-A', contestId: 'A', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', makerSide: 'away', positionType: 0, payoutWei6: '500000', txHash: '0xtxC' }, // payout = stake (refund)
         ]);
         const s = summarize([path]);
         const r = s.liveMetrics.realizedPnl;
         expect(r.pushCount).toBe(1);
-        expect(r.wonCount).toBe(0);
+        expect(r.wonCount).toBe(0); // crucial — the claim event must not promote it to won
         expect(r.lostCount).toBe(0);
+        expect(r.claimedProfitUsdcWei6).toBe('0');
+        expect(r.netUsdcWei6).toBe('0');
+      });
+
+      it('void (same posture as push — auto-claimed with payout=stake; classifier honours the outcome over the claim event)', () => {
+        const path = writeLog('run-void-claim.ndjson', [
+          { kind: 'fill', source: 'commitment-diff', commitmentHash: '0xa', speculationId: 'spec-A', contestId: 'A', makerSide: 'away', newFillWei6: '500000' },
+          { kind: 'settle', speculationId: 'spec-A', contestId: 'A', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', makerSide: 'away', winSide: 'void', txHash: '0xtxS' },
+          { kind: 'claim', speculationId: 'spec-A', contestId: 'A', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', makerSide: 'away', positionType: 0, payoutWei6: '500000', txHash: '0xtxC' },
+        ]);
+        const r = summarize([path]).liveMetrics.realizedPnl;
+        expect(r.pushCount).toBe(1);
+        expect(r.wonCount).toBe(0);
+        expect(r.netUsdcWei6).toBe('0');
+      });
+
+      it('push without a claim — same classification (sometimes the auto-claim hasn\'t ticked yet for the push refund)', () => {
+        const path = writeLog('run-push-no-claim.ndjson', [
+          { kind: 'fill', source: 'commitment-diff', commitmentHash: '0xa', speculationId: 'spec-A', contestId: 'A', makerSide: 'away', newFillWei6: '500000' },
+          { kind: 'settle', speculationId: 'spec-A', contestId: 'A', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', makerSide: 'away', winSide: 'push', txHash: '0xtx' },
+        ]);
+        const r = summarize([path]).liveMetrics.realizedPnl;
+        expect(r.pushCount).toBe(1);
+        expect(r.wonCount).toBe(0);
         expect(r.netUsdcWei6).toBe('0');
       });
 

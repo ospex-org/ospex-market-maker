@@ -1,6 +1,8 @@
 /**
- * Telemetry — the append-only NDJSON event log (DESIGN §11) and (a stub for) the
- * `ospex-mm summary` aggregator.
+ * Telemetry — the append-only NDJSON event log (DESIGN §11) and the
+ * `ospex-mm summary` aggregator (dry-run metrics + live-mode fill rate / gas /
+ * fees / settlement outcomes / realized P&L — see {@link LiveMetrics}; only
+ * unrealized P&L over still-active positions remains as a follow-up).
  *
  * Every line of the event log is `{ ts, runId, kind, ...payload }`. **This NDJSON
  * shape is a stable contract** — a future external scorecard consumes it unchanged
@@ -230,10 +232,11 @@ export function listRunLogs(logDir: string): string[] {
  * from one or more NDJSON event logs. The **dry-run** metrics (would-be-stale rate,
  * quote competitiveness, quote-age distribution, latent-exposure peak, the
  * candidate-skip and error histograms) are fully computed; the **live-mode**
- * ones (fill rate, gas, fees, settlement outcomes — DESIGN §2.3) are also computed
- * by the live-event walk (`submit` / `replace` / `fill` / `settle` / `claim` /
- * `approval` / `onchain-cancel`) and exposed on {@link RunSummary.liveMetrics};
- * realized + unrealized P&L are the remaining Phase-3 follow-ups.
+ * ones (fill rate, gas, fees, settlement outcomes, realized P&L — DESIGN §2.3)
+ * are also computed by the live-event walk (`submit` / `replace` / `fill` /
+ * `settle` / `claim` / `approval` / `onchain-cancel`) and exposed on
+ * {@link RunSummary.liveMetrics}; only unrealized P&L over still-active
+ * positions remains as a Phase-3 follow-up.
  *
  * This is the MM's *own* report; the cross-agent platform-viability scorecard
  * (DESIGN §16) consumes the raw NDJSON, not this.
@@ -288,11 +291,12 @@ export interface RunSummary {
   /** The `kill` event ending the run, if the log has one (graceful shutdown); `null` otherwise (still running, or crashed). */
   kill: { reason: string; ticks: number } | null;
   /**
-   * Live-mode metrics — fill rate / gas / fees / settlement outcomes (DESIGN
-   * §2.3). Always populated, but zero-valued under a pure dry-run log (the
-   * live events — `submit` / `replace` / `fill` / `settle` / `claim` /
-   * `approval` / `onchain-cancel` — only get emitted in live mode). P&L
-   * (realized + unrealized — DESIGN §11) lands in later Phase-3 slices.
+   * Live-mode metrics — fill rate / gas / fees / settlement outcomes /
+   * realized P&L (DESIGN §2.3, §11). Always populated, but zero-valued under
+   * a pure dry-run log (the live events — `submit` / `replace` / `fill` /
+   * `settle` / `claim` / `approval` / `onchain-cancel` — only get emitted
+   * in live mode). Unrealized P&L over still-active positions lands in a
+   * later Phase-3 slice (requires `summarize` to accept an `OspexAdapter`).
    */
   liveMetrics: LiveMetrics;
 }
@@ -513,9 +517,10 @@ function recordAgeIfFirst(quotes: Map<string, WalkedQuote>, hash: string, termin
  * apart from `readFileSync` on each path (a missing/unreadable path throws — the CLI
  * resolves paths via {@link listRunLogs}, which returns only existing files).
  *
- * Dry-run metrics + the (g-i) live-mode metrics (fill rate / gas / fees /
- * settlement outcomes — see {@link LiveMetrics}) are fully computed; P&L
- * (realized + unrealized) is the remaining Phase-3 follow-up.
+ * Dry-run metrics + the live-mode metrics (fill rate / gas / fees /
+ * settlement outcomes / realized P&L — see {@link LiveMetrics}) are fully
+ * computed; only unrealized P&L over still-active positions remains as a
+ * Phase-3 follow-up (it requires `summarize` to accept an `OspexAdapter`).
  *
  * If `opts.polToUsdcRate` is supplied, `liveMetrics.gas.totalUsdcEquivWei6`
  * is populated by converting `totalPolWei` through that rate. The CLI feeds
@@ -774,12 +779,31 @@ export function summarize(logPaths: readonly string[], opts: { sinceIso?: string
     totalUsdcEquivWei6 = usdcWei6.toString();
   }
   // ── realized-P&L post-walk (g-ii) ───────────────────────────────────────
-  // For each position with at least one fill, classify by what we know:
-  // claim present → won (use payout); else settle with winSide:
-  //   - 'push' / 'void' → push (P&L = 0);
-  //   - != makerSide → lost (P&L = -stake);
-  //   - === makerSide and no claim → wonUnclaimed (no P&L contribution, count only);
-  // settle absent → unsettled (held over to unrealized — Phase 3 g-iii).
+  // For each position with at least one fill, classify by what we know.
+  // **Outcome is consulted before claim** because push / void positions are
+  // auto-claimed on chain too (payout == stake) — a claim event alone is NOT
+  // sufficient to call something "won". The SDK's `ClaimablePositionView.result`
+  // is `'won' | 'push' | 'void'`, and the runner's auto-claim path claims every
+  // `claimable` record regardless of outcome (`src/runners/index.ts`'s
+  // `settleAndClaim` walk). Without this ordering a refunded push would be
+  // miscounted as a win (Hermes review-PR33 blocker).
+  //
+  // Order:
+  //   1. settle.winSide ∈ {'push', 'void'} → push bucket (P&L = 0). Discards
+  //      any claim event that may have fired for the refund.
+  //   2. claim present AND (outcome unknown OR outcome === makerSide) → won
+  //      (profit = payout − stake). Outcome-unknown is the externally-settled
+  //      / `--since`-clipped case; outcome-matches is the normal winning case.
+  //   3. settle.winSide !== makerSide (and not push/void) → lost (-stake).
+  //   4. outcome === makerSide and no claim → wonUnclaimed (paper profit).
+  //   5. no settle → unsettled (held over to (g-iii) unrealized).
+  //
+  // Limitation: when `settle` is missing from the window but `claim` is present
+  // for an actual push, we can't distinguish "won with zero profit" from
+  // "push refund" purely from the events available here. Both produce
+  // `netUsdcWei6: '0'` (correct), but the bucket is `won` instead of `push`.
+  // The future fix is to include `result` on the `claim` event payload (see
+  // PR-33 Hermes review's follow-up note).
   let netRealizedPnlWei6 = 0n;
   let claimedProfitWei6 = 0n;
   let realizedLossWei6 = 0n;
@@ -792,27 +816,42 @@ export function summarize(logPaths: readonly string[], opts: { sinceIso?: string
     const idx = key.indexOf(':');
     const speculationId = key.slice(0, idx);
     const makerSide = key.slice(idx + 1); // 'away' | 'home'
+    const outcome = outcomeBySpeculation.get(speculationId);
     const payout = payoutByPosition.get(key);
-    if (payout !== undefined) {
-      const profit = payout - stake; // can be negative on malformed inputs; the renderer accepts signed strings
+
+    // (1) push / void always wins over the claim branch — auto-claim still
+    // emits a claim event for refunded positions, but that's a refund (P&L=0),
+    // not a win.
+    if (outcome === 'push' || outcome === 'void') {
+      pushCount += 1;
+      continue;
+    }
+    // (2) winning claim: outcome unknown (externally settled / window-clipped)
+    // OR outcome agrees with `makerSide`.
+    if (payout !== undefined && (outcome === undefined || outcome === makerSide)) {
+      const profit = payout - stake;
       netRealizedPnlWei6 += profit;
       claimedProfitWei6 += profit;
       wonCount += 1;
       continue;
     }
-    const outcome = outcomeBySpeculation.get(speculationId);
+    // (3) no settle and no claim → unsettled.
     if (outcome === undefined) {
       unsettledCount += 1;
-    } else if (outcome === 'push' || outcome === 'void') {
-      pushCount += 1;
-    } else if (outcome !== makerSide) {
+      continue;
+    }
+    // (4) settled against the maker (and not push/void) → lost. The claim
+    // event shouldn't fire in this case on chain; if it somehow did, the
+    // outcome verdict still classifies it as a loss (we drop the anomalous
+    // payout).
+    if (outcome !== makerSide) {
       netRealizedPnlWei6 -= stake;
       realizedLossWei6 += stake;
       lostCount += 1;
-    } else {
-      // outcome === makerSide AND no claim in this window — paper profit
-      wonUnclaimedCount += 1;
+      continue;
     }
+    // (5) outcome === makerSide AND no claim — paper profit; payout pending.
+    wonUnclaimedCount += 1;
   }
 
   const liveMetrics: LiveMetrics = {

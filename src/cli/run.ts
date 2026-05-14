@@ -8,12 +8,14 @@
  * `listOpenCommitments` diff), the position-status poll (mirrors API buckets into
  * the local `MakerPositionStatus`), boot-time auto-approve of the `PositionModule`
  * USDC allowance (`mode: exact` raises to `min(risk-cap ceiling, current wallet
- * USDC)`, deferred while the state-loss hold is active), and the daily POL
+ * USDC)`, deferred while the state-loss hold is active), the daily POL
  * gas-budget verdict (`canSpendGas` gates every on-chain write, denials emit
- * `candidate` `gas-budget-blocks-reapproval`). Auto-settle / auto-claim, the kill
- * switch's on-chain cancel / `raiseMinNonce` path, and `cancel-stale` / `status`
- * are still landing in later Phase-3 slices. Either mode runs until a kill-switch
- * file appears or a SIGTERM / SIGINT arrives.
+ * `candidate` `gas-budget-blocks-reapproval`), auto-settle / auto-claim, and
+ * the kill switch's on-chain cancel (`killCancelOnChain: true`). The
+ * `raiseMinNonce` bulk-invalidate optimization is still future work; the
+ * `status` CLI is still landing in a later Phase-3 slice (`cancel-stale` ships
+ * as a separate one-shot CLI under `src/cli/cancel-stale.ts`). Either mode
+ * runs until a kill-switch file appears or a SIGTERM / SIGINT arrives.
  *
  * The two-key model (DESIGN §8): live requires *both* `mode.dryRun: false` in the
  * config *and* the `--live` flag. Either alone runs the shadow loop, and `--live`

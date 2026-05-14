@@ -219,7 +219,7 @@ export async function runCancelStale(opts: CancelStaleOpts, deps: CancelStaleDep
   });
   if (assessment.holdQuoting) {
     throw new CancelStaleRefused(
-      `cancel-stale refusing: ${assessment.reason} (writing an empty state here would erase the state-loss signal a subsequent run --live boot relies on). Pass --ignore-missing-state once you have confirmed no prior commitment is still matchable, or run \`ospex-mm run --live\` first to reconstruct the state from telemetry.`,
+      `cancel-stale refusing: ${assessment.reason} (writing an empty state here would erase the state-loss signal a subsequent run --live boot relies on). Pass --ignore-missing-state only after confirming no prior commitment is still matchable on chain, or manually restore the state file (e.g. from a backup, or by reconstructing it from prior telemetry under \`telemetry.logDir\`) before retrying.`,
     );
   }
   const state = loadResult.state;

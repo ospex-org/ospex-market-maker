@@ -18,8 +18,8 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-function cfg(): Config {
-  return parseConfig({ rpcUrl: 'http://localhost:8545', telemetry: { logDir } });
+function cfg(overrides: Record<string, unknown> = {}): Config {
+  return parseConfig({ rpcUrl: 'http://localhost:8545', telemetry: { logDir }, ...overrides });
 }
 function collect(): { sink: { write(s: string): void }; text: () => string } {
   let buf = '';
@@ -51,7 +51,12 @@ function fakeSummary(over: Partial<RunSummary> = {}): RunSummary {
     degradedByReason: {},
     errors: { total: 0, byPhase: {} },
     kill: { reason: 'kill-file', ticks: 5 },
-    liveMetrics: null,
+    liveMetrics: {
+      fills: { quotedUsdcWei6: '0', filledUsdcWei6: '0', fillRate: null },
+      gas: { totalPolWei: '0', byKind: { approval: '0', onchainCancel: '0', settle: '0', claim: '0' }, totalUsdcEquivWei6: null },
+      settlements: { settleCount: 0, claimCount: 0, totalClaimedPayoutWei6: '0' },
+      totalFeeUsdcWei6: '0',
+    },
     ...over,
   };
 }
@@ -65,14 +70,27 @@ describe('runSummary', () => {
     const aggregate = vi.fn(() => summarized);
     const result = runSummary({ config: cfg(), sinceIso: '2030-01-01T00:01:00Z' }, { listRunLogs: list, summarize: aggregate });
     expect(list).toHaveBeenCalledWith(logDir);
-    expect(aggregate).toHaveBeenCalledWith([join(logDir, 'run-r1.ndjson')], { sinceIso: '2030-01-01T00:01:00Z' });
+    // The CLI threads through both `sinceIso` AND `polToUsdcRate` — the latter from `config.gas.nativeTokenUSDCPrice` iff `config.gas.reportInUSDC: true` (the default).
+    expect(aggregate).toHaveBeenCalledWith([join(logDir, 'run-r1.ndjson')], { sinceIso: '2030-01-01T00:01:00Z', polToUsdcRate: expect.any(Number) as unknown as number });
     expect(result).toBe(summarized);
   });
 
-  it('omits the opts arg to summarize when --since is not given', () => {
+  it('passes an empty opts object to summarize when --since is not given (a no-USDC-equiv config supplies no polToUsdcRate either)', () => {
     const aggregate = vi.fn(() => fakeSummary({ sources: [] }));
-    runSummary({ config: cfg() }, { listRunLogs: () => [], summarize: aggregate });
-    expect(aggregate).toHaveBeenCalledWith([], undefined);
+    runSummary({ config: cfg({ gas: { reportInUSDC: false } }) }, { listRunLogs: () => [], summarize: aggregate });
+    expect(aggregate).toHaveBeenCalledWith([], {}); // neither sinceIso nor polToUsdcRate
+  });
+
+  it('threads config.gas.nativeTokenUSDCPrice as polToUsdcRate when reportInUSDC:true', () => {
+    const aggregate = vi.fn(() => fakeSummary());
+    runSummary({ config: cfg({ gas: { reportInUSDC: true, nativeTokenUSDCPrice: 0.42 } }) }, { listRunLogs: () => [], summarize: aggregate });
+    expect(aggregate).toHaveBeenCalledWith([], { polToUsdcRate: 0.42 });
+  });
+
+  it('omits polToUsdcRate when reportInUSDC:false', () => {
+    const aggregate = vi.fn(() => fakeSummary());
+    runSummary({ config: cfg({ gas: { reportInUSDC: false, nativeTokenUSDCPrice: 0.42 } }) }, { listRunLogs: () => [], summarize: aggregate });
+    expect(aggregate).toHaveBeenCalledWith([], {});
   });
 
   it('with no stubs, summarizes the real run logs under config.telemetry.logDir', () => {
@@ -106,7 +124,8 @@ describe('renderSummaryReport*', () => {
     expect(parsed.schemaVersion).toBe(1);
     expect(parsed.summary.ticks).toBe(5);
     expect(parsed.summary.latentExposurePeakWei6).toBe('500000');
-    expect(parsed.summary.liveMetrics).toBeNull();
+    expect(parsed.summary.liveMetrics.fills.fillRate).toBeNull();
+    expect(parsed.summary.liveMetrics.gas.totalPolWei).toBe('0');
   });
 
   it('text render shows the key sections', () => {
@@ -120,7 +139,9 @@ describe('renderSummaryReport*', () => {
     expect(out).toContain('vs reference (ticks): min 5 / p50 6 / mean 6.0 / max 7');
     expect(out).toContain('Quote age (s) over 2 completed quote(s): p50 30 / p90 60 / max 60');
     expect(out).toContain('Latent-exposure peak: 0.500000 USDC (500000 wei6)');
-    expect(out).toMatch(/Live-mode metrics .* Phase 3/);
+    expect(out).toMatch(/Live-mode metrics:/);
+    expect(out).toMatch(/no live activity/); // the fakeSummary has zero-valued live metrics
+    expect(out).toMatch(/realized \+ unrealized P&L are still landing/);
     expect(out).toContain('Event counts:');
   });
 

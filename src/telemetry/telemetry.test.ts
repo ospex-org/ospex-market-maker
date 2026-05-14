@@ -206,7 +206,12 @@ describe('summarize', () => {
       degradedByReason: {},
       errors: { total: 0, byPhase: {} },
       kill: null,
-      liveMetrics: null,
+      liveMetrics: {
+        fills: { quotedUsdcWei6: '0', filledUsdcWei6: '0', fillRate: null },
+        gas: { totalPolWei: '0', byKind: { approval: '0', onchainCancel: '0', settle: '0', claim: '0' }, totalUsdcEquivWei6: null },
+        settlements: { settleCount: 0, claimCount: 0, totalClaimedPayoutWei6: '0' },
+        totalFeeUsdcWei6: '0',
+      },
     });
     expect(s.eventCounts['tick-start']).toBe(0);
     expect(s.eventCounts['would-submit']).toBe(0);
@@ -316,5 +321,108 @@ describe('summarize', () => {
     expect(s.ticks).toBe(2);
     expect(s.firstEventAt).toBe('2030-01-01T00:00:00Z');
     expect(s.lastEventAt).toBe('2030-01-02T00:00:00Z');
+  });
+
+  // ── live-mode metrics (Phase 3 g-i) ─────────────────────────────────────────
+
+  describe('liveMetrics', () => {
+    it('walks `submit` + `replace` for quoted USDC and `fill` for filled USDC; computes fillRate', () => {
+      const path = writeLog('run-live.ndjson', [
+        { kind: 'submit', commitmentHash: '0xa', speculationId: 'spec-A', contestId: 'A', makerSide: 'home', oddsTick: 191, riskAmountWei6: '500000' }, // 0.5 USDC quoted
+        { kind: 'submit', commitmentHash: '0xb', speculationId: 'spec-A', contestId: 'A', makerSide: 'away', oddsTick: 196, riskAmountWei6: '300000' }, // 0.3 USDC quoted
+        { kind: 'replace', replacedCommitmentHash: '0xb', newCommitmentHash: '0xc', speculationId: 'spec-A', contestId: 'A', makerSide: 'away', reason: 'mispriced', riskAmountWei6: '400000' }, // 0.4 USDC quoted (replacement)
+        { kind: 'fill', source: 'commitment-diff', commitmentHash: '0xa', speculationId: 'spec-A', contestId: 'A', makerSide: 'home', newFillWei6: '200000', filledRiskWei6: '200000', partial: true }, // 0.2 USDC filled
+        { kind: 'fill', source: 'commitment-diff', commitmentHash: '0xa', speculationId: 'spec-A', contestId: 'A', makerSide: 'home', newFillWei6: '300000', filledRiskWei6: '500000', partial: false }, // 0.3 USDC filled
+      ]);
+      const s = summarize([path]);
+      expect(s.liveMetrics.fills).toEqual({
+        quotedUsdcWei6: '1200000', // 0.5 + 0.3 + 0.4
+        filledUsdcWei6: '500000', //  0.2 + 0.3
+        fillRate: 500000 / 1200000,
+      });
+    });
+
+    it('fillRate is null when nothing was quoted (division-by-zero guard)', () => {
+      const path = writeLog('run-empty.ndjson', [
+        { kind: 'fill', source: 'position-poll', positionId: 'p1', speculationId: 'spec-A', contestId: 'A', makerSide: 'home', newFillWei6: '100000' }, // a stale-payload fill the maker didn't quote in this window
+      ]);
+      const s = summarize([path]);
+      expect(s.liveMetrics.fills.quotedUsdcWei6).toBe('0');
+      expect(s.liveMetrics.fills.filledUsdcWei6).toBe('100000');
+      expect(s.liveMetrics.fills.fillRate).toBeNull();
+    });
+
+    it('sums `gasPolWei` across `approval` / `onchain-cancel` / `settle` / `claim` events into per-kind + total POL wei18', () => {
+      const path = writeLog('run-gas.ndjson', [
+        { kind: 'approval', purpose: 'positionModule', spender: '0xPM', currentAllowance: '0', requiredAggregateAllowance: '5000000', amountSetTo: '5000000', txHash: '0xtx1', gasPolWei: '3000000000000000' }, // 0.003 POL
+        { kind: 'onchain-cancel', commitmentHash: '0xa', speculationId: 'spec-A', contestId: 'A', makerSide: 'home', txHash: '0xtx2', gasPolWei: '2500000000000000' }, // 0.0025 POL
+        { kind: 'settle', speculationId: 'spec-A', contestId: 'A', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', makerSide: 'home', winSide: 'home', txHash: '0xtx3', gasPolWei: '4000000000000000' }, // 0.004 POL
+        { kind: 'claim', speculationId: 'spec-A', contestId: 'A', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', makerSide: 'home', positionType: 1, payoutWei6: '2000000', txHash: '0xtx4', gasPolWei: '6000000000000000' }, // 0.006 POL
+        { kind: 'claim', speculationId: 'spec-B', contestId: 'B', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', makerSide: 'away', positionType: 0, payoutWei6: '1500000', txHash: '0xtx5', gasPolWei: '6000000000000000' }, // 0.006 POL
+      ]);
+      const s = summarize([path]);
+      expect(s.liveMetrics.gas.byKind).toEqual({
+        approval: '3000000000000000',
+        onchainCancel: '2500000000000000',
+        settle: '4000000000000000',
+        claim: '12000000000000000', // 2 claims × 0.006 POL
+      });
+      expect(s.liveMetrics.gas.totalPolWei).toBe('21500000000000000'); // sum of the above (0.0215 POL)
+      expect(s.liveMetrics.gas.totalUsdcEquivWei6).toBeNull(); // no rate supplied
+    });
+
+    it('populates `gas.totalUsdcEquivWei6` when `polToUsdcRate` is supplied (CLI threads `config.gas.nativeTokenUSDCPrice`)', () => {
+      const path = writeLog('run-gas-usdc.ndjson', [
+        { kind: 'settle', speculationId: 'spec-A', contestId: 'A', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', makerSide: 'home', winSide: 'home', txHash: '0xtx', gasPolWei: '1000000000000000000' }, // 1 POL
+      ]);
+      const s = summarize([path], { polToUsdcRate: 0.42 }); // 1 POL ≈ 0.42 USDC
+      expect(s.liveMetrics.gas.totalPolWei).toBe('1000000000000000000');
+      expect(s.liveMetrics.gas.totalUsdcEquivWei6).toBe('420000'); // 0.42 USDC = 420_000 wei6
+    });
+
+    it('counts `settle` and `claim` events and sums `payoutWei6` across claims', () => {
+      const path = writeLog('run-set.ndjson', [
+        { kind: 'settle', speculationId: 'spec-A', contestId: 'A', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', makerSide: 'home', winSide: 'home', txHash: '0xtxA' },
+        { kind: 'settle', speculationId: 'spec-B', contestId: 'B', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', makerSide: 'away', winSide: 'away', txHash: '0xtxB' },
+        { kind: 'claim', speculationId: 'spec-A', contestId: 'A', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', makerSide: 'home', positionType: 1, payoutWei6: '2500000', txHash: '0xtxAc' }, // 2.5 USDC
+        { kind: 'claim', speculationId: 'spec-B', contestId: 'B', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', makerSide: 'away', positionType: 0, payoutWei6: '1750000', txHash: '0xtxBc' }, // 1.75 USDC
+      ]);
+      const s = summarize([path]);
+      expect(s.liveMetrics.settlements).toEqual({
+        settleCount: 2,
+        claimCount: 2,
+        totalClaimedPayoutWei6: '4250000', // 2.5 + 1.75 = 4.25 USDC
+      });
+    });
+
+    it('skips malformed `riskAmountWei6` / `newFillWei6` / `gasPolWei` / `payoutWei6` values (forward-compat: a future schema oddity does not corrupt the aggregate)', () => {
+      const path = writeLog('run-malformed.ndjson', [
+        { kind: 'submit', commitmentHash: '0xa', riskAmountWei6: 'NaN' }, // not a wei6 string
+        { kind: 'submit', commitmentHash: '0xb', riskAmountWei6: '500000' }, // valid → counted
+        { kind: 'fill', commitmentHash: '0xb', newFillWei6: -100 as unknown as string }, // not a wei6 string
+        { kind: 'fill', commitmentHash: '0xb', newFillWei6: '200000' }, // valid → counted
+        { kind: 'settle', speculationId: 'spec-A', contestId: 'A', sport: 'mlb', awayTeam: 'A', homeTeam: 'B', makerSide: 'away', winSide: 'home', txHash: '0x', gasPolWei: 'not-a-number' }, // counted as 0 gas, but the settleCount still increments
+        { kind: 'claim', speculationId: 'spec-A', contestId: 'A', sport: 'mlb', awayTeam: 'A', homeTeam: 'B', makerSide: 'away', positionType: 0, payoutWei6: '-1', txHash: '0x' }, // negative wei6 → not counted
+      ]);
+      const s = summarize([path]);
+      expect(s.liveMetrics.fills.quotedUsdcWei6).toBe('500000');
+      expect(s.liveMetrics.fills.filledUsdcWei6).toBe('200000');
+      expect(s.liveMetrics.gas.byKind.settle).toBe('0'); // gasPolWei was non-numeric, not summed
+      expect(s.liveMetrics.settlements.settleCount).toBe(1); // count still incremented
+      expect(s.liveMetrics.settlements.totalClaimedPayoutWei6).toBe('0'); // negative payout rejected
+      expect(s.liveMetrics.settlements.claimCount).toBe(1); // claim still counted
+    });
+
+    it('a pure dry-run log produces zero live metrics (the live events are absent — confirms the new walker does not pick up `would-*` etc.)', () => {
+      const path = writeLog('run-dry.ndjson', [
+        { kind: 'would-submit', commitmentHash: 'dry:r1:1', speculationId: 'spec-A', contestId: 'A', sport: 'mlb', awayTeam: 'A', homeTeam: 'B', makerSide: 'away', oddsTick: 198, riskAmountWei6: '250000', expiryUnixSec: 1_900_000_120 },
+        { kind: 'would-soft-cancel', commitmentHash: 'dry:r1:1', speculationId: 'spec-A', contestId: 'A', makerSide: 'away', reason: 'side-not-quoted' },
+      ]);
+      const s = summarize([path]);
+      expect(s.liveMetrics.fills.quotedUsdcWei6).toBe('0');
+      expect(s.liveMetrics.fills.filledUsdcWei6).toBe('0');
+      expect(s.liveMetrics.settlements.settleCount).toBe(0);
+      expect(s.liveMetrics.gas.totalPolWei).toBe('0');
+    });
   });
 });

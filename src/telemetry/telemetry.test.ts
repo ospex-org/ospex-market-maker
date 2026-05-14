@@ -210,6 +210,7 @@ describe('summarize', () => {
         fills: { quotedUsdcWei6: '0', filledUsdcWei6: '0', fillRate: null },
         gas: { totalPolWei: '0', byKind: { approval: '0', onchainCancel: '0', settle: '0', claim: '0' }, totalUsdcEquivWei6: null },
         settlements: { settleCount: 0, claimCount: 0, totalClaimedPayoutWei6: '0' },
+        realizedPnl: { netUsdcWei6: '0', claimedProfitUsdcWei6: '0', realizedLossUsdcWei6: '0', wonCount: 0, lostCount: 0, pushCount: 0, wonUnclaimedCount: 0, unsettledCount: 0 },
         totalFeeUsdcWei6: '0',
       },
     });
@@ -423,6 +424,130 @@ describe('summarize', () => {
       expect(s.liveMetrics.fills.filledUsdcWei6).toBe('0');
       expect(s.liveMetrics.settlements.settleCount).toBe(0);
       expect(s.liveMetrics.gas.totalPolWei).toBe('0');
+    });
+
+    // ── realized P&L (Phase 3 g-ii) ────────────────────────────────────────
+
+    describe('realizedPnl', () => {
+      it('won — claim event → profit = payout − cumulativeStake; positive contribution to net', () => {
+        const path = writeLog('run-won.ndjson', [
+          // 2 fills on spec-A:home totaling 0.5 USDC stake
+          { kind: 'fill', source: 'commitment-diff', commitmentHash: '0xa', speculationId: 'spec-A', contestId: 'A', makerSide: 'home', newFillWei6: '200000' },
+          { kind: 'fill', source: 'commitment-diff', commitmentHash: '0xa', speculationId: 'spec-A', contestId: 'A', makerSide: 'home', newFillWei6: '300000' },
+          { kind: 'settle', speculationId: 'spec-A', contestId: 'A', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', makerSide: 'home', winSide: 'home', txHash: '0xtx' },
+          { kind: 'claim', speculationId: 'spec-A', contestId: 'A', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', makerSide: 'home', positionType: 1, payoutWei6: '900000', txHash: '0xtxC' }, // 0.9 USDC payout
+        ]);
+        const s = summarize([path]);
+        const r = s.liveMetrics.realizedPnl;
+        expect(r.wonCount).toBe(1);
+        expect(r.lostCount).toBe(0);
+        expect(r.pushCount).toBe(0);
+        expect(r.unsettledCount).toBe(0);
+        expect(r.wonUnclaimedCount).toBe(0);
+        // payout 0.9 − stake 0.5 = +0.4 profit
+        expect(r.claimedProfitUsdcWei6).toBe('400000');
+        expect(r.realizedLossUsdcWei6).toBe('0');
+        expect(r.netUsdcWei6).toBe('400000');
+      });
+
+      it('lost — settle.winSide ≠ makerSide, no claim → −stake contribution to net', () => {
+        const path = writeLog('run-lost.ndjson', [
+          { kind: 'fill', source: 'commitment-diff', commitmentHash: '0xa', speculationId: 'spec-A', contestId: 'A', makerSide: 'away', newFillWei6: '500000' }, // 0.5 USDC staked on away
+          { kind: 'settle', speculationId: 'spec-A', contestId: 'A', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', makerSide: 'away', winSide: 'home', txHash: '0xtx' }, // home won, away (maker's side) lost
+          // no claim event — losing positions don't claim
+        ]);
+        const s = summarize([path]);
+        const r = s.liveMetrics.realizedPnl;
+        expect(r.wonCount).toBe(0);
+        expect(r.lostCount).toBe(1);
+        expect(r.realizedLossUsdcWei6).toBe('500000');
+        expect(r.netUsdcWei6).toBe('-500000'); // signed
+        expect(r.claimedProfitUsdcWei6).toBe('0');
+      });
+
+      it('push — settle.winSide=push → P&L 0; stake refunded (no claim emitted, but stake is also not counted as loss)', () => {
+        const path = writeLog('run-push.ndjson', [
+          { kind: 'fill', source: 'commitment-diff', commitmentHash: '0xa', speculationId: 'spec-A', contestId: 'A', makerSide: 'away', newFillWei6: '500000' },
+          { kind: 'settle', speculationId: 'spec-A', contestId: 'A', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', makerSide: 'away', winSide: 'push', txHash: '0xtx' },
+        ]);
+        const s = summarize([path]);
+        const r = s.liveMetrics.realizedPnl;
+        expect(r.pushCount).toBe(1);
+        expect(r.wonCount).toBe(0);
+        expect(r.lostCount).toBe(0);
+        expect(r.netUsdcWei6).toBe('0');
+      });
+
+      it('wonUnclaimed — settle.winSide=makerSide but no claim in the window → count incremented, NO net P&L contribution (payout unknown until claim fires)', () => {
+        const path = writeLog('run-paper.ndjson', [
+          { kind: 'fill', source: 'commitment-diff', commitmentHash: '0xa', speculationId: 'spec-A', contestId: 'A', makerSide: 'home', newFillWei6: '500000' },
+          { kind: 'settle', speculationId: 'spec-A', contestId: 'A', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', makerSide: 'home', winSide: 'home', txHash: '0xtx' },
+          // no claim event yet — auto-claim either disabled, hasn't ticked, or threw
+        ]);
+        const s = summarize([path]);
+        const r = s.liveMetrics.realizedPnl;
+        expect(r.wonUnclaimedCount).toBe(1);
+        expect(r.wonCount).toBe(0);
+        expect(r.netUsdcWei6).toBe('0'); // payout unknown — don't guess
+      });
+
+      it('unsettled — fills exist but no settle event → counted in unsettled (held over to unrealized P&L)', () => {
+        const path = writeLog('run-open.ndjson', [
+          { kind: 'fill', source: 'commitment-diff', commitmentHash: '0xa', speculationId: 'spec-A', contestId: 'A', makerSide: 'home', newFillWei6: '500000' },
+        ]);
+        const s = summarize([path]);
+        const r = s.liveMetrics.realizedPnl;
+        expect(r.unsettledCount).toBe(1);
+        expect(r.wonCount + r.lostCount + r.pushCount + r.wonUnclaimedCount).toBe(0);
+        expect(r.netUsdcWei6).toBe('0');
+      });
+
+      it('a maker quoting BOTH sides of one contest: home wins → home position won (profit), away position lost (-stake); two independent positions tracked', () => {
+        const path = writeLog('run-both-sides.ndjson', [
+          // Maker on both sides of spec-A. Both sides get filled.
+          { kind: 'fill', source: 'commitment-diff', commitmentHash: '0xa', speculationId: 'spec-A', contestId: 'A', makerSide: 'home', newFillWei6: '500000' },
+          { kind: 'fill', source: 'commitment-diff', commitmentHash: '0xb', speculationId: 'spec-A', contestId: 'A', makerSide: 'away', newFillWei6: '500000' },
+          // Speculation settles: home wins. Runner emits a settle event from each position's perspective (auto-settle iterates state.positions); both carry winSide='home'.
+          { kind: 'settle', speculationId: 'spec-A', contestId: 'A', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', makerSide: 'home', winSide: 'home', txHash: '0xtx1' },
+          { kind: 'settle', speculationId: 'spec-A', contestId: 'A', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', makerSide: 'away', winSide: 'home', txHash: '0xtx2' },
+          // Only the home position claims (away lost — no claim).
+          { kind: 'claim', speculationId: 'spec-A', contestId: 'A', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', makerSide: 'home', positionType: 1, payoutWei6: '900000', txHash: '0xtxC' },
+        ]);
+        const s = summarize([path]);
+        const r = s.liveMetrics.realizedPnl;
+        expect(r.wonCount).toBe(1); // home
+        expect(r.lostCount).toBe(1); // away
+        expect(r.claimedProfitUsdcWei6).toBe('400000'); // 0.9 - 0.5 = 0.4 profit on home
+        expect(r.realizedLossUsdcWei6).toBe('500000'); // 0.5 loss on away
+        expect(r.netUsdcWei6).toBe('-100000'); // 0.4 - 0.5 = -0.1 net (the maker ate the spread the wrong way)
+      });
+
+      it('mixes the buckets: 1 won + 1 lost + 1 push + 1 unsettled', () => {
+        const path = writeLog('run-mixed.ndjson', [
+          // spec-A: won
+          { kind: 'fill', source: 'commitment-diff', commitmentHash: '0xa', speculationId: 'spec-A', contestId: 'A', makerSide: 'home', newFillWei6: '100000' },
+          { kind: 'settle', speculationId: 'spec-A', contestId: 'A', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', makerSide: 'home', winSide: 'home', txHash: '0xtxA' },
+          { kind: 'claim', speculationId: 'spec-A', contestId: 'A', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', makerSide: 'home', positionType: 1, payoutWei6: '180000', txHash: '0xtxAc' }, // +0.08 profit
+          // spec-B: lost
+          { kind: 'fill', source: 'commitment-diff', commitmentHash: '0xb', speculationId: 'spec-B', contestId: 'B', makerSide: 'away', newFillWei6: '200000' },
+          { kind: 'settle', speculationId: 'spec-B', contestId: 'B', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', makerSide: 'away', winSide: 'home', txHash: '0xtxB' }, // -0.2 loss
+          // spec-C: push
+          { kind: 'fill', source: 'commitment-diff', commitmentHash: '0xc', speculationId: 'spec-C', contestId: 'C', makerSide: 'home', newFillWei6: '50000' },
+          { kind: 'settle', speculationId: 'spec-C', contestId: 'C', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', makerSide: 'home', winSide: 'push', txHash: '0xtxC' },
+          // spec-D: unsettled (still open)
+          { kind: 'fill', source: 'commitment-diff', commitmentHash: '0xd', speculationId: 'spec-D', contestId: 'D', makerSide: 'home', newFillWei6: '300000' },
+        ]);
+        const s = summarize([path]);
+        const r = s.liveMetrics.realizedPnl;
+        expect(r.wonCount).toBe(1);
+        expect(r.lostCount).toBe(1);
+        expect(r.pushCount).toBe(1);
+        expect(r.unsettledCount).toBe(1);
+        expect(r.wonUnclaimedCount).toBe(0);
+        expect(r.claimedProfitUsdcWei6).toBe('80000'); // 0.18 - 0.10 = 0.08 profit
+        expect(r.realizedLossUsdcWei6).toBe('200000'); // 0.2 loss
+        expect(r.netUsdcWei6).toBe('-120000'); // 0.08 - 0.20 = -0.12 net
+      });
     });
   });
 });

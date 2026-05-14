@@ -121,6 +121,17 @@ export function renderSummaryReportText(summary: RunSummary, logDir: string, out
   } else {
     out.write(`  Fills:        ${formatUsdcWei6(lm.fills.filledUsdcWei6)} / ${formatUsdcWei6(lm.fills.quotedUsdcWei6)} USDC filled / quoted (rate ${pctOrNa(lm.fills.fillRate)})\n`);
     out.write(`  Settlements:  ${lm.settlements.settleCount} settle / ${lm.settlements.claimCount} claim — total claimed payout ${formatUsdcWei6(lm.settlements.totalClaimedPayoutWei6)} USDC\n`);
+    const r = lm.realizedPnl;
+    out.write(`  Realized P&L: ${formatSignedUsdcWei6(r.netUsdcWei6)} USDC — ${r.wonCount} won / ${r.lostCount} lost / ${r.pushCount} push`);
+    if (r.wonUnclaimedCount > 0) out.write(` / ${r.wonUnclaimedCount} won-unclaimed`);
+    if (r.unsettledCount > 0) out.write(` / ${r.unsettledCount} unsettled`);
+    out.write(`\n`);
+    if (r.claimedProfitUsdcWei6 !== '0' || r.realizedLossUsdcWei6 !== '0') {
+      out.write(`                claimed profit ${formatUsdcWei6(r.claimedProfitUsdcWei6)} USDC / realized loss ${formatUsdcWei6(r.realizedLossUsdcWei6)} USDC\n`);
+    }
+    if (r.wonUnclaimedCount > 0) {
+      out.write(`                (won-unclaimed: payout not yet swept this window — \`ospex-mm status\` shows the live claimable totals)\n`);
+    }
     const g = lm.gas;
     out.write(`  Gas (POL):    ${formatPolWei18(g.totalPolWei)} total — approval ${formatPolWei18(g.byKind.approval)} / onchain-cancel ${formatPolWei18(g.byKind.onchainCancel)} / settle ${formatPolWei18(g.byKind.settle)} / claim ${formatPolWei18(g.byKind.claim)}\n`);
     if (g.totalUsdcEquivWei6 !== null) {
@@ -128,7 +139,7 @@ export function renderSummaryReportText(summary: RunSummary, logDir: string, out
     }
     out.write(`  Fees:         ${formatUsdcWei6(lm.totalFeeUsdcWei6)} USDC\n`);
   }
-  out.write(`Note: realized + unrealized P&L are still landing in later Phase-3 slices (DESIGN §11).\n`);
+  out.write(`Note: unrealized P&L (active positions marked to current fair) is the remaining Phase-3 slice (DESIGN §11).\n`);
   out.write(`Event counts: ${histogramText(nonZero(summary.eventCounts)) || '(none)'}\n`);
 }
 
@@ -161,6 +172,13 @@ function formatUsdcWei6(wei6: string): string {
   const whole = n / 1_000_000n;
   const frac = (n % 1_000_000n).toString().padStart(6, '0');
   return `${whole.toString()}.${frac}`;
+}
+
+/** A signed wei6 decimal string (leading `-` for losses) → `±USDC.dddddd` display with explicit `+` on positive values. */
+function formatSignedUsdcWei6(wei6: string): string {
+  if (wei6.startsWith('-')) return `-${formatUsdcWei6(wei6.slice(1))}`;
+  if (wei6 === '0') return '0.000000';
+  return `+${formatUsdcWei6(wei6)}`;
 }
 
 /** A non-negative POL wei18 decimal string → `D.dddddd` (6 fractional digits — Polygon gas costs round to ~1e-6 POL of precision in practice). */

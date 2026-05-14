@@ -1971,6 +1971,8 @@ describe('Runner — position-status transitions (Phase 3 c-ii)', () => {
     const reloaded = StateStore.at(stateDir).load().state;
     expect(reloaded.positions['spec-1234:home']?.status).toBe('pendingSettle');
     expect(reloaded.positions['spec-1234:home']?.riskAmountWei6).toBe('250000'); // risk unchanged — pure status transition
+    // result is captured from the ClaimablePositionView.result on transition (PR g-iii-a) — closes the realized-P&L window-clip loophole when the position later auto-claims.
+    expect(reloaded.positions['spec-1234:home']?.result).toBe('won');
 
     const events = readEvents();
     const transitions = events.filter((e) => e.kind === 'position-transition');
@@ -2560,6 +2562,39 @@ describe('Runner — auto-settle + auto-claim (Phase 3 e-i)', () => {
     const adapter = liveSpiedAdapter(config, () => Promise.resolve([]), { settleSpeculation: settleRecorder().fn, claimPosition: claim.fn });
     await makeRunner({ config, adapter, maxTicks: 1 }).run();
     expect(claim.calls).toEqual([{ speculationId: 9n, positionType: 0 }]); // away → 0
+  });
+
+  // ── claim.result enrichment (Phase 3 g-iii-a) ───────────────────────────
+
+  it('claim event carries `result` from the position record (the outcome the position-poll observed) — closes Hermes review-PR33\'s realized-P&L window-clip loophole', async () => {
+    const claim = claimRecorder(70_000n, 30_000_000_000n, 500_000n); // payout=500_000 (the stake — push refund)
+    // Pre-seed the position with result:'push' as if the position-poll had
+    // already captured it on the API's ClaimablePositionView.result.
+    StateStore.at(stateDir).flush({
+      ...emptyMakerState(),
+      positions: {
+        '5678:home': { ...claimableRecord('5678', '5678', 'home'), result: 'push' },
+      },
+    });
+    const config = cfg({ mode: { dryRun: false }, settlement: { autoSettleOwn: false, autoClaimOwn: true, continueOnGasBudgetExhausted: false } });
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([]), { settleSpeculation: settleRecorder().fn, claimPosition: claim.fn });
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    const event = readEvents().find((e) => e.kind === 'claim');
+    expect(event).toMatchObject({ speculationId: '5678', makerSide: 'home', result: 'push' });
+  });
+
+  it('claim event omits `result` when the position record\'s result is unset (older state or never-set) — backwards-compatible with logs from before (g-iii-a)', async () => {
+    const claim = claimRecorder();
+    StateStore.at(stateDir).flush({
+      ...emptyMakerState(),
+      positions: { '5678:home': claimableRecord('5678', '5678', 'home') }, // no result field
+    });
+    const config = cfg({ mode: { dryRun: false }, settlement: { autoSettleOwn: false, autoClaimOwn: true, continueOnGasBudgetExhausted: false } });
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([]), { settleSpeculation: settleRecorder().fn, claimPosition: claim.fn });
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    const event = readEvents().find((e) => e.kind === 'claim');
+    expect(event).toBeDefined();
+    expect((event as { result?: string }).result).toBeUndefined();
   });
 
   it('budget already exhausted (no reserve allowance) + continueOnGasBudgetExhausted=false → settle is denied with `candidate` `gas-budget-blocks-settlement` `purpose: settleSpeculation`; no on-chain write', async () => {

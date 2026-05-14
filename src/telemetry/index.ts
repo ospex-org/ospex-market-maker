@@ -581,17 +581,23 @@ export function summarize(logPaths: readonly string[], opts: { sinceIso?: string
   /** Helper: read a `gasPolWei` decimal-string field from a payload, returning 0n when missing/malformed. */
   const readGas = (v: unknown): bigint => (isWei6String(v) ? BigInt(v) : 0n);
 
-  // Realized-P&L cross-event correlation tables (g-ii). For each unique
+  // Realized-P&L cross-event correlation tables. For each unique
   // `(speculationId, makerSide)` position seen in this log: track cumulative
   // own stake from `fill` events. Track per-speculation `winSide` from
   // `settle` events (a contest-level outcome — same value on both sides). Track
-  // per-position `payoutWei6` from `claim` events (claims fire only on winning
-  // positions). The post-walk pass combines these into win/loss/push/
-  // wonUnclaimed/unsettled buckets.
+  // per-position `{payout, result?}` from `claim` events — `result` (added in
+  // PR (g-iii-a)) is the definitive `'won' | 'push' | 'void'` outcome from the
+  // SDK's `ClaimablePositionView.result`, captured by the runner during the
+  // position poll and propagated through the claim payload. The post-walk
+  // pass combines these into win / loss / push / wonUnclaimed / unsettled
+  // buckets — `claim.result` takes precedence over `settle.winSide` for the
+  // bucket verdict (a `--since` window can clip the settle event but the
+  // claim event carries the outcome directly).
   const stakesByPosition = new Map<string, bigint>(); // key = `${speculationId}:${makerSide}`
   const outcomeBySpeculation = new Map<string, string>(); // speculationId → winSide ('away' | 'home' | 'push' | 'void' | …)
-  const payoutByPosition = new Map<string, bigint>();
+  const claimByPosition = new Map<string, { payout: bigint; result?: 'won' | 'push' | 'void' }>();
   const isMakerSide = (v: unknown): v is 'away' | 'home' => v === 'away' || v === 'home';
+  const isClaimResult = (v: unknown): v is 'won' | 'push' | 'void' => v === 'won' || v === 'push' || v === 'void';
 
   // The `ts`-ordered walk: track each posted would-be quote by its synthetic hash to
   // reconstruct the running `visibleOpen + softCancelled-not-yet-expired` risk (peak)
@@ -745,11 +751,17 @@ export function summarize(logPaths: readonly string[], opts: { sinceIso?: string
         if (isWei6String(p.payoutWei6)) {
           const payout = BigInt(p.payoutWei6);
           totalClaimedPayoutWei6 += payout;
-          // Realized-P&L: per-position payout. Idempotent on a duplicate (the
-          // claim event only fires once per position on chain; this is just
-          // defense against an over-eager log replay).
+          // Realized-P&L: per-position payout + result. Idempotent on a
+          // duplicate (the claim event only fires once per position on chain;
+          // this is just defense against an over-eager log replay). `result`
+          // is the runner-emitted outcome from `ClaimablePositionView.result`
+          // (added in PR (g-iii-a)); absent on logs from before that PR
+          // and on `--since` windows that clip the position-poll observation
+          // — in either case the classifier falls back to settle.winSide.
           if (typeof p.speculationId === 'string' && isMakerSide(p.makerSide)) {
-            payoutByPosition.set(`${p.speculationId}:${p.makerSide}`, payout);
+            const entry: { payout: bigint; result?: 'won' | 'push' | 'void' } = { payout };
+            if (isClaimResult(p.result)) entry.result = p.result;
+            claimByPosition.set(`${p.speculationId}:${p.makerSide}`, entry);
           }
         }
         break;
@@ -778,32 +790,31 @@ export function summarize(logPaths: readonly string[], opts: { sinceIso?: string
     const usdcWei6 = BigInt(Math.round(polFloat * opts.polToUsdcRate * 1e6));
     totalUsdcEquivWei6 = usdcWei6.toString();
   }
-  // ── realized-P&L post-walk (g-ii) ───────────────────────────────────────
+  // ── realized-P&L post-walk ──────────────────────────────────────────────
   // For each position with at least one fill, classify by what we know.
-  // **Outcome is consulted before claim** because push / void positions are
-  // auto-claimed on chain too (payout == stake) — a claim event alone is NOT
-  // sufficient to call something "won". The SDK's `ClaimablePositionView.result`
-  // is `'won' | 'push' | 'void'`, and the runner's auto-claim path claims every
-  // `claimable` record regardless of outcome (`src/runners/index.ts`'s
-  // `settleAndClaim` walk). Without this ordering a refunded push would be
-  // miscounted as a win (Hermes review-PR33 blocker).
+  // **The runner-emitted `claim.result` (PR (g-iii-a)) is the authoritative
+  // outcome when present** — it comes from the SDK's
+  // `ClaimablePositionView.result` (`'won' | 'push' | 'void'`) captured during
+  // the position-status poll, so it doesn't depend on a `settle` event being
+  // in the same `--since` window. When it's absent (older logs, or a
+  // window-clipped position-poll observation), the classifier falls back to
+  // `settle.winSide`-derivation — which itself orders push/void before "claim
+  // = won" so the runner's auto-claim on a refund doesn't miscount (Hermes
+  // review-PR33 blocker, preserved).
   //
-  // Order:
-  //   1. settle.winSide ∈ {'push', 'void'} → push bucket (P&L = 0). Discards
-  //      any claim event that may have fired for the refund.
-  //   2. claim present AND (outcome unknown OR outcome === makerSide) → won
-  //      (profit = payout − stake). Outcome-unknown is the externally-settled
-  //      / `--since`-clipped case; outcome-matches is the normal winning case.
-  //   3. settle.winSide !== makerSide (and not push/void) → lost (-stake).
-  //   4. outcome === makerSide and no claim → wonUnclaimed (paper profit).
-  //   5. no settle → unsettled (held over to (g-iii) unrealized).
-  //
-  // Limitation: when `settle` is missing from the window but `claim` is present
-  // for an actual push, we can't distinguish "won with zero profit" from
-  // "push refund" purely from the events available here. Both produce
-  // `netUsdcWei6: '0'` (correct), but the bucket is `won` instead of `push`.
-  // The future fix is to include `result` on the `claim` event payload (see
-  // PR-33 Hermes review's follow-up note).
+  // Final order:
+  //   1. claim.result ∈ {'push', 'void'} → push (whatever payout came with it
+  //      was a refund, ignored).
+  //   2. settle.winSide ∈ {'push', 'void'} → push (no claim.result; falls back
+  //      to the contest-level verdict; same posture as above).
+  //   3. claim.result === 'won' → won (use payout).
+  //   4. claim present without `result` AND (settle missing OR settle agrees) →
+  //      won. Outcome-unknown is the externally-settled / window-clipped case;
+  //      outcome-matches is the normal winning path.
+  //   5. no settle and no claim → unsettled.
+  //   6. settle.winSide ≠ makerSide (and not push/void) → lost. A stray
+  //      claim in this case is anomalous; the outcome verdict wins.
+  //   7. settle.winSide === makerSide and no claim → wonUnclaimed.
   let netRealizedPnlWei6 = 0n;
   let claimedProfitWei6 = 0n;
   let realizedLossWei6 = 0n;
@@ -817,40 +828,53 @@ export function summarize(logPaths: readonly string[], opts: { sinceIso?: string
     const speculationId = key.slice(0, idx);
     const makerSide = key.slice(idx + 1); // 'away' | 'home'
     const outcome = outcomeBySpeculation.get(speculationId);
-    const payout = payoutByPosition.get(key);
+    const claim = claimByPosition.get(key);
 
-    // (1) push / void always wins over the claim branch — auto-claim still
-    // emits a claim event for refunded positions, but that's a refund (P&L=0),
-    // not a win.
+    // (1) claim.result is authoritative — push / void here means the claim
+    // was a refund, regardless of whether settle.winSide is in the window.
+    if (claim?.result === 'push' || claim?.result === 'void') {
+      pushCount += 1;
+      continue;
+    }
+    // (2) push / void from the settle event (claim.result absent — older logs
+    // or window-clipped). Discards any claim event that may have fired for
+    // the refund.
     if (outcome === 'push' || outcome === 'void') {
       pushCount += 1;
       continue;
     }
-    // (2) winning claim: outcome unknown (externally settled / window-clipped)
-    // OR outcome agrees with `makerSide`.
-    if (payout !== undefined && (outcome === undefined || outcome === makerSide)) {
-      const profit = payout - stake;
+    // (3) claim.result === 'won' — authoritative win.
+    if (claim?.result === 'won') {
+      const profit = claim.payout - stake;
       netRealizedPnlWei6 += profit;
       claimedProfitWei6 += profit;
       wonCount += 1;
       continue;
     }
-    // (3) no settle and no claim → unsettled.
+    // (4) winning claim without result (older log): trust the claim when the
+    // outcome is unknown (externally settled / `--since`-clipped) or agrees
+    // with makerSide.
+    if (claim !== undefined && (outcome === undefined || outcome === makerSide)) {
+      const profit = claim.payout - stake;
+      netRealizedPnlWei6 += profit;
+      claimedProfitWei6 += profit;
+      wonCount += 1;
+      continue;
+    }
+    // (5) no settle and no claim → unsettled.
     if (outcome === undefined) {
       unsettledCount += 1;
       continue;
     }
-    // (4) settled against the maker (and not push/void) → lost. The claim
-    // event shouldn't fire in this case on chain; if it somehow did, the
-    // outcome verdict still classifies it as a loss (we drop the anomalous
-    // payout).
+    // (6) settled against the maker (and not push/void) → lost. A stray
+    // claim event in this case is anomalous; the outcome verdict wins.
     if (outcome !== makerSide) {
       netRealizedPnlWei6 -= stake;
       realizedLossWei6 += stake;
       lostCount += 1;
       continue;
     }
-    // (5) outcome === makerSide AND no claim — paper profit; payout pending.
+    // (7) outcome === makerSide AND no claim — paper profit; payout pending.
     wonUnclaimedCount += 1;
   }
 

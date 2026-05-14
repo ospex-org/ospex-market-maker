@@ -104,6 +104,18 @@ export interface MakerPositionRecord {
   /** The counterparty's staked risk (USDC wei6, decimal string). Settlement pays the winner `1 + counterparty/own` in decimal terms. */
   counterpartyRiskWei6: string;
   status: MakerPositionStatus;
+  /**
+   * The position's settled outcome from the API's `ClaimablePositionView.result`
+   * — captured during the position-status poll once the API view advances to
+   * `pendingSettle` or `claimable`. Absent on `active` positions (the contest
+   * hasn't settled), and on records loaded from older state files (the field
+   * was added as an optional in PR (g-iii-a) — `undefined` flows through the
+   * validator). Used to disambiguate `won` / `push` / `void` at claim time and
+   * is included in the `claim` telemetry event payload so the summary walker
+   * can classify the position without depending on a `settle` event being in
+   * the same `--since` window.
+   */
+  result?: 'won' | 'push' | 'void';
   /** Unix seconds — when `status` last changed. */
   updatedAtUnixSec: number;
 }
@@ -356,21 +368,30 @@ function validatePositionRecord(value: unknown): { ok: true; record: MakerPositi
   if (!isDecimalString(value.riskAmountWei6) || !isDecimalString(value.counterpartyRiskWei6)) return { ok: false, reason: 'riskAmountWei6 / counterpartyRiskWei6 must be decimal strings' };
   if (!(MAKER_POSITION_STATUSES as readonly string[]).includes(value.status as string)) return { ok: false, reason: `status ${describe(value.status)} is not a known status` };
   if (!isNonNegInt(value.updatedAtUnixSec)) return { ok: false, reason: 'updatedAtUnixSec must be a non-negative integer' };
-  return {
-    ok: true,
-    record: {
-      speculationId: value.speculationId,
-      contestId: value.contestId,
-      sport: value.sport,
-      awayTeam: value.awayTeam,
-      homeTeam: value.homeTeam,
-      side: value.side,
-      riskAmountWei6: value.riskAmountWei6,
-      counterpartyRiskWei6: value.counterpartyRiskWei6,
-      status: value.status as MakerPositionStatus,
-      updatedAtUnixSec: value.updatedAtUnixSec,
-    },
+  // `result` is optional (added in g-iii-a). Reject malformed values rather
+  // than silently dropping — fail-closed is the validator's posture.
+  let result: 'won' | 'push' | 'void' | undefined;
+  if (value.result !== undefined) {
+    if (value.result === 'won' || value.result === 'push' || value.result === 'void') {
+      result = value.result;
+    } else {
+      return { ok: false, reason: `result ${describe(value.result)} is not "won"/"push"/"void"` };
+    }
+  }
+  const record: MakerPositionRecord = {
+    speculationId: value.speculationId,
+    contestId: value.contestId,
+    sport: value.sport,
+    awayTeam: value.awayTeam,
+    homeTeam: value.homeTeam,
+    side: value.side,
+    riskAmountWei6: value.riskAmountWei6,
+    counterpartyRiskWei6: value.counterpartyRiskWei6,
+    status: value.status as MakerPositionStatus,
+    updatedAtUnixSec: value.updatedAtUnixSec,
   };
+  if (result !== undefined) record.result = result;
+  return { ok: true, record };
 }
 
 // ── boot-time state-loss fail-safe (DESIGN §12) ──────────────────────────────

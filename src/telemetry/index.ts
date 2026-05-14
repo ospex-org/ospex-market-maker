@@ -313,10 +313,53 @@ export interface LiveGasByKind {
 }
 
 /**
+ * Realized P&L over closed positions (DESIGN §11). Computed by cross-event
+ * correlation: `fill.newFillWei6` accumulates per-(speculationId, makerSide)
+ * cumulative own stake; `settle.winSide` identifies the per-speculation
+ * outcome; `claim.payoutWei6` is the maker's swept payout on a winning
+ * position. For each position with at least one fill:
+ *
+ *   - **won** — a `claim` event exists for that `(speculationId, makerSide)`;
+ *     profit = `payoutWei6 - cumulativeStake`, contributes to `netUsdcWei6`.
+ *   - **lost** — settle exists with `winSide !== makerSide` AND `winSide !==
+ *     'push' / 'void'`, and no claim; -stake contributes to `netUsdcWei6`.
+ *   - **push** — settle's `winSide` is `'push'` or `'void'`; P&L = 0,
+ *     contributes nothing.
+ *   - **wonUnclaimed** — settle's `winSide === makerSide` BUT no claim has
+ *     fired in this log window (auto-claim disabled, hasn't ticked yet, or
+ *     threw). Counted but does NOT contribute to `netUsdcWei6` — the payout
+ *     isn't known yet. Operators should consult `ospex-mm status` for live
+ *     `getPositionStatus` payout totals.
+ *   - **unsettled** — position has fills but no settle event in the window.
+ *     Held over for the (g-iii) unrealized-P&L slice.
+ *
+ * Unrealized P&L (active positions marked to current fair) is the remaining
+ * Phase-3 follow-up and requires `summarize` to accept an `OspexAdapter`.
+ */
+export interface RealizedPnl {
+  /** Net realized P&L in USDC wei6 (SIGNED decimal string — leading `-` for losses; `"0"` for zero). Sum of `won` profits minus `lost` stakes; `push` and `wonUnclaimed` contribute nothing. */
+  netUsdcWei6: string;
+  /** Sum of `payoutWei6 - cumulativeStake` across `won` positions (always non-negative — a claim only fires on winning positions). */
+  claimedProfitUsdcWei6: string;
+  /** Sum of stakes lost across `lost` positions (non-negative; subtracted from `claimedProfitUsdcWei6` to get net). */
+  realizedLossUsdcWei6: string;
+  /** Positions closed in the maker's favor with a `claim` event in this window. */
+  wonCount: number;
+  /** Positions whose `settle.winSide` ≠ `makerSide` (and ≠ push/void). */
+  lostCount: number;
+  /** Positions whose `settle.winSide ∈ {'push', 'void'}` — stake refunded, P&L = 0. */
+  pushCount: number;
+  /** Positions whose `settle.winSide === makerSide` but no `claim` event fired in this window — paper profit, not yet swept. Use `ospex-mm status` for the live payout figure. */
+  wonUnclaimedCount: number;
+  /** Positions with fills whose speculation has not settled in this window — held over for the (g-iii) unrealized-P&L slice. */
+  unsettledCount: number;
+}
+
+/**
  * Live-mode run metrics (DESIGN §2.3 / §11). The fill / settlement / gas /
- * fees aggregators populated by the `submit` / `replace` / `fill` / `settle` /
- * `claim` / `approval` / `onchain-cancel` walk. Wei amounts are decimal
- * strings — the AGENT_CONTRACT numeric rule.
+ * fees / realized-P&L aggregators populated by the `submit` / `replace` /
+ * `fill` / `settle` / `claim` / `approval` / `onchain-cancel` walk. Wei
+ * amounts are decimal strings — the AGENT_CONTRACT numeric rule.
  */
 export interface LiveMetrics {
   /**
@@ -352,13 +395,20 @@ export interface LiveMetrics {
    * events; `totalClaimedPayoutWei6` is the sum of `payoutWei6` across
    * those claims — USDC the maker actually swept back. The maker's net
    * settled P&L (claimed payouts − staked risk on the claimed positions)
-   * is the realized-P&L slice — Phase 3 follow-up.
+   * is on {@link realizedPnl} below.
    */
   settlements: {
     settleCount: number;
     claimCount: number;
     totalClaimedPayoutWei6: string;
   };
+  /**
+   * Realized P&L over closed positions (see {@link RealizedPnl} for the
+   * cross-event correlation rules and bucket definitions). Net P&L is
+   * `claimedProfit − realizedLoss`. Unrealized P&L over still-active
+   * positions is the remaining Phase-3 follow-up (needs adapter).
+   */
+  realizedPnl: RealizedPnl;
   /**
    * Total protocol fees paid by the maker (USDC wei6 decimal string).
    * Genuinely `"0"` in v0 — v0 refuses lazy-creation commitments so there's
@@ -526,6 +576,18 @@ export function summarize(logPaths: readonly string[], opts: { sinceIso?: string
   /** Helper: read a `gasPolWei` decimal-string field from a payload, returning 0n when missing/malformed. */
   const readGas = (v: unknown): bigint => (isWei6String(v) ? BigInt(v) : 0n);
 
+  // Realized-P&L cross-event correlation tables (g-ii). For each unique
+  // `(speculationId, makerSide)` position seen in this log: track cumulative
+  // own stake from `fill` events. Track per-speculation `winSide` from
+  // `settle` events (a contest-level outcome — same value on both sides). Track
+  // per-position `payoutWei6` from `claim` events (claims fire only on winning
+  // positions). The post-walk pass combines these into win/loss/push/
+  // wonUnclaimed/unsettled buckets.
+  const stakesByPosition = new Map<string, bigint>(); // key = `${speculationId}:${makerSide}`
+  const outcomeBySpeculation = new Map<string, string>(); // speculationId → winSide ('away' | 'home' | 'push' | 'void' | …)
+  const payoutByPosition = new Map<string, bigint>();
+  const isMakerSide = (v: unknown): v is 'away' | 'home' => v === 'away' || v === 'home';
+
   // The `ts`-ordered walk: track each posted would-be quote by its synthetic hash to
   // reconstruct the running `visibleOpen + softCancelled-not-yet-expired` risk (peak)
   // and the per-quote visible-life ages. A `would-soft-cancel` / `would-replace`-of /
@@ -640,7 +702,16 @@ export function summarize(logPaths: readonly string[], opts: { sinceIso?: string
         break;
       }
       case 'fill': {
-        if (isWei6String(p.newFillWei6)) filledWei6 += BigInt(p.newFillWei6);
+        if (isWei6String(p.newFillWei6)) {
+          const delta = BigInt(p.newFillWei6);
+          filledWei6 += delta;
+          // Realized-P&L: accumulate per-position own stake. Both commitment-diff
+          // and position-poll `fill` sources carry `speculationId` + `makerSide`.
+          if (typeof p.speculationId === 'string' && isMakerSide(p.makerSide)) {
+            const key = `${p.speculationId}:${p.makerSide}`;
+            stakesByPosition.set(key, (stakesByPosition.get(key) ?? 0n) + delta);
+          }
+        }
         break;
       }
       case 'approval': {
@@ -654,12 +725,28 @@ export function summarize(logPaths: readonly string[], opts: { sinceIso?: string
       case 'settle': {
         settleCount += 1;
         addGas('settle', readGas(p.gasPolWei));
+        // Realized-P&L: capture the contest-level outcome. Last-write-wins on a
+        // duplicate (a maker quoting both sides emits two `settle` events for
+        // the same speculation, but they both carry the same `winSide` — the
+        // contest's outcome is contest-level, not per-position).
+        if (typeof p.speculationId === 'string' && typeof p.winSide === 'string') {
+          outcomeBySpeculation.set(p.speculationId, p.winSide);
+        }
         break;
       }
       case 'claim': {
         claimCount += 1;
         addGas('claim', readGas(p.gasPolWei));
-        if (isWei6String(p.payoutWei6)) totalClaimedPayoutWei6 += BigInt(p.payoutWei6);
+        if (isWei6String(p.payoutWei6)) {
+          const payout = BigInt(p.payoutWei6);
+          totalClaimedPayoutWei6 += payout;
+          // Realized-P&L: per-position payout. Idempotent on a duplicate (the
+          // claim event only fires once per position on chain; this is just
+          // defense against an over-eager log replay).
+          if (typeof p.speculationId === 'string' && isMakerSide(p.makerSide)) {
+            payoutByPosition.set(`${p.speculationId}:${p.makerSide}`, payout);
+          }
+        }
         break;
       }
       default:
@@ -686,6 +773,48 @@ export function summarize(logPaths: readonly string[], opts: { sinceIso?: string
     const usdcWei6 = BigInt(Math.round(polFloat * opts.polToUsdcRate * 1e6));
     totalUsdcEquivWei6 = usdcWei6.toString();
   }
+  // ── realized-P&L post-walk (g-ii) ───────────────────────────────────────
+  // For each position with at least one fill, classify by what we know:
+  // claim present → won (use payout); else settle with winSide:
+  //   - 'push' / 'void' → push (P&L = 0);
+  //   - != makerSide → lost (P&L = -stake);
+  //   - === makerSide and no claim → wonUnclaimed (no P&L contribution, count only);
+  // settle absent → unsettled (held over to unrealized — Phase 3 g-iii).
+  let netRealizedPnlWei6 = 0n;
+  let claimedProfitWei6 = 0n;
+  let realizedLossWei6 = 0n;
+  let wonCount = 0;
+  let lostCount = 0;
+  let pushCount = 0;
+  let wonUnclaimedCount = 0;
+  let unsettledCount = 0;
+  for (const [key, stake] of stakesByPosition) {
+    const idx = key.indexOf(':');
+    const speculationId = key.slice(0, idx);
+    const makerSide = key.slice(idx + 1); // 'away' | 'home'
+    const payout = payoutByPosition.get(key);
+    if (payout !== undefined) {
+      const profit = payout - stake; // can be negative on malformed inputs; the renderer accepts signed strings
+      netRealizedPnlWei6 += profit;
+      claimedProfitWei6 += profit;
+      wonCount += 1;
+      continue;
+    }
+    const outcome = outcomeBySpeculation.get(speculationId);
+    if (outcome === undefined) {
+      unsettledCount += 1;
+    } else if (outcome === 'push' || outcome === 'void') {
+      pushCount += 1;
+    } else if (outcome !== makerSide) {
+      netRealizedPnlWei6 -= stake;
+      realizedLossWei6 += stake;
+      lostCount += 1;
+    } else {
+      // outcome === makerSide AND no claim in this window — paper profit
+      wonUnclaimedCount += 1;
+    }
+  }
+
   const liveMetrics: LiveMetrics = {
     fills: {
       quotedUsdcWei6: quotedWei6.toString(),
@@ -701,6 +830,16 @@ export function summarize(logPaths: readonly string[], opts: { sinceIso?: string
       settleCount,
       claimCount,
       totalClaimedPayoutWei6: totalClaimedPayoutWei6.toString(),
+    },
+    realizedPnl: {
+      netUsdcWei6: netRealizedPnlWei6.toString(),
+      claimedProfitUsdcWei6: claimedProfitWei6.toString(),
+      realizedLossUsdcWei6: realizedLossWei6.toString(),
+      wonCount,
+      lostCount,
+      pushCount,
+      wonUnclaimedCount,
+      unsettledCount,
     },
     totalFeeUsdcWei6: totalFeeUsdcWei6.toString(),
   };

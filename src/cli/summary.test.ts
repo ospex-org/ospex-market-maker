@@ -55,6 +55,7 @@ function fakeSummary(over: Partial<RunSummary> = {}): RunSummary {
       fills: { quotedUsdcWei6: '0', filledUsdcWei6: '0', fillRate: null },
       gas: { totalPolWei: '0', byKind: { approval: '0', onchainCancel: '0', settle: '0', claim: '0' }, totalUsdcEquivWei6: null },
       settlements: { settleCount: 0, claimCount: 0, totalClaimedPayoutWei6: '0' },
+      realizedPnl: { netUsdcWei6: '0', claimedProfitUsdcWei6: '0', realizedLossUsdcWei6: '0', wonCount: 0, lostCount: 0, pushCount: 0, wonUnclaimedCount: 0, unsettledCount: 0 },
       totalFeeUsdcWei6: '0',
     },
     ...over,
@@ -141,8 +142,41 @@ describe('renderSummaryReport*', () => {
     expect(out).toContain('Latent-exposure peak: 0.500000 USDC (500000 wei6)');
     expect(out).toMatch(/Live-mode metrics:/);
     expect(out).toMatch(/no live activity/); // the fakeSummary has zero-valued live metrics
-    expect(out).toMatch(/realized \+ unrealized P&L are still landing/);
+    expect(out).toMatch(/unrealized P&L \(active positions marked to current fair\) is the remaining Phase-3 slice/);
     expect(out).toContain('Event counts:');
+  });
+
+  it('text render shows the Realized P&L line with signed net + per-bucket counts when there is realized activity (Phase 3 g-ii)', () => {
+    const { sink, text } = collect();
+    renderSummaryReportText(fakeSummary({
+      liveMetrics: {
+        fills: { quotedUsdcWei6: '1000000', filledUsdcWei6: '600000', fillRate: 0.6 },
+        gas: { totalPolWei: '0', byKind: { approval: '0', onchainCancel: '0', settle: '0', claim: '0' }, totalUsdcEquivWei6: null },
+        settlements: { settleCount: 2, claimCount: 1, totalClaimedPayoutWei6: '900000' },
+        realizedPnl: { netUsdcWei6: '-100000', claimedProfitUsdcWei6: '400000', realizedLossUsdcWei6: '500000', wonCount: 1, lostCount: 1, pushCount: 0, wonUnclaimedCount: 0, unsettledCount: 0 },
+        totalFeeUsdcWei6: '0',
+      },
+    }), logDir, sink);
+    const out = text();
+    expect(out).toContain('Realized P&L: -0.100000 USDC — 1 won / 1 lost / 0 push');
+    expect(out).toContain('claimed profit 0.400000 USDC / realized loss 0.500000 USDC');
+  });
+
+  it('text render shows the won-unclaimed hint when wonUnclaimedCount > 0 (operators should check `ospex-mm status` for the live payout)', () => {
+    const { sink, text } = collect();
+    renderSummaryReportText(fakeSummary({
+      liveMetrics: {
+        fills: { quotedUsdcWei6: '500000', filledUsdcWei6: '500000', fillRate: 1 },
+        gas: { totalPolWei: '0', byKind: { approval: '0', onchainCancel: '0', settle: '0', claim: '0' }, totalUsdcEquivWei6: null },
+        settlements: { settleCount: 1, claimCount: 0, totalClaimedPayoutWei6: '0' },
+        realizedPnl: { netUsdcWei6: '0', claimedProfitUsdcWei6: '0', realizedLossUsdcWei6: '0', wonCount: 0, lostCount: 0, pushCount: 0, wonUnclaimedCount: 1, unsettledCount: 0 },
+        totalFeeUsdcWei6: '0',
+      },
+    }), logDir, sink);
+    const out = text();
+    expect(out).toContain('1 won-unclaimed');
+    expect(out).toContain('payout not yet swept this window');
+    expect(out).toContain('ospex-mm status');
   });
 
   it('text render shows the Fills line on fill-only activity (a --since window that catches a fill but misses its submit — Hermes review-PR32 blocker #1)', () => {
@@ -152,6 +186,7 @@ describe('renderSummaryReport*', () => {
         fills: { quotedUsdcWei6: '0', filledUsdcWei6: '100000', fillRate: null },
         gas: { totalPolWei: '0', byKind: { approval: '0', onchainCancel: '0', settle: '0', claim: '0' }, totalUsdcEquivWei6: null },
         settlements: { settleCount: 0, claimCount: 0, totalClaimedPayoutWei6: '0' },
+        realizedPnl: { netUsdcWei6: '0', claimedProfitUsdcWei6: '0', realizedLossUsdcWei6: '0', wonCount: 0, lostCount: 0, pushCount: 0, wonUnclaimedCount: 0, unsettledCount: 0 },
         totalFeeUsdcWei6: '0',
       },
     }), logDir, sink);

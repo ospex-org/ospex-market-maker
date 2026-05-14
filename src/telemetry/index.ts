@@ -229,11 +229,11 @@ export function listRunLogs(logDir: string): string[] {
  * The `ospex-mm summary` report (DESIGN §11) — the §2.3 run metrics aggregated
  * from one or more NDJSON event logs. The **dry-run** metrics (would-be-stale rate,
  * quote competitiveness, quote-age distribution, latent-exposure peak, the
- * candidate-skip and error histograms) are fully computed here; the **live-mode**
- * ones (fill rate, P&L, gas, fees, settlement outcomes — DESIGN §2.3) are Phase 3,
- * when the live events (`submit` / `fill` / `settle` / `claim` / `approval`) and
- * their payloads exist — for now those just show up in `eventCounts`, and
- * `liveMetrics` is `null` to say "this section is intentionally absent, not lost".
+ * candidate-skip and error histograms) are fully computed; the **live-mode**
+ * ones (fill rate, gas, fees, settlement outcomes — DESIGN §2.3) are also computed
+ * by the live-event walk (`submit` / `replace` / `fill` / `settle` / `claim` /
+ * `approval` / `onchain-cancel`) and exposed on {@link RunSummary.liveMetrics};
+ * realized + unrealized P&L are the remaining Phase-3 follow-ups.
  *
  * This is the MM's *own* report; the cross-agent platform-viability scorecard
  * (DESIGN §16) consumes the raw NDJSON, not this.

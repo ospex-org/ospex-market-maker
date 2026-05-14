@@ -928,6 +928,14 @@ describe('Runner — per-market reconcile', () => {
       expect(typeof e.takerImpliedProb).toBe('number');
     }
     expect(events.find((e) => e.kind === 'quote-intent')).toMatchObject({ contestId: 'A', speculationId: 'spec-A', canQuote: true });
+    // risk-verdict (Phase 3 h) — engine's per-market decision; emitted alongside quote-intent. Both sides allowed in this happy path; non-zero headroom on both.
+    const verdict = events.find((e) => e.kind === 'risk-verdict');
+    expect(verdict).toMatchObject({ contestId: 'A', speculationId: 'spec-A', allowed: true });
+    expect(verdict?.awayOffer).toMatchObject({ allowed: true });
+    expect(verdict?.homeOffer).toMatchObject({ allowed: true });
+    expect((verdict?.awayOffer as { sizeUSDC: number }).sizeUSDC).toBeGreaterThan(0);
+    expect((verdict?.homeOffer as { sizeUSDC: number }).sizeUSDC).toBeGreaterThan(0);
+    expect((verdict?.awayOffer as { headroomUSDC: number }).headroomUSDC).toBeGreaterThan(0);
 
     const records = Object.values(StateStore.at(stateDir).load().state.commitments);
     expect(records).toHaveLength(2);
@@ -991,10 +999,32 @@ describe('Runner — per-market reconcile', () => {
 
     const events = readEvents();
     expect(events.find((e) => e.kind === 'quote-intent')).toMatchObject({ contestId: 'A', canQuote: false });
+    // risk-verdict (Phase 3 h) — engine refused at the open-commitment count cap. Both sides allowed:false; the notes array carries the reason. sizeUSDC = 0 on a refused side.
+    const verdict = events.find((e) => e.kind === 'risk-verdict');
+    expect(verdict).toMatchObject({ contestId: 'A', speculationId: 'spec-A', allowed: false });
+    expect(verdict?.awayOffer).toMatchObject({ allowed: false, sizeUSDC: 0 });
+    expect(verdict?.homeOffer).toMatchObject({ allowed: false, sizeUSDC: 0 });
+    expect(Array.isArray(verdict?.notes)).toBe(true);
+    expect((verdict?.notes as string[]).join(' ')).toMatch(/open-commitment count/);
     expect(events.find((e) => e.kind === 'would-soft-cancel')).toMatchObject({ commitmentHash: '0xaWay', takerSide: 'home', makerSide: 'away', reason: 'side-not-quoted' }); // makerSide:'away' → a quote on the home offer
     expect(events.some((e) => e.kind === 'would-submit' || e.kind === 'would-replace')).toBe(false);
     expect(events.some((e) => e.kind === 'quote-competitiveness' || e.kind === 'competitiveness-unavailable')).toBe(false); // a refused quote has nothing to assess
     expect(StateStore.at(stateDir).load().state.commitments['0xaWay']?.lifecycle).toBe('softCancelled');
+  });
+
+  it('risk-verdict (Phase 3 h) is NOT emitted when a pre-engine gate skips the market (no-reference-odds / no-open-speculation / etc.) — the engine never ran', async () => {
+    // A contest tracked with no reference moneyline odds → the runner skips
+    // before buildDesiredQuote. The risk-verdict event documents the engine's
+    // verdict; not the pre-gate skips (which surface as `candidate` skipReasons).
+    StateStore.at(stateDir).flush(emptyMakerState());
+    const config = cfg();
+    const adapter = spiedAdapter(config, () => Promise.resolve([contestView({ contestId: 'A' })]));
+    // Override the odds snapshot so the moneyline row is absent → no-reference-odds gate trips before buildDesiredQuote runs.
+    vi.spyOn(adapter, 'getOddsSnapshot').mockResolvedValue(oddsSnapshotView('A', null));
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    const events = readEvents();
+    expect(events.some((e) => e.kind === 'risk-verdict')).toBe(false);
+    expect(events.find((e) => e.kind === 'candidate' && e.skipReason === 'no-reference-odds')).toBeDefined();
   });
 
   it('when the open-commitment count budget runs out mid-plan a side is deferred — a cap-hit candidate, only the affordable side submitted', async () => {

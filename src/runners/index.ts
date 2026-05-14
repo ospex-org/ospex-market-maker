@@ -1024,6 +1024,39 @@ export class Runner {
       home: quoteSideSummary(desired.result.home),
       notes: desired.result.notes,
     });
+    // ── risk-verdict (Phase 3 h) ─────────────────────────────────────────
+    // The risk engine's per-market decision, with the per-cap headroom math
+    // that produced it (DESIGN §11). Distinct from `quote-intent` (the
+    // protocol-level intent — taker tick, maker tick, position type, …): this
+    // event focuses on the exposure-side reasoning that operators ask "why
+    // didn't the MM post here?" about. Emitted only when the engine actually
+    // runs — i.e. after the pre-engine gates (no-reference-odds /
+    // start-too-soon / stale-reference / no-open-speculation) have passed.
+    // For each side (`away` / `home` as the *taker offer* — the side a taker
+    // would back), `allowed` mirrors `desired.result.{away,home} !== null`;
+    // `sizeUSDC` is the engine-bound size when allowed (zero when refused);
+    // `headroomUSDC` is the maximum additional risk the per-cap math allowed
+    // on that side before the pricing layer ran. `notes` carries the
+    // refusal reasons (engine-level + pricing-level) when `allowed: false`.
+    this.eventLog.emit('risk-verdict', {
+      contestId: m.contestId,
+      speculationId: m.speculationId,
+      sport: m.sport,
+      awayTeam: m.awayTeam,
+      homeTeam: m.homeTeam,
+      allowed: desired.result.canQuote,
+      awayOffer: {
+        allowed: desired.result.away !== null,
+        sizeUSDC: desired.result.away?.sizeUSDC ?? 0,
+        headroomUSDC: desired.headroomUSDC.away,
+      },
+      homeOffer: {
+        allowed: desired.result.home !== null,
+        sizeUSDC: desired.result.home?.sizeUSDC ?? 0,
+        headroomUSDC: desired.headroomUSDC.home,
+      },
+      notes: desired.result.notes,
+    });
     const recordsOnSpec = Object.values(this.state.commitments).filter((r) => r.speculationId === m.speculationId);
     const plan = reconcileBook(recordsOnSpec, desired, this.config, now, inventory.openCommitmentCount);
     const outcome = await this.applyReconcilePlan(m, plan, now);

@@ -33,17 +33,27 @@ export interface SummaryOpts {
 /** Injectable seams so `runSummary` can be exercised without touching the filesystem. */
 export interface SummaryDeps {
   listRunLogs?: (logDir: string) => string[];
-  summarize?: (logPaths: readonly string[], opts?: { sinceIso?: string }) => RunSummary;
+  summarize?: (logPaths: readonly string[], opts?: { sinceIso?: string; polToUsdcRate?: number }) => RunSummary;
 }
 
 // ── the command ──────────────────────────────────────────────────────────────
 
-/** Resolve the run-log files under `config.telemetry.logDir` and aggregate them into a {@link RunSummary}. Throws on an unreadable log dir/file or a malformed `--since`. */
+/**
+ * Resolve the run-log files under `config.telemetry.logDir` and aggregate them
+ * into a {@link RunSummary}. Throws on an unreadable log dir/file or a malformed
+ * `--since`. Threads `config.gas.nativeTokenUSDCPrice` to `summarize` as the
+ * `polToUsdcRate` iff `config.gas.reportInUSDC: true`, so the live-metrics gas
+ * section gets its USDC-equivalent populated (otherwise that field stays
+ * `null`).
+ */
 export function runSummary(opts: SummaryOpts, deps: SummaryDeps = {}): RunSummary {
   const list = deps.listRunLogs ?? listRunLogsImpl;
   const aggregate = deps.summarize ?? summarizeImpl;
   const paths = list(opts.config.telemetry.logDir);
-  return aggregate(paths, opts.sinceIso !== undefined ? { sinceIso: opts.sinceIso } : undefined);
+  const summarizeOpts: { sinceIso?: string; polToUsdcRate?: number } = {};
+  if (opts.sinceIso !== undefined) summarizeOpts.sinceIso = opts.sinceIso;
+  if (opts.config.gas.reportInUSDC) summarizeOpts.polToUsdcRate = opts.config.gas.nativeTokenUSDCPrice;
+  return aggregate(paths, summarizeOpts);
 }
 
 /** A summary is informational — always exit `0`. (Operational failures throw; the CLI maps those to exit 1.) */
@@ -98,7 +108,22 @@ export function renderSummaryReportText(summary: RunSummary, logDir: string, out
   out.write(`Degraded events: ${histogramText(summary.degradedByReason) || 'none'}\n`);
   out.write(`Errors: ${summary.errors.total}${summary.errors.total > 0 ? ` — by phase: ${histogramText(summary.errors.byPhase)}` : ''}\n`);
 
-  out.write(`\nLive-mode metrics (fill rate, P&L, gas, fees, settlements): not computed yet — Phase 3 (those events show up in the event-count histogram below).\n`);
+  const lm = summary.liveMetrics;
+  const hasLiveActivity = lm.fills.quotedUsdcWei6 !== '0' || lm.settlements.settleCount > 0 || lm.settlements.claimCount > 0 || lm.gas.totalPolWei !== '0';
+  out.write(`\nLive-mode metrics:\n`);
+  if (!hasLiveActivity) {
+    out.write(`  (no live activity — submit / fill / settle / claim events absent; check the event-count histogram below)\n`);
+  } else {
+    out.write(`  Fills:        ${formatUsdcWei6(lm.fills.filledUsdcWei6)} / ${formatUsdcWei6(lm.fills.quotedUsdcWei6)} USDC filled / quoted (rate ${pctOrNa(lm.fills.fillRate)})\n`);
+    out.write(`  Settlements:  ${lm.settlements.settleCount} settle / ${lm.settlements.claimCount} claim — total claimed payout ${formatUsdcWei6(lm.settlements.totalClaimedPayoutWei6)} USDC\n`);
+    const g = lm.gas;
+    out.write(`  Gas (POL):    ${formatPolWei18(g.totalPolWei)} total — approval ${formatPolWei18(g.byKind.approval)} / onchain-cancel ${formatPolWei18(g.byKind.onchainCancel)} / settle ${formatPolWei18(g.byKind.settle)} / claim ${formatPolWei18(g.byKind.claim)}\n`);
+    if (g.totalUsdcEquivWei6 !== null) {
+      out.write(`  Gas (≈USDC):  ${formatUsdcWei6(g.totalUsdcEquivWei6)} (POL → USDC via config.gas.nativeTokenUSDCPrice)\n`);
+    }
+    out.write(`  Fees:         ${formatUsdcWei6(lm.totalFeeUsdcWei6)} USDC\n`);
+  }
+  out.write(`Note: realized + unrealized P&L are still landing in later Phase-3 slices (DESIGN §11).\n`);
   out.write(`Event counts: ${histogramText(nonZero(summary.eventCounts)) || '(none)'}\n`);
 }
 
@@ -130,5 +155,13 @@ function formatUsdcWei6(wei6: string): string {
   const n = BigInt(wei6);
   const whole = n / 1_000_000n;
   const frac = (n % 1_000_000n).toString().padStart(6, '0');
+  return `${whole.toString()}.${frac}`;
+}
+
+/** A non-negative POL wei18 decimal string → `D.dddddd` (6 fractional digits — Polygon gas costs round to ~1e-6 POL of precision in practice). */
+function formatPolWei18(wei18: string): string {
+  const n = BigInt(wei18);
+  const whole = n / 10n ** 18n;
+  const frac = (n % 10n ** 18n).toString().padStart(18, '0').slice(0, 6);
   return `${whole.toString()}.${frac}`;
 }

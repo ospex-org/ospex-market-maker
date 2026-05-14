@@ -287,8 +287,85 @@ export interface RunSummary {
   errors: { total: number; byPhase: Record<string, number> };
   /** The `kill` event ending the run, if the log has one (graceful shutdown); `null` otherwise (still running, or crashed). */
   kill: { reason: string; ticks: number } | null;
-  /** Live-mode metrics (fill rate / P&L / gas / fees / settlements — DESIGN §2.3) — Phase 3 (the live events and their payloads don't exist yet; see `eventCounts`). */
-  liveMetrics: null;
+  /**
+   * Live-mode metrics — fill rate / gas / fees / settlement outcomes (DESIGN
+   * §2.3). Always populated, but zero-valued under a pure dry-run log (the
+   * live events — `submit` / `replace` / `fill` / `settle` / `claim` /
+   * `approval` / `onchain-cancel` — only get emitted in live mode). P&L
+   * (realized + unrealized — DESIGN §11) lands in later Phase-3 slices.
+   */
+  liveMetrics: LiveMetrics;
+}
+
+/**
+ * Per-on-chain-op gas attribution — POL wei18 decimal strings, summed across
+ * every event of each kind that carried `gasPolWei`.
+ */
+export interface LiveGasByKind {
+  /** Boot-time `PositionModule` USDC allowance bumps — `approval` events. */
+  approval: string;
+  /** Shutdown-time `cancelCommitmentOnchain` + `cancel-stale --authoritative` — `onchain-cancel` events. */
+  onchainCancel: string;
+  /** Auto-settle's `settleSpeculation` calls — `settle` events. */
+  settle: string;
+  /** Auto-claim's `claimPosition` calls — `claim` events. */
+  claim: string;
+}
+
+/**
+ * Live-mode run metrics (DESIGN §2.3 / §11). The fill / settlement / gas /
+ * fees aggregators populated by the `submit` / `replace` / `fill` / `settle` /
+ * `claim` / `approval` / `onchain-cancel` walk. Wei amounts are decimal
+ * strings — the AGENT_CONTRACT numeric rule.
+ */
+export interface LiveMetrics {
+  /**
+   * Fill rate (DESIGN §2.3). `quotedUsdcWei6` sums `riskAmountWei6` across
+   * every `submit` and `replace` event (USDC the maker actually committed
+   * onto the book); `filledUsdcWei6` sums `newFillWei6` across every `fill`
+   * event (USDC of that committed risk that takers matched). `fillRate` is
+   * `filledUsdc / quotedUsdc` as a number in [0, 1+]; `null` when nothing
+   * was quoted (division-by-zero). Future per-sport / per-time-to-tip
+   * bucketing is a follow-up (`bucketed: …`).
+   */
+  fills: {
+    quotedUsdcWei6: string;
+    filledUsdcWei6: string;
+    fillRate: number | null;
+  };
+  /**
+   * Gas spent on chain. `totalPolWei` is the sum across every on-chain op
+   * that carried a `gasPolWei` field; `byKind` attributes it per event
+   * kind. `totalUsdcEquivWei6` is the optional `POL → USDC` conversion
+   * (only present when the caller of {@link summarize} supplied a
+   * `polToUsdcRate`; the CLI feeds it `config.gas.nativeTokenUSDCPrice`
+   * iff `config.gas.reportInUSDC: true`).
+   */
+  gas: {
+    totalPolWei: string;
+    byKind: LiveGasByKind;
+    totalUsdcEquivWei6: string | null;
+  };
+  /**
+   * Settlement outcomes. `settleCount` is the number of `settle` events
+   * (`speculationSettle` calls); `claimCount` is the number of `claim`
+   * events; `totalClaimedPayoutWei6` is the sum of `payoutWei6` across
+   * those claims — USDC the maker actually swept back. The maker's net
+   * settled P&L (claimed payouts − staked risk on the claimed positions)
+   * is the realized-P&L slice — Phase 3 follow-up.
+   */
+  settlements: {
+    settleCount: number;
+    claimCount: number;
+    totalClaimedPayoutWei6: string;
+  };
+  /**
+   * Total protocol fees paid by the maker (USDC wei6 decimal string).
+   * Genuinely `"0"` in v0 — v0 refuses lazy-creation commitments so there's
+   * no `TreasuryModule` creation fee. Kept here for forward-compat: a future
+   * event may emit a `feeUsdcWei6` field that gets summed here.
+   */
+  totalFeeUsdcWei6: string;
 }
 
 interface ParsedLine {
@@ -386,10 +463,16 @@ function recordAgeIfFirst(quotes: Map<string, WalkedQuote>, hash: string, termin
  * apart from `readFileSync` on each path (a missing/unreadable path throws — the CLI
  * resolves paths via {@link listRunLogs}, which returns only existing files).
  *
- * The dry-run metrics are fully computed; the live-mode ones (fill rate / P&L / gas
- * / fees / settlements) are Phase 3 — see {@link RunSummary.liveMetrics}.
+ * Dry-run metrics + the (g-i) live-mode metrics (fill rate / gas / fees /
+ * settlement outcomes — see {@link LiveMetrics}) are fully computed; P&L
+ * (realized + unrealized) is the remaining Phase-3 follow-up.
+ *
+ * If `opts.polToUsdcRate` is supplied, `liveMetrics.gas.totalUsdcEquivWei6`
+ * is populated by converting `totalPolWei` through that rate. The CLI feeds
+ * `config.gas.nativeTokenUSDCPrice` iff `config.gas.reportInUSDC: true`;
+ * otherwise the field stays `null`.
  */
-export function summarize(logPaths: readonly string[], opts: { sinceIso?: string } = {}): RunSummary {
+export function summarize(logPaths: readonly string[], opts: { sinceIso?: string; polToUsdcRate?: number } = {}): RunSummary {
   const sinceMs = opts.sinceIso !== undefined ? parseSinceOrThrow(opts.sinceIso) : null;
   const { kept, lines, malformed } = readAndParse(logPaths, sinceMs);
 
@@ -418,6 +501,30 @@ export function summarize(logPaths: readonly string[], opts: { sinceIso?: string
   let errTotal = 0;
   const errByPhase: Record<string, number> = {};
   let kill: { reason: string; ticks: number } | null = null;
+
+  // Live-mode metric accumulators (DESIGN §2.3 / §11). `submit` + `replace`
+  // contribute to `quotedUsdcWei6` (USDC the maker committed); `fill` events
+  // contribute to `filledUsdcWei6`. The on-chain ops (`approval` /
+  // `onchain-cancel` / `settle` / `claim`) sum `gasPolWei` into the per-kind
+  // gas attribution. `settle` / `claim` contribute to the settlement counts;
+  // `claim.payoutWei6` sums into `totalClaimedPayoutWei6`. All zero under a
+  // pure dry-run log (those events don't get emitted).
+  let quotedWei6 = 0n;
+  let filledWei6 = 0n;
+  let settleCount = 0;
+  let claimCount = 0;
+  let totalClaimedPayoutWei6 = 0n;
+  // `totalFeeUsdcWei6` is genuinely zero in v0 (no maker-side USDC fees — no
+  // lazy-creation path) but the aggregator is kept so a future fee-bearing
+  // event can sum into it without a walker change. `const` because no `let`
+  // path mutates it yet.
+  const totalFeeUsdcWei6 = 0n;
+  const gasByKind: LiveGasByKind = { approval: '0', onchainCancel: '0', settle: '0', claim: '0' };
+  const addGas = (kind: keyof LiveGasByKind, gasPolWei: bigint): void => {
+    gasByKind[kind] = (BigInt(gasByKind[kind]) + gasPolWei).toString();
+  };
+  /** Helper: read a `gasPolWei` decimal-string field from a payload, returning 0n when missing/malformed. */
+  const readGas = (v: unknown): bigint => (isWei6String(v) ? BigInt(v) : 0n);
 
   // The `ts`-ordered walk: track each posted would-be quote by its synthetic hash to
   // reconstruct the running `visibleOpen + softCancelled-not-yet-expired` risk (peak)
@@ -523,13 +630,80 @@ export function summarize(logPaths: readonly string[], opts: { sinceIso?: string
         kill = { reason, ticks: t };
         break;
       }
+      // ── live-mode (Phase 3 g-i) — fill rate / gas / settlements / fees ──
+      case 'submit': {
+        if (isWei6String(p.riskAmountWei6)) quotedWei6 += BigInt(p.riskAmountWei6);
+        break;
+      }
+      case 'replace': {
+        if (isWei6String(p.riskAmountWei6)) quotedWei6 += BigInt(p.riskAmountWei6);
+        break;
+      }
+      case 'fill': {
+        if (isWei6String(p.newFillWei6)) filledWei6 += BigInt(p.newFillWei6);
+        break;
+      }
+      case 'approval': {
+        addGas('approval', readGas(p.gasPolWei));
+        break;
+      }
+      case 'onchain-cancel': {
+        addGas('onchainCancel', readGas(p.gasPolWei));
+        break;
+      }
+      case 'settle': {
+        settleCount += 1;
+        addGas('settle', readGas(p.gasPolWei));
+        break;
+      }
+      case 'claim': {
+        claimCount += 1;
+        addGas('claim', readGas(p.gasPolWei));
+        if (isWei6String(p.payoutWei6)) totalClaimedPayoutWei6 += BigInt(p.payoutWei6);
+        break;
+      }
       default:
-        break; // `fair-value` / `risk-verdict` / `submit` / `soft-cancel` / `replace` / `onchain-cancel` / `nonce-floor-raise` / `approval` / `fill` / `settle` / `claim` — counted in `eventCounts` only (no derived metric in Phase 2)
+        break; // `fair-value` / `risk-verdict` / `soft-cancel` / `nonce-floor-raise` / `position-transition` — counted in `eventCounts` only (no derived metric here in g-i)
     }
   }
 
   const vsRefStats = quartiles(compVsRef);
   const ageStats = quartiles(completedAges);
+
+  // Compose the live metrics. `fillRate` is null when nothing was quoted
+  // (division-by-zero on the empty dry-run case). `totalUsdcEquivWei6` is
+  // null unless the caller supplied a POL→USDC rate (the CLI passes
+  // `config.gas.nativeTokenUSDCPrice` iff `config.gas.reportInUSDC: true`).
+  // Convert POL wei18 × rate to USDC wei6: usdcWei6 = round(polWei18 × rate × 10^-12).
+  const totalPolWei = BigInt(gasByKind.approval) + BigInt(gasByKind.onchainCancel) + BigInt(gasByKind.settle) + BigInt(gasByKind.claim);
+  let totalUsdcEquivWei6: string | null = null;
+  if (opts.polToUsdcRate !== undefined && Number.isFinite(opts.polToUsdcRate) && opts.polToUsdcRate >= 0) {
+    // wei18 (POL) × USDC-per-POL → USDC wei6 = wei18 × rate / 10^12. Do the
+    // float multiply on (wei18 / 1e18) × rate × 1e6 so the rate's significant
+    // figures survive without bigint↔float gymnastics; a daily-budget POL
+    // figure fits well within Number range.
+    const polFloat = Number(totalPolWei) / 1e18;
+    const usdcWei6 = BigInt(Math.round(polFloat * opts.polToUsdcRate * 1e6));
+    totalUsdcEquivWei6 = usdcWei6.toString();
+  }
+  const liveMetrics: LiveMetrics = {
+    fills: {
+      quotedUsdcWei6: quotedWei6.toString(),
+      filledUsdcWei6: filledWei6.toString(),
+      fillRate: quotedWei6 === 0n ? null : Number(filledWei6) / Number(quotedWei6),
+    },
+    gas: {
+      totalPolWei: totalPolWei.toString(),
+      byKind: gasByKind,
+      totalUsdcEquivWei6,
+    },
+    settlements: {
+      settleCount,
+      claimCount,
+      totalClaimedPayoutWei6: totalClaimedPayoutWei6.toString(),
+    },
+    totalFeeUsdcWei6: totalFeeUsdcWei6.toString(),
+  };
 
   return {
     schemaVersion: 1,
@@ -561,6 +735,6 @@ export function summarize(logPaths: readonly string[], opts: { sinceIso?: string
     degradedByReason,
     errors: { total: errTotal, byPhase: errByPhase },
     kill,
-    liveMetrics: null,
+    liveMetrics,
   };
 }

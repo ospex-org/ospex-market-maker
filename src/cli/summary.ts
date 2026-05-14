@@ -109,7 +109,12 @@ export function renderSummaryReportText(summary: RunSummary, logDir: string, out
   out.write(`Errors: ${summary.errors.total}${summary.errors.total > 0 ? ` — by phase: ${histogramText(summary.errors.byPhase)}` : ''}\n`);
 
   const lm = summary.liveMetrics;
-  const hasLiveActivity = lm.fills.quotedUsdcWei6 !== '0' || lm.settlements.settleCount > 0 || lm.settlements.claimCount > 0 || lm.gas.totalPolWei !== '0';
+  // Include `filledUsdcWei6` so a `--since` window catching a `fill` without
+  // the original `submit` still renders the Fills line — without it, the JSON
+  // envelope would correctly show the fill while the text said "no live
+  // activity", which would mislead an operator reading live telemetry
+  // (Hermes review-PR32 blocker #1).
+  const hasLiveActivity = lm.fills.quotedUsdcWei6 !== '0' || lm.fills.filledUsdcWei6 !== '0' || lm.settlements.settleCount > 0 || lm.settlements.claimCount > 0 || lm.gas.totalPolWei !== '0';
   out.write(`\nLive-mode metrics:\n`);
   if (!hasLiveActivity) {
     out.write(`  (no live activity — submit / fill / settle / claim events absent; check the event-count histogram below)\n`);

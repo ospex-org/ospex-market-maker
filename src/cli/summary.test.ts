@@ -145,6 +145,25 @@ describe('renderSummaryReport*', () => {
     expect(out).toContain('Event counts:');
   });
 
+  it('text render shows the Fills line on fill-only activity (a --since window that catches a fill but misses its submit — Hermes review-PR32 blocker #1)', () => {
+    const { sink, text } = collect();
+    renderSummaryReportText(fakeSummary({
+      liveMetrics: {
+        fills: { quotedUsdcWei6: '0', filledUsdcWei6: '100000', fillRate: null },
+        gas: { totalPolWei: '0', byKind: { approval: '0', onchainCancel: '0', settle: '0', claim: '0' }, totalUsdcEquivWei6: null },
+        settlements: { settleCount: 0, claimCount: 0, totalClaimedPayoutWei6: '0' },
+        totalFeeUsdcWei6: '0',
+      },
+    }), logDir, sink);
+    const out = text();
+    expect(out).toMatch(/Live-mode metrics:/);
+    expect(out).not.toMatch(/no live activity/); // the fill must surface — predicate now considers filledUsdcWei6
+    expect(out).toContain('Fills:'); // the line is printed
+    expect(out).toContain('0.100000 / 0.000000 USDC filled / quoted'); // 0.1 USDC filled with nothing quoted (`--since` clipped the submit)
+    expect(out).toContain('rate n/a'); // fillRate is null → "n/a" via pctOrNa
+    expect(out).toContain('Event counts:');
+  });
+
   it('text render handles an empty summary (no logs found)', () => {
     const { sink, text } = collect();
     renderSummaryReportText(fakeSummary({ sources: [], runIds: [], lines: 0, ticks: 0, firstEventAt: null, lastEventAt: null }), logDir, sink);

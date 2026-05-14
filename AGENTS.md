@@ -17,7 +17,7 @@ This file is the **machine surface**: command JSON envelopes, telemetry NDJSON v
 
 1. **Per-CLI-command stdout** — `--json` envelopes shaped `{ schemaVersion: 1, <command>: <Report> }`. Stable contract.
 2. **NDJSON event log** — one file per run under `telemetry.logDir/run-<runId>.ndjson`. Stable contract; the source the `summary` aggregator and any future external scorecard read.
-3. **JSON state file** — `state.dir/maker-state.json`, atomic-write. Versioned (`schemaVersion: 1`). Operator-inspectable; not a wire contract for other systems (the MM owns it), but documented here so agents can parse it for diagnostics.
+3. **JSON state file** — `state.dir/maker-state.json`, atomic-write. Versioned (`version: 1`, matching `MAKER_STATE_VERSION` in `src/state/index.ts` — note this is *not* `schemaVersion`; only the CLI `--json` envelopes use that field name). Operator-inspectable; not a wire contract for other systems (the MM owns it), but documented here so agents can parse it for diagnostics.
 
 Everything else (Heroku logs, internal monitoring) is out of scope for this doc.
 
@@ -211,13 +211,13 @@ Canonical vocabulary (`TELEMETRY_KINDS` in [`src/telemetry/index.ts`](./src/tele
 |---|---|---|
 | `tick-start` | runner, every tick | `{ tick: number }` |
 | `kill` | runner, on graceful shutdown (KILL file / SIGTERM / SIGINT) | `{ reason: string, ticks: number }` |
-| `error` | any phase that catches a throw | `{ class: string, detail: string, phase?: string, contestId?, commitmentHash?, speculationId? }`. `phase` values: `'submit' \| 'cancel' \| 'onchain-cancel' \| 'reconcile' \| 'fill-detection' \| 'fill-detection-lookup' \| 'position-poll' \| 'approve' \| 'settle' \| 'claim'` (`'(none)'` if absent). |
+| `error` | any phase that catches a throw | `{ class: string, detail: string, phase?: string, contestId?, commitmentHash?, speculationId? }`. Known `phase` values at this writing: `'tick'`, `'discovery'`, `'odds-seed'`, `'odds-poll'`, `'odds-unsubscribe'`, `'reconcile'`, `'submit'`, `'cancel'`, `'onchain-cancel'`, `'fill-detection'`, `'fill-detection-lookup'`, `'position-poll'`, `'approve'`, `'settle'`, `'claim'`. `summary` aggregates by phase with `'(none)'` for absent. **Treat the list as authoritative-but-additive** — new runtime paths may add phases without bumping `schemaVersion`; consumers should handle unknown phases gracefully (bucket them as `'other'` rather than rejecting). Source of truth: `grep "phase: '" src/runners/index.ts`. |
 
 ### 3.2 Per-market reconcile (in tick order)
 
 | `kind` | Payload |
 |---|---|
-| `candidate` | `{ contestId: string, skipReason?: CandidateSkipReason, takerSide?: 'away' \| 'home', ...skip-specific }`. **No `skipReason`** = the contest was *tracked*. Skip-specific fields: `cap-hit` → `takerSide`; `gas-budget-blocks-settlement` → `purpose: 'settleSpeculation' \| 'claimPosition'`, `mayUseReserve: boolean`, `speculationId`; `gas-budget-blocks-onchain-cancel` → `commitmentHash`, `speculationId`, `makerSide`, `todayGasSpentPolWei`, `maxDailyGasPolWei`, `emergencyReservePolWei`, `detail`; `gas-budget-blocks-reapproval` → `purpose: 'positionModule'`, `todayGasSpentPolWei`, `maxDailyGasPolWei`, `emergencyReservePolWei`, `detail`. |
+| `candidate` | `{ contestId?: string, skipReason?: CandidateSkipReason, takerSide?: 'away' \| 'home', ...skip-specific }`. **No `skipReason`** = the contest was *tracked* (and `contestId` is present). Skip-specific fields: `cap-hit` → `contestId`, `takerSide`; `tracking-cap-reached` / `no-reference-odds` / `no-open-speculation` / `would-create-lazy-speculation` / `stale-reference` / `start-too-soon` / `refused-pricing` → `contestId` plus skip-reason-specific context; `gas-budget-blocks-settlement` → `purpose: 'settleSpeculation' \| 'claimPosition'`, `mayUseReserve: boolean`, `speculationId`, `todayGasSpentPolWei`, `maxDailyGasPolWei`, `emergencyReservePolWei`, `detail` (no `contestId`); `gas-budget-blocks-onchain-cancel` → `commitmentHash`, `speculationId`, `makerSide`, `todayGasSpentPolWei`, `maxDailyGasPolWei`, `emergencyReservePolWei`, `detail` (no `contestId`); `gas-budget-blocks-reapproval` → `purpose: 'positionModule-approve'`, `todayGasSpentPolWei`, `maxDailyGasPolWei`, `emergencyReservePolWei`, `detail` (no `contestId` — the boot-time auto-approve isn't per-market). |
 | `quote-intent` | `{ contestId, speculationId, sport, awayTeam, homeTeam, canQuote: boolean, away: QuoteSideSummary \| null, home: QuoteSideSummary \| null, notes: string[] }`. `QuoteSideSummary` = `{ takerOddsTick, takerImpliedProb, makerSide, makerOddsTick, positionType, sizeUSDC, sizeWei6 }`. |
 | `risk-verdict` | `{ contestId, speculationId, sport, awayTeam, homeTeam, allowed: boolean, awayOffer: { allowed: boolean, sizeUSDC: number, headroomUSDC: number }, homeOffer: {…}, notes: string[] }`. Emitted **after** pre-engine gates pass (not for `no-reference-odds` / `start-too-soon` / `stale-reference` / `no-open-speculation` skips). |
 | `quote-competitiveness` | `{ contestId, speculationId, side: 'away' \| 'home', quoteTick, quoteProb, makerSide, makerOddsTick, positionType, referenceTick, referenceProb, vsReferenceTicks, bookDepthOnSide, bestBookTick, atOrInsideBook }` |
@@ -227,7 +227,7 @@ Canonical vocabulary (`TELEMETRY_KINDS` in [`src/telemetry/index.ts`](./src/tele
 
 | `kind` | Payload |
 |---|---|
-| `submit` / `would-submit` | `{ commitmentHash, speculationId, contestId, sport, awayTeam, homeTeam, takerSide, makerSide, positionType, makerOddsTick, riskAmountWei6, expiryUnixSec, takerOddsTick, takerImpliedProb }`. Off-chain DELETE under the hood — no `gasPolWei`. |
+| `submit` / `would-submit` | `{ commitmentHash, speculationId, contestId, sport, awayTeam, homeTeam, takerSide, makerSide, positionType, makerOddsTick, riskAmountWei6, expiryUnixSec, takerOddsTick, takerImpliedProb }`. Live submit signs + POSTs the EIP-712 commitment via `commitments.submitRaw` (the API relay path); gasless — no `gasPolWei`. |
 | `replace` / `would-replace` | `{ replacedCommitmentHash, newCommitmentHash, speculationId, contestId, sport, awayTeam, homeTeam, takerSide, makerSide, positionType, reason: 'stale' \| 'mispriced', fromMakerOddsTick, toMakerOddsTick, fromTakerOddsTick, toTakerOddsTick, riskAmountWei6, expiryUnixSec }` |
 | `soft-cancel` / `would-soft-cancel` | `{ commitmentHash, speculationId, contestId, sport, awayTeam, homeTeam, takerSide, makerSide, positionType, makerOddsTick, reason: SoftCancelReason }` |
 | `expire` | `{ commitmentHash, speculationId, contestId, makerSide, oddsTick }` — clock-only terminalization; headroom released |

@@ -103,7 +103,7 @@ This is **experimental software**, provided **without warranty**. Wagering and o
 ## Development
 
 ```bash
-yarn install        # pulls @ospex/sdk from its v0.1.0 GitHub Release tarball + transitive deps
+yarn install        # pulls @ospex/sdk from its v0.2.1 GitHub Release tarball + transitive deps
 yarn build          # tsc -> dist/
 yarn typecheck      # tsc --noEmit
 yarn test           # vitest

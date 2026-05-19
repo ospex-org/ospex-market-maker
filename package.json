@@ -24,6 +24,7 @@
     "lint": "eslint src",
     "dev": "tsx src/cli/index.ts",
     "mm": "node dist/cli/index.js",
+    "smoke": "node scripts/smoke.mjs",
     "prepack": "yarn build"
   },
   "dependencies": {

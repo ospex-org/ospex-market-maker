@@ -1580,6 +1580,63 @@ describe('Runner — fill detection', () => {
     expect(readEvents().some((e) => e.kind === 'fill' || e.kind === 'expire')).toBe(false);
   });
 
+  // ── effective-status fallback: robust to a core-api that predates effective-status ──
+  // When the API still reports the RAW status, an expired/invalidated commitment
+  // drops off the open-book listing but get-by-hash returns 'open'/'partially_filled'.
+  // detectFills falls back to the record's own expiry + the API nonceInvalidated flag.
+
+  it('a disappeared PAST-expiry commitment still reported raw "open" (pre-effective-status API) → terminalized expired, expire event, NO UnexpectedFillStatus', async () => {
+    const record = commitmentRecord({ hash: '0xstaleOpen', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', lifecycle: 'visibleOpen', expiryUnixSec: T0 - 1, postedAtUnixSec: T0 - 100 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xstaleOpen': record } });
+    const config = cfg({ mode: { dryRun: false } });
+    const apiOpen: Commitment = orderbookEntry({ commitmentHash: '0xstaleOpen', maker: DEFAULT_FAKE_MAKER_ADDRESS, status: 'open', isLive: false, expiry: PAST_ISO });
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]), undefined, undefined, undefined,
+      { listOpenCommitments: () => Promise.resolve([]), getCommitment: () => Promise.resolve(apiOpen) },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    const reloaded = StateStore.at(stateDir).load().state;
+    expect(reloaded.commitments['0xstaleOpen']?.lifecycle).toBe('expired');
+    const events = readEvents();
+    expect(events.find((e) => e.kind === 'expire' && e.commitmentHash === '0xstaleOpen')).toBeDefined();
+    expect(events.some((e) => e.kind === 'error' && e.class === 'UnexpectedFillStatus')).toBe(false);
+  });
+
+  it('a disappeared FUTURE-expiry commitment reported raw "open" but nonce-invalidated → authoritativelyInvalidated, NO UnexpectedFillStatus', async () => {
+    const record = commitmentRecord({ hash: '0xinvalidated', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 1 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xinvalidated': record } });
+    const config = cfg({ mode: { dryRun: false } });
+    const apiInvalidated: Commitment = orderbookEntry({ commitmentHash: '0xinvalidated', maker: DEFAULT_FAKE_MAKER_ADDRESS, status: 'open', nonceInvalidated: true, isLive: false });
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]), undefined, undefined, undefined,
+      { listOpenCommitments: () => Promise.resolve([]), getCommitment: () => Promise.resolve(apiInvalidated) },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    const reloaded = StateStore.at(stateDir).load().state;
+    expect(reloaded.commitments['0xinvalidated']?.lifecycle).toBe('authoritativelyInvalidated');
+    const events = readEvents();
+    expect(events.some((e) => e.kind === 'error' && e.class === 'UnexpectedFillStatus')).toBe(false);
+    expect(events.some((e) => e.kind === 'expire')).toBe(false);
+  });
+
+  it('a disappeared FUTURE-expiry, non-invalidated commitment reported raw "open" → STILL logs UnexpectedFillStatus (genuine anomaly), state untouched', async () => {
+    const record = commitmentRecord({ hash: '0xanomaly', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 1 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xanomaly': record } });
+    const config = cfg({ mode: { dryRun: false } });
+    const apiOpen: Commitment = orderbookEntry({ commitmentHash: '0xanomaly', maker: DEFAULT_FAKE_MAKER_ADDRESS, status: 'open', nonceInvalidated: false, isLive: true, expiry: FUTURE_ISO });
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]), undefined, undefined, undefined,
+      { listOpenCommitments: () => Promise.resolve([]), getCommitment: () => Promise.resolve(apiOpen) },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    const reloaded = StateStore.at(stateDir).load().state;
+    expect(reloaded.commitments['0xanomaly']?.lifecycle).toBe('visibleOpen'); // untouched
+    expect(readEvents().find((e) => e.kind === 'error' && e.class === 'UnexpectedFillStatus')).toMatchObject({ commitmentHash: '0xanomaly' });
+  });
+
   it('a `listOpenCommitments` failure is logged (`error` phase fill-detection) and the tick continues; state unchanged', async () => {
     const record = commitmentRecord({ hash: '0xtracked', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 1 });
     StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xtracked': record } });

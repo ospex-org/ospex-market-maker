@@ -1373,6 +1373,12 @@ export class Runner {
    *     - `cancelled` → fill delta applied (if any), record `'authoritativelyInvalidated'`.
    *       No `expire` (v0's MM doesn't on-chain-cancel its own commitments — manual
    *       cancel between runs / outside the MM, which the operator already knows about).
+   *     - any other status (`open` / `partially_filled`, only reachable against a
+   *       core-api predating effective-status, where an expired/invalidated row
+   *       leaves the listing but get-by-hash still reports the raw status) →
+   *       terminalize from local signals: past `expiryUnixSec` → `'expired'` +
+   *       `expire`; else `nonceInvalidated` → `'authoritativelyInvalidated'`; else
+   *       log `UnexpectedFillStatus` (a genuinely live commitment shouldn't vanish).
    *
    * Local **past-local-expiry** records are INCLUDED in the diff: the chain commitment
    * may have filled just before expiry, and `ageOut` (which runs after this step in
@@ -1491,8 +1497,33 @@ export class Runner {
           break;
         }
         default: {
-          // 'open' / 'partially_filled' shouldn't disappear from the listing — log defensively, don't touch state.
-          this.eventLog.emit('error', { class: 'UnexpectedFillStatus', detail: `disappeared commitment ${hash} has status "${apiCommitment.status}"`, phase: 'fill-detection', commitmentHash: hash });
+          // status is 'open' / 'partially_filled' yet the commitment dropped off
+          // the open-book listing. That's the shape of a *time-expired* or
+          // *nonce-invalidated* commitment read from a core-api that predates
+          // effective-status: it leaves the listing on expiry/invalidation while
+          // get-by-hash still reports the raw status. Fall back to signals we
+          // already hold so the bot terminalizes correctly regardless of the
+          // API's status semantics (and so the same expire fires here, with any
+          // last-moment fill delta folded in, rather than waiting for ageOut).
+          if (record.expiryUnixSec <= now) {
+            // Past its own expiry → unmatchable on chain (MatchingModule reverts
+            // when block.timestamp >= expiry).
+            this.applyFill(record, delta, now, 'expired');
+            this.eventLog.emit('expire', {
+              commitmentHash: record.hash,
+              speculationId: record.speculationId,
+              contestId: record.contestId,
+              makerSide: record.makerSide,
+              oddsTick: record.oddsTick,
+            });
+          } else if (apiCommitment.nonceInvalidated) {
+            // Bulk-cancelled via raiseMinNonce → authoritatively dead.
+            this.applyFill(record, delta, now, 'authoritativelyInvalidated');
+          } else {
+            // Genuinely unexpected: a live, future-expiry, non-invalidated
+            // commitment vanished from the listing. Log, don't touch state.
+            this.eventLog.emit('error', { class: 'UnexpectedFillStatus', detail: `disappeared commitment ${hash} has status "${apiCommitment.status}"`, phase: 'fill-detection', commitmentHash: hash });
+          }
           break;
         }
       }

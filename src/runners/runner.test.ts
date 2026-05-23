@@ -3229,6 +3229,24 @@ describe('Runner — cancelMode: onchain (D2 — authoritative cancel of retaine
     expect(readEvents().filter((e) => e.kind === 'error' && e.phase === 'onchain-cancel' && e.commitmentHash === '0xpartialHome')).toHaveLength(2); // one error per attempt
   });
 
+  it('gas-denied on-chain cancel in an UNQUOTEABLE gate (start-too-soon, only a retained partial) does NOT re-fire every tick — one candidate across 2 ticks (Hermes PR#44 re-review)', async () => {
+    // Regression: the unquoteable-market gate (`marketUnquoteable && hasVisibleOpenQuotesOn`) must not count
+    // the retained partial, or it re-fires every tick and re-emits the gas-denial candidate (spam).
+    const SOON_ISO = new Date((T0 + 60) * 1000).toISOString(); // start-too-soon gate (60 <= expirySeconds 120)
+    const stalePartial = commitmentRecord({ hash: '0xpartial', speculationId: 'spec-1234', contestId: '1234', makerSide: 'away', lifecycle: 'partiallyFilled', oddsTick: 200, riskAmountWei6: '500000', filledRiskWei6: '200000', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 200, updatedAtUnixSec: T0 - 200 });
+    // Gas at 0.9 of a 1 POL cap with a 0.2 reserve → mayUseReserve:false denies.
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xpartial': stalePartial }, dailyCounters: { [todayUTC()]: { gasPolWei: ((POL * 9n) / 10n).toString(), feeUsdcWei6: '0' } } });
+    const config = cfg({ mode: { dryRun: false }, orders: { expirySeconds: 120, cancelMode: 'onchain' }, gas: { maxDailyGasPOL: 1, emergencyReservePOL: 0.2 } });
+    const cancel = cancelOnchainRecorder();
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([contestView({ contestId: '1234', matchTime: SOON_ISO })]), { cancelCommitmentOnchain: cancel.fn });
+    await makeRunner({ config, adapter, maxTicks: 2 }).run();
+
+    expect(cancel.calls).toEqual([]); // gas-denied — never attempted on chain
+    const gasDeniedCandidates = readEvents().filter((e) => e.kind === 'candidate' && e.skipReason === 'gas-budget-blocks-onchain-cancel');
+    expect(gasDeniedCandidates).toHaveLength(1); // fires ONCE, not per-tick — the unquoteable gate no longer eagerly re-fires for a retained partial
+    expect(StateStore.at(stateDir).load().state.commitments['0xpartial']?.lifecycle).toBe('partiallyFilled'); // retained — rides to expiry
+  });
+
   it('cancelMode:offchain (the default) does NOT on-chain-cancel a retained partial — it rides to expiry', async () => {
     const stalePartial = commitmentRecord({ hash: '0xpartialHome', speculationId: 'spec-1234', contestId: '1234', makerSide: 'away', lifecycle: 'partiallyFilled', oddsTick: 200, riskAmountWei6: '500000', filledRiskWei6: '200000', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 200, updatedAtUnixSec: T0 - 200 });
     StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xpartialHome': stalePartial } });

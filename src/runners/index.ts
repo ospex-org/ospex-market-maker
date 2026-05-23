@@ -919,23 +919,37 @@ export class Runner {
    * state-loss hold is active (DESIGN §12, don't quote on a blank slate) — recompute
    * the desired two-sided quote and reconcile it against the maker's current book on
    * that speculation, *or* (when the market has become unquoteable) pull its visible
-   * quotes. `dirty` is read-and-cleared / `lastReconciledAt` is set only when a
-   * reconcile *decision was applied* — a transient `getSpeculation` failure leaves
-   * both alone so the market retries promptly next tick rather than hiding behind the
-   * `staleAfterSeconds` throttle (DESIGN §3).
+   * quotes.
+   *
+   * **Retry / cadence invariant (the single source of truth for "when does a market
+   * reconcile again" — keep all four parts consistent, they're a state machine):**
+   *   1. **transient failure** (a `getSpeculation` read threw, or a live
+   *      submit / replace / off-chain-cancel / routine on-chain partial-cancel threw)
+   *      ⇒ `reconcileMarket` returns `'transient-failure'` ⇒ **always force `dirty`**
+   *      (retry next tick) and leave `lastReconciledAt` — never defer a failed live
+   *      write behind the `staleAfterSeconds` cadence. This is unconditional: it must
+   *      not depend on how the market entered reconcile or on `needsReconcile`'s gates
+   *      (those have proven fragile — a pulled `visibleOpen` can stop re-arming the
+   *      eager gate; a recent `lastReconciledAt` can throttle the cadence).
+   *   2. **gas-budget denial** (a policy decision, not a failure) ⇒ `'applied'` ⇒
+   *      re-evaluate on the normal `lastReconciledAt` cadence, NOT every tick (no spam).
+   *   3. **on-chain cancel success** ⇒ `'applied'`, but `maybeOnchainCancelRetainedPartials`
+   *      sets `dirty` so the freed side re-quotes next tick (the read-and-clear below
+   *      happens *before* the reconcile, so that in-reconcile `dirty` survives).
+   *   4. the unquoteable eager gate (`needsReconcile`) counts `visibleOpen` only, never
+   *      `partiallyFilled` — a retained partial relies on (1)/(2)/(3) or natural expiry.
    */
   private async reconcileMarkets(): Promise<void> {
     if (this.isHoldingQuoting()) return; // DESIGN §12 — must not resume quoting on a blank slate
     const now = this.deps.now();
     for (const m of this.trackedMarkets.values()) {
       if (!this.needsReconcile(m, now)) continue;
-      const wasDirty = m.dirty;
-      m.dirty = false; // read-and-clear BEFORE reconciling, so a dirty re-armed DURING the reconcile — a concurrent onChange, or `maybeOnchainCancelRetainedPartials` freeing a side under cancelMode:onchain — survives to the next tick instead of being clobbered
+      m.dirty = false; // read-and-clear BEFORE reconciling, so a dirty re-armed DURING the reconcile (a success re-quote, a concurrent onChange) survives to the next tick instead of being clobbered
       const outcome = await this.reconcileMarket(m, now);
       if (outcome === 'applied') {
         m.lastReconciledAt = now;
       } else {
-        m.dirty = m.dirty || wasDirty; // 'transient-failure' (a getSpeculation read failed): keep the market armed (its entry dirty + any in-reconcile re-dirty) so it retries next tick; leave `lastReconciledAt`
+        m.dirty = true; // invariant (1): a transient failure ALWAYS retries next tick — unconditional, independent of entry path / gates / lastReconciledAt. `lastReconciledAt` left unchanged (no decision applied).
       }
     }
   }

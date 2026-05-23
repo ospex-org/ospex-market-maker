@@ -3247,6 +3247,34 @@ describe('Runner — cancelMode: onchain (D2 — authoritative cancel of retaine
     expect(StateStore.at(stateDir).load().state.commitments['0xpartial']?.lifecycle).toBe('partiallyFilled'); // retained — rides to expiry
   });
 
+  it('a transient on-chain cancel via the unquoteable eager gate retries next tick even when lastReconciledAt is recent (Hermes PR#44 round 3)', async () => {
+    // Round-3 hole: a market applies a reconcile (stamping lastReconciledAt), then becomes unquoteable and
+    // re-enters reconcile via the visibleOpen eager gate (wasDirty=false); the visibleOpen is pulled off-chain and
+    // the retained partial's on-chain cancel throws. The old `m.dirty = m.dirty || wasDirty` left dirty=false, and
+    // with the visibleOpen now pulled the eager gate no longer fires, so the retry was throttled behind
+    // staleAfterSeconds. The fix forces dirty=true on ANY transient → guaranteed next-tick retry.
+    let clock = T0;
+    const matchTimeSec = T0 + 150; // tick 1 (T0): 150 > expirySeconds 120 → quoteable; ticks 2-3 (clock advanced): start-too-soon
+    // Fresh, on-tick partial occupant (makerSide away → home offer). Huge replaceOnOddsMoveBps ⇒ never "mispriced" and
+    // fresh postedAt ⇒ not "stale", so it is NOT retained on the quoteable tick 1 → no on-chain cancel attempted there
+    // → tick 1 applies and stamps lastReconciledAt (the precondition for the round-3 throttle hole).
+    const partial = commitmentRecord({ hash: '0xpart', speculationId: 'spec-1234', contestId: '1234', makerSide: 'away', lifecycle: 'partiallyFilled', oddsTick: 200, riskAmountWei6: '500000', filledRiskWei6: '200000', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 10, updatedAtUnixSec: T0 - 10 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xpart': partial } });
+    const config = cfg({ mode: { dryRun: false }, odds: { subscribe: false }, orders: { expirySeconds: 120, cancelMode: 'onchain', replaceOnOddsMoveBps: 100_000, staleAfterSeconds: 90 } });
+    let attempts = 0;
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([contestView({ contestId: '1234', matchTime: new Date(matchTimeSec * 1000).toISOString() })]), {
+      submitCommitment: submitRecorder().fn,
+      cancelCommitmentOffchain: () => Promise.resolve(),
+      cancelCommitmentOnchain: () => { attempts += 1; return Promise.reject(new Error('RPC down')); },
+    });
+    // Advance the clock ~40s per inter-tick sleep: tick 1 quoteable, ticks 2-3 start-too-soon, and by tick 3 the
+    // elapsed (80s) is still < staleAfterSeconds (90s), so the OLD code's cadence throttle would have blocked the retry.
+    await makeRunner({ config, adapter, maxTicks: 3, deps: { now: () => clock, sleep: () => { clock += 40; return Promise.resolve(); } } }).run();
+
+    expect(attempts).toBe(2); // tick 2 (gate fires via the visibleOpen) + tick 3 (forced dirty after the transient) — the old `|| wasDirty` produced 1
+    expect(StateStore.at(stateDir).load().state.commitments['0xpart']?.lifecycle).toBe('partiallyFilled'); // still retained — never off-chain-cancelled
+  });
+
   it('cancelMode:offchain (the default) does NOT on-chain-cancel a retained partial — it rides to expiry', async () => {
     const stalePartial = commitmentRecord({ hash: '0xpartialHome', speculationId: 'spec-1234', contestId: '1234', makerSide: 'away', lifecycle: 'partiallyFilled', oddsTick: 200, riskAmountWei6: '500000', filledRiskWei6: '200000', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 200, updatedAtUnixSec: T0 - 200 });
     StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xpartialHome': stalePartial } });

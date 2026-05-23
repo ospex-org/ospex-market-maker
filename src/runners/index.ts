@@ -952,7 +952,12 @@ export class Runner {
    */
   private needsReconcile(m: TrackedMarket, now: number): boolean {
     if (m.dirty) return true;
-    if (this.marketUnquoteable(m, now) && this.hasVisibleQuotesOn(m.speculationId, now)) return true;
+    // Force an eager pull only for `visibleOpen` quotes — the ones the gate can actually remove off-chain.
+    // A `partiallyFilled` remainder can't be off-chain-cancelled, so it must NOT force a reconcile every tick:
+    // that would re-fire the unquoteable gate and spam (e.g. re-emit `gas-budget-blocks-onchain-cancel` under
+    // cancelMode:onchain after a gas denial). A retained partial is instead handled by the transient-failure
+    // re-arm (an adapter throw sets the market dirty) or the normal `lastReconciledAt` cadence / natural expiry.
+    if (this.marketUnquoteable(m, now) && this.hasVisibleOpenQuotesOn(m.speculationId, now)) return true;
     if (!this.lacksFreshTwoSidedQuote(m, now)) return false;
     return m.lastReconciledAt === null || now - m.lastReconciledAt >= this.config.orders.staleAfterSeconds;
   }
@@ -964,12 +969,14 @@ export class Runner {
    * moneyline row, or a side isn't priced); the feed has stopped responding
    * (`now - lastOddsAt > staleReferenceAfterSeconds` — a `getOddsSnapshot` failure or
    * no `onChange` / `onRefresh` in a while); or (in subscription mode) its SSE
-   * odds stream has errored / never came up? When such a market still has visible
-   * quotes of ours, they must be pulled (DESIGN §2.2: never quote on missing /
-   * ambiguous / stale data; never leave a stale quote visible) — `needsReconcile`
-   * therefore forces a reconcile for it, and `reconcileMarket`'s matching gate does
-   * the pull. (The speculation-closed case isn't here — it needs the `getSpeculation`
-   * read to detect, so it's handled inside `reconcileMarket` after that read.)
+   * odds stream has errored / never came up? When such a market still has a *pullable*
+   * `visibleOpen` quote of ours, it must be pulled off the book (DESIGN §2.2: never
+   * quote on missing / ambiguous / stale data; never leave a stale quote visible) —
+   * `needsReconcile` therefore forces a reconcile for it, and `reconcileMarket`'s
+   * matching gate does the pull. A `partiallyFilled` remainder can't be
+   * off-chain-cancelled, so it does NOT force this eager reconcile (see
+   * `hasVisibleOpenQuotesOn`). (The speculation-closed case isn't here — it needs the
+   * `getSpeculation` read to detect, so it's handled inside `reconcileMarket` after that read.)
    */
   private marketUnquoteable(m: TrackedMarket, now: number): boolean {
     if (m.matchTimeSec - now <= this.config.orders.expirySeconds) return true; // the game starts within one expiry window
@@ -980,11 +987,19 @@ export class Runner {
     return false;
   }
 
-  /** Does the maker have an API-visible commitment of its own (`visibleOpen` / `partiallyFilled`, not expired) on `speculationId` right now? */
-  private hasVisibleQuotesOn(speculationId: string, now: number): boolean {
+  /**
+   * Does the maker have a non-expired `visibleOpen` commitment of its own on `speculationId` right now?
+   * Used by the unquoteable-market gate in `needsReconcile` to force a reconcile that PULLS such quotes
+   * off the book. **Deliberately excludes `partiallyFilled`**: a matched remainder can't be
+   * off-chain-cancelled, so it must not force an eager every-tick reconcile — that would re-fire the
+   * unquoteable gate and spam (e.g. re-emit `gas-budget-blocks-onchain-cancel` under `cancelMode: onchain`
+   * once gas is exhausted). Retained partials are handled by the transient-failure re-arm (an adapter
+   * throw marks the market dirty) or the normal `lastReconciledAt` cadence / natural expiry instead.
+   */
+  private hasVisibleOpenQuotesOn(speculationId: string, now: number): boolean {
     for (const r of Object.values(this.state.commitments)) {
       if (r.speculationId !== speculationId) continue;
-      if (r.lifecycle !== 'visibleOpen' && r.lifecycle !== 'partiallyFilled') continue;
+      if (r.lifecycle !== 'visibleOpen') continue;
       if (r.expiryUnixSec <= now) continue;
       return true;
     }

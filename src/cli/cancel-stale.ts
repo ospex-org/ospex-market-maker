@@ -6,10 +6,12 @@
  *   - default — gasless off-chain cancels only (`adapter.cancelCommitmentOffchain`).
  *     Removes the quotes from the API book so takers stop seeing them, but anyone
  *     holding a still-signed payload can match them on chain until natural expiry.
- *     Records move `visibleOpen` → `softCancelled` and `partiallyFilled` →
- *     `softCancelled` (preserving `filledRiskWei6`); the latent matchable
- *     remainder stays counted in the risk engine until the record expires or is
- *     on-chain-cancelled.
+ *     `visibleOpen` records move `visibleOpen` → `softCancelled`. A `partiallyFilled`
+ *     record is **skipped** off-chain — the API rejects a DELETE once a commitment
+ *     has matched (409 `COMMITMENT_MATCHED`) — and left `partiallyFilled` (counted in
+ *     `offchainSkippedPartial`); use `--authoritative` to kill its remaining capacity
+ *     on chain. Either way the latent matchable remainder stays counted in the risk
+ *     engine until the record expires or is on-chain-cancelled.
  *
  *   - `--authoritative` — same off-chain step (or a skip for already-softCancelled
  *     records), then an on-chain `cancelCommitmentOnchain` per non-terminal record.
@@ -26,9 +28,10 @@
  *
  * **Stale set covers every API-visible / latently matchable lifecycle**:
  * `visibleOpen` (still on the book), `partiallyFilled` (the unfilled remainder is
- * still on the book and matchable), and `softCancelled` (already pulled but the
- * signed payload is still matchable until expiry — `--authoritative` is the only
- * way to invalidate). Matches the shutdown / on-chain-kill posture in
+ * still on the book and matchable — but only the on-chain leg can touch it; the
+ * off-chain leg skips it), and `softCancelled` (already pulled but the signed
+ * payload is still matchable until expiry — `--authoritative` is the only way to
+ * invalidate). Matches the shutdown / on-chain-kill posture in
  * `src/runners/index.ts`. Filter: `postedAtUnixSec + orders.staleAfterSeconds <=
  * now`. Already-terminal records (`filled` / `expired` /
  * `authoritativelyInvalidated`) are excluded — there's nothing matchable left.
@@ -148,6 +151,8 @@ export interface CancelStaleReport {
   offchainCancelled: number;
   /** Records skipped off-chain because they were already `softCancelled`. */
   offchainSkippedAlready: number;
+  /** `partiallyFilled` records skipped off-chain — the API rejects a DELETE once a commitment has matched (409 `COMMITMENT_MATCHED`). They still flow to the on-chain leg under `--authoritative`; without it they're left to ride to expiry. */
+  offchainSkippedPartial: number;
   /** Records that successfully had their on-chain `cancelCommitment` land. Always `0` when `--authoritative` was not passed. */
   onchainCancelled: number;
   /** Records the gas-budget verdict refused (only meaningful with `--authoritative`). */
@@ -286,6 +291,7 @@ export async function runCancelStale(opts: CancelStaleOpts, deps: CancelStaleDep
     inspected: stale.length,
     offchainCancelled: 0,
     offchainSkippedAlready: 0,
+    offchainSkippedPartial: 0,
     onchainCancelled: 0,
     gasDenied: 0,
     errored: 0,
@@ -305,17 +311,25 @@ export async function runCancelStale(opts: CancelStaleOpts, deps: CancelStaleDep
 
   // ── 6. Off-chain leg (always) ────────────────────────────────────────────
   // Already-softCancelled records skip the off-chain step (they're already
-  // gone from the API book) but stay in the set for the on-chain leg. A
-  // failed off-chain DELETE for a `visibleOpen` / `partiallyFilled` record
-  // is logged but does NOT exclude that record from the on-chain leg — the
-  // off-chain failure could be a transient API blip; `cancelCommitmentOnchain`
-  // is the authoritative path (`MatchingModule.cancelCommitment` operates on
-  // chain regardless of book visibility), which is exactly the reason for
-  // `--authoritative`. `partiallyFilled` records move to `softCancelled`
-  // preserving `filledRiskWei6` (we only stamp `lifecycle` + `updatedAtUnixSec`).
+  // gone from the API book) but stay in the set for the on-chain leg.
+  // `partiallyFilled` records also skip the off-chain step — the API rejects an
+  // off-chain DELETE once a commitment has matched (409 COMMITMENT_MATCHED) — and
+  // stay `partiallyFilled` (counted in `offchainSkippedPartial`); they remain in
+  // the set for the on-chain leg. A failed off-chain DELETE for a `visibleOpen`
+  // record is logged but does NOT exclude it from the on-chain leg — the off-chain
+  // failure could be a transient API blip; `cancelCommitmentOnchain` is the
+  // authoritative path (`MatchingModule.cancelCommitment` operates on chain
+  // regardless of book visibility), which is exactly the reason for `--authoritative`.
   for (const r of stale) {
     if (r.lifecycle === 'softCancelled') {
       report.offchainSkippedAlready += 1;
+      continue;
+    }
+    if (r.lifecycle === 'partiallyFilled') {
+      // The API rejects an off-chain DELETE once a commitment has matched (409 COMMITMENT_MATCHED).
+      // Don't call it — leave the record `partiallyFilled` (its remaining risk stays counted). Under
+      // `--authoritative` the on-chain leg below authoritatively cancels it; otherwise it rides to expiry.
+      report.offchainSkippedPartial += 1;
       continue;
     }
     try {
@@ -422,6 +436,7 @@ export function renderCancelStaleReportText(report: CancelStaleReport, out: { wr
   out.write(`inspected:                  ${report.inspected}\n`);
   out.write(`off-chain cancelled:        ${report.offchainCancelled}\n`);
   out.write(`off-chain skipped (already softCancelled): ${report.offchainSkippedAlready}\n`);
+  out.write(`off-chain skipped (partiallyFilled — use --authoritative): ${report.offchainSkippedPartial}\n`);
   out.write(`on-chain cancelled:         ${report.onchainCancelled}\n`);
   out.write(`gas-budget denied:          ${report.gasDenied}\n`);
   out.write(`errored:                    ${report.errored}\n`);

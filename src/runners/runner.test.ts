@@ -1457,6 +1457,47 @@ describe('Runner — live execution', () => {
     expect(StateStore.at(stateDir).load().state.commitments['0xaWay']?.lifecycle).toBe('softCancelled');
   });
 
+  it('a stale partiallyFilled remainder is RETAINED on reconcile — never off-chain-cancelled, never reposted over, emits a `partial-remainder-retained` candidate', async () => {
+    // maker-on-away partial → serves the *home* offer; stale (posted 200s ago > staleAfterSeconds 90). The home offer
+    // is occupied by it (noop); the away offer (maker-on-home) is empty → exactly one fresh submit, on the away offer.
+    const stalePartial = commitmentRecord({ hash: '0xpartialHome', speculationId: 'spec-1234', contestId: '1234', makerSide: 'away', lifecycle: 'partiallyFilled', oddsTick: 200, riskAmountWei6: '500000', filledRiskWei6: '200000', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 200, updatedAtUnixSec: T0 - 200 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xpartialHome': stalePartial } });
+    const config = cfg({ mode: { dryRun: false } });
+    const submit = submitRecorder();
+    const cancels: string[] = [];
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([contestView({ contestId: '1234' })]), {
+      submitCommitment: submit.fn,
+      cancelCommitmentOffchain: (h) => { cancels.push(h); return Promise.resolve(); },
+    });
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    const events = readEvents();
+    expect(cancels).toEqual([]); // the partial is NEVER off-chain-cancelled (the API would 409 COMMITMENT_MATCHED)
+    expect(events.some((e) => e.kind === 'soft-cancel' && e.commitmentHash === '0xpartialHome')).toBe(false);
+    expect(events.find((e) => e.kind === 'candidate' && e.skipReason === 'partial-remainder-retained')).toMatchObject({ commitmentHash: '0xpartialHome', makerSide: 'away', takerSide: 'home', reason: 'stale' });
+    expect(submit.calls).toHaveLength(1); // only the empty away offer is posted — no same-side repost over the live partial
+    expect(StateStore.at(stateDir).load().state.commitments['0xpartialHome']?.lifecycle).toBe('partiallyFilled'); // unchanged — rides to expiry
+  });
+
+  it('an unquoteable-gate pull RETAINS a partiallyFilled remainder — no off-chain cancel, a `partial-remainder-retained` candidate, lifecycle unchanged', async () => {
+    const SOON_ISO = new Date((T0 + 60) * 1000).toISOString(); // start-too-soon gate (60 <= expirySeconds 120)
+    const partial = commitmentRecord({ hash: '0xpartial', speculationId: 'spec-1234', contestId: '1234', makerSide: 'away', lifecycle: 'partiallyFilled', oddsTick: 200, riskAmountWei6: '500000', filledRiskWei6: '200000', expiryUnixSec: T0 + 100, postedAtUnixSec: T0 - 5, updatedAtUnixSec: T0 - 5 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xpartial': partial } });
+    const config = cfg({ mode: { dryRun: false } });
+    const cancels: string[] = [];
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([contestView({ contestId: '1234', matchTime: SOON_ISO })]), {
+      cancelCommitmentOffchain: (h) => { cancels.push(h); return Promise.resolve(); },
+    });
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    const events = readEvents();
+    expect(events.find((e) => e.kind === 'candidate' && e.skipReason === 'start-too-soon')).toMatchObject({ contestId: '1234' });
+    expect(cancels).toEqual([]); // the partial is not off-chain-cancelled by the gate pull
+    expect(events.find((e) => e.kind === 'candidate' && e.skipReason === 'partial-remainder-retained')).toMatchObject({ commitmentHash: '0xpartial', reason: 'side-not-quoted' });
+    expect(events.some((e) => e.kind === 'soft-cancel')).toBe(false);
+    expect(StateStore.at(stateDir).load().state.commitments['0xpartial']?.lifecycle).toBe('partiallyFilled');
+  });
+
   it('an off-chain-cancel failure is logged (error, phase cancel) and the record stays visibleOpen for retry', async () => {
     const SOON_ISO = new Date((T0 + 60) * 1000).toISOString();
     const visible = commitmentRecord({ hash: '0xvisible', speculationId: 'spec-1234', contestId: '1234', makerSide: 'away', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 100, postedAtUnixSec: T0 - 5, updatedAtUnixSec: T0 - 5 });
@@ -2909,6 +2950,29 @@ describe('Runner — on-chain kill path / killCancelOnChain (Phase 3 e-ii)', () 
     expect(readEvents().find((e) => e.kind === 'soft-cancel')).toMatchObject({ reason: 'shutdown' });
   });
 
+  it('soft-stop sweep RETAINS a partiallyFilled remainder — not off-chain-cancelled, a `partial-remainder-retained` `reason: shutdown` candidate, lifecycle unchanged', async () => {
+    const cancel = cancelOnchainRecorder();
+    StateStore.at(stateDir).flush({
+      ...emptyMakerState(),
+      commitments: {
+        '0xpartial': commitmentRecord({ hash: '0xpartial', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, lifecycle: 'partiallyFilled', riskAmountWei6: '500000', filledRiskWei6: '200000', expiryUnixSec: T0 + 1000 }),
+      },
+    });
+    const config = cfg({ mode: { dryRun: false }, killCancelOnChain: false });
+    const offchainCancels: Hex[] = [];
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([]), {
+      cancelCommitmentOnchain: cancel.fn,
+      cancelCommitmentOffchain: (h) => { offchainCancels.push(h); return Promise.resolve(); },
+    });
+    await makeRunner({ config, adapter, maxTicks: 5, deps: { killFileExists: killFileAfterTick(2) } }).run();
+
+    expect(offchainCancels).toEqual([]); // the partial is never off-chain-cancelled during the soft-stop sweep
+    expect(cancel.calls).toHaveLength(0); // killCancelOnChain=false → no on-chain sweep either
+    expect(StateStore.at(stateDir).load().state.commitments['0xpartial']?.lifecycle).toBe('partiallyFilled'); // retained — rides to expiry
+    expect(readEvents().find((e) => e.kind === 'candidate' && e.skipReason === 'partial-remainder-retained')).toMatchObject({ commitmentHash: '0xpartial', reason: 'shutdown' });
+    expect(readEvents().some((e) => e.kind === 'soft-cancel')).toBe(false);
+  });
+
   it('killCancelOnChain=true + KILL file + non-terminal records → each is cancelOnchain\'d, stamped authoritativelyInvalidated, emits onchain-cancel, gas accumulated', async () => {
     const cancel = cancelOnchainRecorder(60_000n, 30_000_000_000n);
     const expectedGasPerCall = 60_000n * 30_000_000_000n;
@@ -3026,7 +3090,7 @@ describe('Runner — on-chain kill path / killCancelOnChain (Phase 3 e-ii)', () 
     expect(reloaded.commitments['0xgood']?.lifecycle).toBe('authoritativelyInvalidated'); // both sweeps succeeded
   });
 
-  it('killCancelOnChain=false + visibleOpen + partiallyFilled + softCancelled + expired → off-chain sweep pulls visibleOpen + partiallyFilled (gasless), softCancelled is left alone (already pulled), expired untouched; no on-chain calls (Hermes review-PR29 — operator-doc safety contract)', async () => {
+  it('killCancelOnChain=false + visibleOpen + partiallyFilled + softCancelled + expired → off-chain sweep pulls only visibleOpen (gasless); partiallyFilled is RETAINED (can\'t off-chain-cancel a matched commitment); softCancelled / expired untouched; no on-chain calls', async () => {
     const cancel = cancelOnchainRecorder();
     StateStore.at(stateDir).flush({
       ...emptyMakerState(),
@@ -3045,15 +3109,15 @@ describe('Runner — on-chain kill path / killCancelOnChain (Phase 3 e-ii)', () 
     );
     await makeRunner({ config, adapter, maxTicks: 5, deps: { killFileExists: killFileAfterTick(2) } }).run();
 
-    expect(offchainCalls.sort()).toEqual(['0xpartial', '0xvisible']); // softCancelled (already pulled) + expired (terminal) both skipped
+    expect(offchainCalls.sort()).toEqual(['0xvisible']); // only the visibleOpen pulled; partial retained, softCancelled (already pulled) + expired (terminal) skipped
     expect(cancel.calls).toHaveLength(0); // no on-chain calls — killCancelOnChain false
     const reloaded = StateStore.at(stateDir).load().state;
     expect(reloaded.commitments['0xvisible']?.lifecycle).toBe('softCancelled');
-    expect(reloaded.commitments['0xpartial']?.lifecycle).toBe('softCancelled');
+    expect(reloaded.commitments['0xpartial']?.lifecycle).toBe('partiallyFilled'); // RETAINED — never off-chain-cancelled (rides to expiry; killCancelOnChain would authoritatively cancel it)
     expect(reloaded.commitments['0xsoft']?.lifecycle).toBe('softCancelled'); // unchanged
     expect(reloaded.commitments['0xexpired']?.lifecycle).toBe('expired'); // unchanged
-    const softCancelEvents = readEvents().filter((e) => e.kind === 'soft-cancel' && e.reason === 'shutdown');
-    expect(softCancelEvents).toHaveLength(2); // one per record actually pulled
+    expect(readEvents().filter((e) => e.kind === 'soft-cancel' && e.reason === 'shutdown')).toHaveLength(1); // only 0xvisible pulled
+    expect(readEvents().find((e) => e.kind === 'candidate' && e.skipReason === 'partial-remainder-retained')).toMatchObject({ commitmentHash: '0xpartial', reason: 'shutdown' });
   });
 
   it('off-chain sweep failure on one hash is logged (`error` `phase: cancel`) and the loop continues — failed record stays at original lifecycle; the on-chain sweep (if enabled) may still authoritatively cancel it', async () => {

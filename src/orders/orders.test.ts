@@ -291,7 +291,7 @@ describe('inventoryFromState', () => {
 
 describe('reconcileBook', () => {
   const OPEN_COUNT_OK = 0; // plenty of count headroom (risk.maxOpenCommitments defaults to 10)
-  const NOTHING: BookReconciliation = { toSubmit: [], toReplace: [], toSoftCancel: [], deferredSides: [] };
+  const NOTHING: BookReconciliation = { toSubmit: [], toReplace: [], toSoftCancel: [], retainedPartials: [], deferredSides: [] };
 
   // Reminder of the side mapping: a desired offer with `takerSide: 'away'` is served on chain by a
   // maker-on-*home* commitment (so `makerSide: 'home'`, `oddsTick: inverseOddsTick(quoteTick)` — that's
@@ -314,15 +314,13 @@ describe('reconcileBook', () => {
     expect(r.toReplace).toEqual([]);
   });
 
-  it('soft-cancels a non-expired partiallyFilled remainder on a no-longer-quoted offer side (not just visibleOpen ones)', () => {
+  it('on a no-longer-quoted offer side: soft-cancels the visibleOpen but RETAINS the partiallyFilled remainder (off-chain cancel is rejected once matched)', () => {
     const partialHomeOffer = commitmentRecord({ hash: '0xph', makerSide: 'away', lifecycle: 'partiallyFilled', riskAmountWei6: '500000', filledRiskWei6: '200000' });
     const visibleHomeOffer = commitmentRecord({ hash: '0xvh', makerSide: 'away', lifecycle: 'visibleOpen' });
     const r = reconcileBook([partialHomeOffer, visibleHomeOffer], desiredWith(quoteSide('away', 200), null), cfg(), NOW, OPEN_COUNT_OK);
     expect(r.toSubmit.map((q) => q.takerSide)).toEqual(['away']);
-    expect(r.toSoftCancel).toEqual([
-      { record: visibleHomeOffer, reason: 'side-not-quoted' },
-      { record: partialHomeOffer, reason: 'side-not-quoted' },
-    ]);
+    expect(r.toSoftCancel).toEqual([{ record: visibleHomeOffer, reason: 'side-not-quoted' }]); // only the visibleOpen is pulled
+    expect(r.retainedPartials).toEqual([{ record: partialHomeOffer, reason: 'side-not-quoted' }]); // the partial rides to expiry — never off-chain-cancelled
     expect(r.toReplace).toEqual([]);
   });
 
@@ -408,18 +406,41 @@ describe('reconcileBook', () => {
     expect(r.toSubmit.map((q) => q.takerSide)).toEqual(['home']); // the away offer is occupied by the (fresh, on-tick) partial
     expect(r.toReplace).toEqual([]);
     expect(r.toSoftCancel).toEqual([]);
+    expect(r.retainedPartials).toEqual([]); // a fresh, on-tick, lone occupant is normal steady-state — not surfaced (would emit every tick)
 
     const expiredPartial = commitmentRecord({ hash: '0xep', makerSide: 'home', lifecycle: 'partiallyFilled', riskAmountWei6: '500000', filledRiskWei6: '200000', expiryUnixSec: NOW - 1 });
     r = reconcileBook([expiredPartial], d, cfg(), NOW, OPEN_COUNT_OK);
     expect(r.toSubmit.map((q) => q.takerSide).sort()).toEqual(['away', 'home']); // the expired partial doesn't occupy the offer
   });
 
-  it('pulls a stale partiallyFilled incumbent and posts a fresh full quote in its place (v0 doesn\'t refresh a partial in place)', () => {
+  it('RETAINS a stale partiallyFilled remainder and does NOT repost over it (no off-chain cancel, no same-side submit)', () => {
     const stalePartial = commitmentRecord({ hash: '0xsp', makerSide: 'home', lifecycle: 'partiallyFilled', oddsTick: 200, riskAmountWei6: '500000', filledRiskWei6: '200000', postedAtUnixSec: NOW - 200 }); // > staleAfterSeconds
     const fresh = quoteSide('away', 200);
     const r = reconcileBook([stalePartial], desiredWith(fresh, null), cfg(), NOW, OPEN_COUNT_OK);
-    expect(r.toSoftCancel).toEqual([{ record: stalePartial, reason: 'stale' }]);
-    expect(r.toSubmit).toEqual([fresh]);
+    expect(r.toSoftCancel).toEqual([]); // never off-chain-cancelled — the API rejects a DELETE once matched
+    expect(r.toSubmit).toEqual([]); // never reposted over — that would double the side's matchable exposure
+    expect(r.toReplace).toEqual([]);
+    expect(r.retainedPartials).toEqual([{ record: stalePartial, reason: 'stale' }]); // surfaced for telemetry; rides to expiry / authoritative cancel
+  });
+
+  it('RETAINS a mispriced partiallyFilled remainder (reason "mispriced") and does not repost over it', () => {
+    // partial priced for the taker-200 offer (maker tick 200); the desired is the taker-150 offer → ~1667 bps move → mispriced.
+    const mispricedPartial = commitmentRecord({ hash: '0xmp', makerSide: 'home', lifecycle: 'partiallyFilled', oddsTick: 200, riskAmountWei6: '500000', filledRiskWei6: '200000', postedAtUnixSec: NOW - 5 });
+    const r = reconcileBook([mispricedPartial], desiredWith(quoteSide('away', 150), null), cfg(), NOW, OPEN_COUNT_OK);
+    expect(r.toSoftCancel).toEqual([]);
+    expect(r.toSubmit).toEqual([]);
+    expect(r.toReplace).toEqual([]);
+    expect(r.retainedPartials).toEqual([{ record: mispricedPartial, reason: 'mispriced' }]);
+  });
+
+  it('on a wanted side with a partial occupant AND a redundant visibleOpen: pulls the visibleOpen (duplicate), retains the partial, posts nothing', () => {
+    // both maker-on-home → both serve the away offer; the partial occupies the side, the visibleOpen is redundant.
+    const partial = commitmentRecord({ hash: '0xpf', makerSide: 'home', lifecycle: 'partiallyFilled', oddsTick: 200, riskAmountWei6: '500000', filledRiskWei6: '200000', postedAtUnixSec: NOW - 10 });
+    const redundantVisible = commitmentRecord({ hash: '0xrv', makerSide: 'home', lifecycle: 'visibleOpen', oddsTick: 200, postedAtUnixSec: NOW - 5 });
+    const r = reconcileBook([partial, redundantVisible], desiredWith(quoteSide('away', 200), null), cfg(), NOW, OPEN_COUNT_OK);
+    expect(r.toSoftCancel).toEqual([{ record: redundantVisible, reason: 'duplicate' }]); // the removable one is pulled (gasless)
+    expect(r.retainedPartials).toEqual([{ record: partial, reason: 'duplicate' }]); // the partial is kept (can't be off-chain-cancelled)
+    expect(r.toSubmit).toEqual([]); // no fresh post over a live partial
     expect(r.toReplace).toEqual([]);
   });
 

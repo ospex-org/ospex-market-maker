@@ -3,13 +3,20 @@
  *
  * Wraps the surface the MM needs (contests / speculations / commitments /
  * positions / odds / balances / approvals / health on the read side; submit /
- * cancel / approve / settle / claim on the write side) and maps the SDK's
- * provider-specific wire-field names to neutral MM terms at this boundary
- * (`jsonoddsId` → `referenceGameId`) — DESIGN §16 forbids provider names anywhere
- * else. SDK types that have no provider-name leak (`Commitment`, `PositionStatus`,
- * `BalancesSnapshot`, `MoneylineOdds`, the typed `Ospex*Error` classes, …) are
- * re-exported as-is so downstream callers don't have to reach past this adapter
- * to type a variable or `instanceof`-check an error.
+ * cancel / approve / settle / claim on the write side). The one provider-specific
+ * wire-field name the SDK still surfaces is `Contest.jsonoddsId`, renamed to the
+ * neutral `referenceGameId` at this boundary (DESIGN §16 forbids provider names
+ * anywhere else). SDK types that have no provider-name leak (`Commitment`,
+ * `PositionStatus`, `BalancesSnapshot`, the per-market odds shapes `MoneylineOdds`
+ * / `SpreadOdds` / `TotalOdds`, `ContestOddsSnapshot`, the typed `Ospex*Error`
+ * classes, …) are re-exported as-is so downstream callers don't have to reach past
+ * this adapter to type a variable or `instanceof`-check an error.
+ *
+ * SDK 0.3.0 made the odds surface provider-neutral and moved live odds to
+ * `ospex-core-api` SSE: snapshots (`ContestOddsSnapshot`) and the live odds stream
+ * (`subscribeOdds`, contest-id native) now pass straight through — there is no
+ * odds-side rename, and `subscribeOdds`'s `onError` receives a typed
+ * `OspexStreamError` whose `reason` discriminates a retryable drop from a fatal one.
  *
  * Two flavours:
  *   - `createOspexAdapter(config)` — **read-only**: builds the `OspexClient`
@@ -38,6 +45,7 @@ import {
   OspexError,
   OspexScriptApprovalError,
   OspexSigningError,
+  OspexStreamError,
   OspexSubscriptionError,
   OspexValidationError,
   getAddresses,
@@ -53,7 +61,7 @@ import {
   type Hex,
   type MarketType,
   type MoneylineOdds,
-  type OddsSnapshot,
+  type OddsForMarket,
   type OddsSubscribeArgs,
   type OddsSubscribeHandlers,
   type OspexClientOptions,
@@ -81,10 +89,14 @@ export type {
   Commitment,
   CommitmentsListOptions,
   CommitmentStatus,
+  ContestOddsSnapshot,
   ContestsListOptions,
   Hex,
   MarketType,
   MoneylineOdds,
+  OddsForMarket,
+  OddsSubscribeArgs,
+  OddsSubscribeHandlers,
   OspexAddresses,
   OspexClientOptions,
   PositionStatus,
@@ -103,6 +115,7 @@ export {
   OspexError,
   OspexScriptApprovalError,
   OspexSigningError,
+  OspexStreamError,
   OspexSubscriptionError,
   OspexValidationError,
 };
@@ -142,42 +155,6 @@ export interface SpeculationView {
    * quote-competitiveness checks (DESIGN §8).
    */
   orderbook?: Commitment[];
-}
-
-/** One-shot reference odds for a contest, with the SDK's `jsonoddsId` renamed (DESIGN §16). The inner per-market shapes are pure SDK types (no provider names). */
-export interface OddsSnapshotView {
-  contestId: string;
-  referenceGameId: string | null;
-  odds: {
-    moneyline: MoneylineOdds | null;
-    spread: SpreadOdds | null;
-    total: TotalOdds | null;
-  };
-}
-
-/** Args for `subscribeOdds` — neutral `referenceGameId` (the adapter maps it to the SDK's `jsonoddsId`). */
-export interface SubscribeOddsArgs {
-  referenceGameId: string;
-  market: MarketType;
-}
-
-/** A single `onChange` / `onRefresh` payload, with `jsonoddsId` renamed (DESIGN §16). */
-export interface OddsUpdateView {
-  referenceGameId: string;
-  market: MarketType;
-  network: string;
-  line: number | null;
-  awayOddsAmerican: number | null;
-  homeOddsAmerican: number | null;
-  upstreamLastUpdated: string;
-  pollCapturedAt: string;
-  changedAt: string;
-}
-
-export interface OddsSubscribeHandlersView {
-  onChange: (update: OddsUpdateView) => void;
-  onRefresh?: (update: OddsUpdateView) => void;
-  onError?: (err: Error) => void;
 }
 
 // ── the structural subset of `OspexClient` the adapter uses ──────────────────
@@ -324,20 +301,31 @@ export class OspexAdapter {
 
   // ── odds ──────────────────────────────────────────────────────────────
 
-  async getOddsSnapshot(contestId: string): Promise<OddsSnapshotView> {
-    return toOddsSnapshotView(await this.client.odds.snapshot(contestId));
+  /**
+   * One-shot reference odds for a contest (the latest upstream snapshot for all
+   * three markets). Provider-neutral in SDK 0.3.0, so it passes straight through.
+   * The runner seeds a tracked market from this before its odds stream connects
+   * ("snapshot-first"); `quote` reads it for a one-off price.
+   */
+  async getOddsSnapshot(contestId: string): Promise<ContestOddsSnapshot> {
+    return this.client.odds.snapshot(contestId);
   }
 
-  subscribeOdds(args: SubscribeOddsArgs, handlers: OddsSubscribeHandlersView): Promise<Subscription> {
-    const sdkArgs: OddsSubscribeArgs = { jsonoddsId: args.referenceGameId, market: args.market };
-    // Capture the optional callbacks as locals so the `!== undefined` narrowings flow into the closures.
-    const { onChange, onRefresh, onError } = handlers;
-    const sdkHandlers: OddsSubscribeHandlers = {
-      onChange: (o) => onChange(toOddsUpdateView(o)),
-      ...(onRefresh !== undefined ? { onRefresh: (o: OddsSnapshot) => onRefresh(toOddsUpdateView(o)) } : {}),
-      ...(onError !== undefined ? { onError } : {}),
-    };
-    return this.client.odds.subscribe(sdkArgs, sdkHandlers);
+  /**
+   * Open the live core-api SSE odds stream for one `(contest, market)` and deliver
+   * the market-specific shape (`MoneylineOdds` / `SpreadOdds` / `TotalOdds`).
+   * Contest-id native — the server resolves the upstream game. The handlers are the
+   * SDK's own (`onSnapshot` baseline / `onChange` / `onRefresh` / `onStatus` /
+   * `onError`); the transport self-reconnects with backoff, so `onError`'s
+   * `OspexStreamError.reason` is `fatal` only when the subscription has actually
+   * ended (`connection_failed` / `capacity_exceeded` are retried). Pass-through —
+   * the 0.3.0 odds surface is provider-neutral, so no field mapping is needed.
+   */
+  subscribeOdds<M extends MarketType>(
+    args: OddsSubscribeArgs<M>,
+    handlers: OddsSubscribeHandlers<OddsForMarket<M>>,
+  ): Promise<Subscription> {
+    return this.client.odds.subscribe(args, handlers);
   }
 
   // ── commitments ───────────────────────────────────────────────────────
@@ -625,30 +613,4 @@ function toSpeculationView(s: Speculation): SpeculationView {
   };
   if (s.orderbook !== undefined) view.orderbook = s.orderbook; // present on contest-detail / speculation-detail responses; absent on the lean list endpoint
   return view;
-}
-
-function toOddsSnapshotView(snap: ContestOddsSnapshot): OddsSnapshotView {
-  return {
-    contestId: snap.contestId,
-    referenceGameId: snap.jsonoddsId,
-    odds: {
-      moneyline: snap.odds.moneyline,
-      spread: snap.odds.spread,
-      total: snap.odds.total,
-    },
-  };
-}
-
-function toOddsUpdateView(o: OddsSnapshot): OddsUpdateView {
-  return {
-    referenceGameId: o.jsonoddsId,
-    market: o.market,
-    network: o.network,
-    line: o.line,
-    awayOddsAmerican: o.awayOddsAmerican,
-    homeOddsAmerican: o.homeOddsAmerican,
-    upstreamLastUpdated: o.upstreamLastUpdated,
-    pollCapturedAt: o.pollCapturedAt,
-    changedAt: o.changedAt,
-  };
 }

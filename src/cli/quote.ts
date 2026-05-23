@@ -21,7 +21,7 @@
 
 import type { Config } from '../config/index.js';
 import { buildDesiredQuote, type ReferenceOddsBreakdown } from '../orders/index.js';
-import type { OspexAdapter, OddsSnapshotView } from '../ospex/index.js';
+import type { OspexAdapter, ContestOddsSnapshot } from '../ospex/index.js';
 import type { QuoteResult } from '../pricing/index.js';
 
 // ── report shape ─────────────────────────────────────────────────────────────
@@ -177,7 +177,7 @@ function refused(contestId: string, reason: string, context: QuoteContext): Quot
   return { pipeline: 'refused', contestId, reason, context };
 }
 
-function extractMoneylineOdds(snapshot: OddsSnapshotView): { awayOddsAmerican: number | null; homeOddsAmerican: number | null } | null {
+function extractMoneylineOdds(snapshot: ContestOddsSnapshot): { awayOddsAmerican: number | null; homeOddsAmerican: number | null } | null {
   const m = snapshot.odds.moneyline;
   if (m === null) return null;
   return { awayOddsAmerican: m.awayOddsAmerican, homeOddsAmerican: m.homeOddsAmerican };

@@ -12,7 +12,7 @@ import type {
   Contest,
   ContestOddsSnapshot,
   Hex,
-  OddsSnapshot,
+  MoneylineOdds,
   OddsSubscribeArgs,
   OddsSubscribeHandlers,
   PositionStatus,
@@ -79,7 +79,6 @@ const SAMPLE_CONTEST_NO_LINKAGE: Contest = {
 
 const SAMPLE_ODDS: ContestOddsSnapshot = {
   contestId: 'contest-1',
-  jsonoddsId: 'GAME-1',
   odds: {
     moneyline: {
       market: 'moneyline',
@@ -94,11 +93,8 @@ const SAMPLE_ODDS: ContestOddsSnapshot = {
   },
 };
 
-const SAMPLE_ODDS_UPDATE: OddsSnapshot = {
-  jsonoddsId: 'GAME-1',
+const SAMPLE_ODDS_UPDATE: MoneylineOdds = {
   market: 'moneyline',
-  network: 'polygon',
-  line: null,
   awayOddsAmerican: 145,
   homeOddsAmerican: -175,
   upstreamLastUpdated: '2026-05-11T20:01:00Z',
@@ -123,6 +119,7 @@ const SAMPLE_COMMITMENT: Commitment = {
   speculationKey: 'key-1',
   signature: '0xsig',
   status: 'open',
+  storedStatus: 'open',
   source: 'api',
   network: 'polygon',
   nonceInvalidated: false,
@@ -352,11 +349,12 @@ describe('OspexAdapter — contest views', () => {
 });
 
 describe('OspexAdapter — odds (snapshot + subscribe)', () => {
-  it('getOddsSnapshot renames jsonoddsId → referenceGameId and passes inner per-market shapes through', async () => {
+  it('getOddsSnapshot passes the provider-neutral ContestOddsSnapshot straight through (no jsonoddsId)', async () => {
     const adapter = adapterWith({ odds: { snapshot: () => Promise.resolve(SAMPLE_ODDS), subscribe: () => Promise.resolve(FAKE_SUBSCRIPTION) } });
     const snap = await adapter.getOddsSnapshot('contest-1');
+    expect(snap).toEqual(SAMPLE_ODDS);
     expect(snap.contestId).toBe('contest-1');
-    expect(snap.referenceGameId).toBe('GAME-1');
+    // 0.3.0 removed jsonoddsId from the odds surface — the snapshot is provider-neutral.
     expect((snap as unknown as Record<string, unknown>).jsonoddsId).toBeUndefined();
     expect(snap.odds.moneyline?.awayOddsAmerican).toBe(150);
     expect(snap.odds.moneyline?.homeOddsAmerican).toBe(-180);
@@ -364,68 +362,61 @@ describe('OspexAdapter — odds (snapshot + subscribe)', () => {
     expect(snap.odds.total).toBeNull();
   });
 
-  it('subscribeOdds maps referenceGameId → jsonoddsId in the SDK args and wraps the handlers', async () => {
-    let capturedArgs: OddsSubscribeArgs | null = null;
-    let capturedHandlers: OddsSubscribeHandlers | null = null;
+  it('subscribeOdds forwards contest-id args and the caller\'s handlers straight to the SDK (no wrapping)', async () => {
+    let capturedArgs: OddsSubscribeArgs<'moneyline'> | null = null;
+    let capturedHandlers: OddsSubscribeHandlers<MoneylineOdds> | null = null;
     const adapter = adapterWith({
       odds: {
         snapshot: () => Promise.reject(new Error('unused')),
         subscribe: (args, handlers) => {
-          capturedArgs = args;
-          capturedHandlers = handlers;
+          capturedArgs = args as OddsSubscribeArgs<'moneyline'>;
+          capturedHandlers = handlers as OddsSubscribeHandlers<MoneylineOdds>;
           return Promise.resolve(FAKE_SUBSCRIPTION);
         },
       },
     });
 
+    const onSnapshot = vi.fn();
     const onChange = vi.fn();
     const onRefresh = vi.fn();
+    const onStatus = vi.fn();
     const onError = vi.fn();
     const sub = await adapter.subscribeOdds(
-      { referenceGameId: 'GAME-1', market: 'moneyline' },
-      { onChange, onRefresh, onError },
+      { contestId: 'contest-1', market: 'moneyline' },
+      { onSnapshot, onChange, onRefresh, onStatus, onError },
     );
 
-    expect(capturedArgs).toEqual({ jsonoddsId: 'GAME-1', market: 'moneyline' });
+    // Contest-id native (0.3.0) — no referenceGameId/jsonoddsId remap.
+    expect(capturedArgs).toEqual({ contestId: 'contest-1', market: 'moneyline' });
     expect(sub).toBe(FAKE_SUBSCRIPTION);
 
-    // The SDK fires onChange with an OddsSnapshot — the adapter remaps to OddsUpdateView (jsonoddsId → referenceGameId).
-    capturedHandlers!.onChange(SAMPLE_ODDS_UPDATE);
-    expect(onChange).toHaveBeenCalledOnce();
-    expect(onChange.mock.calls[0]?.[0]).toEqual({
-      referenceGameId: 'GAME-1',
-      market: 'moneyline',
-      network: 'polygon',
-      line: null,
-      awayOddsAmerican: 145,
-      homeOddsAmerican: -175,
-      upstreamLastUpdated: '2026-05-11T20:01:00Z',
-      pollCapturedAt: '2026-05-11T20:01:30Z',
-      changedAt: '2026-05-11T20:01:00Z',
-    });
-
-    // onRefresh is passed through, mapped.
-    capturedHandlers!.onRefresh!(SAMPLE_ODDS_UPDATE);
-    expect(onRefresh).toHaveBeenCalledOnce();
-    expect(onRefresh.mock.calls[0]?.[0]).toMatchObject({ referenceGameId: 'GAME-1', awayOddsAmerican: 145 });
-
-    // onError is passed through as a direct reference (no wrapping needed — it doesn't carry SDK types).
+    // Pass-through: every handler the caller passed is forwarded by reference.
+    expect(capturedHandlers!.onSnapshot).toBe(onSnapshot);
+    expect(capturedHandlers!.onChange).toBe(onChange);
+    expect(capturedHandlers!.onRefresh).toBe(onRefresh);
+    expect(capturedHandlers!.onStatus).toBe(onStatus);
     expect(capturedHandlers!.onError).toBe(onError);
+
+    // The forwarded onChange receives the SDK's per-market shape unchanged.
+    capturedHandlers!.onChange(SAMPLE_ODDS_UPDATE);
+    expect(onChange).toHaveBeenCalledWith(SAMPLE_ODDS_UPDATE);
   });
 
-  it('subscribeOdds omits onRefresh / onError when the caller didn\'t pass them (exactOptionalPropertyTypes)', async () => {
-    let capturedHandlers: OddsSubscribeHandlers | null = null;
+  it('subscribeOdds forwards exactly the handlers passed — omitted optionals stay omitted (exactOptionalPropertyTypes)', async () => {
+    let capturedHandlers: OddsSubscribeHandlers<MoneylineOdds> | null = null;
     const adapter = adapterWith({
       odds: {
         snapshot: () => Promise.reject(new Error('unused')),
         subscribe: (_args, handlers) => {
-          capturedHandlers = handlers;
+          capturedHandlers = handlers as OddsSubscribeHandlers<MoneylineOdds>;
           return Promise.resolve(FAKE_SUBSCRIPTION);
         },
       },
     });
-    await adapter.subscribeOdds({ referenceGameId: 'G', market: 'moneyline' }, { onChange: () => {} });
+    await adapter.subscribeOdds({ contestId: 'contest-1', market: 'moneyline' }, { onChange: () => {} });
+    expect(capturedHandlers!.onSnapshot).toBeUndefined();
     expect(capturedHandlers!.onRefresh).toBeUndefined();
+    expect(capturedHandlers!.onStatus).toBeUndefined();
     expect(capturedHandlers!.onError).toBeUndefined();
   });
 });

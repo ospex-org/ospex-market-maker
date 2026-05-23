@@ -8,7 +8,9 @@ import { inverseOddsTick } from '../pricing/index.js';
 import {
   createLiveOspexAdapter,
   createOspexAdapter,
+  OspexStreamError,
   type Commitment,
+  type ContestOddsSnapshot,
   type ContestView,
   type Hex,
   type MoneylineOdds,
@@ -18,16 +20,13 @@ import {
   type CancelOnchainResult,
   type ClaimPositionResult,
   type SettleSpeculationResult,
-  type OddsSnapshotView,
-  type OddsSubscribeHandlersView,
-  type OddsUpdateView,
+  type OddsSubscribeHandlers,
   type OspexAdapter,
   type PositionStatus,
   type Signer,
   type SpeculationView,
   type SubmitCommitmentArgs,
   type SubmitCommitmentResult,
-  type SubscribeOddsArgs,
   type Subscription,
 } from '../ospex/index.js';
 import { StateStore, emptyMakerState, type MakerCommitmentRecord, type MakerSide, type MakerState } from '../state/index.js';
@@ -140,13 +139,9 @@ function contestView(overrides: Partial<ContestView> & { contestId: string }): C
 function moneylineOdds(awayOddsAmerican: number | null, homeOddsAmerican: number | null): MoneylineOdds {
   return { market: 'moneyline', awayOddsAmerican, homeOddsAmerican, upstreamLastUpdated: '2026-01-01T00:00:00Z', pollCapturedAt: '2026-01-01T00:00:00Z', changedAt: '2026-01-01T00:00:00Z' };
 }
-/** A one-shot odds snapshot view for a contest — `referenceGameId` echoes `GAME-<contestId>` (matching `spiedAdapter`'s default `getContest`); the moneyline defaults to `-110 / -110`, pass `null` for "no moneyline row yet". */
-function oddsSnapshotView(contestId: string, moneyline: MoneylineOdds | null = moneylineOdds(-110, -110)): OddsSnapshotView {
-  return { contestId, referenceGameId: `GAME-${contestId}`, odds: { moneyline, spread: null, total: null } };
-}
-/** A Realtime `onChange` / `onRefresh` payload for a moneyline channel. */
-function oddsUpdate(referenceGameId: string, awayOddsAmerican: number | null, homeOddsAmerican: number | null): OddsUpdateView {
-  return { referenceGameId, market: 'moneyline', network: 'polygon', line: null, awayOddsAmerican, homeOddsAmerican, upstreamLastUpdated: '2026-02-02T00:00:00Z', pollCapturedAt: '2026-02-02T00:00:00Z', changedAt: '2026-02-02T00:00:00Z' };
+/** A one-shot odds snapshot for a contest — the moneyline defaults to `-110 / -110`; pass `null` for "no moneyline row yet". Provider-neutral (0.3.0): no referenceGameId on the odds surface. The live `onChange` / `onRefresh` payloads use `moneylineOdds(...)` directly (the per-market shape). */
+function oddsSnapshotView(contestId: string, moneyline: MoneylineOdds | null = moneylineOdds(-110, -110)): ContestOddsSnapshot {
+  return { contestId, odds: { moneyline, spread: null, total: null } };
 }
 /** A `getSpeculation` view for a moneyline speculation — `open` defaults to true (the realistic case the per-market reconcile expects); `orderbook` defaults to `[]` (the detail endpoint always populates it — pass entries to exercise the competitiveness check, or `{ ...speculationView(id) }` without an `orderbook` override for the degraded case). */
 function speculationView(speculationId: string, open = true, orderbook: Commitment[] = []): SpeculationView {
@@ -171,6 +166,7 @@ function orderbookEntry(overrides: Partial<Commitment> = {}): Commitment {
     speculationKey: 'sk-A',
     signature: '0xsig',
     status: 'open',
+    storedStatus: 'open',
     source: 'agent',
     network: 'polygon',
     nonceInvalidated: false,
@@ -185,34 +181,38 @@ function noopSubscription(): Subscription {
 
 /**
  * A `subscribeOdds` stub that records each call (the handlers + a per-call
- * `unsubscribe` spy), keyed by `referenceGameId`. By default every call succeeds;
- * `rejectWhen(matcher)` makes matching calls reject (e.g. the first attempt for a
- * given game — simulating the Realtime-credentials fetch failing).
+ * `unsubscribe` spy), keyed by `contestId` (0.3.0 odds streams are contest-id
+ * native). By default every call succeeds; `rejectWhen(matcher)` makes matching
+ * calls reject (e.g. the first attempt for a given contest).
  */
 function makeSubscribeRecorder() {
-  const handlers = new Map<string, OddsSubscribeHandlersView>();
+  const handlers = new Map<string, OddsSubscribeHandlers<MoneylineOdds>>();
   const unsubs = new Map<string, ReturnType<typeof vi.fn>>();
-  const calls: string[] = []; // referenceGameId per successful subscribe, in order
+  const calls: string[] = []; // contestId per successful subscribe, in order
   const attempts = new Map<string, number>();
-  let rejectMatcher: ((referenceGameId: string, attempt: number) => boolean) | null = null;
+  let rejectMatcher: ((contestId: string, attempt: number) => boolean) | null = null;
+  // Typed as the adapter's generic method so it slots straight into mockImplementation.
+  const subscribe: OspexAdapter['subscribeOdds'] = (args, h) => {
+    const contestId = String(args.contestId);
+    const attempt = (attempts.get(contestId) ?? 0) + 1;
+    attempts.set(contestId, attempt);
+    if (rejectMatcher !== null && rejectMatcher(contestId, attempt)) {
+      return Promise.reject(new Error('subscribe failed (test)'));
+    }
+    const unsubscribe = vi.fn(); // a no-impl spy: `await unsubscribe()` resolves to undefined, which is fine
+    // The harness is moneyline-only — the runner always subscribes with market: 'moneyline'.
+    handlers.set(contestId, h as unknown as OddsSubscribeHandlers<MoneylineOdds>);
+    unsubs.set(contestId, unsubscribe);
+    calls.push(contestId);
+    return Promise.resolve({ unsubscribe });
+  };
   return {
-    subscribe(args: SubscribeOddsArgs, h: OddsSubscribeHandlersView): Promise<Subscription> {
-      const attempt = (attempts.get(args.referenceGameId) ?? 0) + 1;
-      attempts.set(args.referenceGameId, attempt);
-      if (rejectMatcher !== null && rejectMatcher(args.referenceGameId, attempt)) {
-        return Promise.reject(new Error('subscribe failed (test)'));
-      }
-      const unsubscribe = vi.fn(); // a no-impl spy: `await unsubscribe()` resolves to undefined, which is fine
-      handlers.set(args.referenceGameId, h);
-      unsubs.set(args.referenceGameId, unsubscribe);
-      calls.push(args.referenceGameId);
-      return Promise.resolve({ unsubscribe });
-    },
-    rejectWhen(matcher: (referenceGameId: string, attempt: number) => boolean): void { rejectMatcher = matcher; },
-    handlersFor(referenceGameId: string): OddsSubscribeHandlersView | undefined { return handlers.get(referenceGameId); },
-    unsubscribeFor(referenceGameId: string): ReturnType<typeof vi.fn> | undefined { return unsubs.get(referenceGameId); },
+    subscribe,
+    rejectWhen(matcher: (contestId: string, attempt: number) => boolean): void { rejectMatcher = matcher; },
+    handlersFor(contestId: string): OddsSubscribeHandlers<MoneylineOdds> | undefined { return handlers.get(contestId); },
+    unsubscribeFor(contestId: string): ReturnType<typeof vi.fn> | undefined { return unsubs.get(contestId); },
     successfulCalls(): string[] { return [...calls]; },
-    attemptsFor(referenceGameId: string): number { return attempts.get(referenceGameId) ?? 0; },
+    attemptsFor(contestId: string): number { return attempts.get(contestId) ?? 0; },
   };
 }
 
@@ -229,8 +229,8 @@ function spiedAdapter(
   listContests: () => Promise<ContestView[]>,
   getContest?: (id: string) => Promise<ContestView>,
   odds?: {
-    snapshot?: (contestId: string) => Promise<OddsSnapshotView>;
-    subscribe?: (args: SubscribeOddsArgs, handlers: OddsSubscribeHandlersView) => Promise<Subscription>;
+    snapshot?: (contestId: string) => Promise<ContestOddsSnapshot>;
+    subscribe?: OspexAdapter['subscribeOdds'];
     getSpeculation?: (speculationId: string) => Promise<SpeculationView>;
   },
 ): OspexAdapter {
@@ -286,8 +286,8 @@ function liveSpiedAdapter(
   },
   getContest?: (id: string) => Promise<ContestView>,
   odds?: {
-    snapshot?: (contestId: string) => Promise<OddsSnapshotView>;
-    subscribe?: (args: SubscribeOddsArgs, handlers: OddsSubscribeHandlersView) => Promise<Subscription>;
+    snapshot?: (contestId: string) => Promise<ContestOddsSnapshot>;
+    subscribe?: OspexAdapter['subscribeOdds'];
     getSpeculation?: (speculationId: string) => Promise<SpeculationView>;
   },
   reads?: {
@@ -758,7 +758,7 @@ describe('Runner — odds subscriptions', () => {
     await runner.run();
 
     expect(snapshotCalls).toBe(1); // seeded before subscribing
-    expect(recorder.successfulCalls()).toEqual(['GAME-A']);
+    expect(recorder.successfulCalls()).toEqual(['A']);
     expect(runner.trackedMarketView('A')).toMatchObject({
       subscribed: true,
       lastMoneylineOdds: { awayOddsAmerican: -150, homeOddsAmerican: 130 },
@@ -785,8 +785,8 @@ describe('Runner — odds subscriptions', () => {
     expect(runner.trackedMarketView('C')?.subscribed).toBe(true);
     const capEvents = readEvents().filter((e) => e.kind === 'degraded' && e.reason === 'channel-cap');
     expect(capEvents.map((e) => e.contestId)).toEqual(['C']);
-    expect(recorder.successfulCalls().filter((id) => id === 'GAME-C')).toHaveLength(1); // C subscribed once, on cycle 2
-    expect(recorder.successfulCalls().filter((id) => id === 'GAME-A')).toHaveLength(1); // A subscribed cycle 1, then departed
+    expect(recorder.successfulCalls().filter((id) => id === 'C')).toHaveLength(1); // C subscribed once, on cycle 2
+    expect(recorder.successfulCalls().filter((id) => id === 'A')).toHaveLength(1); // A subscribed cycle 1, then departed
   });
 
   it('a channel onChange updates the odds + marks the market dirty; onRefresh updates without marking dirty; a seed with no moneyline row leaves lastMoneylineOdds null', async () => {
@@ -803,21 +803,21 @@ describe('Runner — odds subscriptions', () => {
     // after the seed: subscribed, the feed responded (so lastOddsAt is set) but the response had no moneyline row, so no usable odds yet; not dirty (it had none before either).
     expect(runner.trackedMarketView('A')).toMatchObject({ subscribed: true, lastMoneylineOdds: null, lastOddsAt: T0, dirty: false });
 
-    const handlers = recorder.handlersFor('GAME-A');
+    const handlers = recorder.handlersFor('A');
     expect(handlers).toBeDefined();
 
     // onRefresh: stores the odds + bumps freshness, but does NOT mark the market dirty.
     t = T0 + 5;
-    handlers?.onRefresh?.(oddsUpdate('GAME-A', -120, 100));
+    handlers?.onRefresh?.(moneylineOdds(-120, 100));
     expect(runner.trackedMarketView('A')).toMatchObject({ lastMoneylineOdds: { awayOddsAmerican: -120, homeOddsAmerican: 100 }, lastOddsAt: T0 + 5, dirty: false });
 
     // onChange: updates the odds, bumps freshness, marks the market dirty.
     t = T0 + 10;
-    handlers?.onChange(oddsUpdate('GAME-A', 150, -180));
+    handlers?.onChange(moneylineOdds(150, -180));
     expect(runner.trackedMarketView('A')).toMatchObject({ lastMoneylineOdds: { awayOddsAmerican: 150, homeOddsAmerican: -180 }, lastOddsAt: T0 + 10, dirty: true });
   });
 
-  it('a channel onError degrades the market (subscription cleared) + emits a degraded channel-error event; the next discovery cycle re-subscribes it', async () => {
+  it('a fatal channel onError degrades the market (subscription cleared) + emits a degraded channel-error event; the next discovery cycle re-subscribes it', async () => {
     const config = cfg({ discovery: { everyNTicks: 1 } });
     const recorder = makeSubscribeRecorder();
     let sleeps = 0;
@@ -826,28 +826,70 @@ describe('Runner — odds subscriptions', () => {
       config,
       adapter,
       maxTicks: 2,
-      deps: { sleep: () => { sleeps += 1; if (sleeps === 1) recorder.handlersFor('GAME-A')?.onError?.(new Error('channel boom')); return Promise.resolve(); } },
+      deps: { sleep: () => { sleeps += 1; if (sleeps === 1) recorder.handlersFor('A')?.onError?.(new OspexStreamError('channel boom', { reason: 'fatal' })); return Promise.resolve(); } },
     });
     await runner.run();
 
     expect(runner.trackedMarketView('A')?.subscribed).toBe(true); // re-subscribed on cycle 2
-    expect(recorder.successfulCalls()).toEqual(['GAME-A', 'GAME-A']);
+    expect(recorder.successfulCalls()).toEqual(['A', 'A']);
     const degraded = readEvents().filter((e) => e.kind === 'degraded');
     expect(degraded).toHaveLength(1);
     expect(degraded[0]).toMatchObject({ contestId: 'A', referenceGameId: 'GAME-A', reason: 'channel-error', detail: 'channel boom' });
   });
 
-  it('a subscribeOdds rejection (e.g. the Realtime-credentials fetch failed) degrades the market with a subscribe-failed event; the next discovery cycle retries', async () => {
+  it('a retryable (non-fatal) channel onError keeps the subscription alive (the SDK self-reconnects) and logs a breadcrumb — no teardown, no re-subscribe', async () => {
     const config = cfg({ discovery: { everyNTicks: 1 } });
     const recorder = makeSubscribeRecorder();
-    recorder.rejectWhen((referenceGameId, attempt) => referenceGameId === 'GAME-A' && attempt === 1);
+    let sleeps = 0;
+    const adapter = spiedAdapter(config, () => Promise.resolve([contestView({ contestId: 'A' })]), undefined, { subscribe: recorder.subscribe });
+    const runner = makeRunner({
+      config,
+      adapter,
+      maxTicks: 2,
+      deps: { sleep: () => { sleeps += 1; if (sleeps === 1) recorder.handlersFor('A')?.onError?.(new OspexStreamError('blip', { reason: 'connection_failed' })); return Promise.resolve(); } },
+    });
+    await runner.run();
+
+    // The transport is still reconnecting — the channel must NOT be torn down or re-subscribed.
+    expect(runner.trackedMarketView('A')?.subscribed).toBe(true);
+    expect(recorder.successfulCalls()).toEqual(['A']); // subscribed once; no re-subscribe
+    expect(readEvents().some((e) => e.kind === 'degraded' && e.reason === 'channel-error')).toBe(false);
+    // A breadcrumb is logged for observability — the class carries the stream reason.
+    expect(readEvents().find((e) => e.kind === 'error' && e.phase === 'odds-stream')).toMatchObject({ class: 'stream-connection_failed', detail: 'blip', contestId: 'A' });
+  });
+
+  it('onStatus reconnecting / degraded emit stream-* degraded telemetry without tearing the channel down; connected is not a degraded signal', async () => {
+    const config = cfg({ discovery: { everyNTicks: 1 } });
+    const recorder = makeSubscribeRecorder();
+    let sleeps = 0;
+    const adapter = spiedAdapter(config, () => Promise.resolve([contestView({ contestId: 'A' })]), undefined, { subscribe: recorder.subscribe });
+    const runner = makeRunner({
+      config,
+      adapter,
+      maxTicks: 2,
+      deps: { sleep: () => { sleeps += 1; if (sleeps === 1) { const h = recorder.handlersFor('A'); h?.onStatus?.('reconnecting'); h?.onStatus?.('degraded'); h?.onStatus?.('connected'); } return Promise.resolve(); } },
+    });
+    await runner.run();
+
+    expect(runner.trackedMarketView('A')?.subscribed).toBe(true); // status transitions never tear the channel down
+    expect(recorder.successfulCalls()).toEqual(['A']); // no re-subscribe
+    const reasons = readEvents().filter((e) => e.kind === 'degraded').map((e) => e.reason);
+    expect(reasons).toContain('stream-reconnecting');
+    expect(reasons).toContain('stream-degraded');
+    expect(reasons).not.toContain('stream-connected'); // 'connected' is the healthy state, not a degraded signal
+  });
+
+  it('a subscribeOdds rejection (e.g. the initial SSE connect was rejected) degrades the market with a subscribe-failed event; the next discovery cycle retries', async () => {
+    const config = cfg({ discovery: { everyNTicks: 1 } });
+    const recorder = makeSubscribeRecorder();
+    recorder.rejectWhen((contestId, attempt) => contestId === 'A' && attempt === 1);
     const adapter = spiedAdapter(config, () => Promise.resolve([contestView({ contestId: 'A' })]), undefined, { subscribe: recorder.subscribe });
     const runner = makeRunner({ config, adapter, maxTicks: 2 });
     await runner.run();
 
     expect(runner.trackedMarketView('A')?.subscribed).toBe(true); // succeeded on the 2nd attempt
-    expect(recorder.attemptsFor('GAME-A')).toBe(2);
-    expect(recorder.successfulCalls()).toEqual(['GAME-A']);
+    expect(recorder.attemptsFor('A')).toBe(2);
+    expect(recorder.successfulCalls()).toEqual(['A']);
     const degraded = readEvents().filter((e) => e.kind === 'degraded');
     expect(degraded).toHaveLength(1);
     expect(degraded[0]).toMatchObject({ contestId: 'A', reason: 'subscribe-failed', detail: 'subscribe failed (test)' });
@@ -866,7 +908,7 @@ describe('Runner — odds subscriptions', () => {
     expect(runner.trackedMarketView('A')).toMatchObject({ subscribed: true, lastMoneylineOdds: null }); // channel up despite the seed failure
     expect(readEvents().find((e) => e.kind === 'error')).toMatchObject({ phase: 'odds-seed', contestId: 'A', detail: 'snapshot 503' });
 
-    recorder.handlersFor('GAME-A')?.onChange(oddsUpdate('GAME-A', -200, 170));
+    recorder.handlersFor('A')?.onChange(moneylineOdds(-200, 170));
     expect(runner.trackedMarketView('A')?.lastMoneylineOdds).toEqual({ awayOddsAmerican: -200, homeOddsAmerican: 170 });
   });
 
@@ -879,8 +921,8 @@ describe('Runner — odds subscriptions', () => {
     await runner.run();
 
     expect(runner.trackedContestIds()).toEqual(['A']);
-    expect(recorder.unsubscribeFor('GAME-B')).toHaveBeenCalledTimes(1);
-    expect(recorder.unsubscribeFor('GAME-A')).not.toHaveBeenCalled(); // A is still tracked
+    expect(recorder.unsubscribeFor('B')).toHaveBeenCalledTimes(1);
+    expect(recorder.unsubscribeFor('A')).not.toHaveBeenCalled(); // A is still tracked
     expect(runner.trackedMarketView('A')?.subscribed).toBe(true);
   });
 
@@ -1172,7 +1214,7 @@ describe('Runner — per-market reconcile', () => {
       config,
       adapter,
       maxTicks: 2,
-      deps: { sleep: () => { sleeps += 1; if (sleeps === 1) recorder.handlersFor('GAME-A')?.onChange(oddsUpdate('GAME-A', -110, -110)); return Promise.resolve(); } },
+      deps: { sleep: () => { sleeps += 1; if (sleeps === 1) recorder.handlersFor('A')?.onChange(moneylineOdds(-110, -110)); return Promise.resolve(); } },
     }).run();
     expect(readEvents().filter((e) => e.kind === 'quote-intent' && e.contestId === 'A')).toHaveLength(2);
   });
@@ -1208,7 +1250,7 @@ describe('Runner — per-market reconcile', () => {
       config,
       adapter,
       maxTicks: 2,
-      deps: { sleep: () => { sleeps += 1; if (sleeps === 1) recorder.handlersFor('GAME-A')?.onError?.(new Error('channel boom')); return Promise.resolve(); } },
+      deps: { sleep: () => { sleeps += 1; if (sleeps === 1) recorder.handlersFor('A')?.onError?.(new OspexStreamError('channel boom', { reason: 'fatal' })); return Promise.resolve(); } },
     }).run();
 
     const events = readEvents();

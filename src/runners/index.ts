@@ -103,10 +103,11 @@ import type {
   ApproveUSDCAmount,
   ApprovalsSnapshot,
   Commitment,
+  ContestOddsSnapshot,
   ContestView,
   Hex,
-  OddsSnapshotView,
-  OddsSubscribeHandlersView,
+  MoneylineOdds,
+  OddsSubscribeHandlers,
   OspexAdapter,
   PositionStatus,
   SpeculationView,
@@ -281,7 +282,12 @@ export interface TrackedMarketView {
 }
 
 /** Reasons a tracked market is in a `degraded` (no live odds channel) state — carried on the `degraded` telemetry event. */
-type DegradedReason = 'channel-error' | 'subscribe-failed' | 'channel-cap';
+type DegradedReason =
+  | 'channel-error' //        a fatal stream error ended the subscription (re-subscribed next discovery cycle)
+  | 'subscribe-failed' //     the initial subscribe call rejected (re-subscribed next discovery cycle)
+  | 'channel-cap' //          over the per-process odds-channel cap; tracked but unsubscribed until a slot frees
+  | 'stream-reconnecting' //  the SSE transport dropped and is retrying with backoff (subscription kept alive)
+  | 'stream-degraded'; //     the upstream odds source fell behind; live updates paused until the next snapshot
 
 export class Runner {
   readonly config: Config;
@@ -776,7 +782,7 @@ export class Runner {
   }
 
   /** One-shot reference-odds snapshot for a market; logs an `error` (with the given `phase`) and returns `null` on failure. */
-  private async snapshotOdds(m: TrackedMarket, phase: 'odds-seed' | 'odds-poll'): Promise<OddsSnapshotView | null> {
+  private async snapshotOdds(m: TrackedMarket, phase: 'odds-seed' | 'odds-poll'): Promise<ContestOddsSnapshot | null> {
     try {
       return await this.adapter.getOddsSnapshot(m.contestId);
     } catch (err) {
@@ -786,34 +792,67 @@ export class Runner {
   }
 
   /**
-   * Open a Realtime channel for a market's reference moneyline odds and install it
-   * on the market (`m.subscription`), wiring `onChange` (→ store the odds, bump
-   * freshness, mark dirty) / `onRefresh` (→ store the odds, bump freshness) /
-   * `onError` (→ degrade the market: clear its subscription, emit `degraded`, tear
-   * down the dead channel; the next discovery cycle re-subscribes it). Returns
-   * `true` if subscribed, `false` if `subscribeOdds` rejected (e.g. the
-   * Realtime-credentials fetch — `/v1/config/public` — failed), in which case a
+   * Open the core-api SSE odds stream for a market's reference moneyline odds and
+   * install it on the market (`m.subscription`), wiring all five handlers:
+   * `onSnapshot` (the baseline on connect / after a degraded recovery → store +
+   * mark dirty), `onChange` (a price move → store, bump freshness, mark dirty),
+   * `onRefresh` (a no-change re-poll → store, bump freshness), `onStatus` (surface
+   * `reconnecting` / `degraded` as `degraded` telemetry), and `onError`. Returns
+   * `true` if subscribed, `false` if the initial `subscribeOdds` call rejected (a
    * `degraded` `subscribe-failed` event is emitted and the next discovery cycle
-   * retries. The `onError` handler only acts while *its* channel is still the live
-   * one (`m.subscription === thisSub`), so a stale error from a channel already
+   * retries).
+   *
+   * The 0.3.0 SSE transport self-reconnects with full-jitter backoff, so `onError`
+   * is `reason`-aware: only a `fatal` error means the subscription has actually
+   * ended (clear it, emit `degraded`, tear the dead channel down, re-subscribe next
+   * cycle); a retryable `connection_failed` / `capacity_exceeded` keeps the channel
+   * (the transport is still reconnecting) and is surfaced as an `error` breadcrumb —
+   * the stale-reference gate pulls quotes if the outage outlasts
+   * `staleReferenceAfterSeconds`. Every handler first checks it is still *its*
+   * channel (`m.subscription === thisSub`), so a delivery from a channel already
    * replaced by a later cycle's re-subscribe can't clobber the new one.
    */
   private async subscribeMarketOdds(m: TrackedMarket): Promise<boolean> {
     let thisSub: Subscription | null = null;
-    const handlers: OddsSubscribeHandlersView = {
-      onChange: (u) => this.recordOdds(m, u, { markDirty: true }),
-      onRefresh: (u) => this.recordOdds(m, u, { markDirty: false }),
+    const handlers: OddsSubscribeHandlers<MoneylineOdds> = {
+      onSnapshot: (odds) => {
+        if (thisSub === null || m.subscription !== thisSub) return; // a delivery from an already-replaced channel
+        this.recordOdds(m, odds, { markDirty: true });
+      },
+      onChange: (odds) => {
+        if (thisSub === null || m.subscription !== thisSub) return;
+        this.recordOdds(m, odds, { markDirty: true });
+      },
+      onRefresh: (odds) => {
+        if (thisSub === null || m.subscription !== thisSub) return;
+        this.recordOdds(m, odds, { markDirty: false });
+      },
+      onStatus: (status) => {
+        if (thisSub === null || m.subscription !== thisSub) return;
+        if (status === 'reconnecting') this.emitDegraded(m, 'stream-reconnecting');
+        else if (status === 'degraded') this.emitDegraded(m, 'stream-degraded');
+        // 'connected' → live (initial connect or a recovery); no degraded signal.
+      },
       onError: (err) => {
         if (thisSub === null || m.subscription !== thisSub) return; // a stale error from an already-replaced channel
-        m.subscription = null;
-        this.emitDegraded(m, 'channel-error', err.message);
-        void this.dropChannel(thisSub, m.contestId);
+        if (err.reason === 'fatal') {
+          // The subscription has ended (e.g. unknown contest/market). Tear it down
+          // and let the next discovery cycle re-subscribe.
+          m.subscription = null;
+          this.emitDegraded(m, 'channel-error', err.message);
+          void this.dropChannel(thisSub, m.contestId);
+          return;
+        }
+        // connection_failed / capacity_exceeded: the transport keeps reconnecting —
+        // keep the channel; onStatus reports the resulting state and the
+        // stale-reference gate handles a prolonged outage.
+        this.eventLog.emit('error', { class: `stream-${err.reason}`, detail: err.message, phase: 'odds-stream', contestId: m.contestId });
       },
     };
     try {
-      const sub = await this.adapter.subscribeOdds({ referenceGameId: m.referenceGameId, market: 'moneyline' }, handlers);
+      const sub = await this.adapter.subscribeOdds({ contestId: m.contestId, market: 'moneyline' }, handlers);
       thisSub = sub;
-      m.subscription = sub; // installed synchronously after the await resolves — no gap for an onError to race with
+      m.subscription = sub; // installed synchronously after the await resolves — no gap for a handler to race with
       return true;
     } catch (err) {
       this.emitDegraded(m, 'subscribe-failed', errMessage(err));

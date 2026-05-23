@@ -55,7 +55,7 @@ function oddsWith(moneyline: ContestOddsSnapshot['odds']['moneyline'] = {
   pollCapturedAt: '2026-05-11T20:00:30Z',
   changedAt: '2026-05-11T20:00:00Z',
 }): ContestOddsSnapshot {
-  return { contestId: 'contest-1', jsonoddsId: 'GAME-1', odds: { moneyline, spread: null, total: null } };
+  return { contestId: 'contest-1', odds: { moneyline, spread: null, total: null } };
 }
 
 type ClientOverrides = { [K in keyof OspexClientLike]?: Partial<OspexClientLike[K]> };

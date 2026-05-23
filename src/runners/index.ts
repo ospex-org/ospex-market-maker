@@ -1027,28 +1027,28 @@ export class Runner {
   private async reconcileMarket(m: TrackedMarket, now: number): Promise<'applied' | 'transient-failure'> {
     // Gate: the game starts within one expiry window — stop quoting it (a fresh quote would still be matchable at game time / outlive the pre-game window), and pull whatever's still up.
     if (m.matchTimeSec - now <= this.config.orders.expirySeconds) {
-      await this.pullVisibleQuotes(m, now);
+      const outcome = await this.pullVisibleQuotes(m, now);
       this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'start-too-soon' });
-      return 'applied';
+      return outcome;
     }
     // Gate: the reference odds have gone stale (the upstream feed stopped advancing). A never-seen-odds market (`lastOddsAt === null`) falls through to the `no-reference-odds` gate below — `lastOddsAt === null` iff `lastMoneylineOdds === null` (`recordOdds` sets both or neither).
     if (m.lastOddsAt !== null && now - m.lastOddsAt > this.config.orders.staleReferenceAfterSeconds) {
-      await this.pullVisibleQuotes(m, now);
+      const outcome = await this.pullVisibleQuotes(m, now);
       this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'stale-reference' });
-      return 'applied';
+      return outcome;
     }
     // Gate: no usable reference moneyline odds (both sides must be priced — `buildDesiredQuote` itself refuses out-of-range *values*, but it can't be handed a `null`).
     const ml = m.lastMoneylineOdds;
     if (ml === null || ml.awayOddsAmerican === null || ml.homeOddsAmerican === null) {
-      await this.pullVisibleQuotes(m, now);
+      const outcome = await this.pullVisibleQuotes(m, now);
       this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'no-reference-odds' });
-      return 'applied';
+      return outcome;
     }
     // Gate: the SSE odds stream is down (subscription mode) — the reference is no longer being kept fresh, so treat it as unsafe and pull. (`syncOddsSubscriptions` re-subscribes on the next discovery cycle; the existing `degraded` event already carries the precise cause.)
     if (this.config.odds.subscribe && m.subscription === null) {
-      await this.pullVisibleQuotes(m, now);
+      const outcome = await this.pullVisibleQuotes(m, now);
       this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'stale-reference' });
-      return 'applied';
+      return outcome;
     }
     // Lazy-creation re-check (DESIGN §6/§9): the speculation we'd post to must still exist + be open — discovery confirmed it; re-confirm via the per-speculation detail read (PR 5's competitiveness check reuses the `getSpeculation` orderbook).
     let spec: SpeculationView;
@@ -1059,9 +1059,9 @@ export class Runner {
       return 'transient-failure'; // no decision applied — retry next tick rather than wait out the staleAfterSeconds throttle
     }
     if (!spec.open) {
-      await this.pullVisibleQuotes(m, now);
+      const outcome = await this.pullVisibleQuotes(m, now);
       this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'no-open-speculation' });
-      return 'applied';
+      return outcome;
     }
     // Price → plan → apply.
     const market: Market = { contestId: m.contestId, sport: m.sport, awayTeam: m.awayTeam, homeTeam: m.homeTeam };
@@ -1118,20 +1118,22 @@ export class Runner {
     return outcome; // `'transient-failure'` if a live write failed mid-plan — `reconcileMarkets` then leaves `dirty` / `lastReconciledAt` so the market re-reconciles next tick
   }
 
-  /** Pull (off-chain) every API-visible `visibleOpen` commitment of the maker's on `m.speculationId` — in live mode an actual `cancelCommitmentOffchain` per record (a failed one stays `visibleOpen` for the next pass), in dry-run a state-only simulation — then reclassify the pulled ones `softCancelled` and emit `would-soft-cancel` / `soft-cancel` (reason `side-not-quoted`: when a market is unquoteable, neither side is being quoted). A `partiallyFilled` remainder is NOT pulled — the API rejects an off-chain DELETE once a commitment has matched (409 `COMMITMENT_MATCHED`); it's retained (a `partial-remainder-retained` candidate is emitted) and rides to expiry / authoritative on-chain cancel. Used by the unquoteable-market gates above — the visible book must never carry a quote the MM is no longer pricing (DESIGN §2.2 / §3). A pulled / retained quote's signed payload stays matchable on chain until expiry, so the risk engine keeps counting it. */
-  private async pullVisibleQuotes(m: TrackedMarket, now: number): Promise<void> {
+  /** Pull (off-chain) every API-visible `visibleOpen` commitment of the maker's on `m.speculationId` — in live mode an actual `cancelCommitmentOffchain` per record (a failed one stays `visibleOpen` for the next pass), in dry-run a state-only simulation — then reclassify the pulled ones `softCancelled` and emit `would-soft-cancel` / `soft-cancel` (reason `side-not-quoted`: when a market is unquoteable, neither side is being quoted). A `partiallyFilled` remainder is NOT pulled — the API rejects an off-chain DELETE once a commitment has matched (409 `COMMITMENT_MATCHED`); it's retained (a `partial-remainder-retained` candidate is emitted) and rides to expiry / authoritative on-chain cancel. Used by the unquoteable-market gates above — the visible book must never carry a quote the MM is no longer pricing (DESIGN §2.2 / §3). A pulled / retained quote's signed payload stays matchable on chain until expiry, so the risk engine keeps counting it. Returns `'transient-failure'` if a live off-chain pull threw or a `cancelMode: onchain` authoritative cancel threw — the gate propagates it so the market stays dirty / un-throttled and retries next tick; `'applied'` otherwise. */
+  private async pullVisibleQuotes(m: TrackedMarket, now: number): Promise<'applied' | 'transient-failure'> {
     const retained: RetainedPartial[] = [];
+    let outcome: 'applied' | 'transient-failure' = 'applied';
     for (const r of Object.values(this.state.commitments)) {
       if (r.speculationId !== m.speculationId) continue;
       if (r.expiryUnixSec <= now) continue; // already dead on chain — `ageOut` handles it
       if (r.lifecycle === 'visibleOpen') {
-        await this.softCancelRecord(r, 'side-not-quoted', now);
+        if (!(await this.softCancelRecord(r, 'side-not-quoted', now))) outcome = 'transient-failure'; // live off-chain cancel threw — re-arm so the pull retries next tick
       } else if (r.lifecycle === 'partiallyFilled') {
         this.emitPartialRetained(r, 'side-not-quoted'); // can't off-chain-cancel a matched commitment — retain the remainder
         retained.push({ record: r, reason: 'side-not-quoted' });
       }
     }
-    await this.maybeOnchainCancelRetainedPartials(retained, now); // cancelMode:onchain only — authoritatively free the remainder (gasless modes leave it to ride to expiry)
+    if ((await this.maybeOnchainCancelRetainedPartials(retained, now)) === 'transient-failure') outcome = 'transient-failure'; // cancelMode:onchain authoritative cancel threw — re-arm for next-tick retry (gasless modes leave the remainder to ride to expiry)
+    return outcome;
   }
 
   /**
@@ -1213,22 +1215,31 @@ export class Runner {
    * `authoritativelyInvalidated`, emit `onchain-cancel`, and mark the market dirty
    * so the now-free side re-quotes on the **next** tick — never same-tick, because
    * `reconcileBook` already declined to submit over the (then-live) partial, so the
-   * cancel→re-quote ordering footgun can't arise. On a gas-budget denial: emit
-   * `candidate` `gas-budget-blocks-onchain-cancel` and leave the partial retained —
-   * no off-chain DELETE fallback (the API would reject it) and no repost over it.
-   * On an adapter throw: log `error` `phase: onchain-cancel` and keep it retained
-   * (next tick retries). No-op under `cancelMode: offchain` (the default) and in
-   * dry-run (never writes to chain). The gas budget is re-checked per record (each
+   * cancel→re-quote ordering footgun can't arise.
+   *
+   * **Outcome (so the caller can re-arm the market):** returns `'transient-failure'`
+   * iff a `cancelCommitmentOnchain` call **threw** (an adapter / RPC failure) —
+   * `applyReconcilePlan` / `pullVisibleQuotes` propagate that up so `reconcileMarkets`
+   * leaves the market dirty / un-throttled and the cancel retries on the **next** tick
+   * (the runner's live-write fail-closed rule), rather than waiting out
+   * `orders.staleAfterSeconds`. A **gas-budget denial** is NOT a transient failure: it
+   * emits `candidate` `gas-budget-blocks-onchain-cancel`, leaves the partial retained
+   * (no off-chain DELETE fallback — the API would reject it — and no repost over it),
+   * and stays `'applied'` — the operator must free gas budget, so a per-tick retry
+   * would just spam; the standing `lacksFreshTwoSidedQuote` path re-evaluates it on the
+   * normal cadence. No-op (`'applied'`) under `cancelMode: offchain` (the default) and
+   * in dry-run (never writes to chain). The gas budget is re-checked per record (each
    * landed cancel grows today's spend), so a tight budget cancels what it can and
    * defers the rest.
    */
-  private async maybeOnchainCancelRetainedPartials(retained: readonly RetainedPartial[], now: number): Promise<void> {
-    if (this.config.orders.cancelMode !== 'onchain') return; // default `offchain`: the remainder rides to expiry
-    if (this.config.mode.dryRun || this.makerAddress === null) return; // dry-run never writes to chain
-    if (retained.length === 0) return;
+  private async maybeOnchainCancelRetainedPartials(retained: readonly RetainedPartial[], now: number): Promise<'applied' | 'transient-failure'> {
+    if (this.config.orders.cancelMode !== 'onchain') return 'applied'; // default `offchain`: the remainder rides to expiry
+    if (this.config.mode.dryRun || this.makerAddress === null) return 'applied'; // dry-run never writes to chain
+    if (retained.length === 0) return 'applied';
 
     const maxDailyGasPolWei = polFloatToWei18(this.config.gas.maxDailyGasPOL);
     const emergencyReservePolWei = polFloatToWei18(this.config.gas.emergencyReservePOL);
+    let outcome: 'applied' | 'transient-failure' = 'applied';
     for (const { record } of retained) {
       if (record.lifecycle !== 'partiallyFilled') continue; // defensive — only a matched remainder is cancelled here
       const today = todayUTCDateString(now);
@@ -1247,14 +1258,15 @@ export class Runner {
           emergencyReservePolWei: emergencyReservePolWei.toString(),
           detail: verdict.reason,
         });
-        continue; // keep the partial retained — no off-chain fallback, no repost over it
+        continue; // gas denial is NOT transient — keep the partial retained, no off-chain fallback, no repost; outcome stays 'applied' (operator must free gas; the normal cadence re-evaluates)
       }
       let result: Awaited<ReturnType<OspexAdapter['cancelCommitmentOnchain']>>;
       try {
         result = await this.adapter.cancelCommitmentOnchain(record.hash as Hex);
       } catch (err) {
         this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'onchain-cancel', commitmentHash: record.hash });
-        continue; // keep retained; next tick retries
+        outcome = 'transient-failure'; // adapter/RPC failure — re-arm the market for a prompt next-tick retry (matches the live-write fail-closed rule), not the staleAfterSeconds throttle
+        continue;
       }
       const gasPolWei = BigInt(result.receipt.gasUsed) * BigInt(result.receipt.effectiveGasPrice);
       this.recordGasSpentToday(today, gasPolWei);
@@ -1271,6 +1283,7 @@ export class Runner {
       const m = this.trackedMarkets.get(record.contestId);
       if (m !== undefined) m.dirty = true; // re-quote the freed side next tick (never same-tick over a just-cancelled partial)
     }
+    return outcome;
   }
 
   /**
@@ -1358,7 +1371,7 @@ export class Runner {
     for (const rp of plan.retainedPartials) {
       this.emitPartialRetained(rp.record, rp.reason); // a matched remainder occupying its side — left in place (off-chain cancel would be rejected; reposting over it would double exposure)
     }
-    await this.maybeOnchainCancelRetainedPartials(plan.retainedPartials, now); // cancelMode:onchain only — authoritatively free the side; the freed side re-quotes next tick (never same-tick — reconcileBook declined to submit over the live partial)
+    if ((await this.maybeOnchainCancelRetainedPartials(plan.retainedPartials, now)) === 'transient-failure') outcome = 'transient-failure'; // cancelMode:onchain authoritative cancel threw — re-arm the market so the cancel retries next tick (not throttled behind staleAfterSeconds)
     for (const offerSide of plan.deferredSides) {
       this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'cap-hit', takerSide: offerSide });
     }

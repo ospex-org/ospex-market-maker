@@ -232,7 +232,7 @@ Canonical vocabulary (`TELEMETRY_KINDS` in [`src/telemetry/index.ts`](./src/tele
 | `replace` / `would-replace` | `{ replacedCommitmentHash, newCommitmentHash, speculationId, contestId, sport, awayTeam, homeTeam, takerSide, makerSide, positionType, reason: 'stale' \| 'mispriced', fromMakerOddsTick, toMakerOddsTick, fromTakerOddsTick, toTakerOddsTick, riskAmountWei6, expiryUnixSec }` |
 | `soft-cancel` / `would-soft-cancel` | `{ commitmentHash, speculationId, contestId, sport, awayTeam, homeTeam, takerSide, makerSide, positionType, makerOddsTick, reason: SoftCancelReason }` |
 | `expire` | `{ commitmentHash, speculationId, contestId, makerSide, oddsTick }` — clock-only terminalization; headroom released |
-| `onchain-cancel` | `{ commitmentHash, speculationId, contestId, makerSide, txHash, gasPolWei: string }` — `MatchingModule.cancelCommitment` landed (shutdown kill or `cancel-stale --authoritative`). Record → `authoritativelyInvalidated`. |
+| `onchain-cancel` | `{ commitmentHash, speculationId, contestId, makerSide, txHash, gasPolWei: string }` — `MatchingModule.cancelCommitment` landed (shutdown kill, `cancel-stale --authoritative`, or the routine `cancelMode: onchain` partial-remainder cancel). Record → `authoritativelyInvalidated`. |
 | `approval` | `{ purpose: 'positionModule', spender, currentAllowance, requiredAggregateAllowance, amountSetTo, walletBalanceWei6?, txHash, gasPolWei }` — `walletBalanceWei6` present in `mode:'exact'`, absent in `mode:'unlimited'` |
 
 ### 3.4 Fills + positions
@@ -268,7 +268,7 @@ Canonical vocabulary (`TELEMETRY_KINDS` in [`src/telemetry/index.ts`](./src/tele
 'partial-remainder-retained'
 ```
 
-`refused-pricing` / `cap-hit` arrive during the per-market reconcile. The three `gas-budget-blocks-*` arrive from the on-chain write paths (boot approve, auto-settle/claim, shutdown kill / cancel-stale). `partial-remainder-retained` marks a `partiallyFilled` remainder the runner left in place — never off-chain-cancelled (the API rejects a DELETE once matched), never reposted over (would double side exposure); its payload is `{ commitmentHash, contestId, speculationId, makerSide, takerSide, reason }`, where `reason ∈ {side-not-quoted, stale, mispriced, duplicate, shutdown}` is why it would have been actioned were it a `visibleOpen`. The others are pre-engine market-discovery gates.
+`refused-pricing` / `cap-hit` arrive during the per-market reconcile. The three `gas-budget-blocks-*` arrive from the on-chain write paths (boot approve, auto-settle/claim, shutdown kill / cancel-stale, and the routine `cancelMode: onchain` partial-remainder cancel). `partial-remainder-retained` marks a `partiallyFilled` remainder the runner left in place — never off-chain-cancelled (the API rejects a DELETE once matched), never reposted over (would double side exposure); its payload is `{ commitmentHash, contestId, speculationId, makerSide, takerSide, reason }`, where `reason ∈ {side-not-quoted, stale, mispriced, duplicate, shutdown}` is why it would have been actioned were it a `visibleOpen`. The others are pre-engine market-discovery gates.
 
 ### 3.8 Soft-cancel + replace reasons
 

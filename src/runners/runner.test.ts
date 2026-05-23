@@ -3142,3 +3142,88 @@ describe('Runner — on-chain kill path / killCancelOnChain (Phase 3 e-ii)', () 
     expect(reloaded.commitments['0xok']?.lifecycle).toBe('softCancelled'); // succeeded
   });
 });
+
+describe('Runner — cancelMode: onchain (D2 — authoritative cancel of retained partial remainders)', () => {
+  const POL = 10n ** 18n;
+  function todayUTC(): string {
+    const d = new Date(T0 * 1000);
+    return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+  }
+  function cancelOnchainRecorder(gasUsed = 60_000n, effectiveGasPrice = 30_000_000_000n): { fn: OspexAdapter['cancelCommitmentOnchain']; calls: Hex[]; gasPolWeiPerCall: bigint } {
+    const calls: Hex[] = [];
+    return {
+      calls,
+      gasPolWeiPerCall: gasUsed * effectiveGasPrice,
+      fn: (hash: Hex) => {
+        calls.push(hash);
+        const receipt = { gasUsed, effectiveGasPrice } as unknown as CancelOnchainResult['receipt'];
+        return Promise.resolve({ txHash: '0xcanceltx' as Hex, commitmentHash: hash, receipt });
+      },
+    };
+  }
+
+  it('a stale retained partial is authoritatively cancelled on chain → authoritativelyInvalidated + onchain-cancel + gas accrued; the freed side re-quotes NEXT tick (never same-tick)', async () => {
+    // maker-on-away stale partial → occupies the *home* offer. cancelMode:onchain frees it; the away offer (maker-on-home) submits tick 1.
+    const stalePartial = commitmentRecord({ hash: '0xpartialHome', speculationId: 'spec-1234', contestId: '1234', makerSide: 'away', lifecycle: 'partiallyFilled', oddsTick: 200, riskAmountWei6: '500000', filledRiskWei6: '200000', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 200, updatedAtUnixSec: T0 - 200 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xpartialHome': stalePartial } });
+    const config = cfg({ mode: { dryRun: false }, orders: { expirySeconds: 120, cancelMode: 'onchain' }, gas: { maxDailyGasPOL: 1, emergencyReservePOL: 0.2 } });
+    const submit = submitRecorder();
+    const cancel = cancelOnchainRecorder();
+    const offchainCancels: Hex[] = [];
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([contestView({ contestId: '1234' })]), {
+      submitCommitment: submit.fn,
+      cancelCommitmentOnchain: cancel.fn,
+      cancelCommitmentOffchain: (h) => { offchainCancels.push(h); return Promise.resolve(); },
+    });
+    await makeRunner({ config, adapter, maxTicks: 2 }).run();
+
+    expect(cancel.calls).toEqual(['0xpartialHome']); // authoritative on-chain cancel of the matched remainder
+    expect(offchainCancels).not.toContain('0xpartialHome'); // never the off-chain DELETE (would 409)
+    const reloaded = StateStore.at(stateDir).load().state;
+    expect(reloaded.commitments['0xpartialHome']?.lifecycle).toBe('authoritativelyInvalidated');
+    const events = readEvents();
+    expect(events.find((e) => e.kind === 'onchain-cancel' && e.commitmentHash === '0xpartialHome')).toMatchObject({ speculationId: 'spec-1234', makerSide: 'away', txHash: '0xcanceltx' });
+    expect(reloaded.dailyCounters[todayUTC()]?.gasPolWei).toBe(cancel.gasPolWeiPerCall.toString()); // gas accrued
+    // The freed side re-quotes next tick: by tick 2 both maker sides hold a fresh visibleOpen (away offer tick 1, home offer tick 2).
+    expect(Object.values(reloaded.commitments).filter((r) => r.lifecycle === 'visibleOpen').map((r) => r.makerSide).sort()).toEqual(['away', 'home']);
+  });
+
+  it('gas-budget denial (mayUseReserve:false — routine refresh must not burn the reserve) → candidate gas-budget-blocks-onchain-cancel; partial stays partiallyFilled; no off-chain DELETE; no repost over it', async () => {
+    const stalePartial = commitmentRecord({ hash: '0xpartialHome', speculationId: 'spec-1234', contestId: '1234', makerSide: 'away', lifecycle: 'partiallyFilled', oddsTick: 200, riskAmountWei6: '500000', filledRiskWei6: '200000', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 200, updatedAtUnixSec: T0 - 200 });
+    // Spend 0.9 POL of a 1 POL cap with a 0.2 POL reserve: mayUseReserve:false denies (0.9 + 0.2 ≥ 1.0), but mayUseReserve:true WOULD allow (0.9 < 1.0) — proving the routine path passes false.
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xpartialHome': stalePartial }, dailyCounters: { [todayUTC()]: { gasPolWei: ((POL * 9n) / 10n).toString(), feeUsdcWei6: '0' } } });
+    const config = cfg({ mode: { dryRun: false }, orders: { expirySeconds: 120, cancelMode: 'onchain' }, gas: { maxDailyGasPOL: 1, emergencyReservePOL: 0.2 } });
+    const submit = submitRecorder();
+    const cancel = cancelOnchainRecorder();
+    const offchainCancels: Hex[] = [];
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([contestView({ contestId: '1234' })]), {
+      submitCommitment: submit.fn,
+      cancelCommitmentOnchain: cancel.fn,
+      cancelCommitmentOffchain: (h) => { offchainCancels.push(h); return Promise.resolve(); },
+    });
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    expect(cancel.calls).toEqual([]); // the on-chain cancel was gas-denied (proves mayUseReserve:false)
+    expect(offchainCancels).not.toContain('0xpartialHome'); // no off-chain fallback for a matched commitment
+    const events = readEvents();
+    expect(events.find((e) => e.kind === 'candidate' && e.skipReason === 'gas-budget-blocks-onchain-cancel')).toMatchObject({ commitmentHash: '0xpartialHome', makerSide: 'away' });
+    expect(StateStore.at(stateDir).load().state.commitments['0xpartialHome']?.lifecycle).toBe('partiallyFilled'); // retained — rides to expiry
+    expect(submit.calls).toHaveLength(1); // only the empty away offer — no repost over the still-live partial
+  });
+
+  it('cancelMode:offchain (the default) does NOT on-chain-cancel a retained partial — it rides to expiry', async () => {
+    const stalePartial = commitmentRecord({ hash: '0xpartialHome', speculationId: 'spec-1234', contestId: '1234', makerSide: 'away', lifecycle: 'partiallyFilled', oddsTick: 200, riskAmountWei6: '500000', filledRiskWei6: '200000', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 200, updatedAtUnixSec: T0 - 200 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xpartialHome': stalePartial } });
+    const config = cfg({ mode: { dryRun: false } }); // orders.cancelMode defaults to 'offchain'
+    const cancel = cancelOnchainRecorder();
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([contestView({ contestId: '1234' })]), {
+      submitCommitment: submitRecorder().fn,
+      cancelCommitmentOnchain: cancel.fn,
+    });
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    expect(cancel.calls).toEqual([]); // default mode never on-chain-cancels routinely
+    expect(StateStore.at(stateDir).load().state.commitments['0xpartialHome']?.lifecycle).toBe('partiallyFilled');
+    expect(readEvents().find((e) => e.kind === 'candidate' && e.skipReason === 'partial-remainder-retained')).toMatchObject({ commitmentHash: '0xpartialHome', reason: 'stale' });
+  });
+});

@@ -97,7 +97,7 @@
 import { existsSync } from 'node:fs';
 
 import { DEFAULT_PER_IP_STREAM_CAP, POLL_INTERVAL_FLOOR_MS, RESERVED_OWN_STATE_STREAMS, type Config } from '../config/index.js';
-import { buildDesiredQuote, inventoryFromState, reconcileBook, type BookReconciliation, type DesiredQuote, type RetainedPartialReason, type SoftCancelReason } from '../orders/index.js';
+import { buildDesiredQuote, inventoryFromState, reconcileBook, type BookReconciliation, type DesiredQuote, type RetainedPartial, type RetainedPartialReason, type SoftCancelReason } from '../orders/index.js';
 import type {
   ApproveResult,
   ApproveUSDCAmount,
@@ -929,12 +929,14 @@ export class Runner {
     const now = this.deps.now();
     for (const m of this.trackedMarkets.values()) {
       if (!this.needsReconcile(m, now)) continue;
+      const wasDirty = m.dirty;
+      m.dirty = false; // read-and-clear BEFORE reconciling, so a dirty re-armed DURING the reconcile — a concurrent onChange, or `maybeOnchainCancelRetainedPartials` freeing a side under cancelMode:onchain — survives to the next tick instead of being clobbered
       const outcome = await this.reconcileMarket(m, now);
       if (outcome === 'applied') {
-        m.dirty = false; // read-and-clear (a re-fired onChange before the next tick re-arms it)
         m.lastReconciledAt = now;
+      } else {
+        m.dirty = m.dirty || wasDirty; // 'transient-failure' (a getSpeculation read failed): keep the market armed (its entry dirty + any in-reconcile re-dirty) so it retries next tick; leave `lastReconciledAt`
       }
-      // 'transient-failure' (a getSpeculation read failed): leave `dirty` / `lastReconciledAt` so the market retries next tick
     }
   }
 
@@ -1118,6 +1120,7 @@ export class Runner {
 
   /** Pull (off-chain) every API-visible `visibleOpen` commitment of the maker's on `m.speculationId` — in live mode an actual `cancelCommitmentOffchain` per record (a failed one stays `visibleOpen` for the next pass), in dry-run a state-only simulation — then reclassify the pulled ones `softCancelled` and emit `would-soft-cancel` / `soft-cancel` (reason `side-not-quoted`: when a market is unquoteable, neither side is being quoted). A `partiallyFilled` remainder is NOT pulled — the API rejects an off-chain DELETE once a commitment has matched (409 `COMMITMENT_MATCHED`); it's retained (a `partial-remainder-retained` candidate is emitted) and rides to expiry / authoritative on-chain cancel. Used by the unquoteable-market gates above — the visible book must never carry a quote the MM is no longer pricing (DESIGN §2.2 / §3). A pulled / retained quote's signed payload stays matchable on chain until expiry, so the risk engine keeps counting it. */
   private async pullVisibleQuotes(m: TrackedMarket, now: number): Promise<void> {
+    const retained: RetainedPartial[] = [];
     for (const r of Object.values(this.state.commitments)) {
       if (r.speculationId !== m.speculationId) continue;
       if (r.expiryUnixSec <= now) continue; // already dead on chain — `ageOut` handles it
@@ -1125,8 +1128,10 @@ export class Runner {
         await this.softCancelRecord(r, 'side-not-quoted', now);
       } else if (r.lifecycle === 'partiallyFilled') {
         this.emitPartialRetained(r, 'side-not-quoted'); // can't off-chain-cancel a matched commitment — retain the remainder
+        retained.push({ record: r, reason: 'side-not-quoted' });
       }
     }
+    await this.maybeOnchainCancelRetainedPartials(retained, now); // cancelMode:onchain only — authoritatively free the remainder (gasless modes leave it to ride to expiry)
   }
 
   /**
@@ -1195,6 +1200,77 @@ export class Runner {
       takerSide: oppositeSide(record.makerSide),
       reason,
     });
+  }
+
+  /**
+   * Under `orders.cancelMode: onchain`, authoritatively cancel retained partial
+   * remainders on chain — the opt-in path for freeing a side a `partiallyFilled`
+   * remainder occupies (DESIGN §9), instead of waiting out its expiry. For each
+   * retained partial: gas-gate via `canSpendGas` with **`mayUseReserve: false`** —
+   * a routine quote refresh must NOT burn the emergency reserve (unlike the
+   * shutdown kill / settlement paths) — then `cancelCommitmentOnchain` (the
+   * authoritative `MatchingModule.cancelCommitment`). On success: stamp the record
+   * `authoritativelyInvalidated`, emit `onchain-cancel`, and mark the market dirty
+   * so the now-free side re-quotes on the **next** tick — never same-tick, because
+   * `reconcileBook` already declined to submit over the (then-live) partial, so the
+   * cancel→re-quote ordering footgun can't arise. On a gas-budget denial: emit
+   * `candidate` `gas-budget-blocks-onchain-cancel` and leave the partial retained —
+   * no off-chain DELETE fallback (the API would reject it) and no repost over it.
+   * On an adapter throw: log `error` `phase: onchain-cancel` and keep it retained
+   * (next tick retries). No-op under `cancelMode: offchain` (the default) and in
+   * dry-run (never writes to chain). The gas budget is re-checked per record (each
+   * landed cancel grows today's spend), so a tight budget cancels what it can and
+   * defers the rest.
+   */
+  private async maybeOnchainCancelRetainedPartials(retained: readonly RetainedPartial[], now: number): Promise<void> {
+    if (this.config.orders.cancelMode !== 'onchain') return; // default `offchain`: the remainder rides to expiry
+    if (this.config.mode.dryRun || this.makerAddress === null) return; // dry-run never writes to chain
+    if (retained.length === 0) return;
+
+    const maxDailyGasPolWei = polFloatToWei18(this.config.gas.maxDailyGasPOL);
+    const emergencyReservePolWei = polFloatToWei18(this.config.gas.emergencyReservePOL);
+    for (const { record } of retained) {
+      if (record.lifecycle !== 'partiallyFilled') continue; // defensive — only a matched remainder is cancelled here
+      const today = todayUTCDateString(now);
+      const todayGasSpentPolWei = BigInt(this.state.dailyCounters[today]?.gasPolWei ?? '0');
+      // mayUseReserve:false — a routine quote refresh must preserve the emergency reserve (unlike shutdown kill / settlement).
+      const verdict = canSpendGas({ todayGasSpentPolWei, maxDailyGasPolWei, emergencyReservePolWei, mayUseReserve: false });
+      if (!verdict.allowed) {
+        this.eventLog.emit('candidate', {
+          skipReason: 'gas-budget-blocks-onchain-cancel',
+          commitmentHash: record.hash,
+          speculationId: record.speculationId,
+          contestId: record.contestId,
+          makerSide: record.makerSide,
+          todayGasSpentPolWei: todayGasSpentPolWei.toString(),
+          maxDailyGasPolWei: maxDailyGasPolWei.toString(),
+          emergencyReservePolWei: emergencyReservePolWei.toString(),
+          detail: verdict.reason,
+        });
+        continue; // keep the partial retained — no off-chain fallback, no repost over it
+      }
+      let result: Awaited<ReturnType<OspexAdapter['cancelCommitmentOnchain']>>;
+      try {
+        result = await this.adapter.cancelCommitmentOnchain(record.hash as Hex);
+      } catch (err) {
+        this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'onchain-cancel', commitmentHash: record.hash });
+        continue; // keep retained; next tick retries
+      }
+      const gasPolWei = BigInt(result.receipt.gasUsed) * BigInt(result.receipt.effectiveGasPrice);
+      this.recordGasSpentToday(today, gasPolWei);
+      record.lifecycle = 'authoritativelyInvalidated';
+      record.updatedAtUnixSec = now;
+      this.eventLog.emit('onchain-cancel', {
+        commitmentHash: record.hash,
+        speculationId: record.speculationId,
+        contestId: record.contestId,
+        makerSide: record.makerSide,
+        txHash: result.txHash,
+        gasPolWei: gasPolWei.toString(),
+      });
+      const m = this.trackedMarkets.get(record.contestId);
+      if (m !== undefined) m.dirty = true; // re-quote the freed side next tick (never same-tick over a just-cancelled partial)
+    }
   }
 
   /**
@@ -1282,6 +1358,7 @@ export class Runner {
     for (const rp of plan.retainedPartials) {
       this.emitPartialRetained(rp.record, rp.reason); // a matched remainder occupying its side — left in place (off-chain cancel would be rejected; reposting over it would double exposure)
     }
+    await this.maybeOnchainCancelRetainedPartials(plan.retainedPartials, now); // cancelMode:onchain only — authoritatively free the side; the freed side re-quotes next tick (never same-tick — reconcileBook declined to submit over the live partial)
     for (const offerSide of plan.deferredSides) {
       this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'cap-hit', takerSide: offerSide });
     }

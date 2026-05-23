@@ -83,7 +83,13 @@ orders:
   staleAfterSeconds: 90             # pull-and-repost a quote this old (< expirySeconds, so it never just lapses)
   staleReferenceAfterSeconds: 300   # treat reference odds as stale (pull quotes, don't repost) if nothing heard this long
   replaceOnOddsMoveBps: 50          # pull-and-repost when fair value moves more than this since posting
-  cancelMode: offchain              # routine cancels: "offchain" (gasless, soft — see DESIGN §6) or "onchain" (authoritative, gas)
+  cancelMode: offchain              # how to free a partially-filled remainder that's stale/mispriced/unwanted:
+                                    #   "offchain" (default) — leave it; its off-chain cancel is rejected once matched (409),
+                                    #     so it rides to expiry. Fine under short fixed-seconds expiry. (visibleOpen quotes are
+                                    #     always pulled gasless off-chain regardless of this setting.)
+                                    #   "onchain" — authoritatively cancelCommitment the remainder on chain (costs POL gas,
+                                    #     gas-gated WITHOUT the emergency reserve), then re-quote the freed side. Use this for
+                                    #     long-lived / match-time quotes where a remainder would otherwise block the side for hours.
 
 settlement:
   autoSettleOwn: true                       # settle the maker's own already-scored speculations (permissionless)

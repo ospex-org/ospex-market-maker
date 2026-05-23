@@ -491,6 +491,19 @@ describe('Runner — tick loop', () => {
     expect(lines.filter((l) => /clamping to 30000ms/.test(l))).toHaveLength(1);
   });
 
+  it('warns at boot when odds.maxRealtimeChannels + reserved own-state streams would exceed the core-api per-IP cap', () => {
+    const lines: string[] = [];
+    // 8 odds channels + 3 reserved own-state = 11 > the per-IP cap of 10.
+    makeRunner({ config: cfg({ odds: { maxRealtimeChannels: 8 } }), deps: { log: (l) => lines.push(l) } });
+    expect(lines.filter((l) => /per-IP cap/.test(l))).toHaveLength(1);
+  });
+
+  it('does not warn at the default stream caps (fits under the per-IP cap with own-state headroom)', () => {
+    const lines: string[] = [];
+    makeRunner({ config: cfg(), deps: { log: (l) => lines.push(l) } });
+    expect(lines.filter((l) => /per-IP cap/.test(l))).toHaveLength(0);
+  });
+
   it('a state-flush failure propagates (the runner must not keep ticking on an un-persistable state)', async () => {
     const stateStore = StateStore.at(stateDir);
     const flushSpy = vi.spyOn(stateStore, 'flush').mockImplementation(() => {

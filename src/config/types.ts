@@ -32,6 +32,24 @@ export type LogLevel = (typeof LOG_LEVELS)[number];
 /** Enforced floor for `pollIntervalMs` (DESIGN §7) — the runner clamps + warns below this. */
 export const POLL_INTERVAL_FLOOR_MS = 30_000;
 
+/**
+ * The conservative per-IP SSE-connection cap on `ospex-core-api` (its default
+ * `MAX_STREAM_CONNECTIONS_PER_IP`). Every open odds subscription — and, once they
+ * land, every own-state stream — is one connection counted against this from a
+ * single host; exceeding it gets the connection refused with HTTP 429. Operators
+ * running their own core-api can raise the server-side cap. Used only for a
+ * boot-time guardrail warning — the MM never silently rewrites the operator's caps.
+ */
+export const DEFAULT_PER_IP_STREAM_CAP = 10;
+
+/**
+ * Connections to hold in reserve out of {@link DEFAULT_PER_IP_STREAM_CAP} for the
+ * runner's own-state streams (fills + commitments + positions) — a deferred
+ * push-architecture item. Reserving them now keeps the default odds-channel cap
+ * compatible with the per-IP budget once they're wired (5 odds + 3 = 8 ≤ 10).
+ */
+export const RESERVED_OWN_STATE_STREAMS = 3;
+
 export interface WalletConfig {
   /** Path to a Foundry v3 keystore. May be omitted — then `OSPEX_KEYSTORE_PATH` or the SDK default applies. */
   keystorePath?: string;

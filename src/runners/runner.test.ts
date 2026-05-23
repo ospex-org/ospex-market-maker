@@ -3201,14 +3201,32 @@ describe('Runner — cancelMode: onchain (D2 — authoritative cancel of retaine
       cancelCommitmentOnchain: cancel.fn,
       cancelCommitmentOffchain: (h) => { offchainCancels.push(h); return Promise.resolve(); },
     });
-    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    await makeRunner({ config, adapter, maxTicks: 2 }).run();
 
     expect(cancel.calls).toEqual([]); // the on-chain cancel was gas-denied (proves mayUseReserve:false)
     expect(offchainCancels).not.toContain('0xpartialHome'); // no off-chain fallback for a matched commitment
     const events = readEvents();
-    expect(events.find((e) => e.kind === 'candidate' && e.skipReason === 'gas-budget-blocks-onchain-cancel')).toMatchObject({ commitmentHash: '0xpartialHome', makerSide: 'away' });
+    const gasDeniedCandidates = events.filter((e) => e.kind === 'candidate' && e.skipReason === 'gas-budget-blocks-onchain-cancel');
+    expect(gasDeniedCandidates).toHaveLength(1); // gas denial is APPLIED, not transient: throttled behind staleAfterSeconds, NOT retried every tick — across 2 ticks it fires once (contrast: an adapter throw retries next tick — see below)
+    expect(gasDeniedCandidates[0]).toMatchObject({ commitmentHash: '0xpartialHome', makerSide: 'away' });
     expect(StateStore.at(stateDir).load().state.commitments['0xpartialHome']?.lifecycle).toBe('partiallyFilled'); // retained — rides to expiry
     expect(submit.calls).toHaveLength(1); // only the empty away offer — no repost over the still-live partial
+  });
+
+  it('a failed routine on-chain cancel (adapter throw) re-arms the market — the cancel RETRIES next tick, not throttled behind staleAfterSeconds (Hermes PR#44 blocker)', async () => {
+    const stalePartial = commitmentRecord({ hash: '0xpartialHome', speculationId: 'spec-1234', contestId: '1234', makerSide: 'away', lifecycle: 'partiallyFilled', oddsTick: 200, riskAmountWei6: '500000', filledRiskWei6: '200000', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 200, updatedAtUnixSec: T0 - 200 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xpartialHome': stalePartial } });
+    const config = cfg({ mode: { dryRun: false }, orders: { expirySeconds: 120, cancelMode: 'onchain' }, gas: { maxDailyGasPOL: 1, emergencyReservePOL: 0.2 } });
+    let attempts = 0;
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([contestView({ contestId: '1234' })]), {
+      submitCommitment: submitRecorder().fn,
+      cancelCommitmentOnchain: () => { attempts += 1; return Promise.reject(new Error('RPC down')); },
+    });
+    await makeRunner({ config, adapter, maxTicks: 2 }).run();
+
+    expect(attempts).toBe(2); // retried on tick 2 (the bug throttled it to 1 — `applied` stamped lastReconciledAt, deferring to staleAfterSeconds)
+    expect(StateStore.at(stateDir).load().state.commitments['0xpartialHome']?.lifecycle).toBe('partiallyFilled'); // still retained — never off-chain-cancelled, never reposted over
+    expect(readEvents().filter((e) => e.kind === 'error' && e.phase === 'onchain-cancel' && e.commitmentHash === '0xpartialHome')).toHaveLength(2); // one error per attempt
   });
 
   it('cancelMode:offchain (the default) does NOT on-chain-cancel a retained partial — it rides to expiry', async () => {

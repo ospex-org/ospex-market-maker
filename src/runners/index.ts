@@ -12,9 +12,9 @@
  *     starting within `marketSelection.maxStartsWithinHours`, honour the allow/deny
  *     lists, track up to `marketSelection.maxTrackedContests` of them, untrack the
  *     departed ones; `candidate` telemetry for the skipped/tracked);
- *   - **reference odds** (DESIGN §10's Realtime guardrails): for each tracked
+ *   - **reference odds** (DESIGN §10's stream guardrails): for each tracked
  *     market keep its reference moneyline odds + freshness current — by default a
- *     Supabase Realtime channel per market (snapshot-first seed, then the channel's
+ *     core-api SSE odds stream per market (snapshot-first seed, then the stream's
  *     `onChange` / `onRefresh` / `onError`), capped at `odds.maxRealtimeChannels`
  *     (markets over the cap stay tracked but *degraded* — no odds — and are retried
  *     when a slot frees); `odds.subscribe: false` falls back to a bounded
@@ -228,7 +228,7 @@ interface MoneylineOddsPair {
  */
 interface TrackedMarket {
   contestId: string;
-  /** The neutral reference-game id — always set (a contest with no upstream linkage is skipped at discovery with `no-reference-odds`). Used to open the odds Realtime channel. */
+  /** The neutral reference-game id — always set (a contest with no upstream linkage is skipped at discovery with `no-reference-odds`). Retained for the upstream-linkage gate and telemetry; the odds SSE stream itself is opened by `contestId`. */
   referenceGameId: string;
   /** Contest sport / teams — for the risk engine's `Market` (per-team / per-sport caps). */
   sport: string;
@@ -239,8 +239,8 @@ interface TrackedMarket {
   /** Contest match time, unix seconds. */
   matchTimeSec: number;
   /**
-   * The live Realtime channel for this market's reference odds, or `null` — not
-   * yet (re)subscribed (a newcomer this discovery cycle, or one whose channel
+   * The live SSE odds stream for this market's reference odds, or `null` — not
+   * yet (re)subscribed (a newcomer this discovery cycle, or one whose stream
    * errored), over the `odds.maxRealtimeChannels` cap, or running in
    * `odds.subscribe: false` polling mode. A `null` here on a discovery cycle is
    * the signal to (re)subscribe.
@@ -269,7 +269,7 @@ export interface TrackedMarketView {
   homeTeam: string;
   speculationId: string;
   matchTimeSec: number;
-  /** Is a Realtime odds channel live for this market right now? (`false` while degraded / over the channel cap / in `odds.subscribe: false` polling mode.) */
+  /** Is an SSE odds stream live for this market right now? (`false` while degraded / over the channel cap / in `odds.subscribe: false` polling mode.) */
   subscribed: boolean;
   /** The latest reference moneyline odds (American), or `null` if none seen yet. */
   lastMoneylineOdds: MoneylineOddsPair | null;
@@ -733,14 +733,14 @@ export class Runner {
    * (DESIGN §10). Two modes:
    *
    * - `odds.subscribe: true` (default) — on a discovery cycle, (re)subscribe a
-   *   Supabase Realtime channel for each tracked market that doesn't have a live
+   *   core-api SSE odds stream for each tracked market that doesn't have a live
    *   one (a newcomer, or one whose channel errored), up to `odds.maxRealtimeChannels`
    *   (markets over the cap stay tracked but degraded — no odds — and are retried
    *   when a slot frees); the channel's `onChange` / `onRefresh` / `onError`
    *   handlers keep the market's odds + freshness + dirty flag current between
    *   cycles. The discovery interval is the (re)subscription throttle, so this is a
    *   no-op on non-discovery ticks.
-   * - `odds.subscribe: false` — no Realtime; snapshot every tracked market every
+   * - `odds.subscribe: false` — no streaming; snapshot every tracked market every
    *   tick (bounded — one `getOddsSnapshot` per tracked market, ≤ `maxTrackedContests`).
    *
    * Each (re)subscribe is "snapshot-first": a `getOddsSnapshot` seed so the market
@@ -757,7 +757,7 @@ export class Runner {
     await this.syncOddsSubscriptions();
   }
 
-  /** Subscription mode (`odds.subscribe: true`): (re)subscribe a Realtime channel for each tracked market lacking a live one, soonest games first, up to `odds.maxRealtimeChannels`; the rest get a `degraded` `channel-cap` event (retried when a slot frees). */
+  /** Subscription mode (`odds.subscribe: true`): (re)subscribe an SSE odds stream for each tracked market lacking a live one, soonest games first, up to `odds.maxRealtimeChannels`; the rest get a `degraded` `channel-cap` event (retried when a slot frees). */
   private async syncOddsSubscriptions(): Promise<void> {
     const cap = this.config.odds.maxRealtimeChannels;
     let live = 0;
@@ -788,7 +788,7 @@ export class Runner {
     }
   }
 
-  /** Seed a market's reference odds from a one-shot snapshot (DESIGN §10 — "snapshot-first"). A failure is logged (inside `snapshotOdds`) and ignored: the Realtime channel will deliver odds on its first `onChange`. */
+  /** Seed a market's reference odds from a one-shot snapshot (DESIGN §10 — "snapshot-first"). A failure is logged (inside `snapshotOdds`) and ignored: the SSE odds stream will deliver odds on its first `onChange`. */
   private async seedOdds(m: TrackedMarket): Promise<void> {
     const snap = await this.snapshotOdds(m, 'odds-seed');
     if (snap !== null) this.recordOdds(m, snap.odds.moneyline, { markDirty: true });
@@ -897,7 +897,7 @@ export class Runner {
     if (opts.markDirty) m.dirty = true;
   }
 
-  /** Best-effort teardown of a Realtime channel — a failure is logged but not fatal (the server reaps idle channels). */
+  /** Best-effort teardown of an SSE odds stream — a failure is logged but not fatal (the server reaps idle streams). */
   private async dropChannel(sub: Subscription, contestId: string): Promise<void> {
     try {
       await sub.unsubscribe();
@@ -961,8 +961,8 @@ export class Runner {
    * have no usable reference moneyline odds (none seen yet, the latest response had no
    * moneyline row, or a side isn't priced); the feed has stopped responding
    * (`now - lastOddsAt > staleReferenceAfterSeconds` — a `getOddsSnapshot` failure or
-   * no `onChange` / `onRefresh` in a while); or (in subscription mode) its Realtime
-   * odds channel has errored / never came up? When such a market still has visible
+   * no `onChange` / `onRefresh` in a while); or (in subscription mode) its SSE
+   * odds stream has errored / never came up? When such a market still has visible
    * quotes of ours, they must be pulled (DESIGN §2.2: never quote on missing /
    * ambiguous / stale data; never leave a stale quote visible) — `needsReconcile`
    * therefore forces a reconcile for it, and `reconcileMarket`'s matching gate does
@@ -974,7 +974,7 @@ export class Runner {
     const ml = m.lastMoneylineOdds;
     if (ml === null || ml.awayOddsAmerican === null || ml.homeOddsAmerican === null) return true; // no usable reference moneyline odds — none seen yet, the latest response had no moneyline row, or a side isn't priced
     if (m.lastOddsAt !== null && now - m.lastOddsAt > this.config.orders.staleReferenceAfterSeconds) return true; // the feed has stopped responding
-    if (this.config.odds.subscribe && m.subscription === null) return true; // the Realtime odds channel errored / never came up (re-subscribed on the next discovery cycle; in polling mode pollTrackedOdds re-snapshots every tick, so there's no "degraded" notion)
+    if (this.config.odds.subscribe && m.subscription === null) return true; // the SSE odds stream errored / never came up (re-subscribed on the next discovery cycle; in polling mode pollTrackedOdds re-snapshots every tick, so there's no "degraded" notion)
     return false;
   }
 
@@ -1042,7 +1042,7 @@ export class Runner {
       this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'no-reference-odds' });
       return 'applied';
     }
-    // Gate: the Realtime odds channel is down (subscription mode) — the reference is no longer being kept fresh, so treat it as unsafe and pull. (`syncOddsSubscriptions` re-subscribes on the next discovery cycle; the existing `degraded` event already carries the precise cause.)
+    // Gate: the SSE odds stream is down (subscription mode) — the reference is no longer being kept fresh, so treat it as unsafe and pull. (`syncOddsSubscriptions` re-subscribes on the next discovery cycle; the existing `degraded` event already carries the precise cause.)
     if (this.config.odds.subscribe && m.subscription === null) {
       await this.pullVisibleQuotes(m, now);
       this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'stale-reference' });

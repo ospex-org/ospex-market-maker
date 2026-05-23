@@ -298,7 +298,7 @@ export function parseConfig(raw: unknown, env: EnvLike = {}): Config {
     sports: def<Sport[]>(ms.sports, ['mlb'], (v) => asSportArray(v, 'marketSelection.sports')),
     markets: def<MarketType[]>(ms.markets, ['moneyline'], (v) => asMarketArray(v, 'marketSelection.markets')),
     maxStartsWithinHours: def(ms.maxStartsWithinHours, 24, (v) => asPositiveNumber(v, 'marketSelection.maxStartsWithinHours')),
-    maxTrackedContests: def(ms.maxTrackedContests, 30, (v) => asPositiveInt(v, 'marketSelection.maxTrackedContests')),
+    maxTrackedContests: def(ms.maxTrackedContests, 5, (v) => asPositiveInt(v, 'marketSelection.maxTrackedContests')),
     requireReferenceOdds: def(ms.requireReferenceOdds, true, (v) => asBoolean(v, 'marketSelection.requireReferenceOdds')),
     requireOpenSpeculation: def(ms.requireOpenSpeculation, true, (v) => asBoolean(v, 'marketSelection.requireOpenSpeculation')),
     contestAllowList: def<string[]>(ms.contestAllowList, [], (v) => asStringArray(v, 'marketSelection.contestAllowList')),
@@ -314,7 +314,7 @@ export function parseConfig(raw: unknown, env: EnvLike = {}): Config {
   const o = section(root, 'odds', ODDS_KEYS);
   const odds: OddsConfig = {
     subscribe: def(o.subscribe, true, (v) => asBoolean(v, 'odds.subscribe')),
-    maxRealtimeChannels: def(o.maxRealtimeChannels, 60, (v) => asPositiveInt(v, 'odds.maxRealtimeChannels')),
+    maxRealtimeChannels: def(o.maxRealtimeChannels, 5, (v) => asPositiveInt(v, 'odds.maxRealtimeChannels')),
   };
 
   const p = section(root, 'pricing', PRICING_KEYS);

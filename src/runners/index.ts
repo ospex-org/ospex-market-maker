@@ -96,7 +96,7 @@
 
 import { existsSync } from 'node:fs';
 
-import { POLL_INTERVAL_FLOOR_MS, type Config } from '../config/index.js';
+import { DEFAULT_PER_IP_STREAM_CAP, POLL_INTERVAL_FLOOR_MS, RESERVED_OWN_STATE_STREAMS, type Config } from '../config/index.js';
 import { buildDesiredQuote, inventoryFromState, reconcileBook, type BookReconciliation, type DesiredQuote, type SoftCancelReason } from '../orders/index.js';
 import type {
   ApproveResult,
@@ -371,6 +371,19 @@ export class Runner {
 
     if (this.config.pollIntervalMs < POLL_INTERVAL_FLOOR_MS) {
       this.deps.log(`[runner] pollIntervalMs=${this.config.pollIntervalMs}ms is below the ${POLL_INTERVAL_FLOOR_MS}ms floor — clamping to ${POLL_INTERVAL_FLOOR_MS}ms`);
+    }
+
+    // Stream-budget guardrail: each odds subscription is one core-api SSE connection,
+    // counted against the per-IP cap shared with the (deferred) own-state streams. Warn
+    // (don't clamp) if the configured cap + reserved own-state streams would exceed the
+    // conservative default — the operator may have raised MAX_STREAM_CONNECTIONS_PER_IP.
+    if (
+      this.config.odds.subscribe &&
+      this.config.odds.maxRealtimeChannels + RESERVED_OWN_STATE_STREAMS > DEFAULT_PER_IP_STREAM_CAP
+    ) {
+      this.deps.log(
+        `[runner] odds.maxRealtimeChannels=${this.config.odds.maxRealtimeChannels} + ${RESERVED_OWN_STATE_STREAMS} reserved own-state streams exceeds the core-api per-IP cap of ${DEFAULT_PER_IP_STREAM_CAP} — odds subscriptions past the cap are refused (HTTP 429). Lower odds.maxRealtimeChannels (and marketSelection.maxTrackedContests), or raise MAX_STREAM_CONNECTIONS_PER_IP on your core-api.`,
+      );
     }
 
     const { state, status } = this.stateStore.load();

@@ -18,7 +18,8 @@ marketSelection:
   sports: ["mlb"]                  # any of: mlb, nba, nhl, ncaab, ncaaf, nfl (config-driven; add more freely)
   markets: ["moneyline"]           # v0 supports only "moneyline"; "spread"/"total" are REJECTED by config validation.
   maxStartsWithinHours: 24         # only quote games starting within this window
-  maxTrackedContests: 30           # hard cap on contests tracked at once (bounds odds subscriptions)
+  maxTrackedContests: 5            # hard cap on contests tracked at once. Each tracked contest opens one live odds stream
+                                   #   (moneyline-only in v0), so this also bounds SSE connections — see odds.maxRealtimeChannels.
   requireReferenceOdds: true       # skip games with no upstream odds linkage
   requireOpenSpeculation: true     # v0: only quote markets whose speculation already exists (no lazy creation)
   contestAllowList: []             # optional: if non-empty, ONLY these contestIds
@@ -29,9 +30,12 @@ discovery:
   jitterPct: 0.2                   # +/- jitter on the discovery interval
 
 odds:
-  subscribe: true                  # subscription-first: stream reference-odds changes. Strongly preferred.
+  subscribe: true                  # subscription-first: stream reference-odds changes over core-api SSE. Strongly preferred.
                                    #   false = degraded fallback to bounded snapshot polling (restricted nets only).
-  maxRealtimeChannels: 60          # hard cap on open Realtime channels (~ maxTrackedContests * markets)
+  maxRealtimeChannels: 5           # hard cap on open odds-stream connections (~ maxTrackedContests * markets; moneyline-only in v0).
+                                   #   core-api enforces a per-IP cap (default 10, MAX_STREAM_CONNECTIONS_PER_IP) shared across ALL
+                                   #   streams from one host — keep this (plus ~3 reserved for own-state streams) under it, or raise
+                                   #   the server cap. The runner warns at boot if the budget would be exceeded.
 
 pricing:
   mode: economics                  # "economics" (derive spread from your return target) or "direct"

@@ -13,9 +13,10 @@ describe('parseConfig', () => {
     expect(c.pollIntervalMs).toBe(30_000);
     expect(c.marketSelection.markets).toEqual(['moneyline']);
     expect(c.marketSelection.sports).toEqual(['mlb']);
-    expect(c.marketSelection.maxTrackedContests).toBe(30);
+    expect(c.marketSelection.maxTrackedContests).toBe(5);
     expect(c.discovery.everyNTicks).toBe(10);
     expect(c.odds.subscribe).toBe(true);
+    expect(c.odds.maxRealtimeChannels).toBe(5);
     expect(c.pricing.mode).toBe('economics');
     expect(c.pricing.quoteBothSides).toBe(true);
     expect(c.pricing.economics.capitalUSDC).toBe(50);

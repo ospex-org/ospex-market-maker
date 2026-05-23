@@ -86,12 +86,30 @@ export type SoftCancelReason =
   | 'side-not-quoted' //   the desired quote has no `QuoteSide` for that side (no headroom, or the whole quote was refused)
   | 'duplicate' //         more than one API-visible commitment on a `(speculation, side)` — keep the newest, pull the rest (book hygiene, DESIGN §9)
   | 'shutdown' //          the runner is shutting down — sweep every visible quote off-chain (gasless), regardless of `killCancelOnChain`; the latent (matchable until expiry) window stays until the on-chain kill path also fires (if `killCancelOnChain: true`) or natural expiry
-  | ReplaceReason; //      a stale/mispriced quote we'd replace, but the open-commitment count budget is exhausted (or a `partiallyFilled` incumbent we don't refresh in place) — pull it; a fresh post follows only if there's count headroom
+  | ReplaceReason; //      a stale/mispriced `visibleOpen` quote we'd replace, but the open-commitment count budget is exhausted — pull it; a fresh post follows only if there's count headroom. (Never a `partiallyFilled` record — those can't be off-chain-cancelled; see `RetainedPartial`.)
 
-/** A commitment to pull off-chain without re-posting. */
+/** A commitment to pull off-chain without re-posting. Always a `visibleOpen` record — a `partiallyFilled` remainder is never off-chain-cancelled (the API returns 409 `COMMITMENT_MATCHED` once a commitment has matched). */
 export interface SoftCancelPlan {
   record: MakerCommitmentRecord;
   reason: SoftCancelReason;
+}
+
+/** Why a `partiallyFilled` remainder was *retained* in place rather than pulled — the reason it would have been actioned were it a `visibleOpen`: its side is no longer quoted (`side-not-quoted`), the remainder is `stale` / `mispriced`, or it was kept over a redundant same-side quote (`duplicate`). */
+export type RetainedPartialReason = 'side-not-quoted' | 'stale' | 'mispriced' | 'duplicate';
+
+/**
+ * A `partiallyFilled` remainder the reconciler left in place. It is **never**
+ * off-chain-cancelled (the API rejects a DELETE once a commitment has matched) and
+ * **never** reposted over (a fresh same-side quote on top of it would double the
+ * side's matchable exposure). The unfilled remainder stays matchable on chain and
+ * the risk engine keeps counting it until expiry / fill / authoritative on-chain
+ * cancel. The runner emits a `candidate` `partial-remainder-retained` per entry as
+ * positive telemetry, and (under `cancelMode: onchain`) this is the set it routes
+ * to a gas-gated authoritative cancel.
+ */
+export interface RetainedPartial {
+  record: MakerCommitmentRecord;
+  reason: RetainedPartialReason;
 }
 
 /** A `visibleOpen` commitment to replace: pull `stale` off-chain, then post `replacement` at the current price. */
@@ -117,6 +135,8 @@ export interface BookReconciliation {
   toSubmit: QuoteSide[];
   toReplace: ReplacePlan[];
   toSoftCancel: SoftCancelPlan[];
+  /** `partiallyFilled` remainders left in place this tick (never off-chain-cancelled, never reposted over). The runner emits a `partial-remainder-retained` candidate per entry; under `cancelMode: onchain` it routes them to a gas-gated authoritative cancel. */
+  retainedPartials: RetainedPartial[];
   /** Taker-offer sides (`'away'` / `'home'`) the plan wanted to (re)post but couldn't this tick — the open-commitment count budget was exhausted; the runner records a `cap-hit` candidate and retries. */
   deferredSides: MakerSide[];
 }
@@ -281,19 +301,22 @@ type SideAction =
  * retries next tick. Replaces take budget priority over fresh submits.
  *
  * Only non-expired records matter (an expired commitment is dead on chain — the
- * runner ages it out). On a side's visible surface the reconciler keeps the newest
- * `visibleOpen`, or — absent any — the newest non-expired `partiallyFilled` (its
- * remainder is still matchable and API-visible), and soft-cancels the rest as
- * `duplicate`; a kept incumbent that's `stale` (`now - postedAtUnixSec >
- * orders.staleAfterSeconds`) or `mispriced` (its tick's implied probability differs
+ * runner ages it out). **A live `partiallyFilled` remainder occupies its maker
+ * side**: it is never off-chain-cancelled (the API returns 409 `COMMITMENT_MATCHED`
+ * once a commitment has matched) and never reposted over (a fresh same-side quote on
+ * top of it would double the side's matchable exposure), so while one is live the
+ * side does `noop` — its unfilled remainder rides to expiry (or an authoritative
+ * on-chain cancel under `cancelMode: onchain`) and the risk engine keeps counting
+ * it. Any redundant `visibleOpen` on that side is pulled (`duplicate`, gasless), and
+ * the retained partial is surfaced in `retainedPartials`. Absent a live partial, the
+ * reconciler keeps the newest `visibleOpen` and soft-cancels the rest as
+ * `duplicate`; a kept `visibleOpen` incumbent that's `stale` (`now - postedAtUnixSec
+ * > orders.staleAfterSeconds`) or `mispriced` (its tick's implied probability differs
  * from the desired tick's by more than `orders.replaceOnOddsMoveBps / 10000`) is
- * replaced in place if it's a `visibleOpen`, or — if it's a `partiallyFilled`
- * incumbent (v0 doesn't refresh a partial in place) — soft-cancelled with a fresh
- * quote posted in its place. When the side isn't quoted (`desired.result[side] ===
- * null` — no headroom, or the whole quote was refused), *every* non-expired
- * `visibleOpen` and `partiallyFilled` on it is soft-cancelled (`side-not-quoted`):
- * an unwanted quote must not stay on the visible book. A wanted side with no visible
- * / partial record gets a fresh submit.
+ * replaced in place. When the side isn't quoted (`desired.result[side] === null` — no
+ * headroom, or the whole quote was refused), every non-expired `visibleOpen` on it is
+ * soft-cancelled (`side-not-quoted`) and any partial remainder is retained. A wanted
+ * side with no live record gets a fresh submit.
  *
  * **Taker vs maker sides:** `desired.result.away` / `.home` are *taker offers* —
  * the side a taker would back by matching the resulting commitment. The commitment
@@ -319,12 +342,19 @@ export function reconcileBook(
   const toSubmit: QuoteSide[] = [];
   const toReplace: ReplacePlan[] = [];
   const toSoftCancel: SoftCancelPlan[] = [];
+  const retainedPartials: RetainedPartial[] = [];
   const deferredSides: MakerSide[] = [];
 
   const live = currentRecords.filter((r) => r.expiryUnixSec > nowUnixSec); // expired records are dead on chain — the runner ages them out
   const actions = new Map<MakerSide, SideAction>();
 
-  // Pass 1 — per taker-offer side: emit the soft-cancels (unwanted side / book-hygiene duplicates) and classify what (if anything) we want to post.
+  // Pass 1 — per taker-offer side: classify what (if anything) to post, and emit off-chain
+  // soft-cancels for VISIBLE-OPEN records only. A live `partiallyFilled` remainder is never
+  // off-chain-cancelled (the API rejects a DELETE once a commitment has matched — 409
+  // COMMITMENT_MATCHED) and never reposted over (a fresh same-side quote on top of it would
+  // double the side's matchable exposure — the original partial-fill bug): it OCCUPIES its
+  // maker side until expiry / authoritative on-chain cancel, with the risk engine counting its
+  // remaining risk the whole time. Retained partials surface in `retainedPartials`.
   for (const offerSide of SIDES) {
     const desiredSide: QuoteSide | null = offerSide === 'away' ? desired.result.away : desired.result.home;
     // The commitment that serves the away offer is maker-on-*home* (it loses if away wins), so the
@@ -334,34 +364,57 @@ export function reconcileBook(
     const partiallyFilled = onSide.filter((r) => r.lifecycle === 'partiallyFilled').sort(newestFirst);
 
     if (desiredSide === null) {
+      // Side no longer quoted: pull every visible-open quote off-chain (gasless, valid); retain
+      // any partial remainder — it can't be off-chain-cancelled, so it rides to expiry.
       for (const r of visibleOpen) toSoftCancel.push({ record: r, reason: 'side-not-quoted' });
-      for (const r of partiallyFilled) toSoftCancel.push({ record: r, reason: 'side-not-quoted' });
+      for (const r of partiallyFilled) retainedPartials.push({ record: r, reason: 'side-not-quoted' });
       actions.set(offerSide, { kind: 'noop' });
       continue;
     }
 
-    const incumbent = visibleOpen[0] ?? partiallyFilled[0]; // prefer a fresh `visibleOpen`; else the (matchable) partial remainder
+    const occupant = partiallyFilled[0]; // newest non-expired partial remainder on this side, if any
+    if (occupant !== undefined) {
+      // A live partial remainder OCCUPIES this side. Don't off-chain-cancel it and don't stack a
+      // fresh same-side quote over it. Pull any redundant visible-open quotes (gasless, valid); the
+      // side reopens for a fresh quote only once the partial expires / is authoritatively cancelled.
+      for (const r of visibleOpen) toSoftCancel.push({ record: r, reason: 'duplicate' });
+      const occupantStale = nowUnixSec - occupant.postedAtUnixSec > config.orders.staleAfterSeconds;
+      const occupantMispriced = oddsMovedTooFar(occupant.oddsTick, inverseOddsTick(desiredSide.quoteTick), config.orders.replaceOnOddsMoveBps);
+      // Surface the occupant only when there's something to act on (it's stale/mispriced, or it
+      // suppressed a redundant same-side quote). A fresh, on-tick, lone occupant is normal
+      // steady-state — surfacing it would emit a candidate every reconcile tick while it lives.
+      const occupantReason: RetainedPartialReason | null = occupantStale
+        ? 'stale'
+        : occupantMispriced
+          ? 'mispriced'
+          : visibleOpen.length > 0 || partiallyFilled.length > 1
+            ? 'duplicate'
+            : null;
+      if (occupantReason !== null) retainedPartials.push({ record: occupant, reason: occupantReason });
+      for (const r of partiallyFilled.slice(1)) retainedPartials.push({ record: r, reason: 'duplicate' }); // extra partials (shouldn't normally arise) — retained too
+      actions.set(offerSide, { kind: 'noop' });
+      continue;
+    }
+
+    // No live partial occupies the side — the visible-open-only path.
+    const incumbent = visibleOpen[0];
     if (incumbent === undefined) {
       actions.set(offerSide, { kind: 'submit', quoteSide: desiredSide });
       continue;
     }
     // Book hygiene (DESIGN §9): exactly one visible quote per (speculation, side) — pull the rest.
-    for (const r of [...visibleOpen, ...partiallyFilled]) {
+    for (const r of visibleOpen) {
       if (r !== incumbent) toSoftCancel.push({ record: r, reason: 'duplicate' });
     }
-
     const stale = nowUnixSec - incumbent.postedAtUnixSec > config.orders.staleAfterSeconds;
     // Compare in the protocol's *maker* space: the incumbent stores a maker tick; convert the
     // desired (taker-facing) `quoteTick` to its maker tick — one `inverseOddsTick` hop, no round-trip.
     const mispriced = oddsMovedTooFar(incumbent.oddsTick, inverseOddsTick(desiredSide.quoteTick), config.orders.replaceOnOddsMoveBps);
     if (!stale && !mispriced) {
       actions.set(offerSide, { kind: 'noop' }); // incumbent is fresh and correctly priced — leave it
-    } else if (incumbent.lifecycle === 'visibleOpen') {
-      actions.set(offerSide, { kind: 'replace', stale: incumbent, reason: stale ? 'stale' : 'mispriced', replacement: desiredSide });
     } else {
-      // a stale/mispriced `partiallyFilled` incumbent — v0 pulls it and posts a fresh full quote in its place
-      toSoftCancel.push({ record: incumbent, reason: stale ? 'stale' : 'mispriced' });
-      actions.set(offerSide, { kind: 'submit', quoteSide: desiredSide });
+      // a stale/mispriced `visibleOpen` incumbent — refresh it in place (pull off-chain, repost fresh).
+      actions.set(offerSide, { kind: 'replace', stale: incumbent, reason: stale ? 'stale' : 'mispriced', replacement: desiredSide });
     }
   }
 
@@ -389,7 +442,7 @@ export function reconcileBook(
     }
   }
 
-  return { toSubmit, toReplace, toSoftCancel, deferredSides };
+  return { toSubmit, toReplace, toSoftCancel, retainedPartials, deferredSides };
 }
 
 function newestFirst(a: MakerCommitmentRecord, b: MakerCommitmentRecord): number {

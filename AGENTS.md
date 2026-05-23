@@ -95,6 +95,7 @@ interface CancelStaleReport {
   inspected: number;              // total stale records matched
   offchainCancelled: number;
   offchainSkippedAlready: number; // records already in `softCancelled`; off-chain DELETE skipped
+  offchainSkippedPartial: number; // `partiallyFilled` records; off-chain DELETE skipped (API 409 once matched) — only --authoritative can cancel them
   onchainCancelled: number;       // 0 unless --authoritative was passed
   gasDenied: number;              // records the gas-budget verdict refused (on-chain leg)
   errored: number;                // per-record adapter throws
@@ -103,7 +104,7 @@ interface CancelStaleReport {
 }
 ```
 
-Stale-set rule: `lifecycle ∈ {visibleOpen, softCancelled, partiallyFilled}` AND `postedAtUnixSec + orders.staleAfterSeconds ≤ now`. Terminal lifecycles (`filled` / `expired` / `authoritativelyInvalidated`) are never in the set.
+Stale-set rule: `lifecycle ∈ {visibleOpen, softCancelled, partiallyFilled}` AND `postedAtUnixSec + orders.staleAfterSeconds ≤ now`. Terminal lifecycles (`filled` / `expired` / `authoritativelyInvalidated`) are never in the set. The **off-chain leg skips `partiallyFilled`** records (the API rejects a DELETE once a commitment has matched — `409 COMMITMENT_MATCHED`), counting them in `offchainSkippedPartial`; only `--authoritative` (the on-chain leg) can cancel a matched commitment's remaining capacity.
 
 ### 2.5 StatusReport (envelope: `{schemaVersion:1, status: …}`)
 
@@ -264,9 +265,10 @@ Canonical vocabulary (`TELEMETRY_KINDS` in [`src/telemetry/index.ts`](./src/tele
 'stale-reference' | 'start-too-soon' | 'cap-hit' | 'refused-pricing'
 'tracking-cap-reached' | 'gas-budget-blocks-reapproval'
 'gas-budget-blocks-settlement' | 'gas-budget-blocks-onchain-cancel'
+'partial-remainder-retained'
 ```
 
-`refused-pricing` / `cap-hit` arrive during the per-market reconcile. The three `gas-budget-blocks-*` arrive from the on-chain write paths (boot approve, auto-settle/claim, shutdown kill / cancel-stale). The others are pre-engine market-discovery gates.
+`refused-pricing` / `cap-hit` arrive during the per-market reconcile. The three `gas-budget-blocks-*` arrive from the on-chain write paths (boot approve, auto-settle/claim, shutdown kill / cancel-stale). `partial-remainder-retained` marks a `partiallyFilled` remainder the runner left in place — never off-chain-cancelled (the API rejects a DELETE once matched), never reposted over (would double side exposure); its payload is `{ commitmentHash, contestId, speculationId, makerSide, takerSide, reason }`, where `reason ∈ {side-not-quoted, stale, mispriced, duplicate, shutdown}` is why it would have been actioned were it a `visibleOpen`. The others are pre-engine market-discovery gates.
 
 ### 3.8 Soft-cancel + replace reasons
 
@@ -276,7 +278,7 @@ SoftCancelReason: 'side-not-quoted' | 'duplicate' | 'shutdown'
 ReplaceReason:   'stale' | 'mispriced'
 ```
 
-`'stale'` and `'mispriced'` appear on `would-replace` / `replace` (replacement actions) AND on `would-soft-cancel` / `soft-cancel` (when the replacement was deferred for cap budget). `'side-not-quoted'` only on soft-cancels. `'duplicate'` on book-hygiene pulls. `'shutdown'` only on the kill-switch's unconditional off-chain sweep.
+`'stale'` and `'mispriced'` appear on `would-replace` / `replace` (replacement actions) AND on `would-soft-cancel` / `soft-cancel` (when the replacement was deferred for cap budget). `'side-not-quoted'` only on soft-cancels. `'duplicate'` on book-hygiene pulls. `'shutdown'` only on the kill-switch's unconditional off-chain sweep. **All soft-cancels target `visibleOpen` records only** — a `partiallyFilled` remainder is never off-chain-cancelled (the API rejects a DELETE once matched); it surfaces as a `partial-remainder-retained` candidate (§3.7) carrying the same reason vocabulary.
 
 ---
 
@@ -344,6 +346,7 @@ MakerPositionStatus: 'active' | 'pendingSettle' | 'claimable' | 'claimed'
 **Lifecycle invariants**:
 - `visibleOpen`, `softCancelled`, `partiallyFilled` — **non-terminal**; still matchable on chain until expiry (or `authoritativelyInvalidated` via on-chain cancel / nonce raise).
 - `softCancelled` records are pulled from the API book but **still matchable on chain** until expiry. The risk engine still counts their exposure.
+- `partiallyFilled` is **never off-chain-cancelled** — once a commitment has matched, the API rejects the DELETE (`409 COMMITMENT_MATCHED`), so it never transitions to `softCancelled`. It moves only to `filled` (fully matched), `expired`, or `authoritativelyInvalidated` (on-chain cancel / nonce raise). Off-chain soft-cancel applies to `visibleOpen` only.
 - `filled`, `expired`, `authoritativelyInvalidated` — **terminal**; headroom released. Pruned from state after `max(3600, 10 × orders.expirySeconds)` seconds.
 
 ### 4.3 State-loss model

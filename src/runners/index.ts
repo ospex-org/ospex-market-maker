@@ -97,7 +97,7 @@
 import { existsSync } from 'node:fs';
 
 import { DEFAULT_PER_IP_STREAM_CAP, POLL_INTERVAL_FLOOR_MS, RESERVED_OWN_STATE_STREAMS, type Config } from '../config/index.js';
-import { buildDesiredQuote, inventoryFromState, reconcileBook, type BookReconciliation, type DesiredQuote, type SoftCancelReason } from '../orders/index.js';
+import { buildDesiredQuote, inventoryFromState, reconcileBook, type BookReconciliation, type DesiredQuote, type RetainedPartialReason, type SoftCancelReason } from '../orders/index.js';
 import type {
   ApproveResult,
   ApproveUSDCAmount,
@@ -1116,13 +1116,16 @@ export class Runner {
     return outcome; // `'transient-failure'` if a live write failed mid-plan — `reconcileMarkets` then leaves `dirty` / `lastReconciledAt` so the market re-reconciles next tick
   }
 
-  /** Pull (off-chain) every API-visible commitment of the maker's on `m.speculationId` — in live mode an actual `cancelCommitmentOffchain` per record (a failed one stays `visibleOpen` for the next pass), in dry-run a state-only simulation — then reclassify the pulled ones `softCancelled` and emit `would-soft-cancel` / `soft-cancel` (reason `side-not-quoted`: when a market is unquoteable, neither side is being quoted). Used by the unquoteable-market gates above — the visible book must never carry a quote the MM is no longer pricing (DESIGN §2.2 / §3). The pulled quote's signed payload stays matchable on chain until expiry, so the risk engine keeps counting it. */
+  /** Pull (off-chain) every API-visible `visibleOpen` commitment of the maker's on `m.speculationId` — in live mode an actual `cancelCommitmentOffchain` per record (a failed one stays `visibleOpen` for the next pass), in dry-run a state-only simulation — then reclassify the pulled ones `softCancelled` and emit `would-soft-cancel` / `soft-cancel` (reason `side-not-quoted`: when a market is unquoteable, neither side is being quoted). A `partiallyFilled` remainder is NOT pulled — the API rejects an off-chain DELETE once a commitment has matched (409 `COMMITMENT_MATCHED`); it's retained (a `partial-remainder-retained` candidate is emitted) and rides to expiry / authoritative on-chain cancel. Used by the unquoteable-market gates above — the visible book must never carry a quote the MM is no longer pricing (DESIGN §2.2 / §3). A pulled / retained quote's signed payload stays matchable on chain until expiry, so the risk engine keeps counting it. */
   private async pullVisibleQuotes(m: TrackedMarket, now: number): Promise<void> {
     for (const r of Object.values(this.state.commitments)) {
       if (r.speculationId !== m.speculationId) continue;
-      if (r.lifecycle !== 'visibleOpen' && r.lifecycle !== 'partiallyFilled') continue;
       if (r.expiryUnixSec <= now) continue; // already dead on chain — `ageOut` handles it
-      await this.softCancelRecord(r, 'side-not-quoted', now);
+      if (r.lifecycle === 'visibleOpen') {
+        await this.softCancelRecord(r, 'side-not-quoted', now);
+      } else if (r.lifecycle === 'partiallyFilled') {
+        this.emitPartialRetained(r, 'side-not-quoted'); // can't off-chain-cancel a matched commitment — retain the remainder
+      }
     }
   }
 
@@ -1136,8 +1139,27 @@ export class Runner {
    * `transient-failure` so the market re-reconciles and retries). The off-chain cancel
    * is visibility-only: the signed payload stays matchable on chain until expiry, so
    * the risk engine keeps counting it.
+   *
+   * **Off-chain cancel is only valid for `visibleOpen`.** The API returns 409
+   * `COMMITMENT_MATCHED` for a `partiallyFilled` (or `filled`) commitment — once a
+   * match exists the off-chain DELETE is rejected; only an authoritative on-chain
+   * `cancelCommitment` can kill the remaining fillability. The reconciler never routes
+   * a partial here (`reconcileBook` retains them), but this guards the call site so a
+   * future path can't silently re-introduce the reject-loop bug: a non-`visibleOpen`
+   * record skips the API call, keeps its lifecycle, and returns `true` (handled — no
+   * `transient-failure` retry on a permanent rejection).
    */
   private async softCancelRecord(record: MakerCommitmentRecord, reason: SoftCancelReason, now: number): Promise<boolean> {
+    if (record.lifecycle !== 'visibleOpen') {
+      this.eventLog.emit('error', {
+        class: 'NonVisibleOpenSoftCancel',
+        detail: `refusing off-chain cancel of a ${record.lifecycle} commitment — the API rejects a DELETE once a commitment has matched (409 COMMITMENT_MATCHED)`,
+        phase: 'cancel',
+        contestId: record.contestId,
+        commitmentHash: record.hash,
+      });
+      return true; // deliberately not pulled; report handled so the caller doesn't loop on a permanent rejection
+    }
     if (!this.config.mode.dryRun) {
       try {
         // Every tracked record in a live run is a real EIP-712 hash (`0x…`): submits record
@@ -1153,6 +1175,26 @@ export class Runner {
     record.updatedAtUnixSec = now;
     this.eventLog.emit(this.config.mode.dryRun ? 'would-soft-cancel' : 'soft-cancel', softCancelEventPayload(record, reason));
     return true;
+  }
+
+  /**
+   * Emit a `candidate` `partial-remainder-retained` for a `partiallyFilled` remainder the runner
+   * left in place — never off-chain-cancelled (the API rejects a DELETE once matched) and never
+   * reposted over (a same-side quote on top would double the side's matchable exposure). Positive
+   * telemetry so an operator / the summary walker sees the side is occupied by a matchable
+   * remainder riding to expiry (or, under `cancelMode: onchain`, awaiting authoritative cancel).
+   * `reason` is why it would have been actioned were it a `visibleOpen`.
+   */
+  private emitPartialRetained(record: MakerCommitmentRecord, reason: RetainedPartialReason | 'shutdown'): void {
+    this.eventLog.emit('candidate', {
+      skipReason: 'partial-remainder-retained',
+      commitmentHash: record.hash,
+      contestId: record.contestId,
+      speculationId: record.speculationId,
+      makerSide: record.makerSide,
+      takerSide: oppositeSide(record.makerSide),
+      reason,
+    });
   }
 
   /**
@@ -1236,6 +1278,9 @@ export class Runner {
 
     for (const sc of plan.toSoftCancel) {
       if (!(await this.softCancelRecord(sc.record, sc.reason, now))) outcome = 'transient-failure'; // live cancel threw — `error` already emitted; the quote's still up, retry next tick
+    }
+    for (const rp of plan.retainedPartials) {
+      this.emitPartialRetained(rp.record, rp.reason); // a matched remainder occupying its side — left in place (off-chain cancel would be rejected; reposting over it would double exposure)
     }
     for (const offerSide of plan.deferredSides) {
       this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'cap-hit', takerSide: offerSide });
@@ -2172,13 +2217,16 @@ export class Runner {
   /**
    * Shutdown-time off-chain "soft stop" sweep (DESIGN §6 — kill switch).
    * Runs on every actual operator-triggered shutdown (`shutdownReason !== null`)
-   * regardless of `killCancelOnChain`. For every `visibleOpen` and
-   * `partiallyFilled` commitment, calls `adapter.cancelCommitmentOffchain`
-   * (gasless API DELETE) to pull the quote from the book and then reclassifies
-   * the record to `softCancelled` + emits `soft-cancel` `reason: 'shutdown'`.
-   * The signed payload stays matchable on chain until natural expiry — the
-   * authoritative `onchainKillCancel` below closes that window if
-   * `killCancelOnChain: true`.
+   * regardless of `killCancelOnChain`. For every `visibleOpen` commitment, calls
+   * `adapter.cancelCommitmentOffchain` (gasless API DELETE) to pull the quote from
+   * the book and then reclassifies the record to `softCancelled` + emits
+   * `soft-cancel` `reason: 'shutdown'`. A `partiallyFilled` remainder is NOT
+   * off-chain-cancelled — the API rejects a DELETE once a commitment has matched
+   * (409 `COMMITMENT_MATCHED`); it's retained (a `partial-remainder-retained`
+   * candidate, `reason: 'shutdown'`) and left for the authoritative
+   * `onchainKillCancel` below (if `killCancelOnChain: true`) or natural expiry.
+   * Either way the signed payload stays matchable on chain until natural expiry
+   * unless the on-chain sweep closes that window.
    *
    * Per-record failures are logged (`error` `phase: 'cancel'`) and the loop
    * continues — pulling one record doesn't depend on another.
@@ -2192,6 +2240,12 @@ export class Runner {
 
     const now = this.deps.now();
     for (const r of records) {
+      if (r.lifecycle === 'partiallyFilled') {
+        // Off-chain DELETE is rejected once matched. Retain the remainder — `onchainKillCancel`
+        // below (if `killCancelOnChain: true`) authoritatively cancels it; else it rides to expiry.
+        this.emitPartialRetained(r, 'shutdown');
+        continue;
+      }
       try {
         await this.adapter.cancelCommitmentOffchain(r.hash as Hex);
       } catch (err) {

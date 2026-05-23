@@ -274,7 +274,7 @@ describe('runCancelStale — off-chain leg (default, no --authoritative)', () =>
     expect(events.filter((e) => e.kind === 'soft-cancel')).toHaveLength(1);
   });
 
-  it('stale partiallyFilled records are included — pulled off-chain, reclassified to softCancelled, filledRiskWei6 preserved (Hermes review-PR30 blocker #1)', async () => {
+  it('stale partiallyFilled records are SKIPPED off-chain (the API rejects a DELETE once matched) — counted in offchainSkippedPartial, lifecycle + filledRiskWei6 preserved', async () => {
     seedState([
       rec('0xpf', T0 - 200, { lifecycle: 'partiallyFilled', filledRiskWei6: '50', riskAmountWei6: '100' }),
     ]);
@@ -287,12 +287,13 @@ describe('runCancelStale — off-chain leg (default, no --authoritative)', () =>
       { config: liveConfig(), authoritative: false, ignoreMissingState: false },
       { ...baseDeps(), createLiveAdapter },
     );
-    expect(report).toMatchObject({ inspected: 1, offchainCancelled: 1 });
-    expect(captured!.cancelCommitmentOffchain).toHaveBeenCalledWith('0xpf');
+    expect(report).toMatchObject({ inspected: 1, offchainCancelled: 0, offchainSkippedPartial: 1, errored: 0 });
+    expect(captured!.cancelCommitmentOffchain).not.toHaveBeenCalled(); // off-chain DELETE never attempted for a matched commitment
     const state = StateStore.at(stateDir).load().state;
-    expect(state.commitments['0xpf']!.lifecycle).toBe('softCancelled');
-    // Crucial: the partial-fill record's filledRiskWei6 must be preserved across the lifecycle stamp.
-    expect(state.commitments['0xpf']!.filledRiskWei6).toBe('50');
+    expect(state.commitments['0xpf']!.lifecycle).toBe('partiallyFilled'); // left in place — rides to expiry (or --authoritative on-chain cancel)
+    expect(state.commitments['0xpf']!.filledRiskWei6).toBe('50'); // preserved (untouched)
+    const events = readEvents('cs-run');
+    expect(events.filter((e) => e.kind === 'soft-cancel')).toHaveLength(0); // not soft-cancelled
   });
 
   it('off-chain throw → counted in errored; lifecycle unchanged; emits error phase:"cancel"; continues to next record', async () => {
@@ -405,7 +406,7 @@ describe('runCancelStale — --authoritative (on-chain leg)', () => {
     expect(StateStore.at(stateDir).load().state.commitments['0xaa']!.lifecycle).toBe('authoritativelyInvalidated');
   });
 
-  it('--authoritative + a stale partiallyFilled record → off-chain → softCancelled → on-chain → authoritativelyInvalidated; filledRiskWei6 preserved through both stamps (Hermes review-PR30 blocker #1)', async () => {
+  it('--authoritative + a stale partiallyFilled record → SKIPPED off-chain (rejected once matched) → on-chain → authoritativelyInvalidated; filledRiskWei6 preserved', async () => {
     seedState([rec('0xpf', T0 - 200, { lifecycle: 'partiallyFilled', filledRiskWei6: '40', riskAmountWei6: '100' })]);
     let captured: OspexAdapter | null = null;
     const createLiveAdapter = (cfg: Config, signer: Signer): OspexAdapter => {
@@ -417,7 +418,9 @@ describe('runCancelStale — --authoritative (on-chain leg)', () => {
       { config: liveConfig(), authoritative: true, ignoreMissingState: false },
       { ...baseDeps(), createLiveAdapter },
     );
-    expect(report).toMatchObject({ inspected: 1, offchainCancelled: 1, onchainCancelled: 1, errored: 0 });
+    expect(report).toMatchObject({ inspected: 1, offchainCancelled: 0, offchainSkippedPartial: 1, onchainCancelled: 1, errored: 0 });
+    expect(captured!.cancelCommitmentOffchain).not.toHaveBeenCalled(); // off-chain DELETE never attempted for the matched commitment
+    expect(captured!.cancelCommitmentOnchain).toHaveBeenCalledWith('0xpf'); // authoritative cancel still kills its remaining capacity
     const state = StateStore.at(stateDir).load().state;
     expect(state.commitments['0xpf']!.lifecycle).toBe('authoritativelyInvalidated');
     expect(state.commitments['0xpf']!.filledRiskWei6).toBe('40');
@@ -481,7 +484,7 @@ describe('runCancelStale — --authoritative (on-chain leg)', () => {
 
 describe('cancelStaleExitCode', () => {
   const baseReport: CancelStaleReport = {
-    inspected: 0, offchainCancelled: 0, offchainSkippedAlready: 0, onchainCancelled: 0,
+    inspected: 0, offchainCancelled: 0, offchainSkippedAlready: 0, offchainSkippedPartial: 0, onchainCancelled: 0,
     gasDenied: 0, errored: 0, gasPolWei: '0', runId: 'r',
   };
   it('clean run → 0', () => {

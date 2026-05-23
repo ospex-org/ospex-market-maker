@@ -69,6 +69,7 @@ export const CANDIDATE_SKIP_REASONS = [
   'gas-budget-blocks-reapproval',
   'gas-budget-blocks-settlement', // on-chain settleSpeculation / claimPosition denied by canSpendGas (mayUseReserve = settlement.continueOnGasBudgetExhausted); `purpose` distinguishes `settleSpeculation` vs `claimPosition`
   'gas-budget-blocks-onchain-cancel', // shutdown-time on-chain cancelCommitment denied by canSpendGas (with mayUseReserve: true since `killCancelOnChain: true` is operator-explicit); the candidate's `commitmentHash` identifies the record that couldn't be cancelled
+  'partial-remainder-retained', //     a `partiallyFilled` remainder left in place (never off-chain-cancelled, never reposted over): it occupies its maker side until expiry / authoritative on-chain cancel. Carries `commitmentHash` / `contestId` / `speculationId` / `makerSide` / `takerSide` and a `reason` (`side-not-quoted` / `stale` / `mispriced` / `duplicate` / `shutdown`)
 ] as const;
 export type CandidateSkipReason = (typeof CANDIDATE_SKIP_REASONS)[number];
 

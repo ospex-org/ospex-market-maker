@@ -756,11 +756,11 @@ describe('interruptibleSleep', () => {
   });
 });
 
-// ── odds subscriptions / Realtime guardrails (DESIGN §10) ────────────────────
+// ── odds subscriptions / stream guardrails (DESIGN §10) ────────────────────
 
 describe('Runner — odds subscriptions', () => {
-  it('seeds odds (snapshot-first) then opens a Realtime channel for each newly-tracked market', async () => {
-    const config = cfg(); // odds.subscribe defaults true, maxRealtimeChannels 60
+  it('seeds odds (snapshot-first) then opens an SSE odds stream for each newly-tracked market', async () => {
+    const config = cfg(); // odds.subscribe defaults true, maxRealtimeChannels 5
     const recorder = makeSubscribeRecorder();
     let snapshotCalls = 0;
     const adapter = spiedAdapter(config, () => Promise.resolve([contestView({ contestId: 'A' })]), undefined, {
@@ -939,7 +939,7 @@ describe('Runner — odds subscriptions', () => {
     expect(runner.trackedMarketView('A')?.subscribed).toBe(true);
   });
 
-  it('odds.subscribe: false → polling mode: snapshots every tracked market each tick, never opens a Realtime channel', async () => {
+  it('odds.subscribe: false → polling mode: snapshots every tracked market each tick, never opens an SSE odds stream', async () => {
     const config = cfg({ odds: { subscribe: false }, discovery: { everyNTicks: 10 } }); // discovery runs once (tick 1)
     let snapshotCalls = 0;
     let subscribeCalls = 0;
@@ -950,7 +950,7 @@ describe('Runner — odds subscriptions', () => {
     const runner = makeRunner({ config, adapter, maxTicks: 3 });
     await runner.run();
 
-    expect(subscribeCalls).toBe(0); // no Realtime in polling mode
+    expect(subscribeCalls).toBe(0); // no SSE stream in polling mode
     expect(snapshotCalls).toBe(3); // one snapshot per tick for the one tracked market
     expect(runner.trackedMarketView('A')).toMatchObject({
       subscribed: false,

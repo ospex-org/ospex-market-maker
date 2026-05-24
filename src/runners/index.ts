@@ -526,11 +526,12 @@ export class Runner {
 
   /**
    * One iteration: discovery → reference-odds refresh → fill detection (live) →
-   * position-status poll (live) → per-market reconcile → age-out → terminal-record
-   * prune → flush. Fill detection runs *before* the reconcile so a fill within this
+   * position-status poll (live) → soft-cancelled-fill convergence (live) → per-market
+   * reconcile → age-out → terminal-record prune → flush. Fill detection +
+   * soft-cancelled-fill convergence run *before* the reconcile so a fill within this
    * tick dirties the market and the same reconcile re-prices the now-imbalanced book.
    *
-   * **Fail-closed on lost fill visibility (live mode).** Three gates, same outcome
+   * **Fail-closed on lost fill visibility (live mode).** Four gates, same outcome
    * (skip reconcile + ageOut, markets stay dirty, next tick retries):
    *   1. `detectFills` can't read the maker's open commitments
    *      (`listOpenCommitments` threw) → also skips the position poll.
@@ -551,6 +552,13 @@ export class Runner {
    *      a taker just filled. With no softCancelled records, the maker's
    *      own posted-commitment fills are fully covered by `detectFills`, so
    *      a position-poll failure is non-fatal.
+   *   4. `reconcileSoftCancelledFills`'s per-hash `getCommitment` lookup threw
+   *      for a `softCancelled` record (a network error, or a 404 for a still-
+   *      matchable signed payload). That record's stale payload could have just
+   *      matched on chain; reading the throw as "unfilled" and letting `ageOut`
+   *      terminalize it would lose the fill. The record stays `softCancelled`
+   *      and the tick fails closed (gate 3's outer block must already have been
+   *      entered — this step only runs when the position poll didn't trip its gate).
    * `pruneTerminalCommitments` still runs (it only touches already-terminal
    * records, which are safe).
    */
@@ -570,9 +578,20 @@ export class Runner {
         if (!this.config.mode.dryRun) positionPollOk = await this.pollPositionStatus();
         const hasSoftCancelled = !this.config.mode.dryRun && Object.values(this.state.commitments).some((r) => r.lifecycle === 'softCancelled');
         if (positionPollOk || !hasSoftCancelled) {
-          if (!this.config.mode.dryRun) await this.settleAndClaim();
-          await this.reconcileMarkets();
-          this.ageOut();
+          // Soft-cancelled-fill convergence (live only) — runs after detectFills + the
+          // position poll, before settle/reconcile/ageOut. It probes each softCancelled
+          // record's authoritative cumulative fill via `getCommitment` and converges the
+          // commitment record (NOT the position — that's the poll's job). A probe failure
+          // fails closed the same way a lost position poll does: skip settle + reconcile +
+          // ageOut so a record that may have just matched isn't terminalized on local time.
+          let softCancelledFillOk = true;
+          if (!this.config.mode.dryRun) softCancelledFillOk = await this.reconcileSoftCancelledFills();
+          if (softCancelledFillOk) {
+            if (!this.config.mode.dryRun) await this.settleAndClaim();
+            await this.reconcileMarkets();
+            this.ageOut();
+          }
+          // else: live mode + a softCancelled-fill probe (`getCommitment`) failed — skip settleAndClaim + reconcile + ageOut (fail-closed; the record stays softCancelled, markets stay dirty for next-tick retry).
         }
         // else: live mode + getPositionStatus failed AND softCancelled records exist — skip settleAndClaim + reconcile + ageOut (fail-closed; markets stay dirty for next-tick retry).
       }
@@ -1818,6 +1837,129 @@ export class Runner {
       existing.counterpartyRiskWei6 = (BigInt(existing.counterpartyRiskWei6) + counterpartyDelta).toString();
       existing.updatedAtUnixSec = now;
     }
+  }
+
+  /**
+   * Live-mode soft-cancelled-fill convergence (DESIGN §9, §10). A commitment the MM
+   * soft-cancelled off-chain (`lifecycle: 'softCancelled'`) is API-*hidden* from
+   * `listOpenCommitments`, so `detectFills` never probes it — yet its stale signed
+   * payload stays matchable on chain until expiry, and a taker can match it. The
+   * resulting maker risk shows up in `pollPositionStatus`'s aggregate (which converges
+   * the *position*), but the originating commitment record is left stranded
+   * `softCancelled` with `filledRiskWei6: '0'` — a split-brain the risk engine reads
+   * wrong. This step closes that: for each `softCancelled` record it reads the
+   * AUTHORITATIVE cumulative `filledRiskAmount` from `getCommitment(hash)` (a shipped
+   * data-layer fix returns the real cumulative fill even for hidden / soft-cancelled
+   * rows) and converges the record's `filledRiskWei6` up to it — commitment-only, no
+   * position mutation (positions are `pollPositionStatus`'s job; touching them here
+   * would double-count).
+   *
+   * **Cumulative, never additive, never decreasing** — `convergeCommitmentFilledRiskFromCumulative`
+   * sets `filledRiskWei6 = min(apiCumulative, riskAmount)` only when it would grow.
+   * For a *visible* matched commitment `detectFills` converges to the same API
+   * cumulative; whichever path runs first applies the change, the other sees
+   * `apiCumulative <= local` and no-ops — so there's no double-count even though both
+   * paths target the same number. Soft-cancelled records are reached ONLY here.
+   *
+   * **Status is NOT consulted.** A hidden row presents effective status `'cancelled'`
+   * for backward-compat — that is *not* what we use. The lifecycle is derived purely
+   * from the (clamped) cumulative fill: `0` → stays `softCancelled`; `0 < f < risk` →
+   * `partiallyFilled`; `f >= risk` → `filled`.
+   *
+   * **Fail-closed.** If `getCommitment(hash)` throws — a network error, or a 404 for a
+   * still-matchable signed payload — we must NOT treat the record as resolved /
+   * unfilled or let `ageOut` terminalize it this tick: it could have just matched. The
+   * record stays `softCancelled`, an `error` (`class: 'SoftCancelledProbeFailed'`) is
+   * emitted, and the step returns `false` so `tick()` skips `settleAndClaim` /
+   * `reconcileMarkets` / `ageOut` (the same fail-closed posture as a lost position
+   * poll). Returns `true` when every probe succeeded — or when there were no
+   * `softCancelled` records (nothing to do).
+   */
+  private async reconcileSoftCancelledFills(): Promise<boolean> {
+    if (this.makerAddress === null) return true; // dry-run path — defensive (the caller skips); treat as ok
+    const now = this.deps.now();
+    const softCancelled = Object.values(this.state.commitments).filter((r) => r.lifecycle === 'softCancelled');
+    if (softCancelled.length === 0) return true; // nothing soft-cancelled → nothing to converge
+    let allProbesOk = true;
+    for (const record of softCancelled) {
+      let apiCommitment: Commitment;
+      try {
+        apiCommitment = await this.adapter.getCommitment(record.hash as Hex);
+      } catch (err) {
+        // Fail closed: a network error or a 404 for a still-matchable signed payload
+        // must NOT be read as "unfilled / resolved". Keep the record softCancelled,
+        // signal `tick()` to skip reconcile + ageOut so a record that may have just
+        // matched isn't terminalized on local time alone (mirrors the lost-position-poll gate).
+        this.eventLog.emit('error', { class: 'SoftCancelledProbeFailed', detail: errMessage(err), phase: 'softcancel-recovery', commitmentHash: record.hash });
+        allProbesOk = false;
+        continue; // probe the rest; the step returns false regardless
+      }
+      // Derive EVERYTHING from the authoritative cumulative `filledRiskAmount` — never
+      // from `apiCommitment.status` (a hidden row reports effective status 'cancelled'
+      // for backward-compat, which is NOT a signal we use here).
+      this.convergeCommitmentFilledRiskFromCumulative(record, BigInt(apiCommitment.filledRiskAmount), now);
+    }
+    return allProbesOk;
+  }
+
+  /**
+   * Converge ONE commitment record's `filledRiskWei6` up to an authoritative cumulative
+   * on-chain fill — commitment-only, **no position mutation** (unlike {@link applyFill},
+   * whose `filledRiskWei6` bump is coupled to {@link updatePosition}; that coupling is
+   * right for the visible-commitment path but would double-count here, since
+   * `pollPositionStatus` already owns aggregate position convergence — including for
+   * soft-cancelled fills). Cumulative semantics: a no-op when `apiCumulativeWei6 <=`
+   * the local fill (idempotent; never decrease). Otherwise sets `filledRiskWei6 =
+   * min(apiCumulativeWei6, riskAmountWei6)` — **clamped to the commitment's risk**
+   * because the state validator rejects `filledRiskWei6 > riskAmountWei6`; an
+   * over-fill (API cumulative above risk, which shouldn't happen on chain) is clamped
+   * and flagged via an `error` (`class: 'SoftCancelledOverFillClamp'`). The lifecycle
+   * is reclassified from the CLAMPED amount (`0` → `softCancelled`; `0 < f < risk` →
+   * `partiallyFilled`; `f >= risk` → `filled`), the tracked market is dirtied so the
+   * same tick's reconcile re-prices the imbalance (matching `applyFill`), and a `fill`
+   * event with a distinct `source: 'softcancel-recovery'` (same shape as `applyFill`'s)
+   * is emitted.
+   */
+  private convergeCommitmentFilledRiskFromCumulative(record: MakerCommitmentRecord, apiCumulativeWei6: bigint, now: number): void {
+    const localFilled = BigInt(record.filledRiskWei6);
+    if (apiCumulativeWei6 <= localFilled) return; // idempotent — never decrease, never re-apply
+    const risk = BigInt(record.riskAmountWei6);
+    if (apiCumulativeWei6 > risk) {
+      // Over-fill: the API's cumulative exceeds the commitment's own risk — impossible
+      // on chain (MatchingModule can't fill past the commitment), so a data anomaly.
+      // Clamp to risk (the validator rejects filledRiskWei6 > riskAmountWei6) and flag it.
+      this.eventLog.emit('error', {
+        class: 'SoftCancelledOverFillClamp',
+        detail: `getCommitment cumulative filledRiskAmount (${apiCumulativeWei6.toString()}) exceeds the commitment's riskAmountWei6 (${record.riskAmountWei6}) — clamping to risk`,
+        phase: 'softcancel-recovery',
+        commitmentHash: record.hash,
+      });
+    }
+    const clamped = apiCumulativeWei6 > risk ? risk : apiCumulativeWei6;
+    const newFill = clamped - localFilled; // > 0 (guarded above) unless localFilled already exceeds clamp, which the `<=` guard ruled out
+    record.filledRiskWei6 = clamped.toString();
+    // Lifecycle from the CLAMPED amount — never from API status. `clamped > 0` here.
+    const finalLifecycle: CommitmentLifecycle = clamped >= risk ? 'filled' : 'partiallyFilled';
+    if (record.lifecycle !== finalLifecycle) record.lifecycle = finalLifecycle;
+    record.updatedAtUnixSec = now;
+    const m = this.trackedMarkets.get(record.contestId);
+    if (m !== undefined) m.dirty = true; // the matched portion changed the book on this side — re-price next reconcile (same tick)
+    this.eventLog.emit('fill', {
+      source: 'softcancel-recovery',
+      commitmentHash: record.hash,
+      speculationId: record.speculationId,
+      contestId: record.contestId,
+      sport: record.sport,
+      awayTeam: record.awayTeam,
+      homeTeam: record.homeTeam,
+      takerSide: oppositeSide(record.makerSide),
+      makerSide: record.makerSide,
+      positionType: positionTypeForSide(record.makerSide),
+      makerOddsTick: record.oddsTick,
+      newFillWei6: newFill.toString(),
+      filledRiskWei6: record.filledRiskWei6,
+      partial: finalLifecycle === 'partiallyFilled',
+    });
   }
 
   /**

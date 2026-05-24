@@ -1922,6 +1922,227 @@ describe('Runner — fill detection — past-local-expiry classification (review
   });
 });
 
+// ── soft-cancelled-fill convergence (live only) ──────────────────────────────
+//
+// `reconcileSoftCancelledFills` — the tick step (after detectFills + the position poll,
+// before settle/reconcile/ageOut, live mode only) that closes the split-brain where a
+// commitment the MM soft-cancelled off-chain still matched on chain via its stale signed
+// payload. `detectFills`'s commitment-list diff can't see soft-cancelled rows (they're
+// API-hidden), so this step probes each `softCancelled` record's AUTHORITATIVE cumulative
+// `filledRiskAmount` via `getCommitment(hash)` and converges the COMMITMENT record only
+// (filledRiskWei6 + lifecycle) — never the position (that's `pollPositionStatus`'s job;
+// touching it here would double-count). Convergence is cumulative (never additive, never
+// decreasing), clamps to the commitment's risk, and derives lifecycle from the clamped
+// amount (NOT from API status). Fail-closed: a `getCommitment` throw keeps the record
+// softCancelled, emits `error` class SoftCancelledProbeFailed, and skips reconcile + ageOut.
+
+describe('Runner — soft-cancelled-fill convergence', () => {
+  it('a softCancelled record whose API cumulative fill is 0 → stays softCancelled, NO position mutation, no `fill` event (idempotent no-op)', async () => {
+    const softCancelled = commitmentRecord({ hash: '0xsc', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '250000', filledRiskWei6: '0', lifecycle: 'softCancelled', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 5, updatedAtUnixSec: T0 - 5 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xsc': softCancelled } });
+    const config = cfg({ mode: { dryRun: false } });
+    // Never matched on chain — cumulative fill is 0. (A hidden row reports effective status 'cancelled'; the step ignores status and reads the cumulative.)
+    const apiUnfilled: Commitment = orderbookEntry({ commitmentHash: '0xsc', maker: DEFAULT_FAKE_MAKER_ADDRESS, contestId: '1234', positionType: 1, oddsTick: 200, riskAmount: '250000', filledRiskAmount: '0', remainingRiskAmount: '250000', status: 'cancelled', isLive: false });
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]), undefined, undefined, undefined,
+      { getCommitment: (h) => (h === '0xsc' ? Promise.resolve(apiUnfilled) : Promise.reject(new Error('unknown hash'))) },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    const reloaded = StateStore.at(stateDir).load().state;
+    expect(reloaded.commitments['0xsc']?.lifecycle).toBe('softCancelled'); // unchanged
+    expect(reloaded.commitments['0xsc']?.filledRiskWei6).toBe('0'); // unchanged
+    expect(reloaded.commitments['0xsc']?.updatedAtUnixSec).toBe(T0 - 5); // not even touched
+    expect(reloaded.positions['spec-1234:home']).toBeUndefined(); // NO position created
+    expect(readEvents().some((e) => e.kind === 'fill')).toBe(false); // no fill event
+  });
+
+  it('a softCancelled record with a partial cumulative fill (0 < filled < risk) → filledRiskWei6 updated, lifecycle `partiallyFilled`, market dirtied + same-tick reconcile re-prices, `fill` event {source: softcancel-recovery}, NO position mutation', async () => {
+    // Tracked market (discovery) so the convergence can dirty it and the same tick's reconcile re-prices.
+    const softCancelled = commitmentRecord({ hash: '0xsc', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '500000', filledRiskWei6: '0', lifecycle: 'softCancelled', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 5, updatedAtUnixSec: T0 - 5 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xsc': softCancelled } });
+    const config = cfg({ mode: { dryRun: false }, odds: { subscribe: false } });
+    // Cumulative on-chain fill of 200000 (< risk 500000) → partiallyFilled.
+    const apiPartial: Commitment = orderbookEntry({ commitmentHash: '0xsc', maker: DEFAULT_FAKE_MAKER_ADDRESS, contestId: '1234', positionType: 1, oddsTick: 200, riskAmount: '500000', filledRiskAmount: '200000', remainingRiskAmount: '300000', status: 'cancelled', isLive: false });
+    const submit = submitRecorder();
+    const adapter = liveSpiedAdapter(
+      config,
+      () => Promise.resolve([contestView({ contestId: '1234' })]), // numeric so live submit can BigInt() it
+      { submitCommitment: submit.fn },
+      undefined,
+      undefined,
+      { getCommitment: (h) => (h === '0xsc' ? Promise.resolve(apiPartial) : Promise.reject(new Error('unknown hash'))) },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    const reloaded = StateStore.at(stateDir).load().state;
+    expect(reloaded.commitments['0xsc']?.lifecycle).toBe('partiallyFilled');
+    expect(reloaded.commitments['0xsc']?.filledRiskWei6).toBe('200000');
+    expect(reloaded.commitments['0xsc']?.updatedAtUnixSec).toBe(T0);
+    expect(reloaded.positions['spec-1234:home']).toBeUndefined(); // NO position created by this path — pollPositionStatus owns positions
+
+    const fills = readEvents().filter((e) => e.kind === 'fill');
+    expect(fills).toHaveLength(1);
+    expect(fills[0]).toMatchObject({
+      source: 'softcancel-recovery', commitmentHash: '0xsc', speculationId: 'spec-1234', contestId: '1234',
+      takerSide: 'away', makerSide: 'home', positionType: 1, makerOddsTick: 200,
+      newFillWei6: '200000', filledRiskWei6: '200000', partial: true,
+    });
+    // The market was dirtied → the same-tick reconcile ran on it (submitted quotes); proof the dirty flag propagated.
+    expect(submit.calls.length).toBeGreaterThan(0);
+  });
+
+  it('a softCancelled record whose API cumulative fill >= risk → clamp to risk, lifecycle `filled`, NO position mutation', async () => {
+    const softCancelled = commitmentRecord({ hash: '0xsc', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '250000', filledRiskWei6: '0', lifecycle: 'softCancelled', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 5, updatedAtUnixSec: T0 - 5 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xsc': softCancelled } });
+    const config = cfg({ mode: { dryRun: false } });
+    // Fully matched — cumulative fill equals risk → filled.
+    const apiFilled: Commitment = orderbookEntry({ commitmentHash: '0xsc', maker: DEFAULT_FAKE_MAKER_ADDRESS, contestId: '1234', positionType: 1, oddsTick: 200, riskAmount: '250000', filledRiskAmount: '250000', remainingRiskAmount: '0', status: 'cancelled', isLive: false });
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]), undefined, undefined, undefined,
+      { getCommitment: (h) => (h === '0xsc' ? Promise.resolve(apiFilled) : Promise.reject(new Error('unknown hash'))) },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    const reloaded = StateStore.at(stateDir).load().state;
+    expect(reloaded.commitments['0xsc']?.lifecycle).toBe('filled');
+    expect(reloaded.commitments['0xsc']?.filledRiskWei6).toBe('250000');
+    expect(reloaded.positions['spec-1234:home']).toBeUndefined(); // NO position created by this path
+    const fills = readEvents().filter((e) => e.kind === 'fill');
+    expect(fills).toHaveLength(1);
+    expect(fills[0]).toMatchObject({ source: 'softcancel-recovery', commitmentHash: '0xsc', newFillWei6: '250000', filledRiskWei6: '250000', partial: false });
+    expect(readEvents().some((e) => e.kind === 'error' && e.class === 'SoftCancelledOverFillClamp')).toBe(false); // exactly-at-risk is not an over-fill
+  });
+
+  it('an API cumulative fill BELOW the local filledRiskWei6 → no decrease, idempotent no-op (never re-applies, never regresses)', async () => {
+    // The record already reflects a 200000 fill (e.g. observed earlier). A stale/lower API read must not regress it.
+    const softCancelled = commitmentRecord({ hash: '0xsc', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '500000', filledRiskWei6: '200000', lifecycle: 'softCancelled', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 5, updatedAtUnixSec: T0 - 5 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xsc': softCancelled } });
+    const config = cfg({ mode: { dryRun: false } });
+    // API reports a LOWER cumulative (100000 < local 200000) — must be ignored.
+    const apiLower: Commitment = orderbookEntry({ commitmentHash: '0xsc', maker: DEFAULT_FAKE_MAKER_ADDRESS, contestId: '1234', positionType: 1, oddsTick: 200, riskAmount: '500000', filledRiskAmount: '100000', remainingRiskAmount: '400000', status: 'cancelled', isLive: false });
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]), undefined, undefined, undefined,
+      { getCommitment: (h) => (h === '0xsc' ? Promise.resolve(apiLower) : Promise.reject(new Error('unknown hash'))) },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    const reloaded = StateStore.at(stateDir).load().state;
+    expect(reloaded.commitments['0xsc']?.filledRiskWei6).toBe('200000'); // unchanged — never decreased
+    expect(reloaded.commitments['0xsc']?.lifecycle).toBe('softCancelled'); // unchanged
+    expect(reloaded.commitments['0xsc']?.updatedAtUnixSec).toBe(T0 - 5); // not touched
+    expect(readEvents().some((e) => e.kind === 'fill')).toBe(false);
+  });
+
+  it('an API cumulative fill ABOVE the commitment risk → clamp to risk + a warning telemetry (SoftCancelledOverFillClamp); lifecycle `filled`', async () => {
+    const softCancelled = commitmentRecord({ hash: '0xsc', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '250000', filledRiskWei6: '0', lifecycle: 'softCancelled', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 5, updatedAtUnixSec: T0 - 5 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xsc': softCancelled } });
+    const config = cfg({ mode: { dryRun: false } });
+    // Anomalous: API cumulative (300000) exceeds the commitment's own risk (250000) — clamp to risk.
+    const apiOverfill: Commitment = orderbookEntry({ commitmentHash: '0xsc', maker: DEFAULT_FAKE_MAKER_ADDRESS, contestId: '1234', positionType: 1, oddsTick: 200, riskAmount: '250000', filledRiskAmount: '300000', remainingRiskAmount: '0', status: 'cancelled', isLive: false });
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]), undefined, undefined, undefined,
+      { getCommitment: (h) => (h === '0xsc' ? Promise.resolve(apiOverfill) : Promise.reject(new Error('unknown hash'))) },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    const reloaded = StateStore.at(stateDir).load().state;
+    expect(reloaded.commitments['0xsc']?.filledRiskWei6).toBe('250000'); // CLAMPED to risk (the validator rejects filledRiskWei6 > riskAmountWei6)
+    expect(reloaded.commitments['0xsc']?.lifecycle).toBe('filled');
+    const events = readEvents();
+    expect(events.find((e) => e.kind === 'error' && e.class === 'SoftCancelledOverFillClamp')).toMatchObject({ commitmentHash: '0xsc', phase: 'softcancel-recovery' });
+    // The fill event reflects the clamped amounts, not the raw API cumulative.
+    expect(events.find((e) => e.kind === 'fill')).toMatchObject({ source: 'softcancel-recovery', newFillWei6: '250000', filledRiskWei6: '250000', partial: false });
+  });
+
+  it('the visible detectFills path and the soft-cancel path see the same cumulative on the same commitment → whichever runs first applies it, the other no-ops (no double-count)', async () => {
+    // A commitment that is BOTH visibleOpen-in-the-listing AND has a soft-cancelled twin would be a
+    // contradiction; the real invariant is: each path converges to the same API cumulative, so re-running
+    // convergence on an already-converged record is a no-op. Model it directly: a record already converged to
+    // its full risk (e.g. detectFills bumped it to `filled` earlier this run), now soft-cancelled in state, and
+    // the soft-cancel probe returns the SAME cumulative → second pass sees `apiFilled <= local` → no-op.
+    const alreadyConverged = commitmentRecord({ hash: '0xsc', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '250000', filledRiskWei6: '250000', lifecycle: 'softCancelled', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 5, updatedAtUnixSec: T0 - 5 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xsc': alreadyConverged } });
+    const config = cfg({ mode: { dryRun: false } });
+    const apiSameCumulative: Commitment = orderbookEntry({ commitmentHash: '0xsc', maker: DEFAULT_FAKE_MAKER_ADDRESS, contestId: '1234', positionType: 1, oddsTick: 200, riskAmount: '250000', filledRiskAmount: '250000', remainingRiskAmount: '0', status: 'cancelled', isLive: false });
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]), undefined, undefined, undefined,
+      { getCommitment: (h) => (h === '0xsc' ? Promise.resolve(apiSameCumulative) : Promise.reject(new Error('unknown hash'))) },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    const reloaded = StateStore.at(stateDir).load().state;
+    expect(reloaded.commitments['0xsc']?.filledRiskWei6).toBe('250000'); // still risk — not doubled to 500000
+    expect(readEvents().some((e) => e.kind === 'fill')).toBe(false); // already at the cumulative → no second fill emitted
+  });
+
+  it('a `getCommitment` probe failure for a softCancelled record fails closed — the step returns false / the tick skips reconcile + ageOut, the record is PRESERVED softCancelled (not aged out, not zeroed), `error` SoftCancelledProbeFailed emitted', async () => {
+    // The stale signed payload could have matched on chain at any moment; a probe failure must NOT be read as
+    // "unfilled/resolved" or let ageOut terminalize the record. Past-local-expiry (so ageOut WOULD otherwise
+    // expire it) makes the fail-closed bite — the record must stay softCancelled, not become `expired`.
+    const stale = commitmentRecord({ hash: '0xsc', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '250000', filledRiskWei6: '0', lifecycle: 'softCancelled', expiryUnixSec: T0 - 1, postedAtUnixSec: T0 - 100, updatedAtUnixSec: T0 - 100 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xsc': stale } });
+    const config = cfg({ mode: { dryRun: false } });
+    const submit = submitRecorder();
+    const adapter = liveSpiedAdapter(
+      config,
+      () => Promise.resolve([contestView({ contestId: '1234' })]),
+      { submitCommitment: submit.fn },
+      undefined,
+      undefined,
+      { getCommitment: () => Promise.reject(new Error('commitment API 503')) },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    const reloaded = StateStore.at(stateDir).load().state;
+    expect(reloaded.commitments['0xsc']?.lifecycle).toBe('softCancelled'); // PRESERVED — ageOut skipped, not terminalized to `expired`
+    expect(reloaded.commitments['0xsc']?.filledRiskWei6).toBe('0'); // not zeroed / not mutated
+    const events = readEvents();
+    expect(events.find((e) => e.kind === 'error' && e.class === 'SoftCancelledProbeFailed')).toMatchObject({ commitmentHash: '0xsc', phase: 'softcancel-recovery', detail: 'commitment API 503' });
+    expect(submit.calls).toHaveLength(0); // reconcile skipped — no replacement quotes on unverified exposure
+    expect(events.some((e) => e.kind === 'expire')).toBe(false); // ageOut did not run
+  });
+
+  it('the soft-cancel path does NOT extend the position aggregate (decoupled from pollPositionStatus, which owns position convergence — no double-count)', async () => {
+    // A softCancelled commitment that converges to `filled` here, with a pre-existing position record on the
+    // same (speculationId, side). The position poll reports the SAME aggregate the position already holds (a
+    // no-op for the poll); the soft-cancel step converges the commitment but must leave the position untouched.
+    const softCancelled = commitmentRecord({ hash: '0xsc', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '250000', filledRiskWei6: '0', lifecycle: 'softCancelled', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 5, updatedAtUnixSec: T0 - 5 });
+    StateStore.at(stateDir).flush({
+      ...emptyMakerState(),
+      commitments: { '0xsc': softCancelled },
+      positions: {
+        'spec-1234:home': { speculationId: 'spec-1234', contestId: '1234', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', side: 'home', riskAmountWei6: '250000', counterpartyRiskWei6: '250000', status: 'active', updatedAtUnixSec: T0 - 5 },
+      },
+    });
+    const config = cfg({ mode: { dryRun: false } });
+    const apiFilled: Commitment = orderbookEntry({ commitmentHash: '0xsc', maker: DEFAULT_FAKE_MAKER_ADDRESS, contestId: '1234', positionType: 1, oddsTick: 200, riskAmount: '250000', filledRiskAmount: '250000', remainingRiskAmount: '0', status: 'cancelled', isLive: false });
+    // The position poll reports the position at its existing aggregate (0.25 USDC = 250000 wei6) → poll no-ops.
+    const withPos: PositionStatus = {
+      active: [{ positionId: '0xpos', speculationId: 'spec-1234', positionType: 1, team: 'X', opponent: 'Y', market: 'moneyline', oddsDecimal: null, riskAmountUSDC: 0.25, profitAmountUSDC: 0.25 }],
+      pendingSettle: [], claimable: [],
+      totals: { activeCount: 1, pendingSettleCount: 0, claimableCount: 0, estimatedPayoutUSDC: 0, estimatedPayoutWei6: '0', pendingSettlePayoutUSDC: 0, pendingSettlePayoutWei6: '0' },
+    };
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]), undefined, undefined, undefined,
+      { getPositionStatus: () => Promise.resolve(withPos), getCommitment: (h) => (h === '0xsc' ? Promise.resolve(apiFilled) : Promise.reject(new Error('unknown hash'))) },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    const reloaded = StateStore.at(stateDir).load().state;
+    // The position aggregate is UNCHANGED — the soft-cancel step never extended it (no 500000 double-count).
+    expect(reloaded.positions['spec-1234:home']?.riskAmountWei6).toBe('250000');
+    expect(reloaded.positions['spec-1234:home']?.counterpartyRiskWei6).toBe('250000');
+    // The commitment converged.
+    expect(reloaded.commitments['0xsc']?.lifecycle).toBe('filled');
+    expect(reloaded.commitments['0xsc']?.filledRiskWei6).toBe('250000');
+    // Exactly one fill — the soft-cancel recovery; the position-poll no-op'd (already caught up).
+    const fills = readEvents().filter((e) => e.kind === 'fill');
+    expect(fills).toHaveLength(1);
+    expect(fills[0]).toMatchObject({ source: 'softcancel-recovery' });
+  });
+});
+
 describe('Runner — fail-closed on lost fill visibility (review-PR23 B3)', () => {
   it('live mode: a `listOpenCommitments` failure SKIPS reconcile (no live writes) and ageOut (no terminalization on unverified fill state); the market stays dirty for next-tick retry', async () => {
     // Without the fail-closed fix, the runner would proceed to reconcile on a tracked-quoteable market
@@ -1974,16 +2195,21 @@ describe('Runner — position-status poll (review-PR23 B4)', () => {
     };
   }
 
-  it('a position the API reports but local state is missing → `MakerPositionRecord` created + `fill` event (source: position-poll). Context (contestId, sport, teams) is copied from the matching local commitment.', async () => {
+  it('a position the API reports but local state is missing → `MakerPositionRecord` created + `fill` event (source: position-poll). Context (contestId, sport, teams) is copied from the matching local commitment. The same soft-cancelled commitment ALSO converges via the soft-cancelled-fill step (its own `getCommitment` probe) — distinct telemetry, no double-counted position.', async () => {
     // Setup: a soft-cancelled commitment (a quote we pulled off-chain). A taker matched it via the
     // stale signed payload before expiry → the chain has a position the commitment-list diff can't see.
-    // The position poll catches it.
+    // The position poll catches the POSITION; the soft-cancelled-fill step catches the COMMITMENT
+    // (probing its authoritative cumulative fill via getCommitment) — the two paths are decoupled, so
+    // the position is recorded exactly once (the poll) and the commitment record converges exactly once
+    // (the new step) without double-counting.
     const softCancelled = commitmentRecord({ hash: '0xstaleSignedPayload', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '250000', lifecycle: 'softCancelled', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 5, updatedAtUnixSec: T0 - 5 });
     StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xstaleSignedPayload': softCancelled } });
     const config = cfg({ mode: { dryRun: false } });
+    // The on-chain match fully filled the commitment → cumulative filledRiskAmount equals its risk.
+    const apiFilled: Commitment = orderbookEntry({ commitmentHash: '0xstaleSignedPayload', maker: DEFAULT_FAKE_MAKER_ADDRESS, contestId: '1234', positionType: 1, oddsTick: 200, riskAmount: '250000', filledRiskAmount: '250000', remainingRiskAmount: '0', status: 'cancelled', isLive: false });
     const adapter = liveSpiedAdapter(
       config, () => Promise.resolve([]), undefined, undefined, undefined,
-      { getPositionStatus: () => Promise.resolve(withActivePosition('spec-1234', 1 /* home */, 0.25, 0.25)) },
+      { getPositionStatus: () => Promise.resolve(withActivePosition('spec-1234', 1 /* home */, 0.25, 0.25)), getCommitment: (h) => (h === '0xstaleSignedPayload' ? Promise.resolve(apiFilled) : Promise.reject(new Error('unknown hash'))) },
     );
     await makeRunner({ config, adapter, maxTicks: 1 }).run();
 
@@ -1991,13 +2217,18 @@ describe('Runner — position-status poll (review-PR23 B4)', () => {
     expect(reloaded.positions['spec-1234:home']).toMatchObject({
       speculationId: 'spec-1234', contestId: '1234', side: 'home',
       sport: softCancelled.sport, awayTeam: softCancelled.awayTeam, homeTeam: softCancelled.homeTeam, // copied from the source commitment
-      riskAmountWei6: '250000', counterpartyRiskWei6: '250000', // 0.25 USDC × 1e6
+      riskAmountWei6: '250000', counterpartyRiskWei6: '250000', // 0.25 USDC × 1e6 — counted ONCE (the poll), not double-counted by the new step
       status: 'active',
     });
-    expect(reloaded.commitments['0xstaleSignedPayload']?.lifecycle).toBe('softCancelled'); // commitment record untouched (we can't attribute the fill to a specific commitment, and the soft-cancelled risk + position will reconcile naturally once ageOut terminalizes)
+    // The commitment now converges from its authoritative cumulative fill — no longer stranded softCancelled.
+    expect(reloaded.commitments['0xstaleSignedPayload']?.lifecycle).toBe('filled');
+    expect(reloaded.commitments['0xstaleSignedPayload']?.filledRiskWei6).toBe('250000');
     const fills = readEvents().filter((e) => e.kind === 'fill');
-    expect(fills).toHaveLength(1);
-    expect(fills[0]).toMatchObject({ source: 'position-poll', speculationId: 'spec-1234', makerSide: 'home', positionType: 1, newFillWei6: '250000', cumulativeRiskWei6: '250000' });
+    // Two fills, one per path — the position-poll (the position) and the soft-cancel recovery (the commitment).
+    expect(fills.filter((e) => e.source === 'position-poll')).toHaveLength(1);
+    expect(fills.find((e) => e.source === 'position-poll')).toMatchObject({ speculationId: 'spec-1234', makerSide: 'home', positionType: 1, newFillWei6: '250000', cumulativeRiskWei6: '250000' });
+    expect(fills.filter((e) => e.source === 'softcancel-recovery')).toHaveLength(1);
+    expect(fills.find((e) => e.source === 'softcancel-recovery')).toMatchObject({ commitmentHash: '0xstaleSignedPayload', speculationId: 'spec-1234', makerSide: 'home', positionType: 1, newFillWei6: '250000', filledRiskWei6: '250000', partial: false });
   });
 
   it('a `getPositionStatus` response that matches local state is a no-op (idempotent — no `fill` event, no position update on subsequent ticks)', async () => {
@@ -2204,15 +2435,20 @@ describe('Runner — position-status transitions (Phase 3 c-ii)', () => {
     const softCancelled = commitmentRecord({ hash: '0xstale', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, lifecycle: 'softCancelled', riskAmountWei6: '250000' });
     StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xstale': softCancelled } });
     const config = cfg({ mode: { dryRun: false } });
+    // The same stale-payload match the poll surfaces also converges the commitment via the
+    // soft-cancelled-fill step (its own getCommitment probe → cumulative fill == risk → `filled`),
+    // which emits its own `fill` (source: softcancel-recovery). This test is about the POSITION
+    // birth path, so it asserts on the position-poll fill specifically (and the absence of a transition).
+    const apiFilled: Commitment = orderbookEntry({ commitmentHash: '0xstale', maker: DEFAULT_FAKE_MAKER_ADDRESS, contestId: '1234', positionType: 1, oddsTick: 200, riskAmount: '250000', filledRiskAmount: '250000', remainingRiskAmount: '0', status: 'cancelled', isLive: false });
     const adapter = liveSpiedAdapter(
       config, () => Promise.resolve([]), undefined, undefined, undefined,
-      { getPositionStatus: () => Promise.resolve(withClaimablePosition('spec-1234', 1, 0.25, 0.25, 'won')) },
+      { getPositionStatus: () => Promise.resolve(withClaimablePosition('spec-1234', 1, 0.25, 0.25, 'won')), getCommitment: (h) => (h === '0xstale' ? Promise.resolve(apiFilled) : Promise.reject(new Error('unknown hash'))) },
     );
     await makeRunner({ config, adapter, maxTicks: 1 }).run();
 
     expect(StateStore.at(stateDir).load().state.positions['spec-1234:home']).toMatchObject({ status: 'claimable', riskAmountWei6: '250000', counterpartyRiskWei6: '250000' });
     const events = readEvents();
-    expect(events.filter((e) => e.kind === 'fill')).toHaveLength(1);
+    expect(events.filter((e) => e.kind === 'fill' && e.source === 'position-poll')).toHaveLength(1); // the position's birth — counted once
     expect(events.some((e) => e.kind === 'position-transition')).toBe(false);
   });
 
@@ -3266,7 +3502,21 @@ describe('Runner — cancelMode: onchain (D2 — authoritative cancel of retaine
       submitCommitment: submitRecorder().fn,
       cancelCommitmentOffchain: () => Promise.resolve(),
       cancelCommitmentOnchain: () => { attempts += 1; return Promise.reject(new Error('RPC down')); },
-    });
+    }, undefined, undefined,
+      // The visibleOpen quote tick 1 posts (hash `0xlive1`) gets pulled off-chain on tick 2 →
+      // it becomes a softCancelled record. The soft-cancelled-fill convergence step probes it
+      // via getCommitment on tick 3; a pulled-but-unmatched quote has filledRiskAmount '0', so
+      // the probe succeeds + no-ops (stays softCancelled) and the reconcile proceeds — this
+      // test is about the on-chain-cancel retry cadence, not about a fill. We return an
+      // unmatched-and-still-`open` shape (filledRiskAmount '0', future expiry, not nonce-
+      // invalidated): on tick 2 detectFills sees it disappear from the listing but, since it's
+      // a future-expiry open row, leaves the record untouched (so the reconcile can pull it →
+      // softCancelled); on tick 3 the convergence step reads cumulative fill '0' and no-ops.
+      // The retained partial `0xpart` keeps the default (reject): it's future-expiry, so a
+      // detectFills lookup failure on it is non-fatal and leaves it `partiallyFilled` (the
+      // precondition the gate needs).
+      { getCommitment: (h) => (h === '0xpart' ? Promise.reject(new Error('not stubbed for the partial')) : Promise.resolve(orderbookEntry({ commitmentHash: h, maker: DEFAULT_FAKE_MAKER_ADDRESS, riskAmount: '500000', filledRiskAmount: '0', remainingRiskAmount: '500000', status: 'open', nonceInvalidated: false, expiry: new Date((T0 + 1000) * 1000).toISOString() }))) },
+    );
     // Advance the clock ~40s per inter-tick sleep: tick 1 quoteable, ticks 2-3 start-too-soon, and by tick 3 the
     // elapsed (80s) is still < staleAfterSeconds (90s), so the OLD code's cadence throttle would have blocked the retry.
     await makeRunner({ config, adapter, maxTicks: 3, deps: { now: () => clock, sleep: () => { clock += 40; return Promise.resolve(); } } }).run();

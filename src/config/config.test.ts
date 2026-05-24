@@ -30,6 +30,7 @@ describe('parseConfig', () => {
     expect(c.approvals.autoApprove).toBe(false);
     expect(c.approvals.mode).toBe('exact');
     expect(c.orders.expiryMode).toBe('fixed-seconds');
+    expect(c.orders.expiryReleaseGraceSeconds).toBe(60);
     expect(c.orders.cancelMode).toBe('offchain');
     expect(c.settlement.autoSettleOwn).toBe(true);
     expect(c.telemetry.logLevel).toBe('info');

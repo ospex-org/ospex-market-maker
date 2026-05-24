@@ -1660,11 +1660,12 @@ describe('Runner — fill detection', () => {
     expect(events.some((e) => e.kind === 'fill')).toBe(false);
   });
 
-  it('a disappeared commitment whose API status is `cancelled` → record reclassified `authoritativelyInvalidated`, no event', async () => {
+  it('a disappeared commitment that is TRULY on-chain-cancelled (storedStatus `cancelled`) → record reclassified `authoritativelyInvalidated`, no event', async () => {
     const record = commitmentRecord({ hash: '0xcancelled', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 1 });
     StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xcancelled': record } });
     const config = cfg({ mode: { dryRun: false } });
-    const apiCancelled: Commitment = orderbookEntry({ commitmentHash: '0xcancelled', maker: DEFAULT_FAKE_MAKER_ADDRESS, status: 'cancelled', isLive: false });
+    // A TRUE on-chain cancel: storedStatus 'cancelled' (NOT merely book-hidden, which would also report effective status 'cancelled' but keep storedStatus open/partially_filled).
+    const apiCancelled: Commitment = orderbookEntry({ commitmentHash: '0xcancelled', maker: DEFAULT_FAKE_MAKER_ADDRESS, status: 'cancelled', storedStatus: 'cancelled', isLive: false });
     const adapter = liveSpiedAdapter(
       config, () => Promise.resolve([]), undefined, undefined, undefined,
       { listOpenCommitments: () => Promise.resolve([]), getCommitment: () => Promise.resolve(apiCancelled) },
@@ -1673,6 +1674,49 @@ describe('Runner — fill detection', () => {
 
     const reloaded = StateStore.at(stateDir).load().state;
     expect(reloaded.commitments['0xcancelled']?.lifecycle).toBe('authoritativelyInvalidated');
+    expect(readEvents().some((e) => e.kind === 'fill' || e.kind === 'expire')).toBe(false);
+  });
+
+  it('a disappeared commitment that is merely BOOK-HIDDEN (effective `cancelled`, but storedStatus `partially_filled`, not nonce-invalidated) → reclassified `softCancelled` (NOT released), the fill converged commitment-only, latent remainder preserved (Hermes review-2)', async () => {
+    // Post-book-visibility-split, a hidden row (book_visible=false) reports effective status
+    // 'cancelled' while its signed payload stays matchable on chain. detectFills must NOT read
+    // that as an authoritative invalidation and release the headroom — it must classify off
+    // storedStatus/nonceInvalidated and hand the row to reconcileSoftCancelledFills.
+    const record = commitmentRecord({ hash: '0xhidden', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '500000', filledRiskWei6: '0', lifecycle: 'partiallyFilled', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 5 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xhidden': record } });
+    const config = cfg({ mode: { dryRun: false } });
+    // Effective 'cancelled' (book-hidden), but storedStatus 'partially_filled' + not nonce-invalidated + a cumulative on-chain fill of 200000 (< risk 500000).
+    const apiHidden: Commitment = orderbookEntry({ commitmentHash: '0xhidden', maker: DEFAULT_FAKE_MAKER_ADDRESS, contestId: '1234', positionType: 1, oddsTick: 200, riskAmount: '500000', filledRiskAmount: '200000', remainingRiskAmount: '300000', status: 'cancelled', storedStatus: 'partially_filled', nonceInvalidated: false, isLive: false });
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]), undefined, undefined, undefined,
+      { listOpenCommitments: () => Promise.resolve([]), getCommitment: (h) => (h === '0xhidden' ? Promise.resolve(apiHidden) : Promise.reject(new Error('unknown hash'))) },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    const reloaded = StateStore.at(stateDir).load().state;
+    expect(reloaded.commitments['0xhidden']?.lifecycle).toBe('softCancelled'); // NOT authoritativelyInvalidated — the remainder is still matchable on chain
+    expect(reloaded.commitments['0xhidden']?.filledRiskWei6).toBe('200000'); // the observed fill converged commitment-only
+    expect(reloaded.positions['spec-1234:home']).toBeUndefined(); // NO position created — pollPositionStatus owns positions (no double-count)
+    const fills = readEvents().filter((e) => e.kind === 'fill');
+    expect(fills).toHaveLength(1);
+    expect(fills[0]).toMatchObject({ source: 'softcancel-recovery', commitmentHash: '0xhidden', newFillWei6: '200000', filledRiskWei6: '200000', partial: true });
+  });
+
+  it('a disappeared commitment reported effective `cancelled` AND nonce-invalidated (storedStatus still `open`) → released `authoritativelyInvalidated` (a nonce-floor raise IS authoritative, even when storedStatus isn\'t `cancelled`)', async () => {
+    // Under the current effective-status core-api a nonce-invalidated commitment reports effective
+    // status 'cancelled'; the canonical signal is `nonceInvalidated`, which must still release.
+    const record = commitmentRecord({ hash: '0xnonce', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '250000', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 1 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xnonce': record } });
+    const config = cfg({ mode: { dryRun: false } });
+    const apiNonce: Commitment = orderbookEntry({ commitmentHash: '0xnonce', maker: DEFAULT_FAKE_MAKER_ADDRESS, status: 'cancelled', storedStatus: 'open', nonceInvalidated: true, isLive: false });
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]), undefined, undefined, undefined,
+      { listOpenCommitments: () => Promise.resolve([]), getCommitment: (h) => (h === '0xnonce' ? Promise.resolve(apiNonce) : Promise.reject(new Error('unknown hash'))) },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    const reloaded = StateStore.at(stateDir).load().state;
+    expect(reloaded.commitments['0xnonce']?.lifecycle).toBe('authoritativelyInvalidated'); // nonce floor raised → headroom released
     expect(readEvents().some((e) => e.kind === 'fill' || e.kind === 'expire')).toBe(false);
   });
 
@@ -1901,11 +1945,11 @@ describe('Runner — fill detection — past-local-expiry classification (review
     expect(events.find((e) => e.kind === 'expire' && e.commitmentHash === '0xpartialThenExpired')).toBeDefined(); // expire still fires (the terminal status was 'expired')
   });
 
-  it('a disappeared `cancelled` API status with prior unobserved filledRiskAmount applies the partial fill BEFORE terminalizing', async () => {
+  it('a disappeared TRULY-cancelled (storedStatus `cancelled`) commitment with prior unobserved filledRiskAmount applies the partial fill BEFORE terminalizing', async () => {
     const record = commitmentRecord({ hash: '0xpartialThenCancelled', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '500000', lifecycle: 'visibleOpen', filledRiskWei6: '0', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 5 });
     StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xpartialThenCancelled': record } });
     const config = cfg({ mode: { dryRun: false } });
-    const apiCancelled: Commitment = orderbookEntry({ commitmentHash: '0xpartialThenCancelled', maker: DEFAULT_FAKE_MAKER_ADDRESS, contestId: '1234', positionType: 1, oddsTick: 200, riskAmount: '500000', filledRiskAmount: '100000', remainingRiskAmount: '400000', status: 'cancelled', isLive: false });
+    const apiCancelled: Commitment = orderbookEntry({ commitmentHash: '0xpartialThenCancelled', maker: DEFAULT_FAKE_MAKER_ADDRESS, contestId: '1234', positionType: 1, oddsTick: 200, riskAmount: '500000', filledRiskAmount: '100000', remainingRiskAmount: '400000', status: 'cancelled', storedStatus: 'cancelled', isLive: false });
     const adapter = liveSpiedAdapter(
       config, () => Promise.resolve([]), undefined, undefined, undefined,
       { listOpenCommitments: () => Promise.resolve([]), getCommitment: () => Promise.resolve(apiCancelled) },
@@ -1957,12 +2001,12 @@ describe('Runner — soft-cancelled-fill convergence', () => {
     expect(readEvents().some((e) => e.kind === 'fill')).toBe(false); // no fill event
   });
 
-  it('a softCancelled record with a partial cumulative fill (0 < filled < risk) → filledRiskWei6 updated, lifecycle `partiallyFilled`, market dirtied + same-tick reconcile re-prices, `fill` event {source: softcancel-recovery}, NO position mutation', async () => {
+  it('a softCancelled record with a partial cumulative fill (0 < filled < risk) → filledRiskWei6 updated, lifecycle STAYS `softCancelled` (still book-hidden + matchable, just partially matched), market dirtied + same-tick reconcile re-prices, `fill` event {source: softcancel-recovery, partial: true}, NO position mutation', async () => {
     // Tracked market (discovery) so the convergence can dirty it and the same tick's reconcile re-prices.
     const softCancelled = commitmentRecord({ hash: '0xsc', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '500000', filledRiskWei6: '0', lifecycle: 'softCancelled', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 5, updatedAtUnixSec: T0 - 5 });
     StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xsc': softCancelled } });
     const config = cfg({ mode: { dryRun: false }, odds: { subscribe: false } });
-    // Cumulative on-chain fill of 200000 (< risk 500000) → partiallyFilled.
+    // Cumulative on-chain fill of 200000 (< risk 500000) → stays softCancelled; the risk engine counts the 300000 remainder.
     const apiPartial: Commitment = orderbookEntry({ commitmentHash: '0xsc', maker: DEFAULT_FAKE_MAKER_ADDRESS, contestId: '1234', positionType: 1, oddsTick: 200, riskAmount: '500000', filledRiskAmount: '200000', remainingRiskAmount: '300000', status: 'cancelled', isLive: false });
     const submit = submitRecorder();
     const adapter = liveSpiedAdapter(
@@ -1976,7 +2020,7 @@ describe('Runner — soft-cancelled-fill convergence', () => {
     await makeRunner({ config, adapter, maxTicks: 1 }).run();
 
     const reloaded = StateStore.at(stateDir).load().state;
-    expect(reloaded.commitments['0xsc']?.lifecycle).toBe('partiallyFilled');
+    expect(reloaded.commitments['0xsc']?.lifecycle).toBe('softCancelled'); // STAYS softCancelled — a partial fill does not promote a book-hidden row into the visible set
     expect(reloaded.commitments['0xsc']?.filledRiskWei6).toBe('200000');
     expect(reloaded.commitments['0xsc']?.updatedAtUnixSec).toBe(T0);
     expect(reloaded.positions['spec-1234:home']).toBeUndefined(); // NO position created by this path — pollPositionStatus owns positions
@@ -2140,6 +2184,33 @@ describe('Runner — soft-cancelled-fill convergence', () => {
     const fills = readEvents().filter((e) => e.kind === 'fill');
     expect(fills).toHaveLength(1);
     expect(fills[0]).toMatchObject({ source: 'softcancel-recovery' });
+  });
+
+  it('TWO TICKS: a softCancelled record recovered to a PARTIAL fill STAYS softCancelled on the next tick — never released to authoritativelyInvalidated, latent remainder preserved (Hermes review-2 regression)', async () => {
+    // The blocker Hermes caught: tick 1 recovers the hidden soft-cancelled commitment; if recovery
+    // promoted it to `partiallyFilled`, tick 2's detectFills would include it in localOpen, fail to
+    // find it in the (book-filtered) listOpenCommitments, take the disappeared-hash path, read its
+    // effective `cancelled` status, and wrongly release the still-matchable remainder. Keeping it
+    // `softCancelled` (owned by reconcileSoftCancelledFills, never in detectFills's visible set) is
+    // the invariant under test. Run two ticks against the SAME hidden partial cumulative.
+    const softCancelled = commitmentRecord({ hash: '0xsc', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '500000', filledRiskWei6: '0', lifecycle: 'softCancelled', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 5, updatedAtUnixSec: T0 - 5 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xsc': softCancelled } });
+    const config = cfg({ mode: { dryRun: false } });
+    // Hidden partial cumulative, identical on both ticks: effective 'cancelled', storedStatus 'partially_filled', fill 200000 < risk 500000.
+    const apiPartialHidden: Commitment = orderbookEntry({ commitmentHash: '0xsc', maker: DEFAULT_FAKE_MAKER_ADDRESS, contestId: '1234', positionType: 1, oddsTick: 200, riskAmount: '500000', filledRiskAmount: '200000', remainingRiskAmount: '300000', status: 'cancelled', storedStatus: 'partially_filled', isLive: false });
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]), undefined, undefined, undefined,
+      { listOpenCommitments: () => Promise.resolve([]), getCommitment: (h) => (h === '0xsc' ? Promise.resolve(apiPartialHidden) : Promise.reject(new Error('unknown hash'))) },
+    );
+    await makeRunner({ config, adapter, maxTicks: 2 }).run();
+
+    const reloaded = StateStore.at(stateDir).load().state;
+    expect(reloaded.commitments['0xsc']?.lifecycle).toBe('softCancelled'); // after the 2nd tick — NOT authoritativelyInvalidated (the pre-fix bug)
+    expect(reloaded.commitments['0xsc']?.filledRiskWei6).toBe('200000'); // remainder (300000) still counted toward latent exposure
+    // The recovery fired once (tick 1); tick 2 saw the same cumulative → no second fill, and detectFills never touched the softCancelled record.
+    const fills = readEvents().filter((e) => e.kind === 'fill');
+    expect(fills).toHaveLength(1);
+    expect(fills[0]).toMatchObject({ source: 'softcancel-recovery', filledRiskWei6: '200000', partial: true });
   });
 });
 

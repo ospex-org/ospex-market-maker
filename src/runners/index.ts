@@ -1605,9 +1605,14 @@ export class Runner {
    *     - `filled` → record `'filled'`, fill delta applied, `fill` `{ partial: false }`.
    *     - `expired` → fill delta applied (if any), record `'expired'`, then `expire`
    *       (matches `ageOut`'s payload). `ageOut` skips already-`expired` records next tick.
-   *     - `cancelled` → fill delta applied (if any), record `'authoritativelyInvalidated'`.
-   *       No `expire` (v0's MM doesn't on-chain-cancel its own commitments — manual
-   *       cancel between runs / outside the MM, which the operator already knows about).
+   *     - `cancelled` (effective) → classify off CANONICAL signals, not the effective
+   *       status (a merely book-hidden row reports `cancelled` too): `storedStatus ===
+   *       'cancelled'` or `nonceInvalidated` → fill delta applied (if any), record
+   *       `'authoritativelyInvalidated'` (no `expire` — v0's MM doesn't on-chain-cancel its
+   *       own commitments; manual cancel between runs / outside the MM). Otherwise the row is
+   *       just book-hidden (`book_visible=false`, still matchable on chain) → reclassify
+   *       `'softCancelled'` + converge the fill commitment-only; the latent remainder is NOT
+   *       released, and `reconcileSoftCancelledFills` owns it thereafter (Hermes review-2).
    *     - any other status (`open` / `partially_filled`, only reachable against a
    *       core-api predating effective-status, where an expired/invalidated row
    *       leaves the listing but get-by-hash still reports the raw status) →
@@ -1728,7 +1733,27 @@ export class Runner {
           break;
         }
         case 'cancelled': {
-          this.applyFill(record, delta, now, 'authoritativelyInvalidated');
+          // Effective `cancelled` is AMBIGUOUS post-book-visibility-split — classify off the
+          // CANONICAL signals, never the effective `status`. A true on-chain cancel
+          // (`storedStatus === 'cancelled'`) or a nonce-floor raise (`nonceInvalidated`) is
+          // authoritatively dead → release headroom. Otherwise the row is merely book-hidden
+          // (`book_visible=false`, `storedStatus` still `open`/`partially_filled`): the signed
+          // payload is STILL matchable on chain, so the latent remainder must NOT be released.
+          // Reclassify `softCancelled` (handing ownership to `reconcileSoftCancelledFills`) and
+          // converge the cumulative fill commitment-only — `applyFill`'s position bump would
+          // double-count `pollPositionStatus`'s aggregate convergence. Hermes review-2.
+          if (apiCommitment.storedStatus === 'cancelled' || apiCommitment.nonceInvalidated) {
+            this.applyFill(record, delta, now, 'authoritativelyInvalidated');
+          } else {
+            this.convergeCommitmentFilledRiskFromCumulative(record, apiFilled, now);
+            if (record.lifecycle !== 'softCancelled' && record.lifecycle !== 'filled') {
+              // No new fill (converge early-returned without reclassifying) — still flip the
+              // record out of the `visibleOpen`/`partiallyFilled` set so the next tick's
+              // `detectFills` doesn't re-trap this always-"disappeared" hidden row.
+              record.lifecycle = 'softCancelled';
+              record.updatedAtUnixSec = now;
+            }
+          }
           break;
         }
         default: {
@@ -1863,8 +1888,9 @@ export class Runner {
    *
    * **Status is NOT consulted.** A hidden row presents effective status `'cancelled'`
    * for backward-compat — that is *not* what we use. The lifecycle is derived purely
-   * from the (clamped) cumulative fill: `0` → stays `softCancelled`; `0 < f < risk` →
-   * `partiallyFilled`; `f >= risk` → `filled`.
+   * from the (clamped) cumulative fill: `f < risk` → stays `softCancelled` (still
+   * book-hidden + matchable on chain, just partially matched — `reconcileSoftCancelledFills`
+   * keeps owning it, and the risk engine counts the remainder); `f >= risk` → `filled`.
    *
    * **Fail-closed.** If `getCommitment(hash)` throws — a network error, or a 404 for a
    * still-matchable signed payload — we must NOT treat the record as resolved /
@@ -1914,8 +1940,8 @@ export class Runner {
    * because the state validator rejects `filledRiskWei6 > riskAmountWei6`; an
    * over-fill (API cumulative above risk, which shouldn't happen on chain) is clamped
    * and flagged via an `error` (`class: 'SoftCancelledOverFillClamp'`). The lifecycle
-   * is reclassified from the CLAMPED amount (`0` → `softCancelled`; `0 < f < risk` →
-   * `partiallyFilled`; `f >= risk` → `filled`), the tracked market is dirtied so the
+   * is reclassified from the CLAMPED amount (`f < risk` → stays `softCancelled`; `f >= risk`
+   * → `filled`), the tracked market is dirtied so the
    * same tick's reconcile re-prices the imbalance (matching `applyFill`), and a `fill`
    * event with a distinct `source: 'softcancel-recovery'` (same shape as `applyFill`'s)
    * is emitted.
@@ -1938,8 +1964,16 @@ export class Runner {
     const clamped = apiCumulativeWei6 > risk ? risk : apiCumulativeWei6;
     const newFill = clamped - localFilled; // > 0 (guarded above) unless localFilled already exceeds clamp, which the `<=` guard ruled out
     record.filledRiskWei6 = clamped.toString();
-    // Lifecycle from the CLAMPED amount — never from API status. `clamped > 0` here.
-    const finalLifecycle: CommitmentLifecycle = clamped >= risk ? 'filled' : 'partiallyFilled';
+    // Lifecycle from the CLAMPED amount — never from API status. `clamped > 0` here. A
+    // book-hidden commitment with an unfilled remainder STAYS `softCancelled`: its stale
+    // signed payload is still matchable on chain, so promoting it to `partiallyFilled` would
+    // pull it into `detectFills`'s visible-commitment set — where, being API-hidden, it always
+    // "disappears" from `listOpenCommitments` and the disappeared-hash path reads its effective
+    // `cancelled` status and wrongly releases the latent remainder (Hermes review-2). The risk
+    // engine already counts a `softCancelled` record at its remaining (`risk − filled`), so the
+    // matched portion is dropped from latent exposure without a lifecycle promotion. Only a
+    // FULL fill (nothing left to match) terminalizes it to `filled`.
+    const finalLifecycle: CommitmentLifecycle = clamped >= risk ? 'filled' : 'softCancelled';
     if (record.lifecycle !== finalLifecycle) record.lifecycle = finalLifecycle;
     record.updatedAtUnixSec = now;
     const m = this.trackedMarkets.get(record.contestId);
@@ -1958,7 +1992,7 @@ export class Runner {
       makerOddsTick: record.oddsTick,
       newFillWei6: newFill.toString(),
       filledRiskWei6: record.filledRiskWei6,
-      partial: finalLifecycle === 'partiallyFilled',
+      partial: finalLifecycle !== 'filled', // a not-fully-filled recovery is a partial fill (lifecycle stays `softCancelled`)
     });
   }
 

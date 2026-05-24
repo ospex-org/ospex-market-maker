@@ -274,6 +274,28 @@ describe('runCancelStale — off-chain leg (default, no --authoritative)', () =>
     expect(events.filter((e) => e.kind === 'soft-cancel')).toHaveLength(1);
   });
 
+  it('a RECOVERED soft-cancel (softCancelled with filledRiskWei6 > 0 — soft-cancelled then matched on chain) is skipped off-chain like any softCancelled; lifecycle + the matched portion preserved', async () => {
+    // PR2 keeps a soft-cancel that matched on chain as `softCancelled` with a converged filledRiskWei6 > 0.
+    // cancel-stale must skip it off-chain (it's already off-book, and an off-chain DELETE would 409 on the matched
+    // commitment) and not lose the matched portion. (Every other softCancelled test uses filledRiskWei6 '0'.)
+    seedState([rec('0xrsc', T0 - 200, { lifecycle: 'softCancelled', filledRiskWei6: '60', riskAmountWei6: '100' })]);
+    let captured: OspexAdapter | null = null;
+    const createLiveAdapter = (cfg: Config, signer: Signer): OspexAdapter => {
+      captured = liveAdapter(cfg, signer);
+      return captured;
+    };
+    const report = await runCancelStale(
+      { config: liveConfig(), authoritative: false, ignoreMissingState: false },
+      { ...baseDeps(), createLiveAdapter },
+    );
+    expect(report).toMatchObject({ inspected: 1, offchainCancelled: 0, offchainSkippedAlready: 1, offchainSkippedPartial: 0, errored: 0 });
+    expect(captured!.cancelCommitmentOffchain).not.toHaveBeenCalled(); // already off-book — no DELETE attempted (a matched commitment would 409)
+    const state = StateStore.at(stateDir).load().state;
+    expect(state.commitments['0xrsc']!.lifecycle).toBe('softCancelled'); // unchanged — the latent remainder rides to expiry (or --authoritative)
+    expect(state.commitments['0xrsc']!.filledRiskWei6).toBe('60'); // the matched portion is preserved (untouched)
+    expect(readEvents('cs-run').filter((e) => e.kind === 'soft-cancel')).toHaveLength(0); // not re-soft-cancelled
+  });
+
   it('stale partiallyFilled records are SKIPPED off-chain (the API rejects a DELETE once matched) — counted in offchainSkippedPartial, lifecycle + filledRiskWei6 preserved', async () => {
     seedState([
       rec('0xpf', T0 - 200, { lifecycle: 'partiallyFilled', filledRiskWei6: '50', riskAmountWei6: '100' }),
@@ -404,6 +426,26 @@ describe('runCancelStale — --authoritative (on-chain leg)', () => {
     expect(captured!.cancelCommitmentOffchain).not.toHaveBeenCalled();
     expect(captured!.cancelCommitmentOnchain).toHaveBeenCalledWith('0xaa');
     expect(StateStore.at(stateDir).load().state.commitments['0xaa']!.lifecycle).toBe('authoritativelyInvalidated');
+  });
+
+  it('--authoritative + a RECOVERED soft-cancel (softCancelled, filledRiskWei6 > 0) → off-chain skipped → on-chain cancel kills the still-matchable remainder → authoritativelyInvalidated; matched portion preserved', async () => {
+    seedState([rec('0xrsc', T0 - 200, { lifecycle: 'softCancelled', filledRiskWei6: '60', riskAmountWei6: '100' })]);
+    let captured: OspexAdapter | null = null;
+    const createLiveAdapter = (cfg: Config, signer: Signer): OspexAdapter => {
+      captured = liveAdapter(cfg, signer);
+      vi.spyOn(captured, 'cancelCommitmentOnchain').mockResolvedValueOnce(onchainOk('0xtx'));
+      return captured;
+    };
+    const report = await runCancelStale(
+      { config: liveConfig(), authoritative: true, ignoreMissingState: false },
+      { ...baseDeps(), createLiveAdapter },
+    );
+    expect(report).toMatchObject({ inspected: 1, offchainCancelled: 0, offchainSkippedAlready: 1, onchainCancelled: 1, errored: 0 });
+    expect(captured!.cancelCommitmentOffchain).not.toHaveBeenCalled(); // already off-book
+    expect(captured!.cancelCommitmentOnchain).toHaveBeenCalledWith('0xrsc'); // authoritative cancel kills the still-matchable remainder
+    const state = StateStore.at(stateDir).load().state;
+    expect(state.commitments['0xrsc']!.lifecycle).toBe('authoritativelyInvalidated');
+    expect(state.commitments['0xrsc']!.filledRiskWei6).toBe('60'); // the matched portion is preserved
   });
 
   it('--authoritative + a stale partiallyFilled record → SKIPPED off-chain (rejected once matched) → on-chain → authoritativelyInvalidated; filledRiskWei6 preserved', async () => {

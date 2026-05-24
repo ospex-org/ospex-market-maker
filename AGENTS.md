@@ -94,7 +94,7 @@ Exits 0 only for `pipeline:'computed' && result.canQuote:true`. See [`src/orders
 interface CancelStaleReport {
   inspected: number;              // total stale records matched
   offchainCancelled: number;
-  offchainSkippedAlready: number; // records already in `softCancelled`; off-chain DELETE skipped
+  offchainSkippedAlready: number; // records already in `softCancelled` (incl. recovered soft-cancels — matched on chain after the pull, filledRiskWei6 > 0); off-chain DELETE skipped — --authoritative kills the latent remainder
   offchainSkippedPartial: number; // `partiallyFilled` records; off-chain DELETE skipped (API 409 once matched) — only --authoritative can cancel them
   onchainCancelled: number;       // 0 unless --authoritative was passed
   gasDenied: number;              // records the gas-budget verdict refused (on-chain leg)

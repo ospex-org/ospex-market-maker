@@ -127,6 +127,16 @@ export interface ApprovalsConfig {
 export interface OrdersConfig {
   expiryMode: ExpiryMode;
   expirySeconds: number;
+  /**
+   * Seconds past a commitment's local `expiryUnixSec` before the MM releases its
+   * accounting headroom / terminalizes it as expired. The contract keeps a commitment
+   * matchable until `block.timestamp >= expiry`, and the MM host / core-api clock can
+   * lead the Polygon block timestamp — so headroom is held for this margin past local
+   * expiry rather than freed (and reposted over) while the signed payload may still
+   * match on chain. Book hygiene still treats a quote as expired at the original expiry;
+   * only headroom release waits for the grace. `0` disables it (release exactly at expiry).
+   */
+  expiryReleaseGraceSeconds: number;
   staleAfterSeconds: number;
   staleReferenceAfterSeconds: number;
   replaceOnOddsMoveBps: number;

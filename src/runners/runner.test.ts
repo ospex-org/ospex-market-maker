@@ -675,9 +675,10 @@ describe('Runner — age-out', () => {
     const state: MakerState = {
       ...emptyMakerState(),
       commitments: {
-        expiredOpen: commitmentRecord({ hash: 'expiredOpen', lifecycle: 'visibleOpen', expiryUnixSec: now - 1 }),
-        expiredSc: commitmentRecord({ hash: 'expiredSc', lifecycle: 'softCancelled', expiryUnixSec: now - 1, makerSide: 'home' }),
-        expiredPartial: commitmentRecord({ hash: 'expiredPartial', lifecycle: 'partiallyFilled', filledRiskWei6: '100000', expiryUnixSec: now - 1 }),
+        // Seeds sit past expiry + the 60s release grace so they're releasable (the grace window itself is covered by the two tests below).
+        expiredOpen: commitmentRecord({ hash: 'expiredOpen', lifecycle: 'visibleOpen', expiryUnixSec: now - 100 }),
+        expiredSc: commitmentRecord({ hash: 'expiredSc', lifecycle: 'softCancelled', expiryUnixSec: now - 100, makerSide: 'home' }),
+        expiredPartial: commitmentRecord({ hash: 'expiredPartial', lifecycle: 'partiallyFilled', filledRiskWei6: '100000', expiryUnixSec: now - 100 }),
         futureOpen: commitmentRecord({ hash: 'futureOpen', lifecycle: 'visibleOpen', expiryUnixSec: now + 50 }),
       },
     };
@@ -693,6 +694,22 @@ describe('Runner — age-out', () => {
 
     const expired = readEvents().filter((e) => e.kind === 'expire');
     expect(expired.map((e) => e.commitmentHash).sort()).toEqual(['expiredOpen', 'expiredPartial', 'expiredSc']);
+  });
+
+  it('does NOT age out a commitment inside the expiry-release grace window', async () => {
+    const now = 1_900_000_000;
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { within: commitmentRecord({ hash: 'within', lifecycle: 'visibleOpen', expiryUnixSec: now - 30 }) } });
+    await makeRunner({ maxTicks: 1, deps: { now: () => now } }).run(); // cfg() default grace 60; 30s past expiry ⇒ held
+    expect(StateStore.at(stateDir).load().state.commitments.within?.lifecycle).toBe('visibleOpen');
+    expect(readEvents().some((e) => e.kind === 'expire')).toBe(false);
+  });
+
+  it('ages out a commitment once it is past expiry + the grace window', async () => {
+    const now = 1_900_000_000;
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { pastGrace: commitmentRecord({ hash: 'pastGrace', lifecycle: 'visibleOpen', expiryUnixSec: now - 61 }) } });
+    await makeRunner({ maxTicks: 1, deps: { now: () => now } }).run(); // 61s past expiry > grace 60 ⇒ released
+    expect(StateStore.at(stateDir).load().state.commitments.pastGrace?.lifecycle).toBe('expired');
+    expect(readEvents().some((e) => e.kind === 'expire' && e.commitmentHash === 'pastGrace')).toBe(true);
   });
 });
 
@@ -1643,7 +1660,7 @@ describe('Runner — fill detection', () => {
   });
 
   it('a disappeared commitment whose API status is `expired` → record reclassified `expired`, an `expire` event (no `fill`)', async () => {
-    const record = commitmentRecord({ hash: '0xexpiry', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 1 });
+    const record = commitmentRecord({ hash: '0xexpiry', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', lifecycle: 'visibleOpen', expiryUnixSec: T0 - 100 /* past expiry + the 60s grace */, postedAtUnixSec: T0 - 200 });
     StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xexpiry': record } });
     const config = cfg({ mode: { dryRun: false } });
     const apiExpired: Commitment = orderbookEntry({ commitmentHash: '0xexpiry', maker: DEFAULT_FAKE_MAKER_ADDRESS, status: 'expired', isLive: false });
@@ -1726,7 +1743,7 @@ describe('Runner — fill detection', () => {
   // detectFills falls back to the record's own expiry + the API nonceInvalidated flag.
 
   it('a disappeared PAST-expiry commitment still reported raw "open" (pre-effective-status API) → terminalized expired, expire event, NO UnexpectedFillStatus', async () => {
-    const record = commitmentRecord({ hash: '0xstaleOpen', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', lifecycle: 'visibleOpen', expiryUnixSec: T0 - 1, postedAtUnixSec: T0 - 100 });
+    const record = commitmentRecord({ hash: '0xstaleOpen', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', lifecycle: 'visibleOpen', expiryUnixSec: T0 - 100 /* past expiry + the 60s grace */, postedAtUnixSec: T0 - 200 });
     StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xstaleOpen': record } });
     const config = cfg({ mode: { dryRun: false } });
     const apiOpen: Commitment = orderbookEntry({ commitmentHash: '0xstaleOpen', maker: DEFAULT_FAKE_MAKER_ADDRESS, status: 'open', isLive: false, expiry: PAST_ISO });
@@ -1822,7 +1839,7 @@ describe('Runner — fill detection', () => {
     // only past-expiry trips the gate.
     // (Numeric contestId so live `submitCommitment`'s `BigInt(contestId)` doesn't throw — the
     // absence of a submit must prove the fail-closed gate worked, not a downstream BigInt error.)
-    const record = commitmentRecord({ hash: '0xpastExpiry', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '250000', lifecycle: 'visibleOpen', expiryUnixSec: T0 - 1, postedAtUnixSec: T0 - 200 });
+    const record = commitmentRecord({ hash: '0xpastExpiry', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '250000', lifecycle: 'visibleOpen', expiryUnixSec: T0 - 100 /* past expiry + the 60s grace */, postedAtUnixSec: T0 - 200 });
     StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xpastExpiry': record } });
     const config = cfg({ mode: { dryRun: false } });
     const submit = submitRecorder();
@@ -1847,7 +1864,7 @@ describe('Runner — fill detection', () => {
 
   it('mixed past-expiry + future-expiry getCommitment failures → still fails closed (the past-expiry one is enough)', async () => {
     // If ANY past-expiry lookup fails, the tick fails closed even if other lookups succeed.
-    const past = commitmentRecord({ hash: '0xpast', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '250000', lifecycle: 'visibleOpen', expiryUnixSec: T0 - 1, postedAtUnixSec: T0 - 200 });
+    const past = commitmentRecord({ hash: '0xpast', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '250000', lifecycle: 'visibleOpen', expiryUnixSec: T0 - 100 /* past expiry + the 60s grace */, postedAtUnixSec: T0 - 200 });
     const future = commitmentRecord({ hash: '0xfuture', speculationId: 'spec-5678', contestId: '5678', makerSide: 'away', oddsTick: 200, riskAmountWei6: '250000', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 1 });
     StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xpast': past, '0xfuture': future } });
     const config = cfg({ mode: { dryRun: false } });
@@ -1924,7 +1941,7 @@ describe('Runner — fill detection — past-local-expiry classification (review
   });
 
   it('a disappeared `expired` API status with prior unobserved filledRiskAmount applies the partial fill BEFORE terminalizing — the position records the matched portion', async () => {
-    const record = commitmentRecord({ hash: '0xpartialThenExpired', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '500000', lifecycle: 'visibleOpen', filledRiskWei6: '0', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 5 });
+    const record = commitmentRecord({ hash: '0xpartialThenExpired', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '500000', lifecycle: 'visibleOpen', filledRiskWei6: '0', expiryUnixSec: T0 - 100 /* past expiry + the 60s grace */, postedAtUnixSec: T0 - 200 });
     StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xpartialThenExpired': record } });
     const config = cfg({ mode: { dryRun: false } });
     // Partial fill of 100000 wei6 landed before the commitment expired — neither was seen locally before now.
@@ -1963,6 +1980,64 @@ describe('Runner — fill detection — past-local-expiry classification (review
     const events = readEvents();
     expect(events.find((e) => e.kind === 'fill' && e.commitmentHash === '0xpartialThenCancelled')).toMatchObject({ partial: false, newFillWei6: '100000' });
     expect(events.some((e) => e.kind === 'expire' && e.commitmentHash === '0xpartialThenCancelled')).toBe(false); // cancelled is not expired
+  });
+});
+
+// ── expiry-release grace margin (interleaving G — host/core-api clock can lead the chain clock) ──
+
+describe('Runner — expiry-release grace', () => {
+  it('a disappeared API `expired` status INSIDE the grace window is held (counted, not terminalized)', async () => {
+    const now = T0;
+    const record = commitmentRecord({ hash: '0xgrace', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '250000', lifecycle: 'visibleOpen', expiryUnixSec: now - 30 /* 30s past expiry, inside the 60s grace */, postedAtUnixSec: now - 200 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xgrace': record } });
+    const config = cfg({ mode: { dryRun: false } }); // grace default 60
+    const apiExpired: Commitment = orderbookEntry({ commitmentHash: '0xgrace', maker: DEFAULT_FAKE_MAKER_ADDRESS, contestId: '1234', positionType: 1, oddsTick: 200, riskAmount: '250000', filledRiskAmount: '0', remainingRiskAmount: '250000', status: 'expired', isLive: false });
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([]), undefined, undefined, undefined, { listOpenCommitments: () => Promise.resolve([]), getCommitment: () => Promise.resolve(apiExpired) });
+    await makeRunner({ config, adapter, maxTicks: 1, deps: { now: () => now } }).run();
+
+    const reloaded = StateStore.at(stateDir).load().state;
+    expect(reloaded.commitments['0xgrace']?.lifecycle).toBe('visibleOpen'); // 30s past expiry < grace 60 ⇒ may still match on chain ⇒ held + counted
+    expect(readEvents().some((e) => e.kind === 'expire')).toBe(false);
+  });
+
+  it('a disappeared API `expired` status with a FULL cumulative fill becomes `filled` even inside the grace window (authoritative full fill wins)', async () => {
+    const now = T0;
+    const record = commitmentRecord({ hash: '0xgracefull', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '250000', filledRiskWei6: '0', lifecycle: 'visibleOpen', expiryUnixSec: now - 30, postedAtUnixSec: now - 200 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xgracefull': record } });
+    const config = cfg({ mode: { dryRun: false } });
+    // API reports effective 'expired', but the cumulative fill is FULL (== risk) — a full fill is authoritative and must become `filled`, never held as partiallyFilled.
+    const apiFull: Commitment = orderbookEntry({ commitmentHash: '0xgracefull', maker: DEFAULT_FAKE_MAKER_ADDRESS, contestId: '1234', positionType: 1, oddsTick: 200, riskAmount: '250000', filledRiskAmount: '250000', remainingRiskAmount: '0', status: 'expired', isLive: false });
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([]), undefined, undefined, undefined, { listOpenCommitments: () => Promise.resolve([]), getCommitment: () => Promise.resolve(apiFull) });
+    await makeRunner({ config, adapter, maxTicks: 1, deps: { now: () => now } }).run();
+
+    const reloaded = StateStore.at(stateDir).load().state;
+    expect(reloaded.commitments['0xgracefull']?.lifecycle).toBe('filled'); // full fill wins over the grace hold
+    expect(reloaded.commitments['0xgracefull']?.filledRiskWei6).toBe('250000');
+    expect(reloaded.positions['spec-1234:home']?.riskAmountWei6).toBe('250000');
+    expect(readEvents().find((e) => e.kind === 'fill' && e.commitmentHash === '0xgracefull')).toMatchObject({ partial: false });
+  });
+
+  it('a thrown on-chain cancel (SDK rejects) leaves the commitment COUNTED — not authoritativelyInvalidated (fails closed)', async () => {
+    // cancelMode: onchain routes a recovered soft-cancel (matched remainder) to an authoritative on-chain
+    // cancel. If the SDK throws (e.g. its reconstructed-hash assertion fails), the record must stay
+    // softCancelled — still counted by the risk engine — never authoritativelyInvalidated.
+    const now = T0;
+    const record = commitmentRecord({ hash: '0xrsc', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '500000', filledRiskWei6: '100000', lifecycle: 'softCancelled', expiryUnixSec: now + 1000, postedAtUnixSec: now - 50 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xrsc': record } });
+    const config = cfg({ mode: { dryRun: false }, orders: { cancelMode: 'onchain' } });
+    const apiPartial: Commitment = orderbookEntry({ commitmentHash: '0xrsc', maker: DEFAULT_FAKE_MAKER_ADDRESS, contestId: '1234', positionType: 1, oddsTick: 200, riskAmount: '500000', filledRiskAmount: '100000', remainingRiskAmount: '400000', status: 'cancelled', storedStatus: 'partially_filled', isLive: false });
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]),
+      { cancelCommitmentOnchain: () => Promise.reject(new Error('cancelOnchain: reconstructed hash mismatch')) },
+      undefined, undefined,
+      { getCommitment: (h) => (h === '0xrsc' ? Promise.resolve(apiPartial) : Promise.reject(new Error('unknown hash'))) },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1, deps: { now: () => now } }).run();
+
+    const reloaded = StateStore.at(stateDir).load().state;
+    expect(reloaded.commitments['0xrsc']?.lifecycle).toBe('softCancelled'); // fail closed — NOT authoritativelyInvalidated (still counted)
+    expect(reloaded.commitments['0xrsc']?.filledRiskWei6).toBe('100000');
+    expect(readEvents().some((e) => e.kind === 'onchain-cancel')).toBe(false); // no successful cancel
   });
 });
 
@@ -3689,7 +3764,7 @@ describe('Runner — cancelMode: onchain (PR3 — authoritative cancel of recove
   });
 
   it('cancelMode:onchain: a PAST-EXPIRY recovered soft-cancel is NOT cancelled (already unmatchable on chain — ageOut terminalizes it to expired; no gas wasted)', async () => {
-    const sc = commitmentRecord({ hash: '0xsc', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '500000', filledRiskWei6: '200000', lifecycle: 'softCancelled', expiryUnixSec: T0 - 1, postedAtUnixSec: T0 - 100, updatedAtUnixSec: T0 - 100 });
+    const sc = commitmentRecord({ hash: '0xsc', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '500000', filledRiskWei6: '200000', lifecycle: 'softCancelled', expiryUnixSec: T0 - 100 /* past expiry + the 60s grace */, postedAtUnixSec: T0 - 200, updatedAtUnixSec: T0 - 200 });
     StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xsc': sc } });
     const config = cfg({ mode: { dryRun: false }, orders: { expirySeconds: 120, cancelMode: 'onchain' }, gas: { maxDailyGasPOL: 1, emergencyReservePOL: 0.2 } });
     const cancel = cancelOnchainRecorder();

@@ -206,6 +206,19 @@ export function buildDesiredQuote(
 const RELEASED_LIFECYCLES: readonly CommitmentLifecycle[] = ['filled', 'expired', 'authoritativelyInvalidated'];
 
 /**
+ * Is a commitment releasable / terminal by the local clock yet? The contract keeps a
+ * commitment matchable until `block.timestamp >= expiry` (strict); the MM host / core-api
+ * clock can lead the Polygon block timestamp, so headroom is released (and the side freed
+ * for a repost) only once `nowUnixSec` is at least `graceSeconds` past the local
+ * `expiryUnixSec`. Single source of truth for the expiry-release predicate — used by
+ * `inventoryFromState` here and by the runner's `ageOut` / `detectFills` terminalizations,
+ * so they cannot drift. `graceSeconds: 0` releases exactly at expiry (the pre-grace behavior).
+ */
+export function isExpiredForRelease(expiryUnixSec: number, nowUnixSec: number, graceSeconds: number): boolean {
+  return nowUnixSec >= expiryUnixSec + graceSeconds;
+}
+
+/**
  * Translate the persisted state into the risk engine's `Inventory` — the
  * aggregate exposure the caps bind (DESIGN §6). The runner builds the inventory it
  * hands `buildDesiredQuote` from this each tick.
@@ -214,8 +227,10 @@ const RELEASED_LIFECYCLES: readonly CommitmentLifecycle[] = ['filled', 'expired'
  * `expiryUnixSec` is still in the future, at their *remaining* risk
  * (`riskAmountWei6 - filledRiskWei6` — the filled portion has become a position,
  * counted separately); drop `filled` / `expired` / `authoritativelyInvalidated`
- * (their headroom is released) and anything past its expiry (dead on chain even if
- * not yet reclassified). `openCommitmentCount` is the count of those kept
+ * (their headroom is released) and anything past `expiry + graceSeconds` (dead on chain
+ * even allowing for host/chain clock skew — see {@link isExpiredForRelease}; a
+ * past-local-expiry commitment is still counted through the grace window).
+ * `openCommitmentCount` is the count of those kept
  * commitments — what the `maxOpenCommitments` cap binds.
  *
  * Positions: keep everything except `claimed`. `pendingSettle` / `claimable` are
@@ -232,13 +247,13 @@ const RELEASED_LIFECYCLES: readonly CommitmentLifecycle[] = ['filled', 'expired'
  * (an in-memory corruption) rather than silently dropping it — fail closed; the
  * dropped-and-undercounted path would under-state latent exposure.
  */
-export function inventoryFromState(state: MakerState, nowUnixSec: number): Inventory {
+export function inventoryFromState(state: MakerState, nowUnixSec: number, graceSeconds: number): Inventory {
   const items: ExposureItem[] = [];
   let openCommitmentCount = 0;
 
   for (const record of Object.values(state.commitments)) {
     if (RELEASED_LIFECYCLES.includes(record.lifecycle)) continue;
-    if (record.expiryUnixSec <= nowUnixSec) continue; // expired but not yet reclassified — dead on chain, headroom released
+    if (isExpiredForRelease(record.expiryUnixSec, nowUnixSec, graceSeconds)) continue; // past expiry + grace — dead on chain even allowing for clock skew; headroom released
     const riskWei6 = BigInt(record.riskAmountWei6);
     const filledWei6 = BigInt(record.filledRiskWei6);
     if (filledWei6 > riskWei6) {

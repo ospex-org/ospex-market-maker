@@ -4,7 +4,7 @@ import { parseConfig, type Config } from '../config/index.js';
 import { decimalToAmerican, decimalToImpliedProb, tickToDecimal, toProtocolQuote, type QuoteSide } from '../pricing/index.js';
 import type { ExposureItem, Inventory, Market } from '../risk/index.js';
 import { emptyMakerState, type MakerCommitmentRecord, type MakerPositionRecord, type MakerState } from '../state/index.js';
-import { breakdownReferenceOdds, buildDesiredQuote, inventoryFromState, reconcileBook, toRiskCaps, type BookReconciliation, type DesiredQuote } from './index.js';
+import { breakdownReferenceOdds, buildDesiredQuote, inventoryFromState, isExpiredForRelease, reconcileBook, toRiskCaps, type BookReconciliation, type DesiredQuote } from './index.js';
 
 const cfg = (overrides: Record<string, unknown> = {}): Config => parseConfig({ rpcUrl: 'http://localhost:8545', ...overrides });
 
@@ -217,13 +217,13 @@ describe('buildDesiredQuote', () => {
 
 describe('inventoryFromState', () => {
   it('an empty state yields an empty inventory', () => {
-    expect(inventoryFromState(emptyMakerState(), NOW)).toEqual({ items: [], openCommitmentCount: 0 });
+    expect(inventoryFromState(emptyMakerState(), NOW, 0)).toEqual({ items: [], openCommitmentCount: 0 });
   });
 
   it('maps a visibleOpen commitment + an active position into items (contest metadata + USDC amounts), counting only the commitment', () => {
     const c = commitmentRecord({ hash: '0x1', makerSide: 'away', riskAmountWei6: '250000' });
     const p = positionRecord({ side: 'home', riskAmountWei6: '100000' });
-    const inv = inventoryFromState(stateWith({ commitments: { '0x1': c }, positions: { 'spec-1:home': p } }), NOW);
+    const inv = inventoryFromState(stateWith({ commitments: { '0x1': c }, positions: { 'spec-1:home': p } }), NOW, 0);
     expect(inv.openCommitmentCount).toBe(1);
     expect(inv.items).toEqual([
       { contestId: 'contest-1', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', makerSide: 'away', riskAmountUSDC: 0.25 },
@@ -239,7 +239,7 @@ describe('inventoryFromState', () => {
       expired: commitmentRecord({ hash: 'expired', lifecycle: 'expired' }),
       invalidated: commitmentRecord({ hash: 'invalidated', lifecycle: 'authoritativelyInvalidated' }),
     };
-    const inv = inventoryFromState(stateWith({ commitments }), NOW);
+    const inv = inventoryFromState(stateWith({ commitments }), NOW, 0);
     expect(inv.openCommitmentCount).toBe(2); // visibleOpen + softCancelled (both still in the future)
     expect(inv.items.map((it) => it.makerSide).sort()).toEqual(['away', 'home']);
   });
@@ -251,26 +251,26 @@ describe('inventoryFromState', () => {
       expiredSoftCancel: commitmentRecord({ hash: 'expiredSoftCancel', lifecycle: 'softCancelled', expiryUnixSec: NOW - 1 }),
       expiredPartial: commitmentRecord({ hash: 'expiredPartial', lifecycle: 'partiallyFilled', riskAmountWei6: '500000', filledRiskWei6: '100000', expiryUnixSec: NOW - 1 }),
     };
-    const inv = inventoryFromState(stateWith({ commitments }), NOW);
+    const inv = inventoryFromState(stateWith({ commitments }), NOW, 0);
     expect(inv.openCommitmentCount).toBe(1);
     expect(inv.items).toEqual([{ contestId: 'contest-1', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', makerSide: 'away', riskAmountUSDC: 0.25 }]);
   });
 
   it('counts a partiallyFilled commitment at its remaining (unfilled) risk', () => {
     const partial = commitmentRecord({ hash: 'p', lifecycle: 'partiallyFilled', riskAmountWei6: '500000', filledRiskWei6: '200000' });
-    const inv = inventoryFromState(stateWith({ commitments: { p: partial } }), NOW);
+    const inv = inventoryFromState(stateWith({ commitments: { p: partial } }), NOW, 0);
     expect(inv.openCommitmentCount).toBe(1);
     expect(inv.items).toEqual([{ contestId: 'contest-1', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', makerSide: 'away', riskAmountUSDC: 0.3 }]);
   });
 
   it('drops a fully-filled commitment (filled === risk — its filled portion is a position; no latent risk left here)', () => {
     const fullyFilled = commitmentRecord({ hash: 'f', lifecycle: 'partiallyFilled', riskAmountWei6: '300000', filledRiskWei6: '300000' });
-    expect(inventoryFromState(stateWith({ commitments: { f: fullyFilled } }), NOW)).toEqual({ items: [], openCommitmentCount: 0 });
+    expect(inventoryFromState(stateWith({ commitments: { f: fullyFilled } }), NOW, 0)).toEqual({ items: [], openCommitmentCount: 0 });
   });
 
   it('throws on a corrupt commitment with filledRiskWei6 > riskAmountWei6 (fail closed — never silently drop latent exposure)', () => {
     const overFilled = commitmentRecord({ hash: 'o', lifecycle: 'softCancelled', riskAmountWei6: '300000', filledRiskWei6: '400000' });
-    expect(() => inventoryFromState(stateWith({ commitments: { o: overFilled } }), NOW)).toThrow(/corrupt inventory/);
+    expect(() => inventoryFromState(stateWith({ commitments: { o: overFilled } }), NOW, 0)).toThrow(/corrupt inventory/);
   });
 
   it('keeps active / pendingSettle / claimable positions; drops claimed (positions never add to the commitment count)', () => {
@@ -280,10 +280,54 @@ describe('inventoryFromState', () => {
       'spec-3:away': positionRecord({ speculationId: 'spec-3', contestId: 'contest-3', status: 'claimable', side: 'away', riskAmountWei6: '50000' }),
       'spec-4:home': positionRecord({ speculationId: 'spec-4', contestId: 'contest-4', status: 'claimed', side: 'home', riskAmountWei6: '999999' }),
     };
-    const inv = inventoryFromState(stateWith({ positions }), NOW);
+    const inv = inventoryFromState(stateWith({ positions }), NOW, 0);
     expect(inv.openCommitmentCount).toBe(0);
     expect(inv.items).toHaveLength(3);
     expect(Object.fromEntries(inv.items.map((it) => [it.contestId, it.riskAmountUSDC]))).toEqual({ 'contest-1': 0.25, 'contest-2': 0.1, 'contest-3': 0.05 });
+  });
+
+  it('with a grace margin, keeps a commitment past its expiry but inside the grace window (still counted, not released)', () => {
+    const within = commitmentRecord({ hash: 'g', lifecycle: 'visibleOpen', expiryUnixSec: NOW - 30 }); // 30s past expiry
+    const inv = inventoryFromState(stateWith({ commitments: { g: within } }), NOW, 60); // grace 60 ⇒ not yet releasable
+    expect(inv.openCommitmentCount).toBe(1);
+    expect(inv.items).toHaveLength(1);
+  });
+
+  it('with a grace margin, releases a commitment only once it is past expiry + grace', () => {
+    const pastGrace = commitmentRecord({ hash: 'g', lifecycle: 'visibleOpen', expiryUnixSec: NOW - 61 }); // past expiry + grace(60)
+    expect(inventoryFromState(stateWith({ commitments: { g: pastGrace } }), NOW, 60)).toEqual({ items: [], openCommitmentCount: 0 });
+  });
+});
+
+describe('isExpiredForRelease', () => {
+  it('is true only once now >= expiry + grace', () => {
+    expect(isExpiredForRelease(1000, 1059, 60)).toBe(false); // 59s past expiry, grace 60
+    expect(isExpiredForRelease(1000, 1060, 60)).toBe(true); //  exactly expiry + grace
+    expect(isExpiredForRelease(1000, 1061, 60)).toBe(true);
+    expect(isExpiredForRelease(1000, 1000, 0)).toBe(true); //   grace 0 ⇒ release exactly at expiry
+    expect(isExpiredForRelease(1000, 999, 0)).toBe(false);
+  });
+});
+
+describe('expiry-release grace — interleaving G (sizing safety)', () => {
+  it('a within-grace commitment still constrains a same-side repost: old_remaining + new headroom <= the per-contest cap', () => {
+    // A maker-on-home commitment of 0.9 USDC on C1, 30s past expiry but inside the 60s grace window.
+    const within = commitmentRecord({ hash: 'g', contestId: 'C1', makerSide: 'home', riskAmountWei6: '900000', lifecycle: 'visibleOpen', expiryUnixSec: NOW - 30 });
+    const graced = inventoryFromState(stateWith({ commitments: { g: within } }), NOW, 60);
+    expect(graced.openCommitmentCount).toBe(1); // still counted through the grace window
+
+    // The away offer is served by a maker-on-home commitment, so it draws on the same outcome bucket as
+    // the within-grace one. Per-contest cap 1.0; the within-grace 0.9 leaves only 0.1 of headroom.
+    const d = buildDesiredQuote(cfg(), MARKET, { away: 150, home: -180 }, graced);
+    expect(d.headroomUSDC.away).toBeCloseTo(0.1, 6); // 0.9 (old remaining) + 0.1 (max repost) = the 1.0 per-contest cap
+
+    // Contrast: at grace 0 the commitment is released from the inventory and the headroom jumps back to
+    // the per-commitment cap (0.25) — so 0.9 (still matchable on chain) + 0.25 would breach the 1.0 cap.
+    const released = inventoryFromState(stateWith({ commitments: { g: within } }), NOW, 0);
+    expect(released.openCommitmentCount).toBe(0);
+    const dReleased = buildDesiredQuote(cfg(), MARKET, { away: 150, home: -180 }, released);
+    expect(dReleased.headroomUSDC.away).toBeCloseTo(0.25, 6);
+    expect(0.9 + dReleased.headroomUSDC.away).toBeGreaterThan(1.0); // the breach the grace prevents
   });
 });
 

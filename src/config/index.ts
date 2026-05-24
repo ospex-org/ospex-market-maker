@@ -123,6 +123,12 @@ function asPositiveInt(v: unknown, name: string): number {
   return n;
 }
 
+function asNonNegativeInt(v: unknown, name: string): number {
+  const n = asNonNegativeNumber(v, name);
+  if (!Number.isInteger(n)) fail(name, `must be an integer, got ${n}`);
+  return n;
+}
+
 function asNumberInRange(
   v: unknown,
   name: string,
@@ -229,7 +235,7 @@ const RISK_KEYS = [
 const GAS_KEYS = ['maxDailyGasPOL', 'emergencyReservePOL', 'reportInUSDC', 'nativeTokenUSDCPrice'] as const;
 const APPROVALS_KEYS = ['autoApprove', 'mode'] as const;
 const ORDERS_KEYS = [
-  'expiryMode', 'expirySeconds', 'staleAfterSeconds', 'staleReferenceAfterSeconds', 'replaceOnOddsMoveBps', 'cancelMode',
+  'expiryMode', 'expirySeconds', 'expiryReleaseGraceSeconds', 'staleAfterSeconds', 'staleReferenceAfterSeconds', 'replaceOnOddsMoveBps', 'cancelMode',
 ] as const;
 const SETTLEMENT_KEYS = ['autoSettleOwn', 'autoClaimOwn', 'continueOnGasBudgetExhausted'] as const;
 const TELEMETRY_KEYS = ['logDir', 'logLevel'] as const;
@@ -373,6 +379,7 @@ export function parseConfig(raw: unknown, env: EnvLike = {}): Config {
   const orders: OrdersConfig = {
     expiryMode: def<ExpiryMode>(ord.expiryMode, 'fixed-seconds', (v) => asEnum(v, 'orders.expiryMode', EXPIRY_MODES)),
     expirySeconds: def(ord.expirySeconds, 120, (v) => asPositiveInt(v, 'orders.expirySeconds')),
+    expiryReleaseGraceSeconds: def(ord.expiryReleaseGraceSeconds, 60, (v) => asNonNegativeInt(v, 'orders.expiryReleaseGraceSeconds')),
     staleAfterSeconds: def(ord.staleAfterSeconds, 90, (v) => asPositiveInt(v, 'orders.staleAfterSeconds')),
     staleReferenceAfterSeconds: def(ord.staleReferenceAfterSeconds, 300, (v) => asPositiveInt(v, 'orders.staleReferenceAfterSeconds')),
     replaceOnOddsMoveBps: def(ord.replaceOnOddsMoveBps, 50, (v) => asPositiveNumber(v, 'orders.replaceOnOddsMoveBps')),

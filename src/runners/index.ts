@@ -97,7 +97,7 @@
 import { existsSync } from 'node:fs';
 
 import { DEFAULT_PER_IP_STREAM_CAP, POLL_INTERVAL_FLOOR_MS, RESERVED_OWN_STATE_STREAMS, type Config } from '../config/index.js';
-import { buildDesiredQuote, inventoryFromState, reconcileBook, type BookReconciliation, type DesiredQuote, type RetainedPartial, type RetainedPartialReason, type SoftCancelReason } from '../orders/index.js';
+import { buildDesiredQuote, inventoryFromState, isExpiredForRelease, reconcileBook, type BookReconciliation, type DesiredQuote, type RetainedPartial, type RetainedPartialReason, type SoftCancelReason } from '../orders/index.js';
 import type {
   ApproveResult,
   ApproveUSDCAmount,
@@ -612,11 +612,12 @@ export class Runner {
     if (!this.isHoldingQuoting()) this.stateStore.flush(this.state);
   }
 
-  /** Reclassify any tracked commitment past its `expiryUnixSec` to `expired` (dead on chain — headroom released; DESIGN §9). Emits an `expire` per reclassification. */
+  /** Reclassify any tracked commitment past its `expiryUnixSec` + the release grace to `expired` (dead on chain even allowing for host/chain clock skew — headroom released; see {@link isExpiredForRelease}, DESIGN §6/§9). Emits an `expire` per reclassification. */
   private ageOut(): void {
     const now = this.deps.now();
+    const grace = this.config.orders.expiryReleaseGraceSeconds;
     for (const record of Object.values(this.state.commitments)) {
-      if ((record.lifecycle === 'visibleOpen' || record.lifecycle === 'softCancelled' || record.lifecycle === 'partiallyFilled') && record.expiryUnixSec <= now) {
+      if ((record.lifecycle === 'visibleOpen' || record.lifecycle === 'softCancelled' || record.lifecycle === 'partiallyFilled') && isExpiredForRelease(record.expiryUnixSec, now, grace)) {
         record.lifecycle = 'expired';
         record.updatedAtUnixSec = now;
         this.eventLog.emit('expire', {
@@ -1116,7 +1117,7 @@ export class Runner {
     }
     // Price → plan → apply.
     const market: Market = { contestId: m.contestId, sport: m.sport, awayTeam: m.awayTeam, homeTeam: m.homeTeam };
-    const inventory = inventoryFromState(this.state, now);
+    const inventory = inventoryFromState(this.state, now, this.config.orders.expiryReleaseGraceSeconds);
     const desired = buildDesiredQuote(this.config, market, { away: ml.awayOddsAmerican, home: ml.homeOddsAmerican }, inventory);
     this.eventLog.emit('quote-intent', {
       contestId: m.contestId,
@@ -1729,6 +1730,7 @@ export class Runner {
   private async detectFills(): Promise<boolean> {
     if (this.makerAddress === null) return true; // dry-run path — defensive (the caller skips); treat as ok so the rest of the tick proceeds
     const now = this.deps.now();
+    const grace = this.config.orders.expiryReleaseGraceSeconds;
     const localOpen = new Map<string, MakerCommitmentRecord>();
     for (const r of Object.values(this.state.commitments)) {
       if (r.lifecycle !== 'visibleOpen' && r.lifecycle !== 'partiallyFilled') continue;
@@ -1777,7 +1779,7 @@ export class Runner {
         apiCommitment = await this.adapter.getCommitment(hash as Hex);
       } catch (err) {
         this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'fill-detection-lookup', commitmentHash: hash });
-        if (record.expiryUnixSec <= now) pastExpiryLookupFailed = true;
+        if (isExpiredForRelease(record.expiryUnixSec, now, grace)) pastExpiryLookupFailed = true; // only past expiry+grace is ageOut's terminalization zone — within grace the record stays live + counted, like a future-expiry one, so a lookup failure there is non-fatal
         continue; // skip this hash; other hashes still processed
       }
       // For every terminal status, first compute and apply any unobserved fill delta —
@@ -1787,20 +1789,37 @@ export class Runner {
       const apiFilled = BigInt(apiCommitment.filledRiskAmount);
       const localFilled = BigInt(record.filledRiskWei6);
       const delta = apiFilled > localFilled ? apiFilled - localFilled : 0n;
+      const riskWei6 = BigInt(record.riskAmountWei6);
       switch (apiCommitment.status) {
         case 'filled': {
           this.applyFill(record, delta, now, 'filled');
           break;
         }
         case 'expired': {
-          this.applyFill(record, delta, now, 'expired');
-          this.eventLog.emit('expire', {
-            commitmentHash: record.hash,
-            speculationId: record.speculationId,
-            contestId: record.contestId,
-            makerSide: record.makerSide,
-            oddsTick: record.oddsTick,
-          });
+          // The API's effective 'expired' is a wall-clock signal (server clock vs expiry),
+          // subject to the same release grace as the MM's own clock. Derive the lifecycle
+          // from authoritative facts first; only treat 'expired' as a release past expiry+grace.
+          if (apiFilled >= riskWei6) {
+            // Full cumulative fill is authoritative — a position, not an expiry release.
+            this.applyFill(record, delta, now, 'filled');
+          } else if (apiCommitment.storedStatus === 'cancelled' || apiCommitment.nonceInvalidated) {
+            // On-chain cancel / nonce-floor raise — finality-confirmed; release now even within grace.
+            this.applyFill(record, delta, now, 'authoritativelyInvalidated');
+          } else if (isExpiredForRelease(record.expiryUnixSec, now, grace)) {
+            this.applyFill(record, delta, now, 'expired');
+            this.eventLog.emit('expire', {
+              commitmentHash: record.hash,
+              speculationId: record.speculationId,
+              contestId: record.contestId,
+              makerSide: record.makerSide,
+              oddsTick: record.oddsTick,
+            });
+          } else if (delta > 0n) {
+            // Inside the grace window: the signed payload may still match on chain. Fold any
+            // real cumulative-fill delta and keep counting the remainder; do NOT terminalize
+            // (ageOut / a later tick releases once past expiry + grace).
+            this.applyFill(record, delta, now, 'partiallyFilled');
+          }
           break;
         }
         case 'cancelled': {
@@ -1836,9 +1855,14 @@ export class Runner {
           // already hold so the bot terminalizes correctly regardless of the
           // API's status semantics (and so the same expire fires here, with any
           // last-moment fill delta folded in, rather than waiting for ageOut).
-          if (record.expiryUnixSec <= now) {
-            // Past its own expiry → unmatchable on chain (MatchingModule reverts
-            // when block.timestamp >= expiry).
+          if (apiFilled >= riskWei6) {
+            // Full cumulative fill is authoritative regardless of the stale status label.
+            this.applyFill(record, delta, now, 'filled');
+          } else if (apiCommitment.nonceInvalidated) {
+            // Bulk-cancelled via raiseMinNonce → authoritatively dead; release now.
+            this.applyFill(record, delta, now, 'authoritativelyInvalidated');
+          } else if (isExpiredForRelease(record.expiryUnixSec, now, grace)) {
+            // Past expiry + grace → unmatchable on chain even allowing for clock skew.
             this.applyFill(record, delta, now, 'expired');
             this.eventLog.emit('expire', {
               commitmentHash: record.hash,
@@ -1847,9 +1871,10 @@ export class Runner {
               makerSide: record.makerSide,
               oddsTick: record.oddsTick,
             });
-          } else if (apiCommitment.nonceInvalidated) {
-            // Bulk-cancelled via raiseMinNonce → authoritatively dead.
-            this.applyFill(record, delta, now, 'authoritativelyInvalidated');
+          } else if (record.expiryUnixSec <= now) {
+            // Past local expiry but inside the grace window: hold + keep counting the
+            // remainder (the signed payload may still match on chain). Fold any real fill delta.
+            if (delta > 0n) this.applyFill(record, delta, now, 'partiallyFilled');
           } else {
             // Genuinely unexpected: a live, future-expiry, non-invalidated
             // commitment vanished from the listing. Log, don't touch state.

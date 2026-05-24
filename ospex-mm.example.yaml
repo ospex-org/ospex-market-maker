@@ -80,6 +80,11 @@ orders:
                                     #   "match-time" (expire at game start) is available but DANGEROUS with off-chain
                                     #   cancel — a pulled quote stays matchable for hours. See DESIGN §6.
   expirySeconds: 120                # used when expiryMode: fixed-seconds. Short bounds latent exposure; tunable.
+  expiryReleaseGraceSeconds: 60     # hold accounting headroom this many seconds past local expiry before releasing /
+                                    #   terminalizing a commitment. The chain keeps it matchable until block.timestamp >=
+                                    #   expiry, and the host / core-api clock can lead the chain clock — so freeing (and
+                                    #   reposting over) the side exactly at local expiry can briefly double exposure. Book
+                                    #   hygiene still treats the quote as expired at expiry; only headroom release waits. 0 = off.
   staleAfterSeconds: 90             # pull-and-repost a quote this old (< expirySeconds, so it never just lapses)
   staleReferenceAfterSeconds: 300   # treat reference odds as stale (pull quotes, don't repost) if nothing heard this long
   replaceOnOddsMoveBps: 50          # pull-and-repost when fair value moves more than this since posting

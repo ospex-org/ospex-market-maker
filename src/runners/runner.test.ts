@@ -3612,3 +3612,132 @@ describe('Runner — cancelMode: onchain (D2 — authoritative cancel of retaine
     expect(readEvents().find((e) => e.kind === 'candidate' && e.skipReason === 'partial-remainder-retained')).toMatchObject({ commitmentHash: '0xpartialHome', reason: 'stale' });
   });
 });
+
+describe('Runner — cancelMode: onchain (PR3 — authoritative cancel of recovered soft-cancels)', () => {
+  const POL = 10n ** 18n;
+  function todayUTC(): string {
+    const d = new Date(T0 * 1000);
+    return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+  }
+  function cancelOnchainRecorder(gasUsed = 60_000n, effectiveGasPrice = 30_000_000_000n): { fn: OspexAdapter['cancelCommitmentOnchain']; calls: Hex[]; gasPolWeiPerCall: bigint } {
+    const calls: Hex[] = [];
+    return {
+      calls,
+      gasPolWeiPerCall: gasUsed * effectiveGasPrice,
+      fn: (hash: Hex) => {
+        calls.push(hash);
+        const receipt = { gasUsed, effectiveGasPrice } as unknown as CancelOnchainResult['receipt'];
+        return Promise.resolve({ txHash: '0xrecoverytx' as Hex, commitmentHash: hash, receipt });
+      },
+    };
+  }
+  // A recovered soft-cancel: the MM soft-cancelled a quote off-chain (→ softCancelled), then a taker
+  // matched the stale signed payload on chain. reconcileSoftCancelledFills converges its cumulative
+  // fill (it STAYS softCancelled with filledRiskWei6 > 0 — PR2); under cancelMode:onchain this step
+  // authoritatively cancels the still-latent remainder rather than letting it ride to expiry.
+  function recoveredScApi(filledRiskAmount: string, riskAmount = '500000', storedStatus: Commitment['storedStatus'] = 'partially_filled'): Commitment {
+    return orderbookEntry({ commitmentHash: '0xsc', maker: DEFAULT_FAKE_MAKER_ADDRESS, contestId: '1234', positionType: 1, oddsTick: 200, riskAmount, filledRiskAmount, remainingRiskAmount: (BigInt(riskAmount) - BigInt(filledRiskAmount)).toString(), status: 'cancelled', storedStatus, isLive: false });
+  }
+
+  it('cancelMode:onchain: a recovered soft-cancel (matched after the off-chain pull) is authoritatively cancelled on chain → authoritativelyInvalidated + onchain-cancel + gas accrued; never the off-chain DELETE (it would 409)', async () => {
+    // filledRiskWei6 starts 0; getCommitment reports a cumulative 200000 → reconcileSoftCancelledFills converges (stays softCancelled), then this step cancels the latent remainder.
+    const sc = commitmentRecord({ hash: '0xsc', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '500000', filledRiskWei6: '0', lifecycle: 'softCancelled', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 5, updatedAtUnixSec: T0 - 5 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xsc': sc } });
+    const config = cfg({ mode: { dryRun: false }, orders: { expirySeconds: 120, cancelMode: 'onchain' }, gas: { maxDailyGasPOL: 1, emergencyReservePOL: 0.2 } });
+    const cancel = cancelOnchainRecorder();
+    const offchainCancels: Hex[] = [];
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([]), {
+      cancelCommitmentOnchain: cancel.fn,
+      cancelCommitmentOffchain: (h) => { offchainCancels.push(h); return Promise.resolve(); },
+    }, undefined, undefined, { getCommitment: (h) => (h === '0xsc' ? Promise.resolve(recoveredScApi('200000')) : Promise.reject(new Error('unknown hash'))) });
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    expect(cancel.calls).toEqual(['0xsc']); // authoritative on-chain cancel of the matched soft-cancel's remainder
+    expect(offchainCancels).not.toContain('0xsc'); // never the off-chain DELETE (a matched commitment 409s)
+    const reloaded = StateStore.at(stateDir).load().state;
+    expect(reloaded.commitments['0xsc']?.lifecycle).toBe('authoritativelyInvalidated');
+    expect(reloaded.commitments['0xsc']?.filledRiskWei6).toBe('200000'); // the matched portion is recorded; the remainder is now cancelled
+    const events = readEvents();
+    expect(events.find((e) => e.kind === 'fill' && e.source === 'softcancel-recovery' && e.commitmentHash === '0xsc')).toBeDefined(); // the recovery fill fired first (the match)
+    expect(events.find((e) => e.kind === 'onchain-cancel' && e.commitmentHash === '0xsc')).toMatchObject({ speculationId: 'spec-1234', makerSide: 'home', txHash: '0xrecoverytx' });
+    expect(reloaded.dailyCounters[todayUTC()]?.gasPolWei).toBe(cancel.gasPolWeiPerCall.toString()); // gas accrued
+  });
+
+  it('cancelMode:offchain (the default): a recovered soft-cancel is NOT on-chain-cancelled — it stays softCancelled and rides to expiry', async () => {
+    const sc = commitmentRecord({ hash: '0xsc', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '500000', filledRiskWei6: '200000', lifecycle: 'softCancelled', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 5, updatedAtUnixSec: T0 - 5 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xsc': sc } });
+    const config = cfg({ mode: { dryRun: false } }); // orders.cancelMode defaults to 'offchain'
+    const cancel = cancelOnchainRecorder();
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([]), { cancelCommitmentOnchain: cancel.fn }, undefined, undefined, { getCommitment: (h) => (h === '0xsc' ? Promise.resolve(recoveredScApi('200000')) : Promise.reject(new Error('unknown hash'))) });
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    expect(cancel.calls).toEqual([]); // default mode never on-chain-cancels routinely
+    expect(StateStore.at(stateDir).load().state.commitments['0xsc']?.lifecycle).toBe('softCancelled'); // rides to expiry
+    expect(readEvents().some((e) => e.kind === 'onchain-cancel')).toBe(false);
+  });
+
+  it('cancelMode:onchain: an UNMATCHED soft-cancel (filledRiskWei6 0) is NOT cancelled — it rides to expiry (gas economy; no point cancelling a quote that may never match)', async () => {
+    const sc = commitmentRecord({ hash: '0xsc', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '500000', filledRiskWei6: '0', lifecycle: 'softCancelled', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 5, updatedAtUnixSec: T0 - 5 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xsc': sc } });
+    const config = cfg({ mode: { dryRun: false }, orders: { expirySeconds: 120, cancelMode: 'onchain' }, gas: { maxDailyGasPOL: 1, emergencyReservePOL: 0.2 } });
+    const cancel = cancelOnchainRecorder();
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([]), { cancelCommitmentOnchain: cancel.fn }, undefined, undefined, { getCommitment: (h) => (h === '0xsc' ? Promise.resolve(recoveredScApi('0', '500000', 'open')) : Promise.reject(new Error('unknown hash'))) });
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    expect(cancel.calls).toEqual([]); // unmatched → never cancelled
+    expect(StateStore.at(stateDir).load().state.commitments['0xsc']?.lifecycle).toBe('softCancelled');
+  });
+
+  it('cancelMode:onchain: a PAST-EXPIRY recovered soft-cancel is NOT cancelled (already unmatchable on chain — ageOut terminalizes it to expired; no gas wasted)', async () => {
+    const sc = commitmentRecord({ hash: '0xsc', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '500000', filledRiskWei6: '200000', lifecycle: 'softCancelled', expiryUnixSec: T0 - 1, postedAtUnixSec: T0 - 100, updatedAtUnixSec: T0 - 100 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xsc': sc } });
+    const config = cfg({ mode: { dryRun: false }, orders: { expirySeconds: 120, cancelMode: 'onchain' }, gas: { maxDailyGasPOL: 1, emergencyReservePOL: 0.2 } });
+    const cancel = cancelOnchainRecorder();
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([]), { cancelCommitmentOnchain: cancel.fn }, undefined, undefined, { getCommitment: (h) => (h === '0xsc' ? Promise.resolve(recoveredScApi('200000')) : Promise.reject(new Error('unknown hash'))) });
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    expect(cancel.calls).toEqual([]); // past-expiry → unmatchable on chain → not cancelled
+    expect(StateStore.at(stateDir).load().state.commitments['0xsc']?.lifecycle).toBe('expired'); // ageOut terminalized it
+  });
+
+  it('cancelMode:onchain: a sustained gas-budget denial surfaces `gas-budget-blocks-onchain-cancel` ONCE across ticks (not per-tick spam), keeps the record softCancelled, and never lands the cancel', async () => {
+    const sc = commitmentRecord({ hash: '0xsc', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '500000', filledRiskWei6: '200000', lifecycle: 'softCancelled', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 5, updatedAtUnixSec: T0 - 5 });
+    // 0.9 POL spent of a 1 POL cap with a 0.2 reserve → mayUseReserve:false denies (0.9 + 0.2 ≥ 1.0).
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xsc': sc }, dailyCounters: { [todayUTC()]: { gasPolWei: ((POL * 9n) / 10n).toString(), feeUsdcWei6: '0' } } });
+    const config = cfg({ mode: { dryRun: false }, orders: { expirySeconds: 120, cancelMode: 'onchain' }, gas: { maxDailyGasPOL: 1, emergencyReservePOL: 0.2 } });
+    const cancel = cancelOnchainRecorder();
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([]), { cancelCommitmentOnchain: cancel.fn }, undefined, undefined, { getCommitment: (h) => (h === '0xsc' ? Promise.resolve(recoveredScApi('200000')) : Promise.reject(new Error('unknown hash'))) });
+    await makeRunner({ config, adapter, maxTicks: 3 }).run();
+
+    expect(cancel.calls).toEqual([]); // gas-denied — never lands
+    const gasDenied = readEvents().filter((e) => e.kind === 'candidate' && e.skipReason === 'gas-budget-blocks-onchain-cancel');
+    expect(gasDenied).toHaveLength(1); // surfaced ONCE across 3 ticks (warn-once throttle), NOT per-tick spam (the cancel is still re-attempted each tick)
+    expect(gasDenied[0]).toMatchObject({ commitmentHash: '0xsc', makerSide: 'home' });
+    expect(StateStore.at(stateDir).load().state.commitments['0xsc']?.lifecycle).toBe('softCancelled'); // retained — rides to expiry
+  });
+
+  it('cancelMode:onchain: a transient on-chain cancel failure (adapter throw) retries every tick; the record stays softCancelled until it lands', async () => {
+    const sc = commitmentRecord({ hash: '0xsc', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '500000', filledRiskWei6: '200000', lifecycle: 'softCancelled', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 5, updatedAtUnixSec: T0 - 5 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xsc': sc } });
+    const config = cfg({ mode: { dryRun: false }, orders: { expirySeconds: 120, cancelMode: 'onchain' }, gas: { maxDailyGasPOL: 1, emergencyReservePOL: 0.2 } });
+    let attempts = 0;
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([]), { cancelCommitmentOnchain: () => { attempts += 1; return Promise.reject(new Error('RPC down')); } }, undefined, undefined, { getCommitment: (h) => (h === '0xsc' ? Promise.resolve(recoveredScApi('200000')) : Promise.reject(new Error('unknown hash'))) });
+    await makeRunner({ config, adapter, maxTicks: 2 }).run();
+
+    expect(attempts).toBe(2); // every-tick scan retries on tick 2 (no throttle on transient failures)
+    expect(StateStore.at(stateDir).load().state.commitments['0xsc']?.lifecycle).toBe('softCancelled'); // still latent until the cancel lands
+    expect(readEvents().filter((e) => e.kind === 'error' && e.phase === 'onchain-cancel' && e.commitmentHash === '0xsc')).toHaveLength(2); // one error per attempt
+  });
+
+  it('dry-run: never on-chain-cancels a recovered soft-cancel even under cancelMode:onchain', async () => {
+    const sc = commitmentRecord({ hash: '0xsc', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '500000', filledRiskWei6: '200000', lifecycle: 'softCancelled', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 5, updatedAtUnixSec: T0 - 5 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xsc': sc } });
+    const config = cfg({ mode: { dryRun: true }, orders: { expirySeconds: 120, cancelMode: 'onchain' } });
+    const cancel = cancelOnchainRecorder();
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([]), { cancelCommitmentOnchain: cancel.fn });
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    expect(cancel.calls).toEqual([]); // dry-run never writes to chain
+    expect(StateStore.at(stateDir).load().state.commitments['0xsc']?.lifecycle).toBe('softCancelled');
+  });
+});

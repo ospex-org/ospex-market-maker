@@ -331,6 +331,8 @@ export class Runner {
   private readonly trackedMarkets = new Map<string, TrackedMarket>();
   /** The tick number at/after which the next discovery cycle runs. `0` ⇒ the first tick (1) always discovers; bumped by `jitteredDiscoveryInterval()` after each cycle. */
   private nextDiscoveryAtTick = 0;
+  /** Hashes of recovered soft-cancels (`softCancelled` with a matched remainder) for which `maybeOnchainCancelRecoveredSoftCancels` has already emitted a `gas-budget-blocks-onchain-cancel` candidate this run — so the denial surfaces ONCE per stuck record rather than every tick (the cancel is still re-attempted each tick, landing when the budget frees). Pruned to currently-eligible hashes each sweep, so it can't grow unbounded. */
+  private readonly gasDeniedRecoveredSoftCancelWarned = new Set<string>();
 
   constructor(opts: RunnerOptions) {
     this.config = opts.config;
@@ -589,6 +591,7 @@ export class Runner {
           if (softCancelledFillOk) {
             if (!this.config.mode.dryRun) await this.settleAndClaim();
             await this.reconcileMarkets();
+            await this.maybeOnchainCancelRecoveredSoftCancels(); // cancelMode:onchain only — authoritatively cancel matched soft-cancels (self-guards offchain/dry-run); after reconcileMarkets so the freed side re-quotes next tick
             this.ageOut();
           }
           // else: live mode + a softCancelled-fill probe (`getCommitment`) failed — skip settleAndClaim + reconcile + ageOut (fail-closed; the record stays softCancelled, markets stay dirty for next-tick retry).
@@ -1283,18 +1286,87 @@ export class Runner {
   private async maybeOnchainCancelRetainedPartials(retained: readonly RetainedPartial[], now: number): Promise<'applied' | 'transient-failure'> {
     if (this.config.orders.cancelMode !== 'onchain') return 'applied'; // default `offchain`: the remainder rides to expiry
     if (this.config.mode.dryRun || this.makerAddress === null) return 'applied'; // dry-run never writes to chain
-    if (retained.length === 0) return 'applied';
-
-    const maxDailyGasPolWei = polFloatToWei18(this.config.gas.maxDailyGasPOL);
-    const emergencyReservePolWei = polFloatToWei18(this.config.gas.emergencyReservePOL);
     let outcome: 'applied' | 'transient-failure' = 'applied';
     for (const { record } of retained) {
-      if (record.lifecycle !== 'partiallyFilled') continue; // defensive — only a matched remainder is cancelled here
-      const today = todayUTCDateString(now);
-      const todayGasSpentPolWei = BigInt(this.state.dailyCounters[today]?.gasPolWei ?? '0');
-      // mayUseReserve:false — a routine quote refresh must preserve the emergency reserve (unlike shutdown kill / settlement).
-      const verdict = canSpendGas({ todayGasSpentPolWei, maxDailyGasPolWei, emergencyReservePolWei, mayUseReserve: false });
-      if (!verdict.allowed) {
+      if (record.lifecycle !== 'partiallyFilled') continue; // defensive — only a matched (visible) remainder is cancelled here
+      // A throw re-arms the market for a prompt next-tick retry (matches the live-write fail-closed
+      // rule), not the staleAfterSeconds throttle. A gas denial is NOT transient (stays 'applied').
+      if ((await this.onchainCancelCommitment(record, now)) === 'transient-failure') outcome = 'transient-failure';
+    }
+    return outcome;
+  }
+
+  /**
+   * Under `orders.cancelMode: onchain`, authoritatively cancel **recovered soft-cancels** —
+   * commitments the MM soft-cancelled off-chain that nonetheless matched on chain via their
+   * stale signed payload (`lifecycle: 'softCancelled'` with `filledRiskWei6 > 0`, set by
+   * {@link reconcileSoftCancelledFills}). Their unfilled remainder is still matchable, so this
+   * stops further matching instead of letting it ride to expiry. The off-chain DELETE never
+   * worked on these (a matched commitment returns `409 COMMITMENT_MATCHED`), so on-chain
+   * `cancelCommitment` is the only lever — the soft-cancelled analogue of
+   * {@link maybeOnchainCancelRetainedPartials} (which handles the *visible* `partiallyFilled`
+   * remainders `reconcileBook` retains).
+   *
+   * Global scan (a soft-cancelled commitment's contest may no longer be tracked). Skips
+   * **unmatched** soft-cancels (`filledRiskWei6 === 0` → rides to expiry; no point spending gas
+   * on a quote that may never match — matches the gas economy of the routine staleness pulls)
+   * and **past-expiry** ones (already unmatchable on chain — `ageOut` terminalizes them). Per
+   * record, {@link onchainCancelCommitment} does the gas-gate + cancel + stamp
+   * `authoritativelyInvalidated` + dirty the market. **Best-effort, no re-arm needed**: the
+   * step scans every tick, so a throw / gas-denial simply leaves the record `softCancelled` for
+   * the next tick to retry — but a gas denial surfaces its `gas-budget-blocks-onchain-cancel`
+   * candidate only ONCE per stuck record (tracked in `gasDeniedRecoveredSoftCancelWarned`, pruned
+   * to current eligibility each sweep), so a sustained budget shortfall doesn't spam the log even
+   * though the cancel is re-attempted every tick. Runs AFTER `reconcileMarkets` so a dirtied
+   * market re-quotes the freed side on the *next* tick — never same-tick over a just-cancelled
+   * commitment. No-op under `cancelMode: offchain` (default) and in dry-run.
+   */
+  private async maybeOnchainCancelRecoveredSoftCancels(): Promise<void> {
+    if (this.config.orders.cancelMode !== 'onchain') return; // default `offchain`: the remainder rides to expiry
+    if (this.config.mode.dryRun || this.makerAddress === null) return; // dry-run never writes to chain
+    const now = this.deps.now();
+    // Eligible = matched soft-cancels (filledRiskWei6 > 0) not past expiry. Unmatched ones ride to
+    // expiry (gas economy — no point cancelling a quote that may never match); past-expiry ones are
+    // already unmatchable on chain (ageOut terminalizes them) so cancelling would just waste gas.
+    const eligible = Object.values(this.state.commitments).filter(
+      (r) => r.lifecycle === 'softCancelled' && BigInt(r.filledRiskWei6) > 0n && r.expiryUnixSec > now,
+    );
+    // Prune the warned-set to current eligibility so it can't grow unbounded (a record that was
+    // gas-denied and then expired / was cancelled drops out — its hash is removed here).
+    const eligibleHashes = new Set(eligible.map((r) => r.hash));
+    for (const h of this.gasDeniedRecoveredSoftCancelWarned) if (!eligibleHashes.has(h)) this.gasDeniedRecoveredSoftCancelWarned.delete(h);
+    for (const record of eligible) {
+      const emitGasDenied = !this.gasDeniedRecoveredSoftCancelWarned.has(record.hash); // surface the denial once per stuck record, not every tick
+      const result = await this.onchainCancelCommitment(record, now, { emitGasDenied }); // best-effort; a throw / gas-denial leaves it softCancelled for the next-tick scan
+      if (result === 'gas-denied') this.gasDeniedRecoveredSoftCancelWarned.add(record.hash);
+      else this.gasDeniedRecoveredSoftCancelWarned.delete(record.hash); // cancelled or transient — clear so a later denial re-warns
+    }
+  }
+
+  /**
+   * Authoritatively cancel ONE commitment on chain — the shared per-record mechanics behind
+   * both {@link maybeOnchainCancelRetainedPartials} (visible `partiallyFilled` remainders) and
+   * {@link maybeOnchainCancelRecoveredSoftCancels} (matched soft-cancels). Gas-gated via
+   * `canSpendGas` with **`mayUseReserve: false`** — a routine exposure-bounding cancel must not
+   * burn the emergency reserve (unlike the shutdown kill / settlement paths). On success:
+   * record today's gas, stamp the record `authoritativelyInvalidated`, emit `onchain-cancel`,
+   * and dirty the market so the freed side re-quotes next tick. Returns `'cancelled'` (landed),
+   * `'gas-denied'` (budget verdict refused — the record is left as-is; operator must free budget,
+   * no off-chain fallback), or `'transient-failure'` (`cancelCommitmentOnchain` threw — record
+   * left as-is for a next-tick retry). A `candidate` `gas-budget-blocks-onchain-cancel` is emitted
+   * on denial unless `opts.emitGasDenied === false` (the recovered-soft-cancel sweep passes false
+   * after the first warning to avoid per-tick spam — see {@link maybeOnchainCancelRecoveredSoftCancels}).
+   * The caller owns lifecycle pre-filtering (which records are eligible) and any re-arm.
+   */
+  private async onchainCancelCommitment(record: MakerCommitmentRecord, now: number, opts: { emitGasDenied?: boolean } = {}): Promise<'cancelled' | 'gas-denied' | 'transient-failure'> {
+    const maxDailyGasPolWei = polFloatToWei18(this.config.gas.maxDailyGasPOL);
+    const emergencyReservePolWei = polFloatToWei18(this.config.gas.emergencyReservePOL);
+    const today = todayUTCDateString(now);
+    const todayGasSpentPolWei = BigInt(this.state.dailyCounters[today]?.gasPolWei ?? '0');
+    // mayUseReserve:false — a routine quote refresh must preserve the emergency reserve (unlike shutdown kill / settlement).
+    const verdict = canSpendGas({ todayGasSpentPolWei, maxDailyGasPolWei, emergencyReservePolWei, mayUseReserve: false });
+    if (!verdict.allowed) {
+      if (opts.emitGasDenied !== false) {
         this.eventLog.emit('candidate', {
           skipReason: 'gas-budget-blocks-onchain-cancel',
           commitmentHash: record.hash,
@@ -1306,32 +1378,31 @@ export class Runner {
           emergencyReservePolWei: emergencyReservePolWei.toString(),
           detail: verdict.reason,
         });
-        continue; // gas denial is NOT transient — keep the partial retained, no off-chain fallback, no repost; outcome stays 'applied' (operator must free gas; the normal cadence re-evaluates)
       }
-      let result: Awaited<ReturnType<OspexAdapter['cancelCommitmentOnchain']>>;
-      try {
-        result = await this.adapter.cancelCommitmentOnchain(record.hash as Hex);
-      } catch (err) {
-        this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'onchain-cancel', commitmentHash: record.hash });
-        outcome = 'transient-failure'; // adapter/RPC failure — re-arm the market for a prompt next-tick retry (matches the live-write fail-closed rule), not the staleAfterSeconds throttle
-        continue;
-      }
-      const gasPolWei = BigInt(result.receipt.gasUsed) * BigInt(result.receipt.effectiveGasPrice);
-      this.recordGasSpentToday(today, gasPolWei);
-      record.lifecycle = 'authoritativelyInvalidated';
-      record.updatedAtUnixSec = now;
-      this.eventLog.emit('onchain-cancel', {
-        commitmentHash: record.hash,
-        speculationId: record.speculationId,
-        contestId: record.contestId,
-        makerSide: record.makerSide,
-        txHash: result.txHash,
-        gasPolWei: gasPolWei.toString(),
-      });
-      const m = this.trackedMarkets.get(record.contestId);
-      if (m !== undefined) m.dirty = true; // re-quote the freed side next tick (never same-tick over a just-cancelled partial)
+      return 'gas-denied'; // keep the record as-is, no off-chain fallback, no repost (operator must free gas; the normal cadence re-evaluates)
     }
-    return outcome;
+    let result: Awaited<ReturnType<OspexAdapter['cancelCommitmentOnchain']>>;
+    try {
+      result = await this.adapter.cancelCommitmentOnchain(record.hash as Hex);
+    } catch (err) {
+      this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'onchain-cancel', commitmentHash: record.hash });
+      return 'transient-failure';
+    }
+    const gasPolWei = BigInt(result.receipt.gasUsed) * BigInt(result.receipt.effectiveGasPrice);
+    this.recordGasSpentToday(today, gasPolWei);
+    record.lifecycle = 'authoritativelyInvalidated';
+    record.updatedAtUnixSec = now;
+    this.eventLog.emit('onchain-cancel', {
+      commitmentHash: record.hash,
+      speculationId: record.speculationId,
+      contestId: record.contestId,
+      makerSide: record.makerSide,
+      txHash: result.txHash,
+      gasPolWei: gasPolWei.toString(),
+    });
+    const m = this.trackedMarkets.get(record.contestId);
+    if (m !== undefined) m.dirty = true; // re-quote the freed side next tick (never same-tick over a just-cancelled commitment)
+    return 'cancelled';
   }
 
   /**

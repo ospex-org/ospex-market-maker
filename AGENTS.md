@@ -232,7 +232,7 @@ Canonical vocabulary (`TELEMETRY_KINDS` in [`src/telemetry/index.ts`](./src/tele
 | `replace` / `would-replace` | `{ replacedCommitmentHash, newCommitmentHash, speculationId, contestId, sport, awayTeam, homeTeam, takerSide, makerSide, positionType, reason: 'stale' \| 'mispriced', fromMakerOddsTick, toMakerOddsTick, fromTakerOddsTick, toTakerOddsTick, riskAmountWei6, expiryUnixSec }` |
 | `soft-cancel` / `would-soft-cancel` | `{ commitmentHash, speculationId, contestId, sport, awayTeam, homeTeam, takerSide, makerSide, positionType, makerOddsTick, reason: SoftCancelReason }` |
 | `expire` | `{ commitmentHash, speculationId, contestId, makerSide, oddsTick }` — clock-only terminalization; headroom released |
-| `onchain-cancel` | `{ commitmentHash, speculationId, contestId, makerSide, txHash, gasPolWei: string }` — `MatchingModule.cancelCommitment` landed (shutdown kill, `cancel-stale --authoritative`, or the routine `cancelMode: onchain` partial-remainder cancel). Record → `authoritativelyInvalidated`. |
+| `onchain-cancel` | `{ commitmentHash, speculationId, contestId, makerSide, txHash, gasPolWei: string }` — `MatchingModule.cancelCommitment` landed (shutdown kill, `cancel-stale --authoritative`, or the routine `cancelMode: onchain` cancel of a matched remainder — a visible `partiallyFilled` retained partial OR a recovered soft-cancel, i.e. soft-cancelled then matched on chain). Record → `authoritativelyInvalidated`. |
 | `approval` | `{ purpose: 'positionModule', spender, currentAllowance, requiredAggregateAllowance, amountSetTo, walletBalanceWei6?, txHash, gasPolWei }` — `walletBalanceWei6` present in `mode:'exact'`, absent in `mode:'unlimited'` |
 
 ### 3.4 Fills + positions

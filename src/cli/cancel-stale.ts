@@ -31,7 +31,9 @@
  * still on the book and matchable — but only the on-chain leg can touch it; the
  * off-chain leg skips it), and `softCancelled` (already pulled but the signed
  * payload is still matchable until expiry — `--authoritative` is the only way to
- * invalidate). Matches the shutdown / on-chain-kill posture in
+ * invalidate; this includes a *recovered* soft-cancel that matched on chain after the
+ * pull, now `softCancelled` with `filledRiskWei6 > 0` — skipped off-chain like any
+ * softCancelled, the matched portion preserved). Matches the shutdown / on-chain-kill posture in
  * `src/runners/index.ts`. Filter: `postedAtUnixSec + orders.staleAfterSeconds <=
  * now`. Already-terminal records (`filled` / `expired` /
  * `authoritativelyInvalidated`) are excluded — there's nothing matchable left.

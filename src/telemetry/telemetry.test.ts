@@ -622,6 +622,43 @@ describe('summarize', () => {
         expect(r.netUsdcWei6).toBe('0'); // payout unknown — don't guess
       });
 
+      it('alreadyClaimed — settle.winSide=makerSide but the position was found ALREADY claimed (candidate already-claimed, no claim event) → counted as alreadyClaimed (NOT wonUnclaimed); no net P&L (no event-sourced payout)', () => {
+        const path = writeLog('run-already-claimed.ndjson', [
+          { kind: 'fill', source: 'commitment-diff', commitmentHash: '0xa', speculationId: 'spec-A', contestId: 'A', makerSide: 'home', newFillWei6: '500000' },
+          { kind: 'settle', speculationId: 'spec-A', contestId: 'A', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', makerSide: 'home', winSide: 'home', txHash: '0xtx' },
+          // Auto-claim found it already claimed (a prior run / another caller) —
+          // a candidate skip, NOT a claim event (no event-sourced payout).
+          { kind: 'candidate', skipReason: 'already-claimed', purpose: 'claimPosition', speculationId: 'spec-A', contestId: 'A', makerSide: 'home', outcome: 'alreadyClaimed' },
+        ]);
+        const s = summarize([path]);
+        const r = s.liveMetrics.realizedPnl;
+        expect(r.alreadyClaimedCount).toBe(1);
+        expect(r.wonUnclaimedCount).toBe(0); // NOT misclassified as genuinely-unswept
+        expect(r.wonCount).toBe(0);
+        expect(r.netUsdcWei6).toBe('0'); // no event-sourced payout — never derived
+      });
+
+      it('alreadyClaimed with NO settle event in the window (outcome unknown) → still alreadyClaimed (NOT unsettled) — the candidate proves it was claimed', () => {
+        const path = writeLog('run-already-claimed-no-settle.ndjson', [
+          { kind: 'fill', source: 'commitment-diff', commitmentHash: '0xa', speculationId: 'spec-A', contestId: 'A', makerSide: 'home', newFillWei6: '500000' },
+          { kind: 'candidate', skipReason: 'already-claimed', purpose: 'claimPosition', speculationId: 'spec-A', contestId: 'A', makerSide: 'home', outcome: 'recovered' },
+        ]);
+        const s = summarize([path]);
+        const r = s.liveMetrics.realizedPnl;
+        expect(r.alreadyClaimedCount).toBe(1);
+        expect(r.unsettledCount).toBe(0); // NOT misclassified as unsettled
+        expect(r.netUsdcWei6).toBe('0');
+      });
+
+      it('a recovered CLAIM race (already-claimed + purpose claimPosition + gasPolWei) folds its reverted gas into the `claim` gas bucket (matches the daily counter)', () => {
+        const path = writeLog('run-recovered-claim-gas.ndjson', [
+          { kind: 'candidate', skipReason: 'already-claimed', purpose: 'claimPosition', speculationId: 'spec-A', contestId: 'A', makerSide: 'home', outcome: 'recovered', revertedTxHash: '0xrev', gasPolWei: '1800000000000000' },
+        ]);
+        const s = summarize([path]);
+        expect(s.liveMetrics.gas.byKind.claim).toBe('1800000000000000'); // reverted-claim gas billed under `claim`
+        expect(s.candidates.skipReasons['already-claimed']).toBe(1);
+      });
+
       it('unsettled — fills exist but no settle event → counted in unsettled (held over to unrealized P&L)', () => {
         const path = writeLog('run-open.ndjson', [
           { kind: 'fill', source: 'commitment-diff', commitmentHash: '0xa', speculationId: 'spec-A', contestId: 'A', makerSide: 'home', newFillWei6: '500000' },

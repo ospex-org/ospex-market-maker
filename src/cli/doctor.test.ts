@@ -71,7 +71,7 @@ function fakeAdapter(client: ClientOverrides = {}, ctx = { chainId: 137 as const
     },
     positions: {
       status: notStubbed('positions.status'), byAddress: notStubbed('positions.byAddress'),
-      settleSpeculation: notStubbed('positions.settleSpeculation'), ensureSpeculationSettled: notStubbed('positions.ensureSpeculationSettled'), claim: notStubbed('positions.claim'),
+      settleSpeculation: notStubbed('positions.settleSpeculation'), ensureSpeculationSettled: notStubbed('positions.ensureSpeculationSettled'), claim: notStubbed('positions.claim'), ensurePositionClaimed: notStubbed('positions.ensurePositionClaimed'),
       claimAll: notStubbed('positions.claimAll'),
       ...client.positions,
     },

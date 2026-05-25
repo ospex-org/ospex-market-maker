@@ -124,6 +124,7 @@ export function renderSummaryReportText(summary: RunSummary, logDir: string, out
     const r = lm.realizedPnl;
     out.write(`  Realized P&L: ${formatSignedUsdcWei6(r.netUsdcWei6)} USDC — ${r.wonCount} won / ${r.lostCount} lost / ${r.pushCount} push`);
     if (r.wonUnclaimedCount > 0) out.write(` / ${r.wonUnclaimedCount} won-unclaimed`);
+    if (r.alreadyClaimedCount > 0) out.write(` / ${r.alreadyClaimedCount} already-claimed`);
     if (r.unsettledCount > 0) out.write(` / ${r.unsettledCount} unsettled`);
     out.write(`\n`);
     if (r.claimedProfitUsdcWei6 !== '0' || r.realizedLossUsdcWei6 !== '0') {
@@ -131,6 +132,9 @@ export function renderSummaryReportText(summary: RunSummary, logDir: string, out
     }
     if (r.wonUnclaimedCount > 0) {
       out.write(`                (won-unclaimed: payout not yet swept this window — \`ospex-mm status\` shows the live claimable totals)\n`);
+    }
+    if (r.alreadyClaimedCount > 0) {
+      out.write(`                (already-claimed: found claimed out-of-window / by a prior run — no payout event this window; \`ospex-mm status\` shows live totals)\n`);
     }
     const g = lm.gas;
     out.write(`  Gas (POL):    ${formatPolWei18(g.totalPolWei)} total — approval ${formatPolWei18(g.byKind.approval)} / onchain-cancel ${formatPolWei18(g.byKind.onchainCancel)} / settle ${formatPolWei18(g.byKind.settle)} / claim ${formatPolWei18(g.byKind.claim)}\n`);

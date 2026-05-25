@@ -174,7 +174,7 @@ export type OspexClientLike = {
     OspexClient['commitments'],
     'list' | 'get' | 'submitRaw' | 'cancel' | 'cancelOnchain' | 'raiseMinNonce' | 'approve' | 'getNonceFloor'
   >;
-  positions: Pick<OspexClient['positions'], 'status' | 'byAddress' | 'settleSpeculation' | 'ensureSpeculationSettled' | 'claim' | 'claimAll'>;
+  positions: Pick<OspexClient['positions'], 'status' | 'byAddress' | 'settleSpeculation' | 'ensureSpeculationSettled' | 'claim' | 'ensurePositionClaimed' | 'claimAll'>;
   balances: Pick<OspexClient['balances'], 'read'>;
   approvals: Pick<OspexClient['approvals'], 'read'>;
   health: Pick<OspexClient['health'], 'check'>;
@@ -217,6 +217,10 @@ export type EnsureSpeculationSettledResult = Awaited<ReturnType<OspexClientLike[
 export type ClaimPositionArgs = Parameters<OspexClientLike['positions']['claim']>[0];
 /** `claimPosition` result — tx hash, block, receipt, and the on-chain payout. */
 export type ClaimPositionResult = Awaited<ReturnType<OspexClientLike['positions']['claim']>>;
+/** `ensurePositionClaimed` args — `{ speculationId, positionType }`. */
+export type EnsurePositionClaimedArgs = Parameters<OspexClientLike['positions']['ensurePositionClaimed']>[0];
+/** `ensurePositionClaimed` result — the idempotent claim outcome: `{ outcome: 'claimed' | 'alreadyClaimed' | 'recovered', payoutWei6?, payoutUSDC?, txHash?, blockNumber?, receipt?, revertedTxHash?, revertedReceipt? }`. Payout (+ txHash/receipt) is present only on `'claimed'`; `alreadyClaimed`/`recovered` carry no payout (the contract zeroes economic fields post-claim). A `recovered` inclusion-time race carries `revertedTxHash` + `revertedReceipt` for gas accounting. */
+export type EnsurePositionClaimedResult = Awaited<ReturnType<OspexClientLike['positions']['ensurePositionClaimed']>>;
 /** `claimAll` args (optional) — `{ address?, opts? }`; address defaults to the signer's. */
 export type ClaimAllArgs = NonNullable<Parameters<OspexClientLike['positions']['claimAll']>[0]>;
 /** `claimAll` result — per-entry settle+claim outcomes and the swept totals. */
@@ -488,6 +492,22 @@ export class OspexAdapter {
    */
   async claimPosition(args: ClaimPositionArgs): Promise<ClaimPositionResult> {
     return this.client.positions.claim(args);
+  }
+
+  /**
+   * Idempotent claim ("make this claimed") — resolves to success whenever the
+   * position is claimed: this call sent the tx (`outcome: 'claimed'`, with the
+   * event-sourced payout + receipt), it was already claimed (`alreadyClaimed`,
+   * no tx, no payout), or a benign already-claimed won the race
+   * (`recovered`, no payout — or a `revertedTxHash` + `revertedReceipt` if this
+   * wallet's claim lost an inclusion-time race). Tolerates a prior run / manual
+   * claim / core-API `claimable` projection lag, so it's the right call for
+   * unattended auto-claim. Only `AlreadyClaimed` is benign — `NotSettled` /
+   * `NoPayout` / RPC errors still throw. The strict `claimPosition` above stays
+   * for callers that need the receipt + payout of a claim they specifically sent.
+   */
+  async ensurePositionClaimed(args: EnsurePositionClaimedArgs): Promise<EnsurePositionClaimedResult> {
+    return this.client.positions.ensurePositionClaimed(args);
   }
 
   /**

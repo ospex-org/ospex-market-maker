@@ -393,7 +393,8 @@ interface RealizedPnl {
   wonCount: number;                     // claim event with result='won' OR (claim w/o result + outcome agrees / unknown)
   lostCount: number;                    // settle.winSide ≠ makerSide AND not push/void AND no claim
   pushCount: number;                    // settle.winSide ∈ {push, void} OR claim.result ∈ {push, void}
-  wonUnclaimedCount: number;            // settle.winSide === makerSide AND no claim in window (paper profit; no net contribution)
+  wonUnclaimedCount: number;            // settle.winSide === makerSide AND no claim event AND no already-claimed skip in window (paper profit; no net contribution)
+  alreadyClaimedCount: number;          // auto-claim found it already claimed (candidate already-claimed, no claim event) — claimed out-of-window / prior run / concurrent caller; distinct from wonUnclaimed; no derived payout, no net contribution
   unsettledCount: number;               // fills exist but no settle in window (held over to unrealized — future slice)
 }
 ```

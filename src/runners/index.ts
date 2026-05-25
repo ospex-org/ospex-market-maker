@@ -2519,26 +2519,53 @@ export class Runner {
         continue;
       }
 
-      let result: Awaited<ReturnType<OspexAdapter['settleSpeculation']>>;
+      // Idempotent settle: under multi-wallet postgame contention another EOA
+      // may have already settled this speculation. `ensureSpeculationSettled`
+      // resolves to success in that case (no tx) instead of reverting, so a
+      // lost race is a boring skip, not an error. A genuine failure (e.g. the
+      // contest isn't scored yet) still throws → the error path below.
+      let result: Awaited<ReturnType<OspexAdapter['ensureSpeculationSettled']>>;
       try {
-        result = await this.adapter.settleSpeculation({ speculationId: BigInt(r.speculationId) });
+        result = await this.adapter.ensureSpeculationSettled({ speculationId: BigInt(r.speculationId) });
       } catch (err) {
         this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'settle', speculationId: r.speculationId });
         continue;
       }
-      const gasPolWei = BigInt(result.receipt.gasUsed) * BigInt(result.receipt.effectiveGasPrice);
-      this.recordGasSpentToday(today, gasPolWei);
-      this.eventLog.emit('settle', {
-        speculationId: r.speculationId,
-        contestId: r.contestId,
-        sport: r.sport,
-        awayTeam: r.awayTeam,
-        homeTeam: r.homeTeam,
-        makerSide: r.side,
-        winSide: result.winSide,
-        txHash: result.txHash,
-        gasPolWei: gasPolWei.toString(),
-      });
+      if (result.receipt !== undefined && result.txHash !== undefined) {
+        // We sent a settle tx that confirmed — debit gas and emit the settle
+        // event, unchanged shape.
+        const gasPolWei = BigInt(result.receipt.gasUsed) * BigInt(result.receipt.effectiveGasPrice);
+        this.recordGasSpentToday(today, gasPolWei);
+        this.eventLog.emit('settle', {
+          speculationId: r.speculationId,
+          contestId: r.contestId,
+          sport: r.sport,
+          awayTeam: r.awayTeam,
+          homeTeam: r.homeTeam,
+          makerSide: r.side,
+          winSide: result.winSide,
+          txHash: result.txHash,
+          gasPolWei: gasPolWei.toString(),
+        });
+      } else {
+        // Already settled (pre-flight read) or recovered from a concurrent
+        // settle — the goal is achieved without our tx. Record a settle-skip
+        // (info, not error); no receipt → no gas debit, and we don't fake a
+        // txHash. The position poll flips the bucket to `claimable` next tick;
+        // we don't force it here. `revertedTxHash` (a settle of ours that lost
+        // an inclusion-time race) is surfaced for audit when present — its gas
+        // isn't billed (the SDK doesn't return that reverted receipt).
+        this.eventLog.emit('candidate', {
+          skipReason: 'already-settled',
+          purpose: 'settleSpeculation',
+          speculationId: r.speculationId,
+          contestId: r.contestId,
+          makerSide: r.side,
+          outcome: result.outcome,
+          winSide: result.winSide,
+          ...(result.revertedTxHash !== undefined ? { revertedTxHash: result.revertedTxHash } : {}),
+        });
+      }
     }
 
     for (const r of claimableRecords) {

@@ -55,7 +55,7 @@ function fakeSummary(over: Partial<RunSummary> = {}): RunSummary {
       fills: { quotedUsdcWei6: '0', filledUsdcWei6: '0', fillRate: null },
       gas: { totalPolWei: '0', byKind: { approval: '0', onchainCancel: '0', settle: '0', claim: '0' }, totalUsdcEquivWei6: null },
       settlements: { settleCount: 0, claimCount: 0, totalClaimedPayoutWei6: '0' },
-      realizedPnl: { netUsdcWei6: '0', claimedProfitUsdcWei6: '0', realizedLossUsdcWei6: '0', wonCount: 0, lostCount: 0, pushCount: 0, wonUnclaimedCount: 0, unsettledCount: 0 },
+      realizedPnl: { netUsdcWei6: '0', claimedProfitUsdcWei6: '0', realizedLossUsdcWei6: '0', wonCount: 0, lostCount: 0, pushCount: 0, wonUnclaimedCount: 0, alreadyClaimedCount: 0, unsettledCount: 0 },
       totalFeeUsdcWei6: '0',
     },
     ...over,
@@ -153,7 +153,7 @@ describe('renderSummaryReport*', () => {
         fills: { quotedUsdcWei6: '1000000', filledUsdcWei6: '600000', fillRate: 0.6 },
         gas: { totalPolWei: '0', byKind: { approval: '0', onchainCancel: '0', settle: '0', claim: '0' }, totalUsdcEquivWei6: null },
         settlements: { settleCount: 2, claimCount: 1, totalClaimedPayoutWei6: '900000' },
-        realizedPnl: { netUsdcWei6: '-100000', claimedProfitUsdcWei6: '400000', realizedLossUsdcWei6: '500000', wonCount: 1, lostCount: 1, pushCount: 0, wonUnclaimedCount: 0, unsettledCount: 0 },
+        realizedPnl: { netUsdcWei6: '-100000', claimedProfitUsdcWei6: '400000', realizedLossUsdcWei6: '500000', wonCount: 1, lostCount: 1, pushCount: 0, wonUnclaimedCount: 0, alreadyClaimedCount: 0, unsettledCount: 0 },
         totalFeeUsdcWei6: '0',
       },
     }), logDir, sink);
@@ -169,13 +169,30 @@ describe('renderSummaryReport*', () => {
         fills: { quotedUsdcWei6: '500000', filledUsdcWei6: '500000', fillRate: 1 },
         gas: { totalPolWei: '0', byKind: { approval: '0', onchainCancel: '0', settle: '0', claim: '0' }, totalUsdcEquivWei6: null },
         settlements: { settleCount: 1, claimCount: 0, totalClaimedPayoutWei6: '0' },
-        realizedPnl: { netUsdcWei6: '0', claimedProfitUsdcWei6: '0', realizedLossUsdcWei6: '0', wonCount: 0, lostCount: 0, pushCount: 0, wonUnclaimedCount: 1, unsettledCount: 0 },
+        realizedPnl: { netUsdcWei6: '0', claimedProfitUsdcWei6: '0', realizedLossUsdcWei6: '0', wonCount: 0, lostCount: 0, pushCount: 0, wonUnclaimedCount: 1, alreadyClaimedCount: 0, unsettledCount: 0 },
         totalFeeUsdcWei6: '0',
       },
     }), logDir, sink);
     const out = text();
     expect(out).toContain('1 won-unclaimed');
     expect(out).toContain('payout not yet swept this window');
+    expect(out).toContain('ospex-mm status');
+  });
+
+  it('text render shows the already-claimed hint when alreadyClaimedCount > 0 (claimed out-of-window — distinct from won-unclaimed)', () => {
+    const { sink, text } = collect();
+    renderSummaryReportText(fakeSummary({
+      liveMetrics: {
+        fills: { quotedUsdcWei6: '500000', filledUsdcWei6: '500000', fillRate: 1 },
+        gas: { totalPolWei: '0', byKind: { approval: '0', onchainCancel: '0', settle: '0', claim: '0' }, totalUsdcEquivWei6: null },
+        settlements: { settleCount: 1, claimCount: 0, totalClaimedPayoutWei6: '0' },
+        realizedPnl: { netUsdcWei6: '0', claimedProfitUsdcWei6: '0', realizedLossUsdcWei6: '0', wonCount: 0, lostCount: 0, pushCount: 0, wonUnclaimedCount: 0, alreadyClaimedCount: 1, unsettledCount: 0 },
+        totalFeeUsdcWei6: '0',
+      },
+    }), logDir, sink);
+    const out = text();
+    expect(out).toContain('1 already-claimed');
+    expect(out).toContain('found claimed out-of-window');
     expect(out).toContain('ospex-mm status');
   });
 
@@ -186,7 +203,7 @@ describe('renderSummaryReport*', () => {
         fills: { quotedUsdcWei6: '0', filledUsdcWei6: '100000', fillRate: null },
         gas: { totalPolWei: '0', byKind: { approval: '0', onchainCancel: '0', settle: '0', claim: '0' }, totalUsdcEquivWei6: null },
         settlements: { settleCount: 0, claimCount: 0, totalClaimedPayoutWei6: '0' },
-        realizedPnl: { netUsdcWei6: '0', claimedProfitUsdcWei6: '0', realizedLossUsdcWei6: '0', wonCount: 0, lostCount: 0, pushCount: 0, wonUnclaimedCount: 0, unsettledCount: 0 },
+        realizedPnl: { netUsdcWei6: '0', claimedProfitUsdcWei6: '0', realizedLossUsdcWei6: '0', wonCount: 0, lostCount: 0, pushCount: 0, wonUnclaimedCount: 0, alreadyClaimedCount: 0, unsettledCount: 0 },
         totalFeeUsdcWei6: '0',
       },
     }), logDir, sink);

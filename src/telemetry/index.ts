@@ -71,6 +71,7 @@ export const CANDIDATE_SKIP_REASONS = [
   'gas-budget-blocks-onchain-cancel', // on-chain cancelCommitment denied by canSpendGas — either the shutdown kill / cancel-stale --authoritative path (mayUseReserve: true, operator-explicit) or the routine `cancelMode: onchain` partial-remainder cancel (mayUseReserve: false — routine refresh must not burn the reserve); the candidate's `commitmentHash` identifies the record that couldn't be cancelled
   'partial-remainder-retained', //     a `partiallyFilled` remainder left in place (never off-chain-cancelled, never reposted over): it occupies its maker side until expiry / authoritative on-chain cancel. Carries `commitmentHash` / `contestId` / `speculationId` / `makerSide` / `takerSide` and a `reason` (`side-not-quoted` / `stale` / `mispriced` / `duplicate` / `shutdown`)
   'already-settled', //                ensureSpeculationSettled found the speculation already settled (pre-flight) or recovered from a concurrent settle — a boring skip, not an error. Emitted by the auto-settle path with `purpose: 'settleSpeculation'`; `outcome` distinguishes `alreadySettled` vs `recovered`. A `recovered` race that broadcast a settle which reverted on inclusion DID spend gas: `revertedTxHash` + `gasPolWei` are present and that gas IS billed (state daily counter + the run summary under `settle`); if the reverted receipt couldn't be fetched, `gasAccountingGap: true` flags the gap. `alreadySettled` / pre-send recovery send no tx → no gas, no faked txHash.
+  'already-claimed', //                ensurePositionClaimed found the position already claimed (pre-flight) or recovered from a benign already-claimed race — a boring skip, not an error, and NOT a `claim` event (no event-sourced payout; the contract zeroes economic fields post-claim, so we never fake/derive one). Emitted by the auto-claim path with `purpose: 'claimPosition'`; `outcome` distinguishes `alreadyClaimed` vs `recovered`. Gas accounting mirrors `already-settled`: a `recovered` race that broadcast a claim which reverted on inclusion DID spend gas — `revertedTxHash` + `gasPolWei` are present and that gas IS billed (state daily counter + the run summary under `claim`); `gasAccountingGap: true` flags a reverted receipt that couldn't be fetched. `alreadyClaimed` / pre-send recovery send no tx → no gas. The run summary classifies these positions `alreadyClaimed` (NOT `wonUnclaimed`) and folds no payout into realized P&L.
 ] as const;
 export type CandidateSkipReason = (typeof CANDIDATE_SKIP_REASONS)[number];
 
@@ -336,6 +337,13 @@ export interface LiveGasByKind {
  *     threw). Counted but does NOT contribute to `netUsdcWei6` — the payout
  *     isn't known yet. Operators should consult `ospex-mm status` for live
  *     `getPositionStatus` payout totals.
+ *   - **alreadyClaimed** — the auto-claim path found the position already
+ *     claimed (a `candidate skipReason:'already-claimed'`, NOT a `claim`
+ *     event): claimed out-of-window / by a prior run / a concurrent caller.
+ *     The position IS claimed, but with no event-sourced payout here, so like
+ *     `wonUnclaimed` it contributes nothing to `netUsdcWei6` (the SDK never
+ *     derives a post-claim payout). Kept distinct from `wonUnclaimed` so the
+ *     latter stays "genuinely unswept."
  *   - **unsettled** — position has fills but no settle event in the window.
  *     Held over for the (g-iii) unrealized-P&L slice.
  *
@@ -343,7 +351,7 @@ export interface LiveGasByKind {
  * Phase-3 follow-up and requires `summarize` to accept an `OspexAdapter`.
  */
 export interface RealizedPnl {
-  /** Net realized P&L in USDC wei6 (SIGNED decimal string — leading `-` for losses; `"0"` for zero). Sum of `won` profits minus `lost` stakes; `push` and `wonUnclaimed` contribute nothing. */
+  /** Net realized P&L in USDC wei6 (SIGNED decimal string — leading `-` for losses; `"0"` for zero). Sum of `won` profits minus `lost` stakes; `push`, `wonUnclaimed`, and `alreadyClaimed` contribute nothing. */
   netUsdcWei6: string;
   /** Sum of `payoutWei6 - cumulativeStake` across `won` positions (always non-negative — a claim only fires on winning positions). */
   claimedProfitUsdcWei6: string;
@@ -355,8 +363,10 @@ export interface RealizedPnl {
   lostCount: number;
   /** Positions whose `settle.winSide ∈ {'push', 'void'}` — stake refunded, P&L = 0. */
   pushCount: number;
-  /** Positions whose `settle.winSide === makerSide` but no `claim` event fired in this window — paper profit, not yet swept. Use `ospex-mm status` for the live payout figure. */
+  /** Positions whose `settle.winSide === makerSide` but no `claim` event AND no `already-claimed` skip fired in this window — paper profit, not yet swept. Use `ospex-mm status` for the live payout figure. */
   wonUnclaimedCount: number;
+  /** Positions the auto-claim path found ALREADY claimed (a `candidate skipReason:'already-claimed'`, no `claim` event) — claimed out-of-window / by a prior run / a concurrent caller. Distinct from `wonUnclaimed` (which is genuinely unswept): these ARE claimed, just with no event-sourced payout in this window, so they contribute nothing to `netUsdcWei6` (never a derived payout). Use `ospex-mm status` for the live payout figure. */
+  alreadyClaimedCount: number;
   /** Positions with fills whose speculation has not settled in this window — held over for the (g-iii) unrealized-P&L slice. */
   unsettledCount: number;
 }
@@ -598,6 +608,12 @@ export function summarize(logPaths: readonly string[], opts: { sinceIso?: string
   const stakesByPosition = new Map<string, bigint>(); // key = `${speculationId}:${makerSide}`
   const outcomeBySpeculation = new Map<string, string>(); // speculationId → winSide ('away' | 'home' | 'push' | 'void' | …)
   const claimByPosition = new Map<string, { payout: bigint; result?: 'won' | 'push' | 'void' }>();
+  // `(speculationId:makerSide)` keys found already-claimed by the auto-claim path
+  // (a `candidate skipReason:'already-claimed'`, no `claim` event). The position
+  // IS claimed (a winner — claimPosition reverts on losers), just not via a
+  // fresh tx in this window, so it must be classified `alreadyClaimed` rather
+  // than `wonUnclaimed` / `unsettled` — and contributes no payout to realized P&L.
+  const alreadyClaimedPositions = new Set<string>();
   const isMakerSide = (v: unknown): v is 'away' | 'home' => v === 'away' || v === 'home';
   const isClaimResult = (v: unknown): v is 'won' | 'push' | 'void' => v === 'won' || v === 'push' || v === 'void';
 
@@ -638,6 +654,19 @@ export function summarize(logPaths: readonly string[], opts: { sinceIso?: string
           // `gasAccountingGap: true` flag is the honest "not exact" signal.)
           if (p.skipReason === 'already-settled' && p.purpose === 'settleSpeculation') {
             addGas('settle', readGas(p.gasPolWei));
+          }
+          // Parallel to `already-settled`: a recovered inclusion-time CLAIM race
+          // (`already-claimed` + `purpose: 'claimPosition'`) reverted a claim tx
+          // of ours, so gas WAS spent and the runner put `gasPolWei` here — fold
+          // it into the gas totals (under `claim`) so the summary matches the
+          // daily counter. NOT a successful claim, so `claimCount` is left alone.
+          // Also remember the position so the P&L pass classifies it
+          // `alreadyClaimed` (not `wonUnclaimed` / `unsettled`).
+          if (p.skipReason === 'already-claimed' && p.purpose === 'claimPosition') {
+            addGas('claim', readGas(p.gasPolWei));
+            if (typeof p.speculationId === 'string' && isMakerSide(p.makerSide)) {
+              alreadyClaimedPositions.add(`${p.speculationId}:${p.makerSide}`);
+            }
           }
         } else {
           candTracked += 1;
@@ -837,6 +866,7 @@ export function summarize(logPaths: readonly string[], opts: { sinceIso?: string
   let lostCount = 0;
   let pushCount = 0;
   let wonUnclaimedCount = 0;
+  let alreadyClaimedCount = 0;
   let unsettledCount = 0;
   for (const [key, stake] of stakesByPosition) {
     const idx = key.indexOf(':');
@@ -874,6 +904,20 @@ export function summarize(logPaths: readonly string[], opts: { sinceIso?: string
       netRealizedPnlWei6 += profit;
       claimedProfitWei6 += profit;
       wonCount += 1;
+      continue;
+    }
+    // (4.5) Already claimed out-of-window — the auto-claim path found this
+    // position already claimed (or recovered from a benign already-claimed
+    // race) and emitted a `candidate skipReason:'already-claimed'` instead of a
+    // `claim` event, so there's no event-sourced payout. The position IS
+    // claimed (a winner — claimPosition reverts on losers / no-payout), just
+    // not in this window. Classify it `alreadyClaimed` (NOT `wonUnclaimed` /
+    // `unsettled`) and fold no payout into realized P&L (we never derive one).
+    // Guarded to the winning / outcome-unknown shape so a genuine push/void
+    // (handled in 1–2 above) or a loss (6 below) still wins on the outcome
+    // verdict — an already-claimed loss would be anomalous.
+    if (alreadyClaimedPositions.has(key) && (outcome === undefined || outcome === makerSide)) {
+      alreadyClaimedCount += 1;
       continue;
     }
     // (5) no settle and no claim → unsettled.
@@ -917,6 +961,7 @@ export function summarize(logPaths: readonly string[], opts: { sinceIso?: string
       lostCount,
       pushCount,
       wonUnclaimedCount,
+      alreadyClaimedCount,
       unsettledCount,
     },
     totalFeeUsdcWei6: totalFeeUsdcWei6.toString(),

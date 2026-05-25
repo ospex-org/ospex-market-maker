@@ -2609,36 +2609,84 @@ export class Runner {
       }
 
       const positionType = r.side === 'away' ? 0 : 1;
-      let result: Awaited<ReturnType<OspexAdapter['claimPosition']>>;
+      // Idempotent claim: under multi-wallet contention, a rerun, or core-API
+      // `claimable`-projection lag the position may already be claimed.
+      // `ensurePositionClaimed` resolves to success in that case (no tx, no
+      // payout) instead of reverting `AlreadyClaimed`, so a benign already-
+      // claimed is a boring skip, not an error. A genuine failure (`NotSettled`
+      // / `NoPayout` / RPC) still throws → the error path below.
+      let result: Awaited<ReturnType<OspexAdapter['ensurePositionClaimed']>>;
       try {
-        result = await this.adapter.claimPosition({ speculationId: BigInt(r.speculationId), positionType });
+        result = await this.adapter.ensurePositionClaimed({ speculationId: BigInt(r.speculationId), positionType });
       } catch (err) {
         this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'claim', speculationId: r.speculationId });
         continue;
       }
-      const gasPolWei = BigInt(result.receipt.gasUsed) * BigInt(result.receipt.effectiveGasPrice);
-      this.recordGasSpentToday(today, gasPolWei);
+      // Every success outcome means the position is (or just became) claimed —
+      // stamp it now so the per-tick loop stops retrying this record (the next
+      // poll drops it from the API anyway). This single stamp covers the fresh
+      // claim AND the benign already-claimed/recovered skip.
       r.status = 'claimed';
       r.updatedAtUnixSec = this.deps.now();
-      const claimPayload: Record<string, unknown> = {
-        speculationId: r.speculationId,
-        contestId: r.contestId,
-        sport: r.sport,
-        awayTeam: r.awayTeam,
-        homeTeam: r.homeTeam,
-        makerSide: r.side,
-        positionType,
-        payoutWei6: result.payoutWei6.toString(),
-        txHash: result.txHash,
-        gasPolWei: gasPolWei.toString(),
-      };
-      // Settled outcome from the API's ClaimablePositionView.result (captured
-      // during the position-status poll, stored on r.result). Lets the summary
-      // walker classify the position as push/void without depending on a
-      // `settle` event being in the same `--since` window (closes Hermes
-      // review-PR33's documented limitation).
-      if (r.result !== undefined) claimPayload.result = r.result;
-      this.eventLog.emit('claim', claimPayload);
+      if (result.receipt !== undefined && result.txHash !== undefined && result.payoutWei6 !== undefined) {
+        // We sent a claim tx that confirmed — debit gas and emit the `claim`
+        // event with the event-sourced payout (unchanged shape).
+        const gasPolWei = BigInt(result.receipt.gasUsed) * BigInt(result.receipt.effectiveGasPrice);
+        this.recordGasSpentToday(today, gasPolWei);
+        const claimPayload: Record<string, unknown> = {
+          speculationId: r.speculationId,
+          contestId: r.contestId,
+          sport: r.sport,
+          awayTeam: r.awayTeam,
+          homeTeam: r.homeTeam,
+          makerSide: r.side,
+          positionType,
+          payoutWei6: result.payoutWei6.toString(),
+          txHash: result.txHash,
+          gasPolWei: gasPolWei.toString(),
+        };
+        // Settled outcome from the API's ClaimablePositionView.result (captured
+        // during the position-status poll, stored on r.result). Lets the summary
+        // walker classify the position as push/void without depending on a
+        // `settle` event being in the same `--since` window (closes Hermes
+        // review-PR33's documented limitation).
+        if (r.result !== undefined) claimPayload.result = r.result;
+        this.eventLog.emit('claim', claimPayload);
+      } else {
+        // Already claimed (pre-flight read) or recovered from a benign already-
+        // claimed race — the goal is achieved without a confirmed claim of ours.
+        // We do NOT fake a `claim` event or a payout (the SDK never derives one;
+        // the contract zeroes economic fields post-claim), and this never enters
+        // `claimTxs`. Surface a `candidate` skip (info) instead.
+        //
+        // Gas accounting mirrors the settle leg: a recovered *inclusion-time*
+        // race DID broadcast a claim that reverted (POL spent). The SDK returns
+        // its `revertedReceipt` so we MUST debit that gas — every tx this wallet
+        // broadcasts is accounted, even reverted ones. If only `revertedTxHash`
+        // is present (the SDK's receipt re-fetch failed), gas was spent but we
+        // can't bill it exactly: flag the gap rather than silently report zero.
+        // Pre-flight / pre-send recovery and `alreadyClaimed` broadcast nothing.
+        let revertedGasPolWei: bigint | undefined;
+        let gasAccountingGap = false;
+        if (result.revertedReceipt !== undefined) {
+          revertedGasPolWei =
+            BigInt(result.revertedReceipt.gasUsed) * BigInt(result.revertedReceipt.effectiveGasPrice);
+          this.recordGasSpentToday(today, revertedGasPolWei);
+        } else if (result.revertedTxHash !== undefined) {
+          gasAccountingGap = true;
+        }
+        this.eventLog.emit('candidate', {
+          skipReason: 'already-claimed',
+          purpose: 'claimPosition',
+          speculationId: r.speculationId,
+          contestId: r.contestId,
+          makerSide: r.side,
+          outcome: result.outcome,
+          ...(result.revertedTxHash !== undefined ? { revertedTxHash: result.revertedTxHash } : {}),
+          ...(revertedGasPolWei !== undefined ? { gasPolWei: revertedGasPolWei.toString() } : {}),
+          ...(gasAccountingGap ? { gasAccountingGap: true } : {}),
+        });
+      }
     }
   }
 

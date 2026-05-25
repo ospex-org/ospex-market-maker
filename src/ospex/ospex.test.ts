@@ -215,6 +215,7 @@ function makeFakeClient(overrides: DeepPartial<OspexClientLike> = {}): OspexClie
       settleSpeculation: notStubbed('positions.settleSpeculation'),
       ensureSpeculationSettled: notStubbed('positions.ensureSpeculationSettled'),
       claim: notStubbed('positions.claim'),
+      ensurePositionClaimed: notStubbed('positions.ensurePositionClaimed'),
       claimAll: notStubbed('positions.claimAll'),
       ...overrides.positions,
     },
@@ -730,13 +731,28 @@ describe('OspexAdapter — write surface', () => {
     expect(received).toEqual({ speculationId: 7n, positionType: 0 });
   });
 
+  it('ensurePositionClaimed forwards { speculationId, positionType } to positions.ensurePositionClaimed', async () => {
+    let received: unknown = null;
+    const result = { speculationId: 7n, positionType: 0 as const, outcome: 'alreadyClaimed' as const };
+    const adapter = liveAdapterWith({
+      positions: {
+        ensurePositionClaimed: (args) => {
+          received = args;
+          return Promise.resolve(result);
+        },
+      },
+    });
+    expect(await adapter.ensurePositionClaimed({ speculationId: 7n, positionType: 0 })).toBe(result);
+    expect(received).toEqual({ speculationId: 7n, positionType: 0 });
+  });
+
   it('claimAll forwards its optional args (including undefined) to positions.claimAll', async () => {
     const received: unknown[] = [];
     const result = {
       address: '0x9999999999999999999999999999999999999999',
       success: true,
       entries: [],
-      totals: { claimed: 0, failed: 0, totalPayoutWei6: '0', totalPayoutUSDC: 0 },
+      totals: { claimed: 0, failed: 0, claimedFresh: 0, alreadyClaimed: 0, recoveredAlreadyClaimed: 0, totalPayoutWei6: '0', totalPayoutUSDC: 0 },
     };
     const adapter = liveAdapterWith({
       positions: {

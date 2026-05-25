@@ -2448,12 +2448,16 @@ export class Runner {
    * with the API buckets):
    *   - For each record at `status: 'pendingSettle'` with `settlement.autoSettleOwn`,
    *     gas-verdict (`mayUseReserve = settlement.continueOnGasBudgetExhausted`) →
-   *     `adapter.settleSpeculation({ speculationId })` → emit `settle` carrying the
-   *     on-chain `winSide` + `txHash` + `gasPolWei`. No local status flip — the next
-   *     `pollPositionStatus` observes the bucket change to `claimable` and runs the
-   *     `position-transition` event through `syncPolledPosition`. The contract
-   *     reverts on already-settled, so an extra concurrent settle by another EOA
-   *     just shows up as `error` `phase: 'settle'` and the tick continues.
+   *     `adapter.ensureSpeculationSettled({ speculationId })` (idempotent). If we
+   *     sent the settle tx → emit `settle` carrying the on-chain `winSide` +
+   *     `txHash` + `gasPolWei`. If it was already settled (pre-flight) or recovered
+   *     from a concurrent settle → emit `candidate` `skipReason: 'already-settled'`
+   *     (info, not error); a recovered inclusion-time revert of ours still bills its
+   *     gas (`gasPolWei`) or flags `gasAccountingGap`. No local status flip — the
+   *     next `pollPositionStatus` observes the bucket change to `claimable` and runs
+   *     the `position-transition` event through `syncPolledPosition`. Only a genuine
+   *     settle failure (e.g. contest not yet scored) surfaces as `error`
+   *     `phase: 'settle'`; the tick continues regardless.
    *   - For each record at `status: 'claimable'` with `settlement.autoClaimOwn`,
    *     gas-verdict (same `mayUseReserve` rule) →
    *     `adapter.claimPosition({ speculationId, positionType })` → emit `claim`

@@ -266,10 +266,10 @@ Canonical vocabulary (`TELEMETRY_KINDS` in [`src/telemetry/index.ts`](./src/tele
 'stale-reference' | 'start-too-soon' | 'cap-hit' | 'refused-pricing'
 'tracking-cap-reached' | 'gas-budget-blocks-reapproval'
 'gas-budget-blocks-settlement' | 'gas-budget-blocks-onchain-cancel'
-'partial-remainder-retained'
+'partial-remainder-retained' | 'already-settled'
 ```
 
-`refused-pricing` / `cap-hit` arrive during the per-market reconcile. The three `gas-budget-blocks-*` arrive from the on-chain write paths (boot approve, auto-settle/claim, shutdown kill / cancel-stale, and the routine `cancelMode: onchain` partial-remainder cancel). `partial-remainder-retained` marks a `partiallyFilled` remainder the runner left in place — never off-chain-cancelled (the API rejects a DELETE once matched), never reposted over (would double side exposure); its payload is `{ commitmentHash, contestId, speculationId, makerSide, takerSide, reason }`, where `reason ∈ {side-not-quoted, stale, mispriced, duplicate, shutdown}` is why it would have been actioned were it a `visibleOpen`. The others are pre-engine market-discovery gates.
+`refused-pricing` / `cap-hit` arrive during the per-market reconcile. The three `gas-budget-blocks-*` arrive from the on-chain write paths (boot approve, auto-settle/claim, shutdown kill / cancel-stale, and the routine `cancelMode: onchain` partial-remainder cancel). `partial-remainder-retained` marks a `partiallyFilled` remainder the runner left in place — never off-chain-cancelled (the API rejects a DELETE once matched), never reposted over (would double side exposure); its payload is `{ commitmentHash, contestId, speculationId, makerSide, takerSide, reason }`, where `reason ∈ {side-not-quoted, stale, mispriced, duplicate, shutdown}` is why it would have been actioned were it a `visibleOpen`. `already-settled` is the auto-settle idempotent skip — emitted when `ensureSpeculationSettled` finds the speculation already settled (pre-flight) or recovers from a concurrent settle, so a lost race is a boring skip rather than an `error`. Payload `{ purpose: 'settleSpeculation', speculationId, contestId, makerSide, outcome: 'alreadySettled' | 'recovered', winSide, revertedTxHash?, gasPolWei?, gasAccountingGap? }` — `gasPolWei` is present (and debited to the daily counter) when our settle reverted on inclusion (POL was spent on the lost race); `gasAccountingGap: true` flags that such a reverted tx's gas couldn't be fetched, so budget state isn't exact. The others are pre-engine market-discovery gates.
 
 ### 3.8 Soft-cancel + replace reasons
 
@@ -409,7 +409,7 @@ Unrealized P&L over `unsettledCount` positions is a future slice (requires `summ
 | `CommitmentLifecycle` (6 values) | [`src/state/index.ts`](./src/state/index.ts) — `COMMITMENT_LIFECYCLE_STATES` |
 | `MakerPositionStatus` (4 values) | [`src/state/index.ts`](./src/state/index.ts) — `MAKER_POSITION_STATUSES` |
 | `TelemetryKind` (24 values) | [`src/telemetry/index.ts`](./src/telemetry/index.ts) — `TELEMETRY_KINDS` |
-| `CandidateSkipReason` (11 values) | [`src/telemetry/index.ts`](./src/telemetry/index.ts) — `CANDIDATE_SKIP_REASONS` |
+| `CandidateSkipReason` (13 values) | [`src/telemetry/index.ts`](./src/telemetry/index.ts) — `CANDIDATE_SKIP_REASONS` |
 | `SoftCancelReason` / `ReplaceReason` | [`src/orders/index.ts`](./src/orders/index.ts) |
 | Risk caps / `headroomForSide` / `canSpendGas` | [`src/risk/index.ts`](./src/risk/index.ts) |
 

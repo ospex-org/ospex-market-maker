@@ -2549,12 +2549,26 @@ export class Runner {
         });
       } else {
         // Already settled (pre-flight read) or recovered from a concurrent
-        // settle — the goal is achieved without our tx. Record a settle-skip
-        // (info, not error); no receipt → no gas debit, and we don't fake a
-        // txHash. The position poll flips the bucket to `claimable` next tick;
-        // we don't force it here. `revertedTxHash` (a settle of ours that lost
-        // an inclusion-time race) is surfaced for audit when present — its gas
-        // isn't billed (the SDK doesn't return that reverted receipt).
+        // settle — the goal is achieved without a confirmed tx of ours. Record
+        // a settle-skip (info, not error); we don't fake a txHash or force the
+        // local bucket (the position poll flips it to `claimable` next tick).
+        //
+        // Gas accounting: a recovered *inclusion-time* race DID broadcast a
+        // settle that reverted (POL spent). The SDK returns its `revertedReceipt`
+        // so we MUST debit that gas — every tx this wallet broadcasts is
+        // accounted, even reverted ones. If only `revertedTxHash` is present
+        // (the SDK's receipt re-fetch failed), gas was spent but we can't bill
+        // it exactly: flag the gap rather than silently report zero. Pre-flight
+        // / pre-send recovery and `alreadySettled` broadcast nothing → no gas.
+        let revertedGasPolWei: bigint | undefined;
+        let gasAccountingGap = false;
+        if (result.revertedReceipt !== undefined) {
+          revertedGasPolWei =
+            BigInt(result.revertedReceipt.gasUsed) * BigInt(result.revertedReceipt.effectiveGasPrice);
+          this.recordGasSpentToday(today, revertedGasPolWei);
+        } else if (result.revertedTxHash !== undefined) {
+          gasAccountingGap = true;
+        }
         this.eventLog.emit('candidate', {
           skipReason: 'already-settled',
           purpose: 'settleSpeculation',
@@ -2564,6 +2578,8 @@ export class Runner {
           outcome: result.outcome,
           winSide: result.winSide,
           ...(result.revertedTxHash !== undefined ? { revertedTxHash: result.revertedTxHash } : {}),
+          ...(revertedGasPolWei !== undefined ? { gasPolWei: revertedGasPolWei.toString() } : {}),
+          ...(gasAccountingGap ? { gasAccountingGap: true } : {}),
         });
       }
     }

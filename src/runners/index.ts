@@ -2460,16 +2460,25 @@ export class Runner {
    *     `phase: 'settle'`; the tick continues regardless.
    *   - For each record at `status: 'claimable'` with `settlement.autoClaimOwn`,
    *     gas-verdict (same `mayUseReserve` rule) →
-   *     `adapter.claimPosition({ speculationId, positionType })` → emit `claim`
-   *     carrying the on-chain `payoutWei6` + `txHash` + `gasPolWei` → stamp the
-   *     record's `status = 'claimed'` so a later poll (with the position now
-   *     absent from the API) doesn't re-attempt the claim.
+   *     `adapter.ensurePositionClaimed({ speculationId, positionType })`
+   *     (idempotent). A fresh claim → emit `claim` carrying the event-sourced
+   *     `payoutWei6` + `txHash` + `gasPolWei`. If it was already claimed
+   *     (pre-flight) or recovered from a benign already-claimed race → emit
+   *     `candidate` `skipReason: 'already-claimed'` (info, not error) — NO `claim`
+   *     event and NO payout (the contract zeroes economic fields post-claim, so
+   *     none is derived); a recovered inclusion-time revert of ours still bills
+   *     its gas (`gasPolWei`) or flags `gasAccountingGap`. EVERY success outcome
+   *     stamps the record's `status = 'claimed'` so a later poll (with the
+   *     position now absent from the API) doesn't re-attempt. Only a genuine
+   *     `NotSettled` / `NoPayout` / RPC failure surfaces as `error` `phase: 'claim'`.
    *
    * Gas accumulates into `state.dailyCounters[YYYY-MM-DD].gasPolWei`; the
    * `gas-budget-blocks-settlement` `candidate` skip fires when the verdict denies.
-   * Errors (adapter throws on `settleSpeculation` / `claim`) are logged + the
-   * tick continues — typically a reverted "already settled" / "no payout" /
-   * "already claimed" by another caller; the next poll re-reads chain state.
+   * Genuine errors (the ensure-helpers throw — e.g. contest not yet scored,
+   * `NotSettled` / `NoPayout`, RPC) are logged (`error` `phase: 'settle' | 'claim'`)
+   * and the tick continues; the next poll re-reads chain state. A benign
+   * "already settled" / "already claimed" by another caller is NOT an error —
+   * it's the idempotent `candidate` skip described above (no event, no payout).
    *
    * Runs after `pollPositionStatus` and before `reconcileMarkets` so the
    * post-claim risk-engine view sees `claimed` status (headroom recovered) on
@@ -2488,8 +2497,9 @@ export class Runner {
     const maxDailyGasPolWei = polFloatToWei18(this.config.gas.maxDailyGasPOL);
     const emergencyReservePolWei = polFloatToWei18(this.config.gas.emergencyReservePOL);
 
-    // Snapshot the records up front — `claimPosition` mutates `state.positions`
-    // (sets `status: 'claimed'`), and modifying an object while iterating its
+    // Snapshot the records up front — the claim leg (`ensurePositionClaimed`)
+    // mutates `state.positions` (sets `status: 'claimed'` on every success
+    // outcome), and modifying an object while iterating its
     // `Object.values()` is fragile.
     const pendingSettleRecords = autoSettle
       ? Object.values(this.state.positions).filter((r) => r.status === 'pendingSettle')

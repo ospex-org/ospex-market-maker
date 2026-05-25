@@ -73,7 +73,7 @@ function fakeAdapter(client: ClientOverrides): OspexAdapter {
     },
     positions: {
       status: notStubbed('positions.status'), byAddress: notStubbed('positions.byAddress'),
-      settleSpeculation: notStubbed('positions.settleSpeculation'), claim: notStubbed('positions.claim'),
+      settleSpeculation: notStubbed('positions.settleSpeculation'), ensureSpeculationSettled: notStubbed('positions.ensureSpeculationSettled'), claim: notStubbed('positions.claim'),
       claimAll: notStubbed('positions.claimAll'),
       ...client.positions,
     },

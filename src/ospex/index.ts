@@ -174,7 +174,7 @@ export type OspexClientLike = {
     OspexClient['commitments'],
     'list' | 'get' | 'submitRaw' | 'cancel' | 'cancelOnchain' | 'raiseMinNonce' | 'approve' | 'getNonceFloor'
   >;
-  positions: Pick<OspexClient['positions'], 'status' | 'byAddress' | 'settleSpeculation' | 'claim' | 'claimAll'>;
+  positions: Pick<OspexClient['positions'], 'status' | 'byAddress' | 'settleSpeculation' | 'ensureSpeculationSettled' | 'claim' | 'claimAll'>;
   balances: Pick<OspexClient['balances'], 'read'>;
   approvals: Pick<OspexClient['approvals'], 'read'>;
   health: Pick<OspexClient['health'], 'check'>;
@@ -209,6 +209,10 @@ export type ApproveResult = Awaited<ReturnType<OspexClientLike['commitments']['a
 export type SettleSpeculationArgs = Parameters<OspexClientLike['positions']['settleSpeculation']>[0];
 /** `settleSpeculation` result — tx hash, block, receipt, and the decoded `winSide`. */
 export type SettleSpeculationResult = Awaited<ReturnType<OspexClientLike['positions']['settleSpeculation']>>;
+/** `ensureSpeculationSettled` args — `{ speculationId }`. */
+export type EnsureSpeculationSettledArgs = Parameters<OspexClientLike['positions']['ensureSpeculationSettled']>[0];
+/** `ensureSpeculationSettled` result — the idempotent settle outcome: `{ outcome: 'settled' | 'alreadySettled' | 'recovered', winSide, txHash?, blockNumber?, receipt?, revertedTxHash? }`. A receipt (+ txHash) is present only on `'settled'`. */
+export type EnsureSpeculationSettledResult = Awaited<ReturnType<OspexClientLike['positions']['ensureSpeculationSettled']>>;
 /** `claimPosition` args — `{ speculationId, positionType }`. */
 export type ClaimPositionArgs = Parameters<OspexClientLike['positions']['claim']>[0];
 /** `claimPosition` result — tx hash, block, receipt, and the on-chain payout. */
@@ -461,6 +465,20 @@ export class OspexAdapter {
    */
   async settleSpeculation(args: SettleSpeculationArgs): Promise<SettleSpeculationResult> {
     return this.client.positions.settleSpeculation(args);
+  }
+
+  /**
+   * Idempotent settle ("make this settled") — resolves to success whenever the
+   * speculation is settled: this call sent the tx (`outcome: 'settled'`, with a
+   * receipt + gas), it was already settled (`alreadySettled`, no tx), or a
+   * concurrent caller settled it mid-flight (`recovered`, no tx — or a
+   * `revertedTxHash` if this wallet's settle lost an inclusion-time race).
+   * Tolerates core-API `pendingSettle` projection lag, so it's the right call
+   * for unattended auto-settle. The strict `settleSpeculation` above stays for
+   * callers that need the receipt of a settle they specifically sent.
+   */
+  async ensureSpeculationSettled(args: EnsureSpeculationSettledArgs): Promise<EnsureSpeculationSettledResult> {
+    return this.client.positions.ensureSpeculationSettled(args);
   }
 
   /**

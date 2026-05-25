@@ -213,6 +213,7 @@ function makeFakeClient(overrides: DeepPartial<OspexClientLike> = {}): OspexClie
       status: notStubbed('positions.status'),
       byAddress: notStubbed('positions.byAddress'),
       settleSpeculation: notStubbed('positions.settleSpeculation'),
+      ensureSpeculationSettled: notStubbed('positions.ensureSpeculationSettled'),
       claim: notStubbed('positions.claim'),
       claimAll: notStubbed('positions.claimAll'),
       ...overrides.positions,
@@ -696,6 +697,21 @@ describe('OspexAdapter — write surface', () => {
       },
     });
     expect(await adapter.settleSpeculation({ speculationId: 7n })).toBe(result);
+    expect(received).toEqual({ speculationId: 7n });
+  });
+
+  it('ensureSpeculationSettled forwards { speculationId } to positions.ensureSpeculationSettled', async () => {
+    let received: unknown = null;
+    const result = { speculationId: 7n, outcome: 'alreadySettled' as const, winSide: 'home' as const };
+    const adapter = liveAdapterWith({
+      positions: {
+        ensureSpeculationSettled: (args) => {
+          received = args;
+          return Promise.resolve(result);
+        },
+      },
+    });
+    expect(await adapter.ensureSpeculationSettled({ speculationId: 7n })).toBe(result);
     expect(received).toEqual({ speculationId: 7n });
   });
 

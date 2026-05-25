@@ -3276,7 +3276,40 @@ describe('Runner — auto-settle + auto-claim (Phase 3 e-i)', () => {
     expect(StateStore.at(stateDir).load().state.positions['1234:home']?.status).toBe('pendingSettle'); // unchanged — the poll flips it
   });
 
-  it('ensureSpeculationSettled reports `recovered` from a concurrent settle → `candidate` `already-settled` outcome=recovered carrying revertedTxHash; no error, no gas (our reverted tx is not billed)', async () => {
+  it('ensureSpeculationSettled `recovered` with a reverted tx of ours → `candidate` `already-settled` carrying revertedTxHash; the reverted POL gas IS debited + reported (no error, no settle)', async () => {
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), positions: { '1234:home': pendingSettleRecord('1234', '1234') } });
+    const config = cfg({ mode: { dryRun: false }, settlement: { autoSettleOwn: true, autoClaimOwn: false, continueOnGasBudgetExhausted: false } });
+    const revertedGasPolWei = 60_000n * 30_000_000_000n;
+    const adapter = liveSpiedAdapter(
+      config,
+      () => Promise.resolve([]),
+      {
+        ensureSpeculationSettled: (args) =>
+          Promise.resolve({
+            speculationId: args.speculationId,
+            outcome: 'recovered',
+            winSide: 'away',
+            revertedTxHash: '0xlostrace' as Hex,
+            revertedReceipt: { gasUsed: 60_000n, effectiveGasPrice: 30_000_000_000n } as unknown as NonNullable<
+              EnsureSpeculationSettledResult['revertedReceipt']
+            >,
+          }),
+        claimPosition: claimRecorder().fn,
+      },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    const events = readEvents();
+    expect(events.some((e) => e.kind === 'error')).toBe(false);
+    expect(events.some((e) => e.kind === 'settle')).toBe(false);
+    expect(events.find((e) => e.kind === 'candidate' && e.skipReason === 'already-settled')).toMatchObject({
+      purpose: 'settleSpeculation', speculationId: '1234', outcome: 'recovered', winSide: 'away',
+      revertedTxHash: '0xlostrace', gasPolWei: revertedGasPolWei.toString(),
+    });
+    // The reverted settle spent POL — it MUST hit the daily gas counter.
+    expect(StateStore.at(stateDir).load().state.dailyCounters[todayUTC()]?.gasPolWei).toBe(revertedGasPolWei.toString());
+  });
+
+  it('recovered with revertedTxHash but no revertedReceipt (SDK receipt re-fetch failed) → flags `gasAccountingGap`, does not silently report zero gas', async () => {
     StateStore.at(stateDir).flush({ ...emptyMakerState(), positions: { '1234:home': pendingSettleRecord('1234', '1234') } });
     const config = cfg({ mode: { dryRun: false }, settlement: { autoSettleOwn: true, autoClaimOwn: false, continueOnGasBudgetExhausted: false } });
     const adapter = liveSpiedAdapter(
@@ -3285,12 +3318,10 @@ describe('Runner — auto-settle + auto-claim (Phase 3 e-i)', () => {
       { ensureSpeculationSettled: (args) => Promise.resolve({ speculationId: args.speculationId, outcome: 'recovered', winSide: 'away', revertedTxHash: '0xlostrace' as Hex }), claimPosition: claimRecorder().fn },
     );
     await makeRunner({ config, adapter, maxTicks: 1 }).run();
-    const events = readEvents();
-    expect(events.some((e) => e.kind === 'error')).toBe(false);
-    expect(events.some((e) => e.kind === 'settle')).toBe(false);
-    expect(events.find((e) => e.kind === 'candidate' && e.skipReason === 'already-settled')).toMatchObject({
-      purpose: 'settleSpeculation', speculationId: '1234', outcome: 'recovered', winSide: 'away', revertedTxHash: '0xlostrace',
-    });
+    const skip = readEvents().find((e) => e.kind === 'candidate' && e.skipReason === 'already-settled');
+    expect(skip).toMatchObject({ outcome: 'recovered', revertedTxHash: '0xlostrace', gasAccountingGap: true });
+    expect(skip).not.toHaveProperty('gasPolWei'); // gas was spent but unknown — not faked as a number
+    // Nothing billed (the gap flag is the honest signal that budget state isn't exact).
     expect(StateStore.at(stateDir).load().state.dailyCounters[todayUTC()]?.gasPolWei ?? '0').toBe('0');
   });
 

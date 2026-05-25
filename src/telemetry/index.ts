@@ -70,7 +70,7 @@ export const CANDIDATE_SKIP_REASONS = [
   'gas-budget-blocks-settlement', // on-chain settleSpeculation / claimPosition denied by canSpendGas (mayUseReserve = settlement.continueOnGasBudgetExhausted); `purpose` distinguishes `settleSpeculation` vs `claimPosition`
   'gas-budget-blocks-onchain-cancel', // on-chain cancelCommitment denied by canSpendGas — either the shutdown kill / cancel-stale --authoritative path (mayUseReserve: true, operator-explicit) or the routine `cancelMode: onchain` partial-remainder cancel (mayUseReserve: false — routine refresh must not burn the reserve); the candidate's `commitmentHash` identifies the record that couldn't be cancelled
   'partial-remainder-retained', //     a `partiallyFilled` remainder left in place (never off-chain-cancelled, never reposted over): it occupies its maker side until expiry / authoritative on-chain cancel. Carries `commitmentHash` / `contestId` / `speculationId` / `makerSide` / `takerSide` and a `reason` (`side-not-quoted` / `stale` / `mispriced` / `duplicate` / `shutdown`)
-  'already-settled', //                ensureSpeculationSettled found the speculation already settled (pre-flight read) or recovered from a concurrent settle — no settle tx sent by us, so no gas is debited and no txHash is faked. Emitted by the auto-settle path with `purpose: 'settleSpeculation'`; `outcome` distinguishes `alreadySettled` vs `recovered`, and `revertedTxHash` is present iff our settle lost an inclusion-time race (its gas is not billed — the SDK doesn't return that reverted receipt).
+  'already-settled', //                ensureSpeculationSettled found the speculation already settled (pre-flight) or recovered from a concurrent settle — a boring skip, not an error. Emitted by the auto-settle path with `purpose: 'settleSpeculation'`; `outcome` distinguishes `alreadySettled` vs `recovered`. A `recovered` race that broadcast a settle which reverted on inclusion DID spend gas: `revertedTxHash` + `gasPolWei` are present and that gas IS billed (state daily counter + the run summary under `settle`); if the reverted receipt couldn't be fetched, `gasAccountingGap: true` flags the gap. `alreadySettled` / pre-send recovery send no tx → no gas, no faked txHash.
 ] as const;
 export type CandidateSkipReason = (typeof CANDIDATE_SKIP_REASONS)[number];
 
@@ -626,6 +626,19 @@ export function summarize(logPaths: readonly string[], opts: { sinceIso?: string
         if (typeof p.skipReason === 'string') {
           bump(candSkipReasons, p.skipReason);
           if (p.skipReason === 'stale-reference') staleQuoteIncidents += 1;
+          // A recovered inclusion-time settle race (`already-settled` +
+          // `purpose: 'settleSpeculation'`) reverted a settle tx of ours, so
+          // gas WAS spent: the runner debited the state daily counter and put
+          // `gasPolWei` on this event. Fold that into the gas totals (under
+          // `settle`) so the summary matches the daily counter — otherwise the
+          // scorecard underreports the gas this exact path spent. NOT a
+          // successful settle, so `settleCount` is intentionally left alone.
+          // (When only `revertedTxHash` is present and gas couldn't be fetched,
+          // there's no `gasPolWei` → `readGas` yields 0n; the event's
+          // `gasAccountingGap: true` flag is the honest "not exact" signal.)
+          if (p.skipReason === 'already-settled' && p.purpose === 'settleSpeculation') {
+            addGas('settle', readGas(p.gasPolWei));
+          }
         } else {
           candTracked += 1;
         }

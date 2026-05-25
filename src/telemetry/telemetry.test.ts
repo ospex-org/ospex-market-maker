@@ -372,6 +372,26 @@ describe('summarize', () => {
       expect(s.liveMetrics.gas.totalUsdcEquivWei6).toBeNull(); // no rate supplied
     });
 
+    it('folds recovered-race settle gas (candidate/already-settled, purpose settleSpeculation) into gas.byKind.settle WITHOUT bumping settleCount', () => {
+      const path = writeLog('run-recovered-gas.ndjson', [
+        // Recovered inclusion-time race: our settle reverted (gas spent); the runner billed it here.
+        { kind: 'candidate', skipReason: 'already-settled', purpose: 'settleSpeculation', speculationId: 'spec-A', contestId: 'A', makerSide: 'home', outcome: 'recovered', winSide: 'away', revertedTxHash: '0xrev', gasPolWei: '1800000000000000' }, // 0.0018 POL
+        // Reverted tx but receipt unavailable → no gasPolWei, gap flagged.
+        { kind: 'candidate', skipReason: 'already-settled', purpose: 'settleSpeculation', speculationId: 'spec-B', contestId: 'B', makerSide: 'away', outcome: 'recovered', revertedTxHash: '0xrev2', gasAccountingGap: true },
+        // Pre-flight already-settled skip: no tx, no gas.
+        { kind: 'candidate', skipReason: 'already-settled', purpose: 'settleSpeculation', speculationId: 'spec-C', contestId: 'C', makerSide: 'home', outcome: 'alreadySettled', winSide: 'home' },
+      ]);
+      const s = summarize([path]);
+      // The reverted settle's gas is in the totals (under `settle`) — matching the
+      // state daily counter the runner debited; the gap / no-tx skips add nothing.
+      expect(s.liveMetrics.gas.byKind.settle).toBe('1800000000000000');
+      expect(s.liveMetrics.gas.totalPolWei).toBe('1800000000000000');
+      // None of these is a successful settle.
+      expect(s.liveMetrics.settlements.settleCount).toBe(0);
+      // All three are still counted as already-settled skips.
+      expect(s.candidates.skipReasons['already-settled']).toBe(3);
+    });
+
     it('populates `gas.totalUsdcEquivWei6` when `polToUsdcRate` is supplied (CLI threads `config.gas.nativeTokenUSDCPrice`)', () => {
       const path = writeLog('run-gas-usdc.ndjson', [
         { kind: 'settle', speculationId: 'spec-A', contestId: 'A', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', makerSide: 'home', winSide: 'home', txHash: '0xtx', gasPolWei: '1000000000000000000' }, // 1 POL

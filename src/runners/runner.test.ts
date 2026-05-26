@@ -3980,3 +3980,224 @@ describe('Runner — cancelMode: onchain (PR3 — authoritative cancel of recove
     expect(StateStore.at(stateDir).load().state.commitments['0xsc']?.lifecycle).toBe('softCancelled');
   });
 });
+
+// ── funding guard (DESIGN §6): C1a hold/halt + C1b active cancel ──────────────
+describe('Runner — funding guard', () => {
+  const MAKER = DEFAULT_FAKE_MAKER_ADDRESS as Hex;
+
+  /** Seed one matchable `visibleOpen` commitment into state (so `required` > 0) and return it. */
+  function seedOne(over: Partial<MakerCommitmentRecord> = {}): MakerCommitmentRecord {
+    const record = commitmentRecord({ hash: '0xfund', contestId: 'contest-fund', speculationId: 'spec-fund', makerSide: 'away', riskAmountWei6: '250000', filledRiskWei6: '0', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 10, updatedAtUnixSec: T0 - 10, ...over });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { [record.hash]: record } });
+    return record;
+  }
+
+  /** The `listOpenCommitments` fixture that keeps a seeded local record "live" through `detectFills` (still on the book, no new fill → stays counted in `required`). */
+  function openFixture(record: MakerCommitmentRecord): Commitment {
+    return orderbookEntry({
+      commitmentHash: record.hash, maker: MAKER, status: 'open', storedStatus: 'open', isLive: true,
+      riskAmount: record.riskAmountWei6, filledRiskAmount: record.filledRiskWei6,
+      remainingRiskAmount: (BigInt(record.riskAmountWei6) - BigInt(record.filledRiskWei6)).toString(),
+    });
+  }
+
+  /** A `readBalances` stub with the given wallet USDC (other balances are safe non-zero placeholders). */
+  function balances(usdc: bigint): (owner: Hex) => Promise<{ owner: Hex; chainId: number; native: bigint; usdc: bigint; link: bigint; usdcAddress: Hex; linkAddress: Hex }> {
+    return (owner) => Promise.resolve({ owner, chainId: 137, native: 10n ** 18n, usdc, link: 0n, usdcAddress: '0xusdc' as Hex, linkAddress: '0xlink' as Hex });
+  }
+
+  function todayUTC(): string {
+    const d = new Date(T0 * 1000);
+    return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+  }
+  function cancelOnchainRecorder(gasUsed = 60_000n, effectiveGasPrice = 30_000_000_000n): { fn: OspexAdapter['cancelCommitmentOnchain']; calls: Hex[] } {
+    const calls: Hex[] = [];
+    return {
+      calls,
+      fn: (hash: Hex) => {
+        calls.push(hash);
+        const receipt = { gasUsed, effectiveGasPrice } as unknown as CancelOnchainResult['receipt'];
+        return Promise.resolve({ txHash: '0xkilltx', receipt, commitmentHash: hash });
+      },
+    };
+  }
+
+  // ── C1a: detect underfunding, enter the hold, halt NEW posting ───────────────
+
+  it('C1a — underfunded (funding < required) enters the hold and halts posting: no quote-intent, no submit, even with a quotable market', async () => {
+    const record = seedOne();
+    const config = cfg({ mode: { dryRun: false }, fundingGuard: { underfundedCancelMode: 'none' } }); // 'none' isolates the hold from the C1b cancel sweep
+    const submit = submitRecorder();
+    const adapter = liveSpiedAdapter(
+      config,
+      () => Promise.resolve([contestView({ contestId: '1234' })]), // a quotable market — the same setup posts both sides absent the hold (see 'posts both sides' above)
+      { submitCommitment: submit.fn },
+      undefined,
+      undefined,
+      { listOpenCommitments: () => Promise.resolve([openFixture(record)]), readBalances: balances(100_000n) }, // wallet 0.10 USDC < required 0.25
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    const events = readEvents();
+    const hold = events.filter((e) => e.kind === 'funding-hold');
+    expect(hold).toHaveLength(1);
+    expect(hold[0]).toMatchObject({ state: 'entered', reason: 'funding-shortfall', requiredWei6: '250000', fundingWei6: '100000' });
+    expect(submit.calls).toHaveLength(0); // posting halted
+    expect(events.some((e) => e.kind === 'submit')).toBe(false);
+    expect(events.some((e) => e.kind === 'quote-intent')).toBe(false); // reconcileMarkets early-returned on the hold — never even priced
+    expect(StateStore.at(stateDir).load().state.commitments['0xfund']?.lifecycle).toBe('visibleOpen'); // mode 'none' → no active cancel
+  });
+
+  it('C1a — adequately funded (funding ≥ required) does not hold', async () => {
+    const record = seedOne();
+    const config = cfg({ mode: { dryRun: false }, fundingGuard: { underfundedCancelMode: 'none' } });
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]), undefined, undefined, undefined,
+      { listOpenCommitments: () => Promise.resolve([openFixture(record)]) }, // default saturated balances/approvals → funding ≫ required
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    expect(readEvents().some((e) => e.kind === 'funding-hold')).toBe(false);
+  });
+
+  it('C1a — fail-closed: a balance read error enters the hold (reason read-failed) when failClosedOnReadError', async () => {
+    const record = seedOne();
+    const config = cfg({ mode: { dryRun: false }, fundingGuard: { underfundedCancelMode: 'none', failClosedOnReadError: true } });
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]), undefined, undefined, undefined,
+      { listOpenCommitments: () => Promise.resolve([openFixture(record)]), readBalances: () => Promise.reject(new Error('rpc 503')) },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    const events = readEvents();
+    expect(events.filter((e) => e.kind === 'funding-hold' && e.state === 'entered' && e.reason === 'read-failed')).toHaveLength(1);
+    expect(events.some((e) => e.kind === 'error' && e.phase === 'funding-check')).toBe(true);
+  });
+
+  it('C1a — failClosedOnReadError:false — a read error does NOT enter the hold, but is still logged', async () => {
+    const record = seedOne();
+    const config = cfg({ mode: { dryRun: false }, fundingGuard: { underfundedCancelMode: 'none', failClosedOnReadError: false } });
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]), undefined, undefined, undefined,
+      { listOpenCommitments: () => Promise.resolve([openFixture(record)]), readApprovals: () => Promise.reject(new Error('rpc 503')) },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    const events = readEvents();
+    expect(events.some((e) => e.kind === 'funding-hold')).toBe(false);
+    expect(events.some((e) => e.kind === 'error' && e.phase === 'funding-check')).toBe(true);
+  });
+
+  it('C1a — no matchable exposure (required = 0) skips the balance/allowance reads entirely', async () => {
+    StateStore.at(stateDir).flush(emptyMakerState()); // no commitments → required 0
+    const config = cfg({ mode: { dryRun: false }, fundingGuard: { underfundedCancelMode: 'none' } });
+    let balanceReads = 0;
+    let approvalReads = 0;
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([]), undefined, undefined, undefined, {
+      readBalances: (o) => { balanceReads += 1; return Promise.resolve({ owner: o, chainId: 137, native: 0n, usdc: 0n, link: 0n, usdcAddress: '0xusdc' as Hex, linkAddress: '0xlink' as Hex }); },
+      readApprovals: () => { approvalReads += 1; return Promise.resolve(approvalsSnapshotWith(0n)); },
+    });
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    expect(balanceReads).toBe(0); // required-first short-circuit (autoApprove:false → no other reader)
+    expect(approvalReads).toBe(0);
+    expect(readEvents().some((e) => e.kind === 'funding-hold')).toBe(false);
+  });
+
+  // ── C1b: active cancel response per underfundedCancelMode ────────────────────
+
+  it('C1b — offchain: pulls visible quotes off the relay (soft-cancel reason "funding"), no on-chain cancel, exposure still counted', async () => {
+    const record = seedOne();
+    const config = cfg({ mode: { dryRun: false }, fundingGuard: { underfundedCancelMode: 'offchain' } });
+    const offchainCancels: Hex[] = [];
+    const cancelOnchain = cancelOnchainRecorder();
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]),
+      { cancelCommitmentOffchain: (h) => { offchainCancels.push(h); return Promise.resolve(); }, cancelCommitmentOnchain: cancelOnchain.fn },
+      undefined, undefined,
+      { listOpenCommitments: () => Promise.resolve([openFixture(record)]), readBalances: balances(0n) },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    const events = readEvents();
+    expect(events.some((e) => e.kind === 'funding-hold' && e.state === 'entered')).toBe(true);
+    expect(offchainCancels).toEqual(['0xfund']); // pulled off the relay
+    expect(cancelOnchain.calls).toEqual([]); // offchain mode → no authoritative cancel
+    const sc = events.filter((e) => e.kind === 'soft-cancel' && e.reason === 'funding');
+    expect(sc).toHaveLength(1);
+    expect(sc[0]).toMatchObject({ commitmentHash: '0xfund', reason: 'funding' });
+    // Pulled, but the signed payload stays matchable on chain → still `softCancelled` and still counted in `required`.
+    expect(StateStore.at(stateDir).load().state.commitments['0xfund']?.lifecycle).toBe('softCancelled');
+  });
+
+  it('C1b — onchain: soft-cancels then authoritatively cancels on chain → authoritativelyInvalidated (drops from required)', async () => {
+    const record = seedOne();
+    const config = cfg({ mode: { dryRun: false }, fundingGuard: { underfundedCancelMode: 'onchain' } });
+    const offchainCancels: Hex[] = [];
+    const cancelOnchain = cancelOnchainRecorder();
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]),
+      { cancelCommitmentOffchain: (h) => { offchainCancels.push(h); return Promise.resolve(); }, cancelCommitmentOnchain: cancelOnchain.fn },
+      undefined, undefined,
+      { listOpenCommitments: () => Promise.resolve([openFixture(record)]), readBalances: balances(0n) },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    const events = readEvents();
+    expect(offchainCancels).toEqual(['0xfund']); // off-chain pull first
+    expect(cancelOnchain.calls).toEqual(['0xfund']); // then authoritative cancel
+    expect(events.some((e) => e.kind === 'onchain-cancel' && e.commitmentHash === '0xfund')).toBe(true);
+    expect(StateStore.at(stateDir).load().state.commitments['0xfund']?.lifecycle).toBe('authoritativelyInvalidated');
+  });
+
+  it('C1b — none: holds but performs NO active cancel (quote rides to expiry)', async () => {
+    const record = seedOne();
+    const config = cfg({ mode: { dryRun: false }, fundingGuard: { underfundedCancelMode: 'none' } });
+    const offchainCancels: Hex[] = [];
+    const cancelOnchain = cancelOnchainRecorder();
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]),
+      { cancelCommitmentOffchain: (h) => { offchainCancels.push(h); return Promise.resolve(); }, cancelCommitmentOnchain: cancelOnchain.fn },
+      undefined, undefined,
+      { listOpenCommitments: () => Promise.resolve([openFixture(record)]), readBalances: balances(0n) },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    const events = readEvents();
+    expect(events.some((e) => e.kind === 'funding-hold' && e.state === 'entered')).toBe(true); // still holds
+    expect(offchainCancels).toEqual([]);
+    expect(cancelOnchain.calls).toEqual([]);
+    expect(events.some((e) => e.kind === 'soft-cancel')).toBe(false);
+    expect(StateStore.at(stateDir).load().state.commitments['0xfund']?.lifecycle).toBe('visibleOpen');
+  });
+
+  it('C1b — onchain + gas budget exhausted: emits the gas-denial candidate ONCE per hold episode (not per tick), record not authoritatively cancelled', async () => {
+    const POL = 10n ** 18n;
+    const record = commitmentRecord({ hash: '0xfund', contestId: 'contest-fund', speculationId: 'spec-fund', makerSide: 'away', riskAmountWei6: '250000', filledRiskWei6: '0', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 10_000, postedAtUnixSec: T0 - 10, updatedAtUnixSec: T0 - 10 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xfund': record }, dailyCounters: { [todayUTC()]: { gasPolWei: POL.toString(), feeUsdcWei6: '0' } } }); // today's spend already at the full cap
+    const config = cfg({ mode: { dryRun: false }, fundingGuard: { underfundedCancelMode: 'onchain' }, gas: { maxDailyGasPOL: 1, emergencyReservePOL: 0 } });
+    const cancelOnchain = cancelOnchainRecorder();
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]),
+      { cancelCommitmentOffchain: () => Promise.resolve(), cancelCommitmentOnchain: cancelOnchain.fn },
+      undefined, undefined,
+      {
+        listOpenCommitments: () => Promise.resolve([openFixture(record)]),
+        getCommitment: (h) => (h === '0xfund' ? Promise.resolve(openFixture(record)) : Promise.reject(new Error('unknown hash'))), // tick-2 soft-cancelled-fill probe
+        readBalances: balances(0n),
+      },
+    );
+    await makeRunner({ config, adapter, maxTicks: 2 }).run(); // two held ticks — the warning must fire once, not per tick
+
+    const events = readEvents();
+    const denied = events.filter((e) => e.kind === 'candidate' && e.skipReason === 'gas-budget-blocks-onchain-cancel');
+    expect(denied).toHaveLength(1); // warn-once per episode (break + fundingOnchainGasDeniedWarned)
+    expect(cancelOnchain.calls).toEqual([]); // gas gate fired before any write
+    expect(StateStore.at(stateDir).load().state.commitments['0xfund']?.lifecycle).not.toBe('authoritativelyInvalidated'); // the authoritative cancel never landed
+  });
+
+  it('C1b — dry-run: the funding guard never reads or holds (live-only)', async () => {
+    seedOne();
+    let reads = 0;
+    const config = cfg({ mode: { dryRun: true }, fundingGuard: { underfundedCancelMode: 'onchain' } });
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([]), undefined, undefined, undefined, {
+      readBalances: (o) => { reads += 1; return Promise.resolve({ owner: o, chainId: 137, native: 0n, usdc: 0n, link: 0n, usdcAddress: '0xusdc' as Hex, linkAddress: '0xlink' as Hex }); },
+    });
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    expect(reads).toBe(0);
+    expect(readEvents().some((e) => e.kind === 'funding-hold')).toBe(false);
+  });
+});

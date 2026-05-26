@@ -27,10 +27,13 @@ export const CANCEL_MODES = ['offchain', 'onchain'] as const;
 export type CancelMode = (typeof CANCEL_MODES)[number];
 
 /**
- * What the funding guard does to EXISTING visible quotes when it trips. Distinct from
+ * What the funding guard does to EXISTING visible quotes while it holds. Distinct from
  * `orders.cancelMode` (the routine partial-fill cancel policy) — the funding guard adds
- * a `none` option (just hold; let quotes ride to expiry). Wired by C1b; C1a always holds
- * regardless of this value.
+ * a `none` option (just hold; let quotes ride to expiry). The guard ALWAYS halts new
+ * posting while held regardless of this value; this only governs the active cancel sweep:
+ * `offchain` pulls visible quotes off the relay (gasless, doesn't reduce on-chain exposure),
+ * `onchain` also authoritatively cancels on chain (the only mode that shrinks `required` so
+ * the hold can clear), `none` leaves quotes up to ride to expiry.
  */
 export const UNDERFUNDED_CANCEL_MODES = ['offchain', 'onchain', 'none'] as const;
 export type UnderfundedCancelMode = (typeof UNDERFUNDED_CANCEL_MODES)[number];
@@ -162,10 +165,12 @@ export interface FundingGuardConfig {
    */
   checkIntervalMs: number;
   /**
-   * What to do with EXISTING visible quotes when underfunded: `offchain` (soft-cancel)
-   * / `onchain` (authoritative cancel) / `none` (hold only, let them ride to expiry).
-   * C1a always halts NEW posting regardless; this governs the active cancel response
-   * (wired in C1b).
+   * What to do with EXISTING visible quotes when underfunded: `offchain` (soft-cancel —
+   * pull them off the relay, gasless) / `onchain` (also authoritatively cancel on chain) /
+   * `none` (hold only, let them ride to expiry). The guard always halts NEW posting while
+   * held regardless; this governs the active cancel sweep. Only `onchain` reduces the
+   * on-chain exposure (`required`), so it's the only mode under which the hold clears before
+   * the commitments expire naturally.
    */
   underfundedCancelMode: UnderfundedCancelMode;
   /**

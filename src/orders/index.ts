@@ -86,6 +86,7 @@ export type SoftCancelReason =
   | 'side-not-quoted' //   the desired quote has no `QuoteSide` for that side (no headroom, or the whole quote was refused)
   | 'duplicate' //         more than one API-visible commitment on a `(speculation, side)` — keep the newest, pull the rest (book hygiene, DESIGN §9)
   | 'shutdown' //          the runner is shutting down — sweep every visible quote off-chain (gasless), regardless of `killCancelOnChain`; the latent (matchable until expiry) window stays until the on-chain kill path also fires (if `killCancelOnChain: true`) or natural expiry
+  | 'funding' //           the funding guard is holding — the wallet can't back its matchable-commitment exposure, so pull every visible quote off the relay (DESIGN §6 / C1b). Off-chain only stops NEW relay fills; the signed payload stays matchable on chain until expiry (or an authoritative on-chain cancel under `fundingGuard.underfundedCancelMode: onchain`), so the latent risk — and the hold — persists until then.
   | ReplaceReason; //      a stale/mispriced `visibleOpen` quote we'd replace, but the open-commitment count budget is exhausted — pull it; a fresh post follows only if there's count headroom. (Never a `partiallyFilled` record — those can't be off-chain-cancelled; see `RetainedPartial`.)
 
 /** A commitment to pull off-chain without re-posting. Always a `visibleOpen` record — a `partiallyFilled` remainder is never off-chain-cancelled (the API returns 409 `COMMITMENT_MATCHED` once a commitment has matched). */

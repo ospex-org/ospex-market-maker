@@ -274,12 +274,12 @@ Canonical vocabulary (`TELEMETRY_KINDS` in [`src/telemetry/index.ts`](./src/tele
 ### 3.8 Soft-cancel + replace reasons
 
 ```
-SoftCancelReason: 'side-not-quoted' | 'duplicate' | 'shutdown'
+SoftCancelReason: 'side-not-quoted' | 'duplicate' | 'shutdown' | 'funding'
                 | 'stale' | 'mispriced'        // = ReplaceReason
 ReplaceReason:   'stale' | 'mispriced'
 ```
 
-`'stale'` and `'mispriced'` appear on `would-replace` / `replace` (replacement actions) AND on `would-soft-cancel` / `soft-cancel` (when the replacement was deferred for cap budget). `'side-not-quoted'` only on soft-cancels. `'duplicate'` on book-hygiene pulls. `'shutdown'` only on the kill-switch's unconditional off-chain sweep. **All soft-cancels target `visibleOpen` records only** — a `partiallyFilled` remainder is never off-chain-cancelled (the API rejects a DELETE once matched); it surfaces as a `partial-remainder-retained` candidate (§3.7) carrying the same reason vocabulary.
+`'stale'` and `'mispriced'` appear on `would-replace` / `replace` (replacement actions) AND on `would-soft-cancel` / `soft-cancel` (when the replacement was deferred for cap budget). `'side-not-quoted'` only on soft-cancels. `'duplicate'` on book-hygiene pulls. `'shutdown'` only on the kill-switch's unconditional off-chain sweep. `'funding'` only on the funding guard's underfunded sweep (DESIGN §6) — when the wallet can no longer back its matchable-commitment exposure, every `visibleOpen` quote is pulled off the relay (`underfundedCancelMode: offchain | onchain`). **All soft-cancels target `visibleOpen` records only** — a `partiallyFilled` remainder is never off-chain-cancelled (the API rejects a DELETE once matched); it surfaces as a `partial-remainder-retained` candidate (§3.7) carrying the same reason vocabulary, **except `'funding'`**: the funding sweep emits no `partial-remainder-retained` — an underfunded partial is authoritatively on-chain-cancelled under `underfundedCancelMode: onchain`, else left to ride to expiry.
 
 ---
 

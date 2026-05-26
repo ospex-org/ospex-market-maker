@@ -342,6 +342,16 @@ export class Runner {
   private fundingHold = false;
   /** Unix-seconds of the last funding re-read; throttles `checkFunding` to `fundingGuard.checkIntervalMs`. `null` = never read. */
   private lastFundingCheckAtSec: number | null = null;
+  /**
+   * Funding guard (C1b): under `underfundedCancelMode: onchain`, whether the active-cancel
+   * sweep has already emitted a `gas-budget-blocks-onchain-cancel` candidate for the *current*
+   * hold episode — so a sustained gas shortfall during a hold doesn't spam the log every tick
+   * (the sweep still re-attempts the cancels each tick, landing once the budget frees, e.g. at the
+   * UTC daily reset). Reset to `false` whenever the hold clears (a fresh episode re-warns) and on
+   * the first cancel that lands within an episode. A single flag (not a per-hash set) suffices —
+   * the sweep BREAKS on the first denial, since today's gas spend only grows so the rest would deny identically.
+   */
+  private fundingOnchainGasDeniedWarned = false;
 
   constructor(opts: RunnerOptions) {
     this.config = opts.config;
@@ -521,6 +531,7 @@ export class Runner {
   ): void {
     if (hold === this.fundingHold) return; // no transition — stay quiet
     this.fundingHold = hold;
+    if (!hold) this.fundingOnchainGasDeniedWarned = false; // hold cleared — the next episode's onchain sweep re-warns on a fresh gas denial (C1b)
     const payload: Record<string, unknown> = { state: hold ? 'entered' : 'cleared', reason: ctx.reason };
     if (ctx.fundingWei6 !== undefined) payload.fundingWei6 = ctx.fundingWei6.toString();
     if (ctx.requiredWei6 !== undefined) payload.requiredWei6 = ctx.requiredWei6.toString();
@@ -533,6 +544,92 @@ export class Runner {
           ? ` — funding ${ctx.fundingWei6} wei6 vs required ${ctx.requiredWei6} wei6`
           : ''),
     );
+  }
+
+  /**
+   * Funding-guard active-cancel response (C1b, DESIGN §6). Runs each live tick while
+   * {@link fundingHold} is set, per `config.fundingGuard.underfundedCancelMode`:
+   *
+   *   - `none`     — no active cancel; the C1a hold (halt NEW posting) is the whole
+   *                  response. Existing quotes ride to expiry, so the hold persists until
+   *                  they age out (or funding is topped up above the still-latent exposure).
+   *   - `offchain` — pull every still-matchable `visibleOpen` quote off the relay (gasless
+   *                  `cancelCommitmentOffchain` → `softCancelled`, reason `'funding'`), so no
+   *                  NEW fills arrive through the relay. **Does NOT reduce `required`**: an
+   *                  off-chain pull is visibility-only — the signed payload stays matchable on
+   *                  chain until expiry, so {@link matchableCommitmentRiskWei6} keeps counting
+   *                  it. The hold therefore persists until those commitments expire.
+   *   - `onchain`  — the off-chain pull above, THEN an authoritative on-chain `cancelCommitment`
+   *                  for every still-matchable non-terminal record. Each landed cancel stamps
+   *                  the record `authoritativelyInvalidated`, which DOES drop it from `required`
+   *                  — so this is the only mode that actively shrinks the exposure and lets the
+   *                  hold clear (once funding ≥ the remaining required). Gas-gated via
+   *                  {@link onchainCancelCommitment} (`mayUseReserve: false` — an automatic
+   *                  guard must not burn the emergency reserve); a gas denial emits ONE
+   *                  `gas-budget-blocks-onchain-cancel` candidate per hold episode (see
+   *                  {@link fundingOnchainGasDeniedWarned}) and stops the sweep for the tick.
+   *
+   * Eligibility mirrors {@link matchableCommitmentRiskWei6} (the `required` this responds to)
+   * exactly — non-terminal lifecycle, not past `expiry + expiryReleaseGraceSeconds` — so the
+   * sweep acts on precisely the commitments that count toward the shortfall. A within-grace
+   * record may still match on chain (the grace exists for host/chain clock skew), so it is
+   * still swept; a past-grace one is dead on chain (`ageOut` terminalizes it) and is skipped so
+   * the sweep doesn't waste a relay call / gas on it. (This is grace-aware, unlike
+   * `pullVisibleQuotes`'s strict `expiry <= now` book-hygiene cutoff — here we match `required`.)
+   *
+   * Global scan of `state.commitments` (NOT per-tracked-market, like {@link offchainKillCancel}):
+   * a matchable commitment's contest may no longer be tracked, yet its latent risk still counts
+   * toward `required`, so the sweep must reach it. Live-only — `fundingHold` is only ever set in
+   * live mode (`checkFunding` is dry-run-gated) and the per-record primitives never write to chain
+   * in dry-run. Per-record failures self-heal: a thrown off-chain cancel leaves the record
+   * `visibleOpen` and a thrown on-chain cancel leaves it as-is, both retried on the next held tick
+   * (the sweep runs every tick while held).
+   */
+  private async fundingCancelSweep(): Promise<void> {
+    const mode = this.config.fundingGuard.underfundedCancelMode;
+    if (mode === 'none') return; // hold-only (C1a) — existing quotes ride to expiry
+    if (this.config.mode.dryRun || this.makerAddress === null) return; // live-only invariant (caller already gates on !dryRun && fundingHold)
+    const now = this.deps.now();
+    const grace = this.config.orders.expiryReleaseGraceSeconds;
+
+    // ── off-chain pull (both `offchain` and `onchain` modes) ──────────────────
+    // Pull every still-matchable `visibleOpen` quote off the relay. `softCancelRecord`
+    // only acts on (and re-emits for) `visibleOpen` records, so re-running this every held
+    // tick is idempotent + quiet once the book is swept; a transient off-chain-cancel failure
+    // leaves the record `visibleOpen`, retried next held tick.
+    let softCancelled = 0;
+    for (const r of Object.values(this.state.commitments)) {
+      if (r.lifecycle !== 'visibleOpen') continue;
+      if (isExpiredForRelease(r.expiryUnixSec, now, grace)) continue; // dead on chain — not in `required`; ageOut handles it
+      if (await this.softCancelRecord(r, 'funding', now)) softCancelled += 1; // true ⟺ pulled (the input is `visibleOpen`); false ⟺ a live cancel threw (stays visible, retried next tick)
+    }
+
+    // ── on-chain authoritative cancel (`onchain` mode only) ───────────────────
+    // Reduce `required` for real: every still-matchable non-terminal record (the just-pulled
+    // `softCancelled` ones, plus any `partiallyFilled` remainders and any `visibleOpen` whose
+    // off-chain pull threw) → `authoritativelyInvalidated`. Scanned AFTER the off-chain step so
+    // it sees the freshly-`softCancelled` lifecycles.
+    let onchainCancelled = 0;
+    if (mode === 'onchain') {
+      for (const r of Object.values(this.state.commitments)) {
+        if (r.lifecycle !== 'visibleOpen' && r.lifecycle !== 'softCancelled' && r.lifecycle !== 'partiallyFilled') continue;
+        if (isExpiredForRelease(r.expiryUnixSec, now, grace)) continue;
+        const result = await this.onchainCancelCommitment(r, now, { emitGasDenied: !this.fundingOnchainGasDeniedWarned });
+        if (result === 'gas-denied') {
+          this.fundingOnchainGasDeniedWarned = true; // warned once for this hold episode
+          break; // today's spend only grows — the rest would deny identically; retry next tick (budget frees at the UTC daily reset)
+        }
+        if (result === 'cancelled') {
+          this.fundingOnchainGasDeniedWarned = false; // a cancel landed — re-warn if a later denial occurs this episode
+          onchainCancelled += 1;
+        }
+        // 'transient-failure': the adapter threw — record left as-is, retried next held tick
+      }
+    }
+
+    if (softCancelled > 0 || onchainCancelled > 0) {
+      this.deps.log(`[runner] funding-cancel sweep (mode=${mode}): soft-cancelled ${softCancelled} visible quote(s), on-chain-cancelled ${onchainCancelled}`);
+    }
   }
 
   /** True once a shutdown has been requested (kill-switch file or an OS signal). */
@@ -691,6 +788,7 @@ export class Runner {
           if (softCancelledFillOk) {
             if (!this.config.mode.dryRun) await this.settleAndClaim();
             if (!this.config.mode.dryRun) await this.checkFunding(); // funding guard (C1a) — sets fundingHold before the posting decision below
+            if (!this.config.mode.dryRun && this.fundingHold) await this.fundingCancelSweep(); // funding guard (C1b) — actively pull/cancel existing quotes while underfunded, per underfundedCancelMode (reconcileMarkets below is gated by fundingHold anyway)
             await this.reconcileMarkets();
             await this.maybeOnchainCancelRecoveredSoftCancels(); // cancelMode:onchain only — authoritatively cancel matched soft-cancels (self-guards offchain/dry-run); after reconcileMarkets so the freed side re-quotes next tick
             this.ageOut();

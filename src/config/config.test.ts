@@ -32,10 +32,34 @@ describe('parseConfig', () => {
     expect(c.orders.expiryMode).toBe('fixed-seconds');
     expect(c.orders.expiryReleaseGraceSeconds).toBe(60);
     expect(c.orders.cancelMode).toBe('offchain');
+    expect(c.fundingGuard.enabled).toBe(true);
+    expect(c.fundingGuard.checkIntervalMs).toBe(30_000);
+    expect(c.fundingGuard.underfundedCancelMode).toBe('offchain');
+    expect(c.fundingGuard.failClosedOnReadError).toBe(true);
     expect(c.settlement.autoSettleOwn).toBe(true);
     expect(c.telemetry.logLevel).toBe('info');
     expect(c.killSwitchFile).toBe('./KILL');
     expect(c.killCancelOnChain).toBe(false);
+  });
+
+  it('fundingGuard: parses overrides; rejects a bad mode + unknown keys', () => {
+    const c = parseConfig(
+      {
+        rpcUrl: 'https://rpc',
+        fundingGuard: { enabled: true, checkIntervalMs: 15_000, underfundedCancelMode: 'onchain', failClosedOnReadError: false },
+      },
+      {},
+    );
+    expect(c.fundingGuard).toEqual({
+      enabled: true,
+      checkIntervalMs: 15_000,
+      underfundedCancelMode: 'onchain',
+      failClosedOnReadError: false,
+    });
+    // 'none' is also valid; an unknown mode and an unknown key fail closed.
+    expect(parseConfig({ rpcUrl: 'https://rpc', fundingGuard: { underfundedCancelMode: 'none' } }, {}).fundingGuard.underfundedCancelMode).toBe('none');
+    expect(() => parseConfig({ rpcUrl: 'https://rpc', fundingGuard: { underfundedCancelMode: 'sometimes' } }, {})).toThrow(/underfundedCancelMode/);
+    expect(() => parseConfig({ rpcUrl: 'https://rpc', fundingGuard: { bogus: true } }, {})).toThrow(/fundingGuard\.bogus/);
   });
 
   it('rpcUrl is required (here or via OSPEX_RPC_URL)', () => {

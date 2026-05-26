@@ -97,7 +97,7 @@
 import { existsSync } from 'node:fs';
 
 import { DEFAULT_PER_IP_STREAM_CAP, POLL_INTERVAL_FLOOR_MS, RESERVED_OWN_STATE_STREAMS, type Config } from '../config/index.js';
-import { buildDesiredQuote, inventoryFromState, isExpiredForRelease, reconcileBook, type BookReconciliation, type DesiredQuote, type RetainedPartial, type RetainedPartialReason, type SoftCancelReason } from '../orders/index.js';
+import { buildDesiredQuote, inventoryFromState, isExpiredForRelease, matchableCommitmentRiskWei6, reconcileBook, type BookReconciliation, type DesiredQuote, type RetainedPartial, type RetainedPartialReason, type SoftCancelReason } from '../orders/index.js';
 import type {
   ApproveResult,
   ApproveUSDCAmount,
@@ -333,6 +333,15 @@ export class Runner {
   private nextDiscoveryAtTick = 0;
   /** Hashes of recovered soft-cancels (`softCancelled` with a matched remainder) for which `maybeOnchainCancelRecoveredSoftCancels` has already emitted a `gas-budget-blocks-onchain-cancel` candidate this run — so the denial surfaces ONCE per stuck record rather than every tick (the cancel is still re-attempted each tick, landing when the budget frees). Pruned to currently-eligible hashes each sweep, so it can't grow unbounded. */
   private readonly gasDeniedRecoveredSoftCancelWarned = new Set<string>();
+  /**
+   * Funding guard (C1a, DESIGN §6): `true` while the wallet can't back its matchable-
+   * commitment exposure. Recomputed by `checkFunding()` (throttled, live-only) and
+   * consulted by the posting gate in `reconcileMarkets`. Distinct from the boot
+   * `holdQuotingUntil` (a one-shot time deadline) — this flips both ways as funding moves.
+   */
+  private fundingHold = false;
+  /** Unix-seconds of the last funding re-read; throttles `checkFunding` to `fundingGuard.checkIntervalMs`. `null` = never read. */
+  private lastFundingCheckAtSec: number | null = null;
 
   constructor(opts: RunnerOptions) {
     this.config = opts.config;
@@ -433,6 +442,97 @@ export class Runner {
   /** Is the boot-time fail-safe still holding quoting right now (DESIGN §12)? The (TODO) reconcile step skips while this is true; surfaced for diagnostics. */
   isHoldingQuoting(): boolean {
     return this.holdQuotingUntil !== null && this.deps.now() < this.holdQuotingUntil;
+  }
+
+  /**
+   * Funding guard (C1a, DESIGN §6). Throttled to `fundingGuard.checkIntervalMs`, re-read
+   * the wallet's USDC balance + PositionModule allowance and set `this.fundingHold` =
+   * `funding < required`, where:
+   *   - funding  = min(walletUSDC, positionModuleAllowance) — what the wallet can actually
+   *                pay into `recordFill` right now;
+   *   - required = the GROSS remaining maker risk over matchable commitments (visible +
+   *                soft-cancelled-unexpired), NOT the risk engine's outcome-netted
+   *                worst-case and NOT position-inclusive — see {@link matchableCommitmentRiskWei6}.
+   *
+   * A balance/allowance READ failure enters the hold when `failClosedOnReadError`: a read
+   * we can't complete must never let the MM post commitments it might not be able to back.
+   * Caller gates this to live mode (it needs `makerAddress` + does chain reads); the hold
+   * only matters live, where `reconcileMarkets` actually posts.
+   */
+  private async checkFunding(): Promise<void> {
+    const fg = this.config.fundingGuard;
+    if (!fg.enabled || this.makerAddress === null) return;
+
+    const nowSec = this.deps.now();
+
+    // `required` is cheap local-state math — compute it every check. No matchable
+    // exposure ⇒ the wallet trivially backs it: clear any hold and skip the (RPC)
+    // reads entirely. This also keeps the guard inert (no balance/allowance reads)
+    // until the MM actually has outstanding commitments to back.
+    const requiredWei6 = matchableCommitmentRiskWei6(this.state, nowSec, this.config.orders.expiryReleaseGraceSeconds);
+    if (requiredWei6 === 0n) {
+      this.setFundingHold(false, { reason: 'funding-shortfall', requiredWei6 });
+      return;
+    }
+
+    // Throttle the funding READS (they cost RPC; funding moves slowly). Between reads the
+    // current hold persists — fail-safe: a hold entered on a read failure stays set until a
+    // successful re-read clears it.
+    if (this.lastFundingCheckAtSec !== null && (nowSec - this.lastFundingCheckAtSec) * 1000 < fg.checkIntervalMs) {
+      return;
+    }
+    this.lastFundingCheckAtSec = nowSec;
+
+    let walletUsdcWei6: bigint;
+    let positionAllowanceWei6: bigint;
+    try {
+      walletUsdcWei6 = (await this.adapter.readBalances(this.makerAddress)).usdc;
+      positionAllowanceWei6 = (await this.adapter.readApprovals(this.makerAddress)).usdc.allowances.positionModule.raw;
+    } catch (err) {
+      this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'funding-check' });
+      if (fg.failClosedOnReadError) this.setFundingHold(true, { reason: 'read-failed' });
+      return;
+    }
+
+    const fundingWei6 = walletUsdcWei6 < positionAllowanceWei6 ? walletUsdcWei6 : positionAllowanceWei6;
+    this.setFundingHold(fundingWei6 < requiredWei6, {
+      reason: 'funding-shortfall',
+      fundingWei6,
+      requiredWei6,
+      walletUsdcWei6,
+      positionAllowanceWei6,
+    });
+  }
+
+  /**
+   * Flip `fundingHold` and emit a `funding-hold` telemetry event ONLY on a state
+   * transition (enter / clear), so a sustained hold doesn't spam the log every check.
+   * Numeric context (wei6 decimal strings) is attached when known.
+   */
+  private setFundingHold(
+    hold: boolean,
+    ctx: {
+      reason: 'funding-shortfall' | 'read-failed';
+      fundingWei6?: bigint;
+      requiredWei6?: bigint;
+      walletUsdcWei6?: bigint;
+      positionAllowanceWei6?: bigint;
+    },
+  ): void {
+    if (hold === this.fundingHold) return; // no transition — stay quiet
+    this.fundingHold = hold;
+    const payload: Record<string, unknown> = { state: hold ? 'entered' : 'cleared', reason: ctx.reason };
+    if (ctx.fundingWei6 !== undefined) payload.fundingWei6 = ctx.fundingWei6.toString();
+    if (ctx.requiredWei6 !== undefined) payload.requiredWei6 = ctx.requiredWei6.toString();
+    if (ctx.walletUsdcWei6 !== undefined) payload.walletUsdcWei6 = ctx.walletUsdcWei6.toString();
+    if (ctx.positionAllowanceWei6 !== undefined) payload.positionModuleAllowanceWei6 = ctx.positionAllowanceWei6.toString();
+    this.eventLog.emit('funding-hold', payload);
+    this.deps.log(
+      `[runner] funding hold ${hold ? 'ENTERED' : 'cleared'} (${ctx.reason})` +
+        (ctx.fundingWei6 !== undefined && ctx.requiredWei6 !== undefined
+          ? ` — funding ${ctx.fundingWei6} wei6 vs required ${ctx.requiredWei6} wei6`
+          : ''),
+    );
   }
 
   /** True once a shutdown has been requested (kill-switch file or an OS signal). */
@@ -590,6 +690,7 @@ export class Runner {
           if (!this.config.mode.dryRun) softCancelledFillOk = await this.reconcileSoftCancelledFills();
           if (softCancelledFillOk) {
             if (!this.config.mode.dryRun) await this.settleAndClaim();
+            if (!this.config.mode.dryRun) await this.checkFunding(); // funding guard (C1a) — sets fundingHold before the posting decision below
             await this.reconcileMarkets();
             await this.maybeOnchainCancelRecoveredSoftCancels(); // cancelMode:onchain only — authoritatively cancel matched soft-cancels (self-guards offchain/dry-run); after reconcileMarkets so the freed side re-quotes next tick
             this.ageOut();
@@ -964,6 +1065,7 @@ export class Runner {
    */
   private async reconcileMarkets(): Promise<void> {
     if (this.isHoldingQuoting()) return; // DESIGN §12 — must not resume quoting on a blank slate
+    if (this.fundingHold) return; // DESIGN §6 funding guard (C1a) — wallet can't back its matchable-commitment exposure; halt NEW posting until a successful funding re-read clears it
     const now = this.deps.now();
     for (const m of this.trackedMarkets.values()) {
       if (!this.needsReconcile(m, now)) continue;

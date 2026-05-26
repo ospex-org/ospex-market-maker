@@ -96,6 +96,19 @@ orders:
                                     #     gas-gated WITHOUT the emergency reserve), then re-quote the freed side. Use this for
                                     #     long-lived / match-time quotes where a remainder would otherwise block the side for hours.
 
+fundingGuard:                       # solvency guard (DESIGN §6): halt NEW posting when the wallet can no longer back its
+                                    #   outstanding fill obligations. funding = min(wallet USDC, PositionModule allowance);
+                                    #   required = GROSS remaining maker risk over open + partial + soft-cancelled-unexpired
+                                    #   commitments (NOT outcome-netted; filled positions excluded — their USDC was already
+                                    #   pulled on chain at fill). Trips when funding < required.
+  enabled: true                     # master switch. false = never read funding, never hold.
+  checkIntervalMs: 30000            # min interval between on-chain funding re-reads (balance + allowance); funding moves slowly.
+  underfundedCancelMode: offchain   # what to do with EXISTING visible quotes when underfunded (active cancel response):
+                                    #   "offchain" soft-cancel / "onchain" authoritative cancel / "none" hold only (ride to expiry).
+                                    #   NEW posting is ALWAYS halted while underfunded, regardless of this setting.
+  failClosedOnReadError: true       # a failed balance/allowance read ENTERS the hold (halts new posting) rather than proceeding —
+                                    #   never post commitments the MM might not be able to back. Strongly recommended.
+
 settlement:
   autoSettleOwn: true                       # settle the maker's own already-scored speculations (permissionless)
   autoClaimOwn: true                        # claim the maker's own winning positions

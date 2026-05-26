@@ -289,6 +289,49 @@ export function inventoryFromState(state: MakerState, nowUnixSec: number, graceS
   return { items, openCommitmentCount };
 }
 
+/**
+ * Gross matchable-commitment risk in wei6 — the funding guard's `required`.
+ *
+ * Σ of remaining maker risk (`riskAmountWei6 - filledRiskWei6`) over every
+ * commitment that could STILL be filled on chain — `visibleOpen` / `softCancelled`
+ * / `partiallyFilled`, not past `expiry + graceSeconds` — mirroring
+ * {@link inventoryFromState}'s commitment filter exactly (same
+ * {@link RELEASED_LIFECYCLES} drop, same {@link isExpiredForRelease} grace, same
+ * corrupt-record fail-closed).
+ *
+ * It is deliberately NOT the risk engine's `totalWorstCaseUSDC`:
+ *   - **Gross, not outcome-netted.** Each commitment that matches pulls its own
+ *     remaining maker risk from the wallet via `PositionModule.recordFill`
+ *     INDEPENDENTLY; if every open commitment fills, the wallet pays the full sum.
+ *     Netting opposing outcomes (the P&L worst-case) would *under*-state the cash
+ *     the wallet must hold — the one error a solvency guard must never make.
+ *   - **Commitments only — no positions.** A filled position's USDC was already
+ *     pulled on chain at fill time, so it is not a future wallet obligation.
+ *
+ * This is the exposure a funding guard keeps `min(walletUSDC,
+ * positionModuleAllowance)` at or above. Exact BigInt wei6 (no USDC/Number lossiness).
+ */
+export function matchableCommitmentRiskWei6(
+  state: MakerState,
+  nowUnixSec: number,
+  graceSeconds: number,
+): bigint {
+  let total = 0n;
+  for (const record of Object.values(state.commitments)) {
+    if (RELEASED_LIFECYCLES.includes(record.lifecycle)) continue;
+    if (isExpiredForRelease(record.expiryUnixSec, nowUnixSec, graceSeconds)) continue;
+    const riskWei6 = BigInt(record.riskAmountWei6);
+    const filledWei6 = BigInt(record.filledRiskWei6);
+    if (filledWei6 > riskWei6) {
+      throw new Error(
+        `orders: commitment ${record.hash} has filledRiskWei6 (${record.filledRiskWei6}) > riskAmountWei6 (${record.riskAmountWei6}) — corrupt inventory`,
+      );
+    }
+    total += riskWei6 - filledWei6;
+  }
+  return total;
+}
+
 // ── reconcileBook ────────────────────────────────────────────────────────────
 
 const SIDES = ['away', 'home'] as const;

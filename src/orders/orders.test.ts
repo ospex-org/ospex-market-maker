@@ -4,7 +4,7 @@ import { parseConfig, type Config } from '../config/index.js';
 import { decimalToAmerican, decimalToImpliedProb, tickToDecimal, toProtocolQuote, type QuoteSide } from '../pricing/index.js';
 import type { ExposureItem, Inventory, Market } from '../risk/index.js';
 import { emptyMakerState, type MakerCommitmentRecord, type MakerPositionRecord, type MakerState } from '../state/index.js';
-import { breakdownReferenceOdds, buildDesiredQuote, inventoryFromState, isExpiredForRelease, reconcileBook, toRiskCaps, type BookReconciliation, type DesiredQuote } from './index.js';
+import { breakdownReferenceOdds, buildDesiredQuote, inventoryFromState, isExpiredForRelease, matchableCommitmentRiskWei6, reconcileBook, toRiskCaps, type BookReconciliation, type DesiredQuote } from './index.js';
 
 const cfg = (overrides: Record<string, unknown> = {}): Config => parseConfig({ rpcUrl: 'http://localhost:8545', ...overrides });
 
@@ -210,6 +210,59 @@ describe('buildDesiredQuote', () => {
     expect(buildDesiredQuote(cfg(), MARKET, { away: 150, home: -180 }, EMPTY).result.targetMonthlyReturnUSDC).not.toBeNull(); // economics mode populates these
     const direct = buildDesiredQuote(cfg({ pricing: { mode: 'direct', direct: { spreadBps: 200 } } }), MARKET, { away: 150, home: -180 }, EMPTY);
     expect(direct.result.targetMonthlyReturnUSDC).toBeNull(); // direct mode has no economics diagnostics
+  });
+});
+
+// ── matchableCommitmentRiskWei6 (funding guard `required`) ───────────────────
+
+describe('matchableCommitmentRiskWei6', () => {
+  it('is 0n on empty state', () => {
+    expect(matchableCommitmentRiskWei6(emptyMakerState(), NOW, 0)).toBe(0n);
+  });
+
+  it('sums GROSS remaining maker risk over visibleOpen + softCancelled + partiallyFilled', () => {
+    const commitments = {
+      open: commitmentRecord({ hash: 'open', lifecycle: 'visibleOpen', riskAmountWei6: '250000', filledRiskWei6: '0' }),
+      sc: commitmentRecord({ hash: 'sc', lifecycle: 'softCancelled', riskAmountWei6: '250000', filledRiskWei6: '0' }),
+      partial: commitmentRecord({ hash: 'partial', lifecycle: 'partiallyFilled', riskAmountWei6: '500000', filledRiskWei6: '200000' }),
+    };
+    // 250000 + 250000 + (500000 - 200000) = 800000
+    expect(matchableCommitmentRiskWei6(stateWith({ commitments }), NOW, 0)).toBe(800_000n);
+  });
+
+  it('drops released lifecycles (filled / expired / authoritativelyInvalidated)', () => {
+    const commitments = {
+      keep: commitmentRecord({ hash: 'keep', lifecycle: 'visibleOpen', riskAmountWei6: '250000' }),
+      filled: commitmentRecord({ hash: 'filled', lifecycle: 'filled', riskAmountWei6: '999000' }),
+      expired: commitmentRecord({ hash: 'expired', lifecycle: 'expired', riskAmountWei6: '999000' }),
+      invalidated: commitmentRecord({ hash: 'invalidated', lifecycle: 'authoritativelyInvalidated', riskAmountWei6: '999000' }),
+    };
+    expect(matchableCommitmentRiskWei6(stateWith({ commitments }), NOW, 0)).toBe(250_000n);
+  });
+
+  it('drops commitments past expiry + grace, keeps those still within the grace window', () => {
+    const commitments = {
+      live: commitmentRecord({ hash: 'live', expiryUnixSec: NOW + 50, riskAmountWei6: '250000' }),
+      withinGrace: commitmentRecord({ hash: 'grace', expiryUnixSec: NOW - 10, riskAmountWei6: '250000' }),
+      pastGrace: commitmentRecord({ hash: 'dead', expiryUnixSec: NOW - 100, riskAmountWei6: '250000' }),
+    };
+    // grace=60: live + within-grace (NOW-10) kept; pastGrace (NOW-100) dropped → 500000
+    expect(matchableCommitmentRiskWei6(stateWith({ commitments }), NOW, 60)).toBe(500_000n);
+  });
+
+  it('EXCLUDES filled positions — their USDC was already pulled on chain, not a future wallet obligation', () => {
+    const commitments = { open: commitmentRecord({ hash: 'open', riskAmountWei6: '250000' }) };
+    const positions = { 'spec-1:away': positionRecord({ riskAmountWei6: '999000', status: 'active' }) };
+    expect(matchableCommitmentRiskWei6(stateWith({ commitments, positions }), NOW, 0)).toBe(250_000n);
+  });
+
+  it('is GROSS, not outcome-netted — opposing-side commitments each count fully', () => {
+    const commitments = {
+      away: commitmentRecord({ hash: 'away', makerSide: 'away', riskAmountWei6: '250000' }),
+      home: commitmentRecord({ hash: 'home', makerSide: 'home', riskAmountWei6: '250000' }),
+    };
+    // each pulls its own makerRisk at fill, independently → 500000 (NOT netted to a smaller worst-case)
+    expect(matchableCommitmentRiskWei6(stateWith({ commitments }), NOW, 0)).toBe(500_000n);
   });
 });
 

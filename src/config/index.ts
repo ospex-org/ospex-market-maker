@@ -19,6 +19,7 @@ import yaml from 'js-yaml';
 import {
   APPROVAL_MODES,
   CANCEL_MODES,
+  UNDERFUNDED_CANCEL_MODES,
   CHAIN_IDS,
   EXPIRY_MODES,
   KNOWN_SPORTS,
@@ -35,6 +36,7 @@ import {
   type DiscoveryConfig,
   type EconomicsConfig,
   type ExpiryMode,
+  type FundingGuardConfig,
   type GasConfig,
   type LogLevel,
   type MarketSelectionConfig,
@@ -49,6 +51,7 @@ import {
   type SpreadMode,
   type StateConfig,
   type TelemetryConfig,
+  type UnderfundedCancelMode,
   type WalletConfig,
 } from './types.js';
 
@@ -212,7 +215,7 @@ function def<T>(value: unknown, fallback: T, validate: (v: unknown) => T): T {
 // Known keys at every object level — anything else is a misspelling / stale field and fails closed.
 const ROOT_KEYS = [
   'wallet', 'rpcUrl', 'apiUrl', 'chainId', 'marketSelection', 'discovery', 'odds', 'pricing',
-  'risk', 'gas', 'approvals', 'orders', 'settlement', 'telemetry', 'state', 'killSwitchFile',
+  'risk', 'gas', 'approvals', 'orders', 'fundingGuard', 'settlement', 'telemetry', 'state', 'killSwitchFile',
   'killCancelOnChain', 'pollIntervalMs', 'mode',
 ] as const;
 const WALLET_KEYS = ['keystorePath'] as const;
@@ -237,6 +240,7 @@ const APPROVALS_KEYS = ['autoApprove', 'mode'] as const;
 const ORDERS_KEYS = [
   'expiryMode', 'expirySeconds', 'expiryReleaseGraceSeconds', 'staleAfterSeconds', 'staleReferenceAfterSeconds', 'replaceOnOddsMoveBps', 'cancelMode',
 ] as const;
+const FUNDING_GUARD_KEYS = ['enabled', 'checkIntervalMs', 'underfundedCancelMode', 'failClosedOnReadError'] as const;
 const SETTLEMENT_KEYS = ['autoSettleOwn', 'autoClaimOwn', 'continueOnGasBudgetExhausted'] as const;
 const TELEMETRY_KEYS = ['logDir', 'logLevel'] as const;
 const STATE_KEYS = ['dir'] as const;
@@ -386,6 +390,18 @@ export function parseConfig(raw: unknown, env: EnvLike = {}): Config {
     cancelMode: def<CancelMode>(ord.cancelMode, 'offchain', (v) => asEnum(v, 'orders.cancelMode', CANCEL_MODES)),
   };
 
+  const fg = section(root, 'fundingGuard', FUNDING_GUARD_KEYS);
+  const fundingGuard: FundingGuardConfig = {
+    enabled: def(fg.enabled, true, (v) => asBoolean(v, 'fundingGuard.enabled')),
+    checkIntervalMs: def(fg.checkIntervalMs, 30_000, (v) => asPositiveInt(v, 'fundingGuard.checkIntervalMs')),
+    underfundedCancelMode: def<UnderfundedCancelMode>(
+      fg.underfundedCancelMode,
+      'offchain',
+      (v) => asEnum(v, 'fundingGuard.underfundedCancelMode', UNDERFUNDED_CANCEL_MODES),
+    ),
+    failClosedOnReadError: def(fg.failClosedOnReadError, true, (v) => asBoolean(v, 'fundingGuard.failClosedOnReadError')),
+  };
+
   const s = section(root, 'settlement', SETTLEMENT_KEYS);
   const settlement: SettlementConfig = {
     autoSettleOwn: def(s.autoSettleOwn, true, (v) => asBoolean(v, 'settlement.autoSettleOwn')),
@@ -421,6 +437,7 @@ export function parseConfig(raw: unknown, env: EnvLike = {}): Config {
     gas,
     approvals,
     orders,
+    fundingGuard,
     settlement,
     telemetry,
     state,

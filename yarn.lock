@@ -282,9 +282,9 @@
   resolved "https://registry.yarnpkg.com/@noble/hashes/-/hashes-1.8.0.tgz#cee43d801fcef9644b11b8194857695acd5f815a"
   integrity sha512-jCs9ldd7NwzpgXDIf6P3+NrHh9/sD6CQdxHyjQI+h/6rDNo88ypBxxz45UDuZHz9r3tNz7N/VInSVoVdtXEI4A==
 
-"@ospex/sdk@https://github.com/ospex-org/ospex-sdk/releases/download/v0.4.7/ospex-sdk-0.4.7.tgz":
-  version "0.4.7"
-  resolved "https://github.com/ospex-org/ospex-sdk/releases/download/v0.4.7/ospex-sdk-0.4.7.tgz#359c5b2177d6f372baff8bc95f50a3b27d79fa18"
+"@ospex/sdk@https://github.com/ospex-org/ospex-sdk/releases/download/v0.4.8/ospex-sdk-0.4.8.tgz":
+  version "0.4.8"
+  resolved "https://github.com/ospex-org/ospex-sdk/releases/download/v0.4.8/ospex-sdk-0.4.8.tgz#4a233770bb894390ca80d93ad3d1b2518aed718c"
   dependencies:
     ethers "^6.13.4"
     viem "^2.21.0"

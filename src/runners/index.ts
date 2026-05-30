@@ -103,6 +103,7 @@ import type {
   ApproveUSDCAmount,
   ApprovalsSnapshot,
   Commitment,
+  PublicVisibleCommitment,
   ContestOddsSnapshot,
   ContestView,
   Hex,
@@ -3124,9 +3125,10 @@ function quoteSideSummary(qs: QuoteSide | null): {
   };
 }
 
-/** An orderbook `Commitment` that's still matchable (`isLive`), carries the fields the competitiveness check needs (`oddsTick` + `positionType`), and has an in-range `oddsTick` (so `inverseOddsTick` can convert it). Legacy / partially-decoded / out-of-range rows are skipped — they can't be valid matchable commitments anyway. */
-type PricedLiveCommitment = Commitment & { oddsTick: number; positionType: 0 | 1 };
+/** An orderbook `Commitment` that's still matchable (`isLive`), carries the fields the competitiveness check needs (`oddsTick` + `positionType`), and has an in-range `oddsTick` (so `inverseOddsTick` can convert it). Legacy / partially-decoded / out-of-range rows are skipped — they can't be valid matchable commitments anyway. SDK v0.5.0 (M5/PR1) narrowed `Commitment` to a discriminated `PublicVisibleCommitment | PublicHiddenCommitment` union; hidden rows have no `oddsTick` / `isLive` (those fields belong to the matchable-payload allow-list, off the public hidden surface), so the predicate refuses them up front before reaching the field reads. */
+type PricedLiveCommitment = PublicVisibleCommitment & { oddsTick: number; positionType: 0 | 1 };
 function isPricedLiveCommitment(c: Commitment): c is PricedLiveCommitment {
+  if (c.redacted === true) return false;
   return c.isLive && c.oddsTick !== null && c.positionType !== null && isTickInRange(c.oddsTick);
 }
 

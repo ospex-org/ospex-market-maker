@@ -53,6 +53,7 @@ import {
   type BalancesSnapshot,
   type ChainId,
   type Commitment,
+  type PublicVisibleCommitment,
   type CommitmentsListOptions,
   type CommitmentStatus,
   type Contest,
@@ -87,6 +88,7 @@ export type {
   BalancesSnapshot,
   ChainId,
   Commitment,
+  PublicVisibleCommitment,
   CommitmentsListOptions,
   CommitmentStatus,
   ContestOddsSnapshot,
@@ -423,7 +425,17 @@ export class OspexAdapter {
    * can't be reconstructed → the SDK throws).
    */
   async cancelCommitmentOnchain(hash: Hex): Promise<CancelOnchainResult> {
-    return this.client.commitments.cancelOnchain(hash);
+    // SDK v0.5.0 (M5/PR2) made `cancelOnchain` a discriminated overload
+    // (`{ hash } | { signedCommitment }`) so the canonical signed-payload
+    // primitive can pass through without an API fetch. The MM adapter
+    // keeps the bare-`Hex` external shape (no on-chain payload caching
+    // here yet) and bridges to the new `{ hash }` form. Migrating this
+    // adapter to surface `signedCommitment` is queued for the future
+    // `MakerCommitmentRecord.signedPayload` persistence work (own-state
+    // SSE plan §M6) — until then, `{ hash }` still routes through the
+    // SDK's redaction-aware refusal helper, so a book-hidden public row
+    // is rejected pre-signer per the M5/PR1 contract.
+    return this.client.commitments.cancelOnchain({ hash });
   }
 
   /**

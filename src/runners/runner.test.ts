@@ -10,6 +10,7 @@ import {
   createOspexAdapter,
   OspexStreamError,
   type Commitment,
+  type PublicVisibleCommitment,
   type ContestOddsSnapshot,
   type ContestView,
   type Hex,
@@ -149,8 +150,18 @@ function speculationView(speculationId: string, open = true, orderbook: Commitme
   return { speculationId, contestId: 'contest', marketType: 'moneyline', lineTicks: null, line: null, open, orderbook };
 }
 /** An orderbook entry (the SDK `Commitment` shape — every maker's, not just ours) — only `positionType` (0 = away/Upper, 1 = home/Lower) and `oddsTick` matter for the competitiveness check; everything else is filler. */
-function orderbookEntry(overrides: Partial<Commitment> = {}): Commitment {
+function orderbookEntry(
+  overrides: Partial<PublicVisibleCommitment> = {},
+): PublicVisibleCommitment {
+  // SDK v0.5.0 (M5/PR1) made `Commitment` a discriminated union over
+  // `visibility: 'visible' | 'hidden'` / `redacted: false | true`. The
+  // matchable-payload fields (`scorer`, `oddsTick`, etc.) only exist on
+  // the `PublicVisibleCommitment` branch; without the discriminators
+  // the object literal can't narrow to that branch and TS rejects them
+  // as unknown properties.
   return {
+    visibility: 'visible',
+    redacted: false,
     commitmentHash: '0xob',
     maker: '0xothermaker',
     contestId: 'A',
@@ -260,7 +271,12 @@ function submitRecorder(): { fn: (args: SubmitCommitmentArgs) => Promise<SubmitC
     calls,
     fn: (args) => {
       calls.push(args);
-      return Promise.resolve({ hash: `0xlive${calls.length}` as Hex, commitment: {} as unknown as Commitment });
+      // `SubmitCommitmentResult.commitment` is `PublicVisibleCommitment` after
+      // the SDK v0.5.0 defensive narrow (M5/PR1) — `submitRaw` inserts
+      // `book_visible=true` by construction, so the public visible branch is
+      // the canonical return type. Derive the cast from the result type so
+      // future SDK signature changes surface as a compile error here.
+      return Promise.resolve({ hash: `0xlive${calls.length}` as Hex, commitment: {} as unknown as SubmitCommitmentResult['commitment'] });
     },
   };
 }

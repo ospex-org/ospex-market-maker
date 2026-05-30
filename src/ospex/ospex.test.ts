@@ -8,7 +8,7 @@ import { DEFAULT_API_URL } from '@ospex/sdk';
 import type {
   ApprovalsSnapshot,
   BalancesSnapshot,
-  Commitment,
+  PublicVisibleCommitment,
   Contest,
   ContestOddsSnapshot,
   Hex,
@@ -102,7 +102,14 @@ const SAMPLE_ODDS_UPDATE: MoneylineOdds = {
   changedAt: '2026-05-11T20:01:00Z',
 };
 
-const SAMPLE_COMMITMENT: Commitment = {
+const SAMPLE_COMMITMENT: PublicVisibleCommitment = {
+  // SDK v0.5.0 (M5/PR1) `Commitment` is a discriminated union; the
+  // matchable-payload fields (`scorer`, `oddsTick`, …) only exist on the
+  // `PublicVisibleCommitment` branch. The `submitRaw` result type is
+  // `PublicVisibleCommitment` by construction (submissions insert
+  // `book_visible=true`), so this fixture types as the narrower variant.
+  visibility: 'visible',
+  redacted: false,
   commitmentHash: '0xabc',
   maker: '0x1111111111111111111111111111111111111111',
   contestId: 'contest-1',
@@ -619,19 +626,22 @@ describe('OspexAdapter — write surface', () => {
     expect(received).toBe('0xabc');
   });
 
-  it('cancelCommitmentOnchain forwards the hash to commitments.cancelOnchain and returns its result', async () => {
+  it('cancelCommitmentOnchain forwards { hash } to commitments.cancelOnchain and returns its result', async () => {
+    // SDK v0.5.0 (M5/PR2) made `cancelOnchain` a discriminated overload
+    // (`{ hash } | { signedCommitment }`); the adapter bridges bare-Hex
+    // → `{ hash }` form. Assertion shape reflects the new wire.
     let received: unknown = null;
     const result = { txHash: '0xtx' as Hex, receipt: {} as unknown as never, commitmentHash: '0xabc' as Hex };
     const adapter = liveAdapterWith({
       commitments: {
-        cancelOnchain: (h) => {
-          received = h;
+        cancelOnchain: (arg) => {
+          received = arg;
           return Promise.resolve(result);
         },
       },
     });
     expect(await adapter.cancelCommitmentOnchain('0xabc')).toBe(result);
-    expect(received).toBe('0xabc');
+    expect(received).toEqual({ hash: '0xabc' });
   });
 
   it('raiseMinNonce forwards { contestId, scorer, lineTicks, newMinNonce } to commitments.raiseMinNonce', async () => {

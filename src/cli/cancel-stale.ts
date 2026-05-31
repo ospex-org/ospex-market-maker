@@ -314,6 +314,69 @@ export async function runCancelStale(opts: CancelStaleOpts, deps: CancelStaleDep
   }
   log(`[cancel-stale] ${stale.length} stale commitment(s) — running off-chain cancels${opts.authoritative ? ' + on-chain authoritative cancels' : ''}.`);
 
+  // ── 5.5 M6/A PRE-PASS (own-state SSE plan §M6, Hermes #63) ───────────────
+  // `--authoritative` only: missing-legacy + visibleOpen records need an
+  // on-chain { hash } cancel BEFORE the off-chain leg DELETEs them off the
+  // book, because once the API row is `book_visible: false` the SDK's
+  // public-fetch path (M2 redaction) refuses, leaving the record stuck in
+  // the BLOCKED dispatch path. Track every attempt (success OR failure) in
+  // `touchedByPrePass` so the off-chain loop skips them: success records are
+  // `authoritativelyInvalidated` anyway (off-chain naturally short-circuits
+  // — but explicit skip costs nothing), while failures stay `visibleOpen`
+  // for the regular on-chain leg below to retry via `use-hash` dispatch.
+  // Inline (not delegated to a runner helper) because the CLI owns its own
+  // gas budget + report counters.
+  let totalGasPolWei = 0n;
+  const maxDailyGasPolWei = polFloatToWei18(opts.config.gas.maxDailyGasPOL);
+  const emergencyReservePolWei = polFloatToWei18(opts.config.gas.emergencyReservePOL);
+  const touchedByPrePass = new Set<string>();
+  if (opts.authoritative) {
+    for (const r of stale) {
+      if (r.signedPayloadStatus !== 'missing-legacy') continue;
+      if (r.lifecycle !== 'visibleOpen') continue;
+      touchedByPrePass.add(r.hash); // mark BEFORE attempting — failure must still skip the off-chain hide
+      const today = todayUTCDateString(wallNow);
+      const todayGasSpentPolWei = BigInt(state.dailyCounters[today]?.gasPolWei ?? '0');
+      const verdict = canSpendGas({ todayGasSpentPolWei, maxDailyGasPolWei, emergencyReservePolWei, mayUseReserve: true });
+      if (!verdict.allowed) {
+        report.gasDenied += 1;
+        eventLog.emit('candidate', {
+          skipReason: 'gas-budget-blocks-onchain-cancel',
+          commitmentHash: r.hash,
+          speculationId: r.speculationId,
+          makerSide: r.makerSide,
+          todayGasSpentPolWei: todayGasSpentPolWei.toString(),
+          maxDailyGasPolWei: maxDailyGasPolWei.toString(),
+          emergencyReservePolWei: emergencyReservePolWei.toString(),
+          detail: verdict.reason,
+        });
+        break; // every later attempt would deny too; touched-set already protects these from off-chain hide
+      }
+      let result: Awaited<ReturnType<OspexAdapter['cancelCommitmentOnchain']>>;
+      try {
+        result = await adapter.cancelCommitmentOnchain({ hash: r.hash as Hex });
+      } catch (err) {
+        report.errored += 1;
+        eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'onchain-cancel', commitmentHash: r.hash });
+        continue; // record stays `visibleOpen`; touched-skip below protects it from off-chain hide; the regular on-chain leg retries
+      }
+      const gasPolWei = BigInt(result.receipt.gasUsed) * BigInt(result.receipt.effectiveGasPrice);
+      recordGasSpentToday(state, today, gasPolWei);
+      totalGasPolWei += gasPolWei;
+      r.lifecycle = 'authoritativelyInvalidated';
+      r.updatedAtUnixSec = wallNow;
+      report.onchainCancelled += 1;
+      eventLog.emit('onchain-cancel', {
+        commitmentHash: r.hash,
+        speculationId: r.speculationId,
+        contestId: r.contestId,
+        makerSide: r.makerSide,
+        txHash: result.txHash,
+        gasPolWei: gasPolWei.toString(),
+      });
+    }
+  }
+
   // ── 6. Off-chain leg (always) ────────────────────────────────────────────
   // Already-softCancelled records skip the off-chain step (they're already
   // gone from the API book) but stay in the set for the on-chain leg.
@@ -326,6 +389,7 @@ export async function runCancelStale(opts: CancelStaleOpts, deps: CancelStaleDep
   // authoritative path (`MatchingModule.cancelCommitment` operates on chain
   // regardless of book visibility), which is exactly the reason for `--authoritative`.
   for (const r of stale) {
+    if (touchedByPrePass.has(r.hash)) continue; // M6/A pre-pass already attempted on-chain; never off-chain-hide these
     if (r.lifecycle === 'softCancelled') {
       report.offchainSkippedAlready += 1;
       continue;
@@ -360,9 +424,8 @@ export async function runCancelStale(opts: CancelStaleOpts, deps: CancelStaleDep
   // Successful cancels stamp the record `authoritativelyInvalidated` (headroom
   // released).
   if (opts.authoritative) {
-    let totalGasPolWei = 0n;
-    const maxDailyGasPolWei = polFloatToWei18(opts.config.gas.maxDailyGasPOL);
-    const emergencyReservePolWei = polFloatToWei18(opts.config.gas.emergencyReservePOL);
+    // `totalGasPolWei` + the gas-budget consts are hoisted above (Hermes #63
+    // pre-pass needed them too) — share between pre-pass and this regular pass.
 
     for (const r of stale) {
       // Skip already-authoritatively-cancelled records (paranoia — only

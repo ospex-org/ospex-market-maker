@@ -541,6 +541,79 @@ describe('runCancelStale — --authoritative (on-chain leg)', () => {
     expect(state.commitments['0xbb']!.lifecycle).toBe('authoritativelyInvalidated');
   });
 
+  // ── M6/A pre-pass regression (Hermes #63) ──────────────────────────────────
+  // A pre-M6/A record (`signedPayloadStatus: 'missing-legacy'`) that's still
+  // `visibleOpen` must be on-chain-cancelled BEFORE the off-chain leg DELETEs
+  // it from the book. Without the pre-pass, the off-chain DELETE flips
+  // `book_visible: false`, the SDK's later `cancelOnchain({ hash })` refuses
+  // via M2 redaction, and the record bricks into BLOCKED.
+  it('--authoritative + missing-legacy + visibleOpen → on-chain { hash } cancel runs in the PRE-PASS (before off-chain), record → authoritativelyInvalidated, off-chain DELETE never called', async () => {
+    const legacy = rec('0xlegacy', T0 - 200, { signedPayloadStatus: 'missing-legacy' });
+    delete legacy.signedPayload; // validator: 'missing-legacy' MUST not carry a payload
+    seedState([legacy]);
+    let captured: OspexAdapter | null = null;
+    const createLiveAdapter = (cfg: Config, signer: Signer): OspexAdapter => {
+      captured = liveAdapter(cfg, signer);
+      vi.spyOn(captured, 'cancelCommitmentOnchain').mockResolvedValueOnce({
+        txHash: '0xprepasstx' as Hex,
+        commitmentHash: '0xlegacy' as Hex,
+        receipt: { gasUsed: 100_000n, effectiveGasPrice: 30_000_000_000n } as unknown as CancelOnchainResult['receipt'],
+      });
+      return captured;
+    };
+    const report = await runCancelStale(
+      { config: liveConfig(), authoritative: true, ignoreMissingState: false },
+      { ...baseDeps(), createLiveAdapter },
+    );
+
+    expect(report).toMatchObject({ inspected: 1, onchainCancelled: 1, blockedMissingPayload: 0, gasDenied: 0, errored: 0 });
+    // Off-chain DELETE was NEVER called — the pre-pass authoritatively invalidated the record FIRST.
+    expect(captured!.cancelCommitmentOffchain).not.toHaveBeenCalled();
+    expect(report.offchainCancelled).toBe(0);
+    // The on-chain cancel went through the `{ hash }` discriminant (not `{ signedCommitment }`)
+    // because the record has no captured bundle — that's the whole migration-fallback point.
+    expect(captured!.cancelCommitmentOnchain).toHaveBeenCalledWith({ hash: '0xlegacy' });
+    const state = StateStore.at(stateDir).load().state;
+    expect(state.commitments['0xlegacy']!.lifecycle).toBe('authoritativelyInvalidated');
+    // The blocked-missing-payload event must NOT fire — the pre-pass intercepted the record BEFORE it could brick.
+    expect(readEvents('cs-run').some((e) => e.kind === 'cancel-blocked-missing-payload')).toBe(false);
+  });
+
+  it("--authoritative + missing-legacy + visibleOpen + pre-pass on-chain THROW → record stays visibleOpen (touched-set skip), regular on-chain leg retries via dispatch, off-chain DELETE never runs", async () => {
+    const legacy = rec('0xlegacy', T0 - 200, { signedPayloadStatus: 'missing-legacy' });
+    delete legacy.signedPayload;
+    seedState([legacy]);
+    let captured: OspexAdapter | null = null;
+    let cancelCallCount = 0;
+    const createLiveAdapter = (cfg: Config, signer: Signer): OspexAdapter => {
+      captured = liveAdapter(cfg, signer);
+      vi.spyOn(captured, 'cancelCommitmentOnchain').mockImplementation(async () => {
+        cancelCallCount += 1;
+        if (cancelCallCount === 1) throw new Error('RPC blip');
+        return {
+          txHash: '0xretrytx' as Hex,
+          commitmentHash: '0xlegacy' as Hex,
+          receipt: { gasUsed: 100_000n, effectiveGasPrice: 30_000_000_000n } as unknown as CancelOnchainResult['receipt'],
+        };
+      });
+      return captured;
+    };
+    const report = await runCancelStale(
+      { config: liveConfig(), authoritative: true, ignoreMissingState: false },
+      { ...baseDeps(), createLiveAdapter },
+    );
+
+    // Pre-pass: cancel attempt #1 threw → counted in errored. The record was added to the touched
+    // set BEFORE the attempt, so the off-chain DELETE skips it (preserves the migration fallback).
+    // The regular on-chain leg then dispatches the still-`visibleOpen` record → `use-hash` →
+    // attempt #2 succeeds → authoritativelyInvalidated.
+    expect(cancelCallCount).toBe(2);
+    expect(captured!.cancelCommitmentOffchain).not.toHaveBeenCalled(); // touched-skip preserved visibleOpen for the retry
+    expect(report.errored).toBe(1); // pre-pass throw counted
+    expect(report.onchainCancelled).toBe(1); // retry landed
+    expect(StateStore.at(stateDir).load().state.commitments['0xlegacy']!.lifecycle).toBe('authoritativelyInvalidated');
+  });
+
   it('--authoritative + gas-budget denial → emits candidate gas-budget-blocks-onchain-cancel and BREAKS the loop (subsequent records remain at softCancelled, today\'s spend only grows)', async () => {
     seedState([
       rec('0xaa', T0 - 200),

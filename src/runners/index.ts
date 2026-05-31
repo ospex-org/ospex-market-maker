@@ -2653,6 +2653,13 @@ export class Runner {
       // #68 review blocker 1 — "after a real resync" is the only authoritative
       // recovery path for queue overflow in Phase 2).
       this.streamOverflowDegraded = false;
+      // Drop any pre-resync deltas still queued — the upcoming fresh snapshot
+      // is authoritative for all on-chain state up to its timestamp; applying
+      // pre-resync events on top of the post-resync baseline would
+      // double-count (Hermes #69 review). PR4b made drainShadow's reducer
+      // dispatch real (was a no-op stub in PR3), so this scenario is now a
+      // shadow-correctness issue rather than a latent one.
+      this.ownStateQueue.clear();
     } else if (status === 'degraded') {
       this.ownStateShadow.healthy = false;
     } else if (status === 'connected') {
@@ -2738,6 +2745,11 @@ export class Runner {
   /** Test seam — reads the `streamOverflowDegraded` latch. */
   streamOverflowDegradedForTest(): boolean {
     return this.streamOverflowDegraded;
+  }
+
+  /** Test seam — current `ownStateQueue` occupancy (PR4b round 2 / Hermes #69). */
+  ownStateQueueSizeForTest(): number {
+    return this.ownStateQueue.size;
   }
 
   /**

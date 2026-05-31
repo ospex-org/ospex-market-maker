@@ -3751,7 +3751,56 @@ describe('Runner — on-chain kill path / killCancelOnChain (Phase 3 e-ii)', () 
     expect(reloaded.commitments['0xok']?.lifecycle).toBe('softCancelled'); // succeeded
   });
 
-  // ── M6/A pre-pass regression (Hermes #63) ──────────────────────────────────
+  // ── M6/A pre-pass regression (Hermes #63 round 2) ──────────────────────────
+  // Two missing-legacy + visibleOpen records + gas-denied on the first
+  // candidate. The fix's load-bearing invariant: BOTH records must keep
+  // their off-chain skip even though the cancel loop broke after candidate 1.
+  // Without it, candidate 2 would be off-chain-hidden by `offchainKillCancel`
+  // and brick into BLOCKED for any future on-chain attempt.
+  it('killCancelOnChain=true + TWO missing-legacy + visibleOpen + pre-pass gas-denied → BOTH records stay visibleOpen (touched-set covers later candidates too), offchainKillCancel does NOT hide either', async () => {
+    const cancel = cancelOnchainRecorder();
+    const a: MakerCommitmentRecord = commitmentRecord({
+      hash: '0xaaa', speculationId: 'spec-a', contestId: 'a', makerSide: 'home', oddsTick: 200,
+      riskAmountWei6: '250000', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000,
+      signedPayloadStatus: 'missing-legacy',
+    });
+    delete a.signedPayload;
+    const b: MakerCommitmentRecord = commitmentRecord({
+      hash: '0xbbb', speculationId: 'spec-b', contestId: 'b', makerSide: 'away', oddsTick: 250,
+      riskAmountWei6: '250000', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000,
+      signedPayloadStatus: 'missing-legacy',
+    });
+    delete b.signedPayload;
+    StateStore.at(stateDir).flush({
+      ...emptyMakerState(),
+      commitments: { '0xaaa': a, '0xbbb': b },
+      // Pre-seed today's gas spend at the daily cap so canSpendGas denies on the FIRST attempt.
+      dailyCounters: { [todayUTC()]: { gasPolWei: '2000000000000000000', feeUsdcWei6: '0' } },
+    });
+    const config = cfg({ mode: { dryRun: false }, killCancelOnChain: true });
+    let offchainCalls = 0;
+    const adapter = liveSpiedAdapter(
+      config,
+      () => Promise.resolve([]),
+      {
+        cancelCommitmentOnchain: cancel.fn,
+        cancelCommitmentOffchain: () => { offchainCalls += 1; return Promise.resolve(); },
+      },
+      undefined,
+      undefined,
+      { getCommitment: () => Promise.reject(new Error('unused')) },
+    );
+    await makeRunner({ config, adapter, maxTicks: 5, deps: { killFileExists: killFileAfterTick(2) } }).run();
+
+    // Pre-pass denied on first attempt → loop broke. Pre-population of the
+    // touched set means BOTH records stay protected from offchainKillCancel.
+    expect(offchainCalls).toBe(0);
+    expect(cancel.calls).toEqual([]); // gas-denied before any cancel landed
+    const reloaded = StateStore.at(stateDir).load().state;
+    expect(reloaded.commitments['0xaaa']?.lifecycle).toBe('visibleOpen');
+    expect(reloaded.commitments['0xbbb']?.lifecycle).toBe('visibleOpen'); // ← THE KEY ASSERTION: NOT bricked into softCancelled
+  });
+
   it('killCancelOnChain=true + missing-legacy + visibleOpen → PRE-PASS on-chain { hash } cancel runs BEFORE the off-chain sweep, record → authoritativelyInvalidated, off-chain DELETE never called on it', async () => {
     const cancel = cancelOnchainRecorder();
     const legacy: MakerCommitmentRecord = commitmentRecord({
@@ -4290,7 +4339,43 @@ describe('Runner — funding guard', () => {
     expect(StateStore.at(stateDir).load().state.commitments['0xfund']?.lifecycle).toBe('authoritativelyInvalidated');
   });
 
-  // ── M6/A pre-pass regression (Hermes #63) ──────────────────────────────────
+  // ── M6/A pre-pass regression (Hermes #63 round 2) ──────────────────────────
+  it('C1b — onchain + TWO missing-legacy + visibleOpen + pre-pass gas-denied → BOTH records stay visibleOpen (touched-set covers later candidates), off-chain pull does NOT hide either', async () => {
+    const a: MakerCommitmentRecord = commitmentRecord({
+      hash: '0xfund-a', contestId: 'contest-a', speculationId: 'spec-a', makerSide: 'away', riskAmountWei6: '250000', filledRiskWei6: '0', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 10, updatedAtUnixSec: T0 - 10, signedPayloadStatus: 'missing-legacy',
+    });
+    delete a.signedPayload;
+    const b: MakerCommitmentRecord = commitmentRecord({
+      hash: '0xfund-b', contestId: 'contest-b', speculationId: 'spec-b', makerSide: 'home', riskAmountWei6: '250000', filledRiskWei6: '0', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 10, updatedAtUnixSec: T0 - 10, signedPayloadStatus: 'missing-legacy',
+    });
+    delete b.signedPayload;
+    const todayKey = new Date(T0 * 1000).toISOString().slice(0, 10);
+    StateStore.at(stateDir).flush({
+      ...emptyMakerState(),
+      commitments: { [a.hash]: a, [b.hash]: b },
+      // Daily cap exhausted → canSpendGas denies on the FIRST candidate.
+      dailyCounters: { [todayKey]: { gasPolWei: '2000000000000000000', feeUsdcWei6: '0' } },
+    });
+    const config = cfg({ mode: { dryRun: false }, fundingGuard: { underfundedCancelMode: 'onchain' } });
+    const offchainCancels: Hex[] = [];
+    const cancelOnchain = cancelOnchainRecorder();
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]),
+      { cancelCommitmentOffchain: (h) => { offchainCancels.push(h); return Promise.resolve(); }, cancelCommitmentOnchain: cancelOnchain.fn },
+      undefined, undefined,
+      { listOpenCommitments: () => Promise.resolve([openFixture(a), openFixture(b)]), readBalances: balances(0n) },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    // Pre-pass denied → no on-chain cancels. Off-chain pull was SKIPPED for
+    // both records because the touched-set was pre-populated.
+    expect(cancelOnchain.calls).toEqual([]);
+    expect(offchainCancels).toEqual([]); // ← THE KEY ASSERTION: neither record was off-chain-hidden
+    const reloaded = StateStore.at(stateDir).load().state;
+    expect(reloaded.commitments[a.hash]?.lifecycle).toBe('visibleOpen');
+    expect(reloaded.commitments[b.hash]?.lifecycle).toBe('visibleOpen'); // not bricked
+  });
+
   it('C1b — onchain + missing-legacy + visibleOpen: PRE-PASS on-chain { hash } cancel runs BEFORE the off-chain pull, off-chain DELETE never called on the record, no BLOCKED telemetry', async () => {
     // `seedOne` calls flush() immediately, so build the record + flush manually
     // so the on-disk state is consistent (missing-legacy MUST have no

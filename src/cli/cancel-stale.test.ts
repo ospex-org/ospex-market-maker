@@ -579,6 +579,48 @@ describe('runCancelStale — --authoritative (on-chain leg)', () => {
     expect(readEvents('cs-run').some((e) => e.kind === 'cancel-blocked-missing-payload')).toBe(false);
   });
 
+  // Hermes #63 round 2: if pre-pass gas-denies on the FIRST candidate, every
+  // OTHER missing-legacy + visibleOpen candidate must still get its off-chain
+  // skip — otherwise the off-chain DELETE bricks them. The fix pre-populates
+  // the touched set with ALL candidates upfront (not just attempted ones).
+  it("--authoritative + TWO missing-legacy + visibleOpen + pre-pass gas-denied → BOTH records stay visibleOpen (touched-set protects later candidates too), off-chain DELETE never runs on either", async () => {
+    const legacyA = rec('0xaaa', T0 - 200, { signedPayloadStatus: 'missing-legacy' });
+    delete legacyA.signedPayload;
+    const legacyB = rec('0xbbb', T0 - 200, { signedPayloadStatus: 'missing-legacy' });
+    delete legacyB.signedPayload;
+    seedState([legacyA, legacyB], {
+      // Already at the daily cap so canSpendGas (mayUseReserve:true) denies on the FIRST attempt.
+      dailyCounters: { [new Date(T0 * 1000).toISOString().slice(0, 10)]: { gasPolWei: '2000000000000000000', feeUsdcWei6: '0' } },
+    });
+    let captured: OspexAdapter | null = null;
+    const createLiveAdapter = (cfg: Config, signer: Signer): OspexAdapter => {
+      captured = liveAdapter(cfg, signer);
+      return captured;
+    };
+    const report = await runCancelStale(
+      { config: liveConfig(), authoritative: true, ignoreMissingState: false },
+      { ...baseDeps(), createLiveAdapter },
+    );
+
+    // Pre-pass denied → cancel-stale exits before any on-chain cancel lands. Both
+    // records stay visibleOpen — neither was off-chain-hidden, so a future run
+    // (after the operator tops up POL) can still recover via the regular { hash }
+    // path while they're still visible.
+    expect(captured!.cancelCommitmentOnchain).not.toHaveBeenCalled();
+    expect(captured!.cancelCommitmentOffchain).not.toHaveBeenCalled();
+    expect(report.onchainCancelled).toBe(0);
+    expect(report.offchainCancelled).toBe(0);
+    // Two denial events: one from the pre-pass first candidate, one from the
+    // regular on-chain leg's first candidate (the regular leg doesn't skip
+    // touched records — it preserves transient-throw retry semantics, see the
+    // sibling test below). Both denials report the same gas state truthfully.
+    expect(report.gasDenied).toBe(2);
+    expect(report.blockedMissingPayload).toBe(0);
+    const state = StateStore.at(stateDir).load().state;
+    expect(state.commitments['0xaaa']!.lifecycle).toBe('visibleOpen');
+    expect(state.commitments['0xbbb']!.lifecycle).toBe('visibleOpen'); // ← THE KEY ASSERTION: NOT softCancelled, not bricked
+  });
+
   it("--authoritative + missing-legacy + visibleOpen + pre-pass on-chain THROW → record stays visibleOpen (touched-set skip), regular on-chain leg retries via dispatch, off-chain DELETE never runs", async () => {
     const legacy = rec('0xlegacy', T0 - 200, { signedPayloadStatus: 'missing-legacy' });
     delete legacy.signedPayload;

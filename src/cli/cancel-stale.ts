@@ -319,62 +319,62 @@ export async function runCancelStale(opts: CancelStaleOpts, deps: CancelStaleDep
   // on-chain { hash } cancel BEFORE the off-chain leg DELETEs them off the
   // book, because once the API row is `book_visible: false` the SDK's
   // public-fetch path (M2 redaction) refuses, leaving the record stuck in
-  // the BLOCKED dispatch path. Track every attempt (success OR failure) in
-  // `touchedByPrePass` so the off-chain loop skips them: success records are
-  // `authoritativelyInvalidated` anyway (off-chain naturally short-circuits
-  // — but explicit skip costs nothing), while failures stay `visibleOpen`
-  // for the regular on-chain leg below to retry via `use-hash` dispatch.
-  // Inline (not delegated to a runner helper) because the CLI owns its own
-  // gas budget + report counters.
+  // the BLOCKED dispatch path.
+  //
+  // CRITICAL (Hermes #63 round 2): populate `touchedByPrePass` with ALL
+  // candidates UPFRONT, before attempting any cancels. A gas-denied verdict
+  // breaks the cancel loop early; if we'd added records inside the loop, later
+  // candidates would lose their off-chain-skip protection and the off-chain
+  // DELETE would brick them into BLOCKED — the same failure mode this
+  // pre-pass exists to prevent. The skip set guarantees every candidate's
+  // off-chain protection even when the cancel loop only reaches some.
   let totalGasPolWei = 0n;
   const maxDailyGasPolWei = polFloatToWei18(opts.config.gas.maxDailyGasPOL);
   const emergencyReservePolWei = polFloatToWei18(opts.config.gas.emergencyReservePOL);
-  const touchedByPrePass = new Set<string>();
-  if (opts.authoritative) {
-    for (const r of stale) {
-      if (r.signedPayloadStatus !== 'missing-legacy') continue;
-      if (r.lifecycle !== 'visibleOpen') continue;
-      touchedByPrePass.add(r.hash); // mark BEFORE attempting — failure must still skip the off-chain hide
-      const today = todayUTCDateString(wallNow);
-      const todayGasSpentPolWei = BigInt(state.dailyCounters[today]?.gasPolWei ?? '0');
-      const verdict = canSpendGas({ todayGasSpentPolWei, maxDailyGasPolWei, emergencyReservePolWei, mayUseReserve: true });
-      if (!verdict.allowed) {
-        report.gasDenied += 1;
-        eventLog.emit('candidate', {
-          skipReason: 'gas-budget-blocks-onchain-cancel',
-          commitmentHash: r.hash,
-          speculationId: r.speculationId,
-          makerSide: r.makerSide,
-          todayGasSpentPolWei: todayGasSpentPolWei.toString(),
-          maxDailyGasPolWei: maxDailyGasPolWei.toString(),
-          emergencyReservePolWei: emergencyReservePolWei.toString(),
-          detail: verdict.reason,
-        });
-        break; // every later attempt would deny too; touched-set already protects these from off-chain hide
-      }
-      let result: Awaited<ReturnType<OspexAdapter['cancelCommitmentOnchain']>>;
-      try {
-        result = await adapter.cancelCommitmentOnchain({ hash: r.hash as Hex });
-      } catch (err) {
-        report.errored += 1;
-        eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'onchain-cancel', commitmentHash: r.hash });
-        continue; // record stays `visibleOpen`; touched-skip below protects it from off-chain hide; the regular on-chain leg retries
-      }
-      const gasPolWei = BigInt(result.receipt.gasUsed) * BigInt(result.receipt.effectiveGasPrice);
-      recordGasSpentToday(state, today, gasPolWei);
-      totalGasPolWei += gasPolWei;
-      r.lifecycle = 'authoritativelyInvalidated';
-      r.updatedAtUnixSec = wallNow;
-      report.onchainCancelled += 1;
-      eventLog.emit('onchain-cancel', {
+  const prePassCandidates = opts.authoritative
+    ? stale.filter((r) => r.signedPayloadStatus === 'missing-legacy' && r.lifecycle === 'visibleOpen')
+    : [];
+  const touchedByPrePass = new Set<string>(prePassCandidates.map((r) => r.hash));
+  for (const r of prePassCandidates) {
+    const today = todayUTCDateString(wallNow);
+    const todayGasSpentPolWei = BigInt(state.dailyCounters[today]?.gasPolWei ?? '0');
+    const verdict = canSpendGas({ todayGasSpentPolWei, maxDailyGasPolWei, emergencyReservePolWei, mayUseReserve: true });
+    if (!verdict.allowed) {
+      report.gasDenied += 1;
+      eventLog.emit('candidate', {
+        skipReason: 'gas-budget-blocks-onchain-cancel',
         commitmentHash: r.hash,
         speculationId: r.speculationId,
-        contestId: r.contestId,
         makerSide: r.makerSide,
-        txHash: result.txHash,
-        gasPolWei: gasPolWei.toString(),
+        todayGasSpentPolWei: todayGasSpentPolWei.toString(),
+        maxDailyGasPolWei: maxDailyGasPolWei.toString(),
+        emergencyReservePolWei: emergencyReservePolWei.toString(),
+        detail: verdict.reason,
       });
+      break; // every later attempt would deny too; touched-set above already protects remaining candidates from off-chain hide
     }
+    let result: Awaited<ReturnType<OspexAdapter['cancelCommitmentOnchain']>>;
+    try {
+      result = await adapter.cancelCommitmentOnchain({ hash: r.hash as Hex });
+    } catch (err) {
+      report.errored += 1;
+      eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'onchain-cancel', commitmentHash: r.hash });
+      continue; // record stays `visibleOpen`; touched-skip below protects it from off-chain hide; the regular on-chain leg retries
+    }
+    const gasPolWei = BigInt(result.receipt.gasUsed) * BigInt(result.receipt.effectiveGasPrice);
+    recordGasSpentToday(state, today, gasPolWei);
+    totalGasPolWei += gasPolWei;
+    r.lifecycle = 'authoritativelyInvalidated';
+    r.updatedAtUnixSec = wallNow;
+    report.onchainCancelled += 1;
+    eventLog.emit('onchain-cancel', {
+      commitmentHash: r.hash,
+      speculationId: r.speculationId,
+      contestId: r.contestId,
+      makerSide: r.makerSide,
+      txHash: result.txHash,
+      gasPolWei: gasPolWei.toString(),
+    });
   }
 
   // ── 6. Off-chain leg (always) ────────────────────────────────────────────

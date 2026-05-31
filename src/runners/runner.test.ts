@@ -1183,6 +1183,49 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
     await runPromise;
   });
 
+  it('onStatus(\'resync\') drops pre-resync queued events — prevents double-count when post-resync baseline is applied (Hermes #69 blocker)', async () => {
+    // Without the queue.clear() on resync, this sequence double-counts:
+    //   1. SDK delivers a fill — runner queues it (drain pending).
+    //   2. SDK delivers `event: resync` — runner clears pendingBaseline + ready
+    //      but the fill stays in the queue.
+    //   3. SDK cold-starts + delivers a fresh snapshot that INCLUDES the fill.
+    //   4. drainShadow applies the stale queued fill on top of the fresh
+    //      baseline → position risk doubled.
+    // This test asserts step 2 actually clears the queue.
+    const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
+
+    // Initial snapshot + ready so the shadow has a baseline.
+    recorder.fire('onSnapshot', {
+      cursor: 'c1',
+      commitments: [],
+      positions: [],
+      truncated: false,
+      positionsTruncated: false,
+    });
+    recorder.fire('onReady');
+
+    // Fire a fill — it enqueues but the loop is paused at the debounce sleep.
+    recorder.fire('onFill', {
+      speculationId: 'spec-1', contestId: 'contest-1', commitmentHash: '0xa',
+      maker: DEFAULT_FAKE_MAKER_ADDRESS, taker: '0xother',
+      makerPositionType: 0, takerPositionType: 1,
+      makerRiskAmount: '50000', takerRiskAmount: '75000',
+      makerRiskUSDC: 0.05, takerRiskUSDC: 0.075, oddsTick: 250,
+      filledAt: '2025-01-01T00:00:00.000Z', contestStarted: false,
+      txHash: '0xtx1', logIndex: 0,
+    });
+    expect(runner.ownStateQueueSizeForTest()).toBe(1);
+
+    // Resync — must clear the queued event.
+    recorder.fire('onStatus', 'resync');
+    expect(runner.ownStateQueueSizeForTest()).toBe(0);
+    expect(runner.ownStateShadowView().ready).toBe(false);
+    expect(runner.ownStateShadowView().pendingBaseline).toBeNull();
+
+    triggerKill();
+    await runPromise;
+  });
+
   it('drainShadow logs error + skips on unknown event kind (Phase 2 PR4b)', async () => {
     const runner = makeRunner({ maxTicks: 1 });
     runner.enqueueOwnStateEvent({ kind: 'made-up-kind', body: {} });

@@ -87,6 +87,22 @@ export class OwnStateQueue {
     return { events, overflowed };
   }
 
+  /**
+   * Discard all queued events + reset the overflow flag WITHOUT yielding them
+   * to a drain. The runner calls this on `onStatus('resync')` — the upcoming
+   * fresh snapshot is authoritative for all on-chain state up to its
+   * timestamp; pre-resync deltas still in the buffer are stale and would
+   * double-apply against the fresh baseline once drained (Hermes #69 review).
+   *
+   * Distinct from {@link drain}: that one delivers events to the consumer
+   * + resets the buffer. `clear` resets without delivering — the events are
+   * gone, and the consumer's next read sees an empty queue.
+   */
+  clear(): void {
+    this.buf = [];
+    this.overflowedSinceLastDrain = false;
+  }
+
   /** Diagnostic — current buffer occupancy. Not part of the runner's loop logic. */
   get size(): number {
     return this.buf.length;

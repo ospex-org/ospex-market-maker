@@ -91,4 +91,35 @@ describe('OwnStateQueue', () => {
     expect(new OwnStateQueue().capacity).toBe(OWN_STATE_QUEUE_MAX);
     expect(new OwnStateQueue(42).capacity).toBe(42);
   });
+
+  // ── clear() — used by the runner on onStatus('resync') (Hermes #69) ───
+
+  it('clear() drops queued events WITHOUT yielding them to a drain — next drain sees an empty queue', () => {
+    const q = new OwnStateQueue();
+    q.enqueue(ev('a', 1));
+    q.enqueue(ev('b', 2));
+    expect(q.size).toBe(2);
+    q.clear();
+    expect(q.size).toBe(0);
+    const drained = q.drain();
+    expect(drained.events).toEqual([]);
+    expect(drained.overflowed).toBe(false);
+  });
+
+  it('clear() resets the overflow flag — a post-clear drain does NOT report a stale overflow', () => {
+    const q = new OwnStateQueue(2);
+    q.enqueue(ev('a', 1));
+    q.enqueue(ev('b', 2));
+    expect(q.enqueue(ev('c', 3))).toBe('overflow');
+    q.clear();
+    const drained = q.drain();
+    expect(drained.overflowed).toBe(false);
+    expect(drained.events).toEqual([]);
+  });
+
+  it('clear() is idempotent on an empty queue', () => {
+    const q = new OwnStateQueue();
+    expect(() => q.clear()).not.toThrow();
+    expect(q.size).toBe(0);
+  });
 });

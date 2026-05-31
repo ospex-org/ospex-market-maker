@@ -276,7 +276,16 @@ function submitRecorder(): { fn: (args: SubmitCommitmentArgs) => Promise<SubmitC
       // `book_visible=true` by construction, so the public visible branch is
       // the canonical return type. Derive the cast from the result type so
       // future SDK signature changes surface as a compile error here.
-      return Promise.resolve({ hash: `0xlive${calls.length}` as Hex, commitment: {} as unknown as SubmitCommitmentResult['commitment'] });
+      // `signedPayload` (SDK v0.5.1) is a required field but its content is
+      // not exercised by any existing test — M6/A will introduce a real
+      // persistence path. Stubbed with the same derived-type-cast pattern
+      // so a future SDK shape change to the canonical payload still
+      // surfaces here at compile time.
+      return Promise.resolve({
+        hash: `0xlive${calls.length}` as Hex,
+        commitment: {} as unknown as SubmitCommitmentResult['commitment'],
+        signedPayload: {} as unknown as SubmitCommitmentResult['signedPayload'],
+      });
     },
   };
 }

@@ -19,6 +19,7 @@ describe('parseConfig', () => {
     expect(c.odds.maxRealtimeChannels).toBe(5);
     expect(c.ownState.subscribe).toBe(false);
     expect(c.ownState.debounceMs).toBe(500);
+    expect(c.ownState.divergenceToleranceMs).toBe(5000);
     expect(c.pricing.mode).toBe('economics');
     expect(c.pricing.quoteBothSides).toBe(true);
     expect(c.pricing.economics.capitalUSDC).toBe(50);

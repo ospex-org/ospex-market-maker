@@ -37,6 +37,11 @@ odds:
                                    #   streams from one host — keep this (plus ~3 reserved for own-state streams) under it, or raise
                                    #   the server cap. The runner warns at boot if the budget would be exceeded.
 
+ownState:
+  debounceMs: 500                  # Phase 2 PR3 — coalescing window (250-1000ms) after a wake fires before the runner drains the
+                                   #   shadow queue. SSE bursts of N events within this window collapse to a single drain pass.
+                                   #   Phase 2 ships shadow-only — no canonical-state writes, no trading-timing changes.
+
 pricing:
   mode: economics                  # "economics" (derive spread from your return target) or "direct"
   economics:

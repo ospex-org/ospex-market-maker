@@ -116,14 +116,18 @@ import type {
 } from '../ospex/index.js';
 import { decimalToTick, inverseOddsTick, isTickInRange, oppositeSide, positionTypeForSide, toProtocolQuote, type ProtocolQuote, type QuoteSide } from '../pricing/index.js';
 import {
+  emptyOwnStateShadow,
   reducePolledCommitmentObservation,
   reducePolledPositionObservation,
   reducePolledSoftCancelledObservation,
   type ApplyDescriptorsResult,
+  type OwnStateShadow,
   type PolledCommitmentObservation,
   type PolledPositionInput,
   type ReducerDescriptor,
 } from '../reducers/index.js';
+import { OwnStateQueue } from './own-state-queue.js';
+import { WakeSignal } from './wake-signal.js';
 import { canSpendGas, requiredPositionModuleAllowanceUSDC, type Market } from '../risk/index.js';
 import { assessStateLoss, dispatchCancel, toMakerSignedPayload, type CancelDispatch, type MakerCommitmentRecord, type MakerSide, type MakerSignedPayload, type MakerState, type StateLossAssessment, type StateStore } from '../state/index.js';
 import { EventLog, eventLogsExist } from '../telemetry/index.js';
@@ -364,6 +368,39 @@ export class Runner {
    * the sweep BREAKS on the first denial, since today's gas spend only grows so the rest would deny identically.
    */
   private fundingOnchainGasDeniedWarned = false;
+
+  /**
+   * Wakeable-sleep primitive (Phase 2 PR3 — own-state-sse-plan §2.5.1). PR4's
+   * SSE handlers will call `wake()` when an own-state event arrives; the runner
+   * loop replaces its straight `deps.sleep` with a `Promise.race` against this
+   * signal so a wake interrupts the wait WITHOUT advancing the poll deadline.
+   * Phase 2 invariant: a wake outcome does NOT increment ticks, run `tick()`,
+   * or alter trading-timing.
+   */
+  private readonly wakeSignal = new WakeSignal();
+  /**
+   * Bounded buffer for SSE events between drains (Phase 2 PR3 — spec §2.5.2).
+   * Empty until PR4 wires the SSE adapter handlers. Overflow is telemetry-only
+   * per the Phase 2 shadow-only contract — does NOT trigger `fundingHold`,
+   * does NOT alter canonical state.
+   */
+  private readonly ownStateQueue = new OwnStateQueue();
+  /**
+   * Projection of canonical state built from the SSE stream (Phase 2 PR2 type;
+   * PR4 wires the SSE feed). Distinct object identity from `this.state` so the
+   * source-aware reducers' compile-time guards prevent crossing the canonical /
+   * shadow boundary. PR5 wires the comparator that reads this against
+   * `this.state` and emits divergence telemetry.
+   */
+  private readonly ownStateShadow: OwnStateShadow = emptyOwnStateShadow();
+  /**
+   * Latch — `true` while the last drain reported `overflowed: true` and a
+   * subsequent recovery (healthy stream + empty queue) hasn't cleared it. Used
+   * to emit `stream-health-degraded {reason: 'queue-overflow'}` ONCE per
+   * overflow window rather than every drain. In Phase 2 the latch can only set
+   * (never clear) since the SSE handlers PR4 will own the recovery path.
+   */
+  private streamOverflowDegraded = false;
 
   constructor(opts: RunnerOptions) {
     this.config = opts.config;
@@ -705,6 +742,137 @@ export class Runner {
   }
 
   /**
+   * Wait for the next poll deadline OR a wake — Phase 2 PR3 (own-state-sse-plan
+   * §2.5.1). Returns when the originally-scheduled poll interval has elapsed
+   * (cadence-preserving). A `wake()` aborts the in-flight sleep early; after
+   * the debounce window, the shadow drains and the wait resumes for the
+   * REMAINING time until the original poll deadline. Multiple wakes collapse
+   * to one debounce + one drain per outer wake-loop iteration.
+   *
+   * Cadence preservation is load-bearing for the Phase 2 contract: a wake
+   * outcome must NOT push the poll deadline back. This method tracks the
+   * deadline against wall-clock time across wake iterations.
+   *
+   * Outcomes:
+   * - poll-deadline: the originally-scheduled sleep ran to completion. The
+   *   outer loop ticks next.
+   * - kill: `this.abortController` aborted (kill-file or signal). The outer
+   *   loop's `stopRequested` check catches it; this method just returns.
+   *
+   * (`wake` is not an external outcome — the wake-loop is internal; the outer
+   * loop only sees the wait return when poll-deadline or kill fires.)
+   */
+  private async waitForNextPollDeadline(): Promise<void> {
+    const pollDeadlineMs = Date.now() + this.sleepMs();
+    while (!this.stopRequested) {
+      const remainingMs = Math.max(0, pollDeadlineMs - Date.now());
+      const wakeSig = this.wakeSignal.beginWait();
+      // Compose wake + kill into a single signal so EITHER firing aborts the
+      // sleep early. We then disambiguate the outcome by checking each
+      // upstream signal. (Adding a listener to an already-aborted signal does
+      // NOT auto-fire it per WHATWG; the explicit pre-checks below handle the
+      // already-aborted-at-entry case.)
+      const composed = new AbortController();
+      if (wakeSig.aborted || this.abortController.signal.aborted) composed.abort();
+      const onAbort = (): void => composed.abort();
+      wakeSig.addEventListener('abort', onAbort, { once: true });
+      this.abortController.signal.addEventListener('abort', onAbort, { once: true });
+      try {
+        await this.deps.sleep(remainingMs, composed.signal);
+      } finally {
+        wakeSig.removeEventListener('abort', onAbort);
+        this.abortController.signal.removeEventListener('abort', onAbort);
+        this.wakeSignal.endWait();
+      }
+      if (this.abortController.signal.aborted) return; // kill — outer loop handles shutdown
+      if (wakeSig.aborted) {
+        // Wake outcome — debounce, drain, loop back to wait for the ORIGINAL deadline.
+        // Cadence preservation: `pollDeadlineMs` is unchanged across wake iterations.
+        await this.deps.sleep(this.config.ownState.debounceMs, this.abortController.signal);
+        if (this.abortController.signal.aborted) return;
+        this.drainShadow();
+        // PR5 wires the comparator hook here.
+        continue;
+      }
+      // Poll-deadline outcome — sleep ran to completion without a wake.
+      return;
+    }
+  }
+
+  /**
+   * Externally-callable wake — Phase 2 PR3 (own-state-sse-plan §2.5.1). PR4's
+   * SSE handlers call this on every incoming event so the runner loop's
+   * between-tick wait drains the shadow queue immediately (after the
+   * `ownState.debounceMs` window) instead of waiting for the next poll
+   * deadline. Tests use the same entry point.
+   *
+   * Calling `wake()` is idempotent: multiple wakes between drains collapse to
+   * one wake-outcome — the consumer's drain pass processes the queue contents.
+   *
+   * Phase 2 invariant: wake does NOT advance the poll deadline, does NOT
+   * increment ticks, does NOT run `tick()`. Trading cadence is byte-identical
+   * to Phase 1.
+   */
+  wake(): void {
+    this.wakeSignal.wake();
+  }
+
+  /**
+   * Enqueue an SSE event for the next shadow drain (Phase 2 PR3). PR4 wires
+   * the SSE adapter handlers to call this + `wake()`; PR3 exposes it so the
+   * queue can be exercised by tests without the SSE adapter present.
+   */
+  enqueueOwnStateEvent(event: { kind: string; body: unknown; arrivedAtMs?: number }): 'enqueued' | 'overflow' {
+    return this.ownStateQueue.enqueue({
+      kind: event.kind,
+      body: event.body,
+      arrivedAtMs: event.arrivedAtMs ?? Date.now(),
+    });
+  }
+
+  /**
+   * Drain the ownState queue, apply owner-source reducers to the shadow, and
+   * handle overflow telemetry (Phase 2 PR3). PR2 stub reducers return `[]`, so
+   * the only side-effect in PR3 is the overflow telemetry path (exercised by
+   * tests). PR4 wires real owner reducers.
+   *
+   * Overflow telemetry — once per overflow window:
+   * - `stream-health-degraded {reason: 'queue-overflow', shadowReady, queueCapacity}` — health flag flipped.
+   * - `stream-would-hold {reason: 'queue-overflow', exposureWei6}` — emitted IFF open exposure > 0.
+   *   Documents what Phase 3 would do here (set `fundingHold`). PR3 does NOT
+   *   actually hold — the Phase 2 shadow-only contract forbids altering
+   *   canonical trading behavior.
+   *
+   * The `streamOverflowDegraded` latch guarantees we emit ONCE per overflow
+   * window. Subsequent drains during the same unhealthy window see the latch
+   * set and skip the emit; recovery (Phase 3+) clears the latch.
+   */
+  private drainShadow(): void {
+    const drained = this.ownStateQueue.drain();
+    if (drained.overflowed && !this.streamOverflowDegraded) {
+      this.streamOverflowDegraded = true;
+      this.ownStateShadow.healthy = false;
+      this.eventLog.emit('stream-health-degraded', {
+        reason: 'queue-overflow',
+        shadowReady: this.ownStateShadow.ready,
+        queueCapacity: this.ownStateQueue.capacity,
+      });
+      const exposureWei6 = computeOpenExposureWei6(this.state, this.deps.now(), this.config.orders.expiryReleaseGraceSeconds);
+      if (exposureWei6 > 0n) {
+        this.eventLog.emit('stream-would-hold', {
+          reason: 'queue-overflow',
+          exposureWei6: exposureWei6.toString(),
+        });
+      }
+    }
+    // PR3 stubs: reduceOwner* return []. PR4 wires real bodies + dedup-set against
+    // MakerCommitmentRecord.fills[]. Iterating the empty list is a free no-op.
+    for (const _event of drained.events) {
+      // Owner reducers + applyDescriptors(_, 'owner') wired here in PR4.
+    }
+  }
+
+  /**
    * The event loop: `{ kill-check → tick → stop-check → sleep }` until killed or
    * `maxTicks` is reached. On shutdown (kill-switch file or SIGTERM/SIGINT) the
    * live runner first sweeps every visible quote off chain via
@@ -752,10 +920,17 @@ export class Runner {
           // else: live + holding — leave the latch false, retry next tick.
         }
         ticks += 1;
+        this.drainShadow(); // own-state-sse-plan §"Drain placement" — pre-tick drain
         await this.tick(ticks);
+        this.drainShadow(); // §"Drain placement" — post-tick drain catches events that arrived during tick IO
         if (this.stopRequested) break;
         if (this.maxTicks !== undefined && ticks >= this.maxTicks) break;
-        await this.deps.sleep(this.sleepMs(), this.abortController.signal);
+        // Phase 2 PR3 — wakeable wait. A wake interrupts the sleep but does NOT
+        // advance the poll deadline (cadence-preserving): after a wake we
+        // debounce, drain the shadow queue, and loop back to wait for the
+        // SAME deadline. Only a poll-deadline outcome exits the wait loop and
+        // triggers the next tick (own-state-sse-plan §2.5.1).
+        await this.waitForNextPollDeadline();
       }
     } finally {
       unregister();
@@ -2891,6 +3066,29 @@ export class Runner {
 }
 
 // ── small helpers ────────────────────────────────────────────────────────────
+
+/**
+ * Sum the maker's currently-at-risk USDC across non-released commitments +
+ * non-claimed positions, in wei6. Used by Phase 2 PR3 overflow telemetry
+ * (`stream-would-hold {exposureWei6}`) — the exposure figure Phase 3 would gate
+ * `fundingHold` on. Identical accounting to `inventoryFromState` minus the
+ * per-item shape; keep the predicates in lockstep with `RELEASED_LIFECYCLES`
+ * and `isExpiredForRelease` over there if either changes.
+ */
+function computeOpenExposureWei6(state: MakerState, nowUnixSec: number, graceSeconds: number): bigint {
+  let total = 0n;
+  for (const c of Object.values(state.commitments)) {
+    if (c.lifecycle !== 'visibleOpen' && c.lifecycle !== 'softCancelled' && c.lifecycle !== 'partiallyFilled') continue;
+    if (isExpiredForRelease(c.expiryUnixSec, nowUnixSec, graceSeconds)) continue;
+    const remaining = BigInt(c.riskAmountWei6) - BigInt(c.filledRiskWei6);
+    if (remaining > 0n) total += remaining;
+  }
+  for (const p of Object.values(state.positions)) {
+    if (p.status === 'claimed') continue;
+    total += BigInt(p.riskAmountWei6);
+  }
+  return total;
+}
 
 function errClass(err: unknown): string {
   return err instanceof Error ? err.constructor.name : typeof err;

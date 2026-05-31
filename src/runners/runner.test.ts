@@ -584,6 +584,166 @@ describe('Runner — tick loop', () => {
   });
 });
 
+// ── wakeable loop (Phase 2 PR3) ──────────────────────────────────────────────
+
+describe('Runner — wakeable loop (Phase 2 PR3)', () => {
+  // A controllable sleep harness: each call pushes the requested ms to `sleepCalls`
+  // and returns a pending Promise that resolves on either signal abort OR a manual
+  // `resolvers[i]()`. Tests advance the loop by either triggering a wake (aborts
+  // the composed signal → resolves the pending sleep) or calling `resolvers[i]()`.
+  function controllableSleep() {
+    const sleepCalls: number[] = [];
+    const resolvers: Array<() => void> = [];
+    const sleep = (ms: number, signal: AbortSignal): Promise<void> =>
+      new Promise<void>((resolve) => {
+        sleepCalls.push(ms);
+        if (signal.aborted) {
+          resolve();
+          return;
+        }
+        resolvers.push(resolve);
+        signal.addEventListener('abort', () => resolve(), { once: true });
+      });
+    return { sleep, sleepCalls, resolvers };
+  }
+
+  // Wait until `predicate()` is true. Yields a microtask + setImmediate between
+  // checks so the runner's loop advances through its tick() awaits and into
+  // the next `deps.sleep` call. Times out after ~1s to keep tests deterministic.
+  async function waitFor(predicate: () => boolean): Promise<void> {
+    for (let i = 0; i < 200; i++) {
+      if (predicate()) return;
+      await new Promise<void>((r) => setImmediate(r));
+    }
+    throw new Error('waitFor: predicate did not become true within ~1s');
+  }
+
+  it('a wake during the poll-deadline wait does NOT increment ticks (drain-only outcome)', async () => {
+    const { sleep, sleepCalls, resolvers } = controllableSleep();
+    let triggerKill!: () => void;
+    const runner = makeRunner({
+      maxTicks: 2,
+      deps: {
+        sleep,
+        registerShutdownSignals: (onSignal) => { triggerKill = onSignal; return () => {}; },
+      },
+    });
+    const runPromise = runner.run();
+
+    // Wait for tick 1 to complete and the first main-wait sleep to be entered.
+    await waitFor(() => sleepCalls.length >= 1);
+    expect(sleepCalls[0]).toBe(30_000);
+
+    runner.wake(); // aborts the composed signal → sleep 1 resolves via the abort listener
+    await waitFor(() => sleepCalls.length >= 2);
+    expect(sleepCalls[1]).toBe(500); // debounce sleep (the kill signal only — wake can't double-trigger here)
+
+    // Manually resolve the debounce so the loop proceeds to drainShadow + next wait.
+    const resolveDebounce = resolvers[1];
+    if (resolveDebounce === undefined) throw new Error('expected debounce resolver');
+    resolveDebounce();
+    await waitFor(() => sleepCalls.length >= 3);
+    expect(sleepCalls[2]).toBeLessThanOrEqual(30_000); // remaining wait of the original deadline
+
+    // Kill the runner so the loop exits — verifies wake didn't promote to tick.
+    triggerKill();
+    await runPromise;
+
+    const events = readEvents();
+    const tickStarts = events.filter((e) => e.kind === 'tick-start');
+    // Tick 1 fired; tick 2 didn't (the wake-outcome did NOT advance the tick counter).
+    expect(tickStarts).toHaveLength(1);
+    expect(tickStarts[0]?.tick).toBe(1);
+  });
+
+  it('multiple wakes between deadlines coalesce — one drain pass + one debounce per wake-outcome (not per wake call)', async () => {
+    const { sleep, sleepCalls } = controllableSleep();
+    let triggerKill!: () => void;
+    const runner = makeRunner({
+      maxTicks: 2,
+      deps: {
+        sleep,
+        registerShutdownSignals: (onSignal) => { triggerKill = onSignal; return () => {}; },
+      },
+    });
+    const runPromise = runner.run();
+
+    await waitFor(() => sleepCalls.length >= 1);
+
+    runner.wake();
+    runner.wake();
+    runner.wake();
+    await waitFor(() => sleepCalls.filter((ms) => ms === 500).length >= 1);
+    // Three wakes converged to ONE debounce.
+    expect(sleepCalls.filter((ms) => ms === 500)).toHaveLength(1);
+
+    triggerKill();
+    await runPromise;
+  });
+
+  it('a poll-deadline outcome (no wake) — drainShadow runs pre+post tick, but no debounce', async () => {
+    // With the default synchronous sleep, the loop runs maxTicks=2 without
+    // any wake interruption. Each tick triggers 2 drainShadow calls (pre + post).
+    // Critical: the test verifies the existing test pattern (which uses
+    // `sleep: () => Promise.resolve()`) STILL works under the new loop shape —
+    // behavior preservation for non-SSE runs.
+    const sleepMsCalls: number[] = [];
+    const runner = makeRunner({
+      maxTicks: 3,
+      deps: { sleep: (ms) => { sleepMsCalls.push(ms); return Promise.resolve(); } },
+    });
+    await runner.run();
+    const events = readEvents();
+    expect(events.filter((e) => e.kind === 'tick-start').map((e) => e.tick)).toEqual([1, 2, 3]);
+    // Same `[30000, 30000]` shape the pre-PR3 test (Runner — tick loop / clamps pollIntervalMs ...) asserted.
+    expect(sleepMsCalls).toEqual([30_000, 30_000]);
+  });
+});
+
+// ── ownStateQueue overflow telemetry (Phase 2 PR3) ───────────────────────────
+
+describe('Runner — own-state queue overflow telemetry (Phase 2 PR3)', () => {
+  it('a single overflow drain emits stream-health-degraded ONCE; further empty drains do not re-emit', async () => {
+    const runner = makeRunner({ maxTicks: 1 });
+    // Force an overflow via the public enqueue surface.
+    const cap = 10_000;
+    for (let i = 0; i < cap; i++) {
+      runner.enqueueOwnStateEvent({ kind: 'fill', body: { i } });
+    }
+    expect(runner.enqueueOwnStateEvent({ kind: 'fill', body: { overflow: true } })).toBe('overflow');
+
+    await runner.run();
+    const events = readEvents();
+    const degraded = events.filter((e) => e.kind === 'stream-health-degraded');
+    expect(degraded).toHaveLength(1);
+    expect(degraded[0]).toMatchObject({ reason: 'queue-overflow', shadowReady: false, queueCapacity: cap });
+  });
+
+  it('stream-would-hold is emitted iff open exposure > 0 (Phase 2 — does NOT actually hold)', async () => {
+    const runner = makeRunner({ maxTicks: 1 });
+    const cap = 10_000;
+    for (let i = 0; i < cap; i++) runner.enqueueOwnStateEvent({ kind: 'fill', body: { i } });
+    runner.enqueueOwnStateEvent({ kind: 'fill', body: {} });
+
+    await runner.run();
+    const events = readEvents();
+    // No open exposure in the default empty-state runner → no stream-would-hold.
+    expect(events.filter((e) => e.kind === 'stream-would-hold')).toHaveLength(0);
+    // The degraded event still fires.
+    expect(events.filter((e) => e.kind === 'stream-health-degraded')).toHaveLength(1);
+  });
+
+  it('overflow does NOT set fundingHold and does NOT block trading (Phase 2 shadow-only contract)', async () => {
+    const runner = makeRunner({ maxTicks: 1 });
+    const cap = 10_000;
+    for (let i = 0; i < cap; i++) runner.enqueueOwnStateEvent({ kind: 'fill', body: { i } });
+    runner.enqueueOwnStateEvent({ kind: 'fill', body: {} });
+    await runner.run();
+    const events = readEvents();
+    expect(events.some((e) => e.kind === 'funding-hold')).toBe(false);
+  });
+});
+
 // ── discovery (DESIGN §10) ───────────────────────────────────────────────────
 
 describe('Runner — discovery', () => {

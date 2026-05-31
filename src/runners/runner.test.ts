@@ -3145,7 +3145,7 @@ describe('Runner — auto-settle + auto-claim (Phase 3 e-i)', () => {
     return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
   }
 
-  /** A `pendingSettle` position record on `(speculationId, makerSide)`. The position-poll's `syncPolledPosition` puts records here when the API reports them in the `pendingSettle` bucket. */
+  /** A `pendingSettle` position record on `(speculationId, makerSide)`. The position-poll's `reducePolledPositionObservation` puts records here when the API reports them in the `pendingSettle` bucket. */
   function pendingSettleRecord(speculationId: string, contestId: string, side: MakerSide = 'home'): MakerState['positions'][string] {
     return { speculationId, contestId, sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', side, riskAmountWei6: '250000', counterpartyRiskWei6: '250000', status: 'pendingSettle', updatedAtUnixSec: T0 - 60 };
   }

@@ -115,8 +115,17 @@ import type {
   Subscription,
 } from '../ospex/index.js';
 import { decimalToTick, inverseOddsTick, isTickInRange, oppositeSide, positionTypeForSide, toProtocolQuote, type ProtocolQuote, type QuoteSide } from '../pricing/index.js';
+import {
+  reducePolledCommitmentObservation,
+  reducePolledPositionObservation,
+  reducePolledSoftCancelledObservation,
+  type ApplyDescriptorsResult,
+  type PolledCommitmentObservation,
+  type PolledPositionInput,
+  type ReducerDescriptor,
+} from '../reducers/index.js';
 import { canSpendGas, requiredPositionModuleAllowanceUSDC, type Market } from '../risk/index.js';
-import { assessStateLoss, dispatchCancel, toMakerSignedPayload, type CancelDispatch, type CommitmentLifecycle, type MakerCommitmentRecord, type MakerPositionRecord, type MakerPositionStatus, type MakerSide, type MakerSignedPayload, type MakerState, type StateLossAssessment, type StateStore } from '../state/index.js';
+import { assessStateLoss, dispatchCancel, toMakerSignedPayload, type CancelDispatch, type MakerCommitmentRecord, type MakerSide, type MakerSignedPayload, type MakerState, type StateLossAssessment, type StateStore } from '../state/index.js';
 import { EventLog, eventLogsExist } from '../telemetry/index.js';
 
 // ── injectable seams (the defaults are the real impls; tests override) ───────
@@ -2042,7 +2051,7 @@ export class Runner {
   private async detectFills(): Promise<boolean> {
     if (this.makerAddress === null) return true; // dry-run path — defensive (the caller skips); treat as ok so the rest of the tick proceeds
     const now = this.deps.now();
-    const grace = this.config.orders.expiryReleaseGraceSeconds;
+    const reducerConfig = { expiryReleaseGraceSeconds: this.config.orders.expiryReleaseGraceSeconds };
     const localOpen = new Map<string, MakerCommitmentRecord>();
     for (const r of Object.values(this.state.commitments)) {
       if (r.lifecycle !== 'visibleOpen' && r.lifecycle !== 'partiallyFilled') continue;
@@ -2063,213 +2072,76 @@ export class Runner {
     const apiByHash = new Map<string, Commitment>();
     for (const c of apiList) apiByHash.set(c.commitmentHash, c);
 
-    // Partial-fill bumps (commitment still listed; filledRiskAmount advanced).
+    let pastExpiryLookupFailed = false;
+
+    // Pass 1 — still-listed commitments (partial-fill bumps).
     for (const [, record] of localOpen) {
       const apiCommitment = apiByHash.get(record.hash);
       if (apiCommitment === undefined) continue; // disappeared — handled below
-      const apiFilled = BigInt(apiCommitment.filledRiskAmount);
-      const localFilled = BigInt(record.filledRiskWei6);
-      if (apiFilled <= localFilled) continue; // no new fill (or somehow regressed — ignore)
-      this.applyFill(record, apiFilled - localFilled, now, 'partiallyFilled');
+      const observation: PolledCommitmentObservation = { kind: 'still-listed', record, apiCommitment };
+      const descriptors = reducePolledCommitmentObservation(this.state, observation, now, reducerConfig);
+      const result = this.applyDescriptors(descriptors, 'poll');
+      if (result.pastExpiryLookupFailed) pastExpiryLookupFailed = true;
     }
 
-    // Disappeared hashes → per-hash terminal classification via `getCommitment`.
-    // **Fail-closed on past-expiry lookup failure.** A future-expiry record whose
-    // lookup fails stays live + counted toward exposure; next tick retries — safe.
-    // But a *past-expiry* record whose lookup fails is the sharp case: `ageOut`
-    // would otherwise terminalize it to `expired` and release its headroom, and
-    // the reconcile would submit replacements against exposure that may have just
-    // filled. Track whether any such failure occurred and signal `tick()` to
-    // skip reconcile + ageOut for the tick (the markets stay dirty for next-tick
-    // retry, the record's lifecycle stays at its current value). Hermes
-    // review-PR23-late.
-    let pastExpiryLookupFailed = false;
+    // Pass 2 — disappeared hashes (per-hash `getCommitment`, then reducer classifies).
+    // Past-expiry lookup failures escalate to fail-closed (the reducer signals via
+    // descriptor; `applyDescriptors` ORs into the result). Future-expiry lookup
+    // failures are non-fatal — the record stays live + counted, next tick retries.
     for (const [hash, record] of localOpen) {
       if (apiByHash.has(hash)) continue;
-      let apiCommitment: Commitment;
+      let observation: PolledCommitmentObservation;
       try {
-        apiCommitment = await this.adapter.getCommitment(hash as Hex);
+        const apiCommitment = await this.adapter.getCommitment(hash as Hex);
+        observation = { kind: 'disappeared', record, apiCommitment };
       } catch (err) {
-        this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'fill-detection-lookup', commitmentHash: hash });
-        if (isExpiredForRelease(record.expiryUnixSec, now, grace)) pastExpiryLookupFailed = true; // only past expiry+grace is ageOut's terminalization zone — within grace the record stays live + counted, like a future-expiry one, so a lookup failure there is non-fatal
-        continue; // skip this hash; other hashes still processed
+        observation = { kind: 'disappeared-lookup-failed', record, err };
       }
-      // For every terminal status, first compute and apply any unobserved fill delta —
-      // a commitment can have partially filled and then expired / been cancelled
-      // between polls; that delta is real on-chain risk and must enter the position
-      // before the commitment is terminalized.
-      const apiFilled = BigInt(apiCommitment.filledRiskAmount);
-      const localFilled = BigInt(record.filledRiskWei6);
-      const delta = apiFilled > localFilled ? apiFilled - localFilled : 0n;
-      const riskWei6 = BigInt(record.riskAmountWei6);
-      switch (apiCommitment.status) {
-        case 'filled': {
-          this.applyFill(record, delta, now, 'filled');
-          break;
-        }
-        case 'expired': {
-          // The API's effective 'expired' is a wall-clock signal (server clock vs expiry),
-          // subject to the same release grace as the MM's own clock. Derive the lifecycle
-          // from authoritative facts first; only treat 'expired' as a release past expiry+grace.
-          if (apiFilled >= riskWei6) {
-            // Full cumulative fill is authoritative — a position, not an expiry release.
-            this.applyFill(record, delta, now, 'filled');
-          } else if (apiCommitment.storedStatus === 'cancelled' || apiCommitment.nonceInvalidated) {
-            // On-chain cancel / nonce-floor raise — finality-confirmed; release now even within grace.
-            this.applyFill(record, delta, now, 'authoritativelyInvalidated');
-          } else if (isExpiredForRelease(record.expiryUnixSec, now, grace)) {
-            this.applyFill(record, delta, now, 'expired');
-            this.eventLog.emit('expire', {
-              commitmentHash: record.hash,
-              speculationId: record.speculationId,
-              contestId: record.contestId,
-              makerSide: record.makerSide,
-              oddsTick: record.oddsTick,
-            });
-          } else if (delta > 0n) {
-            // Inside the grace window: the signed payload may still match on chain. Fold any
-            // real cumulative-fill delta and keep counting the remainder; do NOT terminalize
-            // (ageOut / a later tick releases once past expiry + grace).
-            this.applyFill(record, delta, now, 'partiallyFilled');
-          }
-          break;
-        }
-        case 'cancelled': {
-          // Effective `cancelled` is AMBIGUOUS post-book-visibility-split — classify off the
-          // CANONICAL signals, never the effective `status`. A true on-chain cancel
-          // (`storedStatus === 'cancelled'`) or a nonce-floor raise (`nonceInvalidated`) is
-          // authoritatively dead → release headroom. Otherwise the row is merely book-hidden
-          // (`book_visible=false`, `storedStatus` still `open`/`partially_filled`): the signed
-          // payload is STILL matchable on chain, so the latent remainder must NOT be released.
-          // Reclassify `softCancelled` (handing ownership to `reconcileSoftCancelledFills`) and
-          // converge the cumulative fill commitment-only — `applyFill`'s position bump would
-          // double-count `pollPositionStatus`'s aggregate convergence. Hermes review-2.
-          if (apiCommitment.storedStatus === 'cancelled' || apiCommitment.nonceInvalidated) {
-            this.applyFill(record, delta, now, 'authoritativelyInvalidated');
-          } else {
-            this.convergeCommitmentFilledRiskFromCumulative(record, apiFilled, now);
-            if (record.lifecycle !== 'softCancelled' && record.lifecycle !== 'filled') {
-              // No new fill (converge early-returned without reclassifying) — still flip the
-              // record out of the `visibleOpen`/`partiallyFilled` set so the next tick's
-              // `detectFills` doesn't re-trap this always-"disappeared" hidden row.
-              record.lifecycle = 'softCancelled';
-              record.updatedAtUnixSec = now;
-            }
-          }
-          break;
-        }
-        default: {
-          // status is 'open' / 'partially_filled' yet the commitment dropped off
-          // the open-book listing. That's the shape of a *time-expired* or
-          // *nonce-invalidated* commitment read from a core-api that predates
-          // effective-status: it leaves the listing on expiry/invalidation while
-          // get-by-hash still reports the raw status. Fall back to signals we
-          // already hold so the bot terminalizes correctly regardless of the
-          // API's status semantics (and so the same expire fires here, with any
-          // last-moment fill delta folded in, rather than waiting for ageOut).
-          if (apiFilled >= riskWei6) {
-            // Full cumulative fill is authoritative regardless of the stale status label.
-            this.applyFill(record, delta, now, 'filled');
-          } else if (apiCommitment.nonceInvalidated) {
-            // Bulk-cancelled via raiseMinNonce → authoritatively dead; release now.
-            this.applyFill(record, delta, now, 'authoritativelyInvalidated');
-          } else if (isExpiredForRelease(record.expiryUnixSec, now, grace)) {
-            // Past expiry + grace → unmatchable on chain even allowing for clock skew.
-            this.applyFill(record, delta, now, 'expired');
-            this.eventLog.emit('expire', {
-              commitmentHash: record.hash,
-              speculationId: record.speculationId,
-              contestId: record.contestId,
-              makerSide: record.makerSide,
-              oddsTick: record.oddsTick,
-            });
-          } else if (record.expiryUnixSec <= now) {
-            // Past local expiry but inside the grace window: hold + keep counting the
-            // remainder (the signed payload may still match on chain). Fold any real fill delta.
-            if (delta > 0n) this.applyFill(record, delta, now, 'partiallyFilled');
-          } else {
-            // Genuinely unexpected: a live, future-expiry, non-invalidated
-            // commitment vanished from the listing. Log, don't touch state.
-            this.eventLog.emit('error', { class: 'UnexpectedFillStatus', detail: `disappeared commitment ${hash} has status "${apiCommitment.status}"`, phase: 'fill-detection', commitmentHash: hash });
-          }
-          break;
-        }
-      }
+      const descriptors = reducePolledCommitmentObservation(this.state, observation, now, reducerConfig);
+      const result = this.applyDescriptors(descriptors, 'poll');
+      if (result.pastExpiryLookupFailed) pastExpiryLookupFailed = true;
     }
     return !pastExpiryLookupFailed;
   }
 
   /**
-   * Apply a fill delta to a commitment record and extend the matching position.
-   * Pure fill mechanics — sets `filledRiskWei6 += deltaWei6` (skipping the position
-   * update + `fill` event when `delta === 0`, which the terminal-no-fill case
-   * exercises), reclassifies the lifecycle, dirties the tracked market (so the
-   * same tick's reconcile re-prices the imbalance — `detectFills` runs first).
-   * `finalLifecycle` controls the reclassification: `'partiallyFilled'` for a
-   * still-listed bump, `'filled'` / `'expired'` / `'authoritativelyInvalidated'`
-   * for the corresponding terminal classifications. The `fill` event's `partial`
-   * field is `true` iff the final lifecycle is `'partiallyFilled'`.
+   * Translate a reducer's `ReducerDescriptor[]` into the runner's side-effects:
+   * telemetry emits, market-dirtying (gated on `trackedMarkets`), and orchestrator-
+   * level signals (`pastExpiryLookupFailed`, `softCancelledProbeFailed`). State
+   * mutations have already happened inside the reducer; this method is purely
+   * IO + signal aggregation. The `source` tag is preserved for PR3+ (divergence
+   * telemetry will read it); in Phase 2 it's a label.
    */
-  private applyFill(record: MakerCommitmentRecord, deltaWei6: bigint, now: number, finalLifecycle: CommitmentLifecycle): void {
-    if (deltaWei6 > 0n) {
-      record.filledRiskWei6 = (BigInt(record.filledRiskWei6) + deltaWei6).toString();
-      this.updatePosition(record, deltaWei6, now);
-      const m = this.trackedMarkets.get(record.contestId);
-      if (m !== undefined) m.dirty = true; // the book on this side just changed — re-price next reconcile (same tick — `detectFills` runs before `reconcileMarkets`)
-      this.eventLog.emit('fill', {
-        source: 'commitment-diff',
-        commitmentHash: record.hash,
-        speculationId: record.speculationId,
-        contestId: record.contestId,
-        sport: record.sport,
-        awayTeam: record.awayTeam,
-        homeTeam: record.homeTeam,
-        takerSide: oppositeSide(record.makerSide),
-        makerSide: record.makerSide,
-        positionType: positionTypeForSide(record.makerSide),
-        makerOddsTick: record.oddsTick,
-        newFillWei6: deltaWei6.toString(),
-        filledRiskWei6: record.filledRiskWei6,
-        partial: finalLifecycle === 'partiallyFilled',
-      });
+  private applyDescriptors(descriptors: ReducerDescriptor[], _source: 'poll' | 'owner'): ApplyDescriptorsResult {
+    const result: ApplyDescriptorsResult = { pastExpiryLookupFailed: false, softCancelledProbeFailed: false };
+    for (const d of descriptors) {
+      switch (d.kind) {
+        case 'emit-fill':
+          this.eventLog.emit('fill', d.payload as unknown as Record<string, unknown>);
+          break;
+        case 'emit-expire':
+          this.eventLog.emit('expire', d.payload as unknown as Record<string, unknown>);
+          break;
+        case 'emit-position-transition':
+          this.eventLog.emit('position-transition', d.payload as unknown as Record<string, unknown>);
+          break;
+        case 'emit-error':
+          this.eventLog.emit('error', d.payload as unknown as Record<string, unknown>);
+          break;
+        case 'mark-dirty': {
+          const m = this.trackedMarkets.get(d.contestId);
+          if (m !== undefined) m.dirty = true;
+          break;
+        }
+        case 'signal-past-expiry-lookup-failed':
+          result.pastExpiryLookupFailed = true;
+          break;
+        case 'signal-softcancel-probe-failed':
+          result.softCancelledProbeFailed = true;
+          break;
+      }
     }
-    if (record.lifecycle !== finalLifecycle) {
-      record.lifecycle = finalLifecycle;
-      record.updatedAtUnixSec = now;
-    }
-  }
-
-  /**
-   * Create or extend a `MakerPositionRecord` for `(speculationId, makerSide)` by
-   * `deltaWei6` of the maker's filled risk. Counterparty risk derives from the
-   * commitment's `oddsTick` (the maker's decimal × 100): `delta × (oddsTick − 100) / 100`
-   * — the taker's stake on the other side of the matched pair, the maker's
-   * winnings if their side wins. Multiple fills on different commitments at
-   * different ticks accumulate per-fill; the totals on the record stay consistent
-   * with the on-chain `s_positions[speculationId][maker][positionType]`.
-   */
-  private updatePosition(record: MakerCommitmentRecord, deltaWei6: bigint, now: number): void {
-    const key = `${record.speculationId}:${record.makerSide}`;
-    const counterpartyDelta = (deltaWei6 * BigInt(record.oddsTick - 100)) / 100n;
-    const existing: MakerPositionRecord | undefined = this.state.positions[key];
-    if (existing === undefined) {
-      this.state.positions[key] = {
-        speculationId: record.speculationId,
-        contestId: record.contestId,
-        sport: record.sport,
-        awayTeam: record.awayTeam,
-        homeTeam: record.homeTeam,
-        side: record.makerSide,
-        riskAmountWei6: deltaWei6.toString(),
-        counterpartyRiskWei6: counterpartyDelta.toString(),
-        status: 'active',
-        updatedAtUnixSec: now,
-      };
-    } else {
-      existing.riskAmountWei6 = (BigInt(existing.riskAmountWei6) + deltaWei6).toString();
-      existing.counterpartyRiskWei6 = (BigInt(existing.counterpartyRiskWei6) + counterpartyDelta).toString();
-      existing.updatedAtUnixSec = now;
-    }
+    return result;
   }
 
   /**
@@ -2287,8 +2159,8 @@ export class Runner {
    * position mutation (positions are `pollPositionStatus`'s job; touching them here
    * would double-count).
    *
-   * **Cumulative, never additive, never decreasing** — `convergeCommitmentFilledRiskFromCumulative`
-   * sets `filledRiskWei6 = min(apiCumulative, riskAmount)` only when it would grow.
+   * **Cumulative, never additive, never decreasing** — `reducePolledSoftCancelledObservation`
+   * (in `src/reducers/poll.ts`) sets `filledRiskWei6 = min(apiCumulative, riskAmount)` only when it would grow.
    * For a *visible* matched commitment `detectFills` converges to the same API
    * cumulative; whichever path runs first applies the change, the other sees
    * `apiCumulative <= local` and no-ops — so there's no double-count even though both
@@ -2316,92 +2188,20 @@ export class Runner {
     if (softCancelled.length === 0) return true; // nothing soft-cancelled → nothing to converge
     let allProbesOk = true;
     for (const record of softCancelled) {
-      let apiCommitment: Commitment;
+      let observation:
+        | { kind: 'probed'; record: MakerCommitmentRecord; apiCumulativeWei6: bigint }
+        | { kind: 'probe-failed'; record: MakerCommitmentRecord; err: unknown };
       try {
-        apiCommitment = await this.adapter.getCommitment(record.hash as Hex);
+        const apiCommitment = await this.adapter.getCommitment(record.hash as Hex);
+        observation = { kind: 'probed', record, apiCumulativeWei6: BigInt(apiCommitment.filledRiskAmount) };
       } catch (err) {
-        // Fail closed: a network error or a 404 for a still-matchable signed payload
-        // must NOT be read as "unfilled / resolved". Keep the record softCancelled,
-        // signal `tick()` to skip reconcile + ageOut so a record that may have just
-        // matched isn't terminalized on local time alone (mirrors the lost-position-poll gate).
-        this.eventLog.emit('error', { class: 'SoftCancelledProbeFailed', detail: errMessage(err), phase: 'softcancel-recovery', commitmentHash: record.hash });
-        allProbesOk = false;
-        continue; // probe the rest; the step returns false regardless
+        observation = { kind: 'probe-failed', record, err };
       }
-      // Derive EVERYTHING from the authoritative cumulative `filledRiskAmount` — never
-      // from `apiCommitment.status` (a hidden row reports effective status 'cancelled'
-      // for backward-compat, which is NOT a signal we use here).
-      this.convergeCommitmentFilledRiskFromCumulative(record, BigInt(apiCommitment.filledRiskAmount), now);
+      const descriptors = reducePolledSoftCancelledObservation(this.state, observation, now);
+      const result = this.applyDescriptors(descriptors, 'poll');
+      if (result.softCancelledProbeFailed) allProbesOk = false;
     }
     return allProbesOk;
-  }
-
-  /**
-   * Converge ONE commitment record's `filledRiskWei6` up to an authoritative cumulative
-   * on-chain fill — commitment-only, **no position mutation** (unlike {@link applyFill},
-   * whose `filledRiskWei6` bump is coupled to {@link updatePosition}; that coupling is
-   * right for the visible-commitment path but would double-count here, since
-   * `pollPositionStatus` already owns aggregate position convergence — including for
-   * soft-cancelled fills). Cumulative semantics: a no-op when `apiCumulativeWei6 <=`
-   * the local fill (idempotent; never decrease). Otherwise sets `filledRiskWei6 =
-   * min(apiCumulativeWei6, riskAmountWei6)` — **clamped to the commitment's risk**
-   * because the state validator rejects `filledRiskWei6 > riskAmountWei6`; an
-   * over-fill (API cumulative above risk, which shouldn't happen on chain) is clamped
-   * and flagged via an `error` (`class: 'SoftCancelledOverFillClamp'`). The lifecycle
-   * is reclassified from the CLAMPED amount (`f < risk` → stays `softCancelled`; `f >= risk`
-   * → `filled`), the tracked market is dirtied so the
-   * same tick's reconcile re-prices the imbalance (matching `applyFill`), and a `fill`
-   * event with a distinct `source: 'softcancel-recovery'` (same shape as `applyFill`'s)
-   * is emitted.
-   */
-  private convergeCommitmentFilledRiskFromCumulative(record: MakerCommitmentRecord, apiCumulativeWei6: bigint, now: number): void {
-    const localFilled = BigInt(record.filledRiskWei6);
-    if (apiCumulativeWei6 <= localFilled) return; // idempotent — never decrease, never re-apply
-    const risk = BigInt(record.riskAmountWei6);
-    if (apiCumulativeWei6 > risk) {
-      // Over-fill: the API's cumulative exceeds the commitment's own risk — impossible
-      // on chain (MatchingModule can't fill past the commitment), so a data anomaly.
-      // Clamp to risk (the validator rejects filledRiskWei6 > riskAmountWei6) and flag it.
-      this.eventLog.emit('error', {
-        class: 'SoftCancelledOverFillClamp',
-        detail: `getCommitment cumulative filledRiskAmount (${apiCumulativeWei6.toString()}) exceeds the commitment's riskAmountWei6 (${record.riskAmountWei6}) — clamping to risk`,
-        phase: 'softcancel-recovery',
-        commitmentHash: record.hash,
-      });
-    }
-    const clamped = apiCumulativeWei6 > risk ? risk : apiCumulativeWei6;
-    const newFill = clamped - localFilled; // > 0 (guarded above) unless localFilled already exceeds clamp, which the `<=` guard ruled out
-    record.filledRiskWei6 = clamped.toString();
-    // Lifecycle from the CLAMPED amount — never from API status. `clamped > 0` here. A
-    // book-hidden commitment with an unfilled remainder STAYS `softCancelled`: its stale
-    // signed payload is still matchable on chain, so promoting it to `partiallyFilled` would
-    // pull it into `detectFills`'s visible-commitment set — where, being API-hidden, it always
-    // "disappears" from `listOpenCommitments` and the disappeared-hash path reads its effective
-    // `cancelled` status and wrongly releases the latent remainder (Hermes review-2). The risk
-    // engine already counts a `softCancelled` record at its remaining (`risk − filled`), so the
-    // matched portion is dropped from latent exposure without a lifecycle promotion. Only a
-    // FULL fill (nothing left to match) terminalizes it to `filled`.
-    const finalLifecycle: CommitmentLifecycle = clamped >= risk ? 'filled' : 'softCancelled';
-    if (record.lifecycle !== finalLifecycle) record.lifecycle = finalLifecycle;
-    record.updatedAtUnixSec = now;
-    const m = this.trackedMarkets.get(record.contestId);
-    if (m !== undefined) m.dirty = true; // the matched portion changed the book on this side — re-price next reconcile (same tick)
-    this.eventLog.emit('fill', {
-      source: 'softcancel-recovery',
-      commitmentHash: record.hash,
-      speculationId: record.speculationId,
-      contestId: record.contestId,
-      sport: record.sport,
-      awayTeam: record.awayTeam,
-      homeTeam: record.homeTeam,
-      takerSide: oppositeSide(record.makerSide),
-      makerSide: record.makerSide,
-      positionType: positionTypeForSide(record.makerSide),
-      makerOddsTick: record.oddsTick,
-      newFillWei6: newFill.toString(),
-      filledRiskWei6: record.filledRiskWei6,
-      partial: finalLifecycle !== 'filled', // a not-fully-filled recovery is a partial fill (lifecycle stays `softCancelled`)
-    });
   }
 
   /**
@@ -2466,173 +2266,18 @@ export class Runner {
       return false; // caller fails closed iff any non-terminal softCancelled commitments exist
     }
     for (const p of status.active) {
-      this.syncPolledPosition('active', p, undefined, undefined, now);
+      const descriptors = reducePolledPositionObservation(this.state, 'active', p as PolledPositionInput, undefined, undefined, now);
+      this.applyDescriptors(descriptors, 'poll');
     }
     for (const p of status.pendingSettle) {
-      this.syncPolledPosition('pendingSettle', p, p.result, p.predictedWinSide, now);
+      const descriptors = reducePolledPositionObservation(this.state, 'pendingSettle', p as PolledPositionInput, p.result, p.predictedWinSide, now);
+      this.applyDescriptors(descriptors, 'poll');
     }
     for (const p of status.claimable) {
-      this.syncPolledPosition('claimable', p, p.result, undefined, now);
+      const descriptors = reducePolledPositionObservation(this.state, 'claimable', p as PolledPositionInput, p.result, undefined, now);
+      this.applyDescriptors(descriptors, 'poll');
     }
     return true;
-  }
-
-  /**
-   * Apply one polled position from `getPositionStatus` to local state. Shared by
-   * all three API buckets — `apiStatus` is the bucket name (`active` /
-   * `pendingSettle` / `claimable`), which maps 1:1 to `MakerPositionStatus`.
-   *
-   * Three paths: (1) no local record + positive `apiRiskWei6` → create with
-   * `status = apiStatus`, emit `fill` (the position's birth — no transition
-   * event); (2) existing record, status unchanged + risk grew → fill-only
-   * (the c-i fill-detection path, unchanged); (3) existing record, status
-   * advanced → update status (and risk delta, if any), emit `position-transition`
-   * (and `fill` if risk grew). A backwards transition is refused + logged.
-   */
-  private syncPolledPosition(
-    apiStatus: 'active' | 'pendingSettle' | 'claimable',
-    p: { positionId: string; speculationId: string; positionType: 0 | 1; riskAmountUSDC: number; profitAmountUSDC: number },
-    result: 'won' | 'push' | 'void' | undefined,
-    predictedWinSide: 'away' | 'home' | 'over' | 'under' | 'push' | undefined,
-    now: number,
-  ): void {
-    // Convert USDC float → wei6 integer. `Math.round` accepts the loss; for v0
-    // amounts (well within 2^53) this is exact for whole-cent values and at
-    // worst off-by-one wei for sub-cent fractions — acceptable when the goal
-    // is "detect a missing position" rather than penny-perfect accounting.
-    const apiRiskWei6 = BigInt(Math.round(p.riskAmountUSDC * 1_000_000));
-    const apiCounterpartyWei6 = BigInt(Math.round(p.profitAmountUSDC * 1_000_000));
-    const side: MakerSide = p.positionType === 0 ? 'away' : 'home';
-    const key = `${p.speculationId}:${side}`;
-    const existing = this.state.positions[key];
-    const localRiskWei6 = existing !== undefined ? BigInt(existing.riskAmountWei6) : 0n;
-    const riskGrew = apiRiskWei6 > localRiskWei6;
-    const statusChanged = existing !== undefined && existing.status !== apiStatus;
-    // `resultChanged` covers the upgrade path: a position record persisted
-    // before PR (g-iii-a) sits in the same bucket with `result: undefined`;
-    // a fresh API poll now carries `result` (`'won' | 'push' | 'void'`).
-    // Without this, the early-return below skips the result-refresh path —
-    // the runner would never stamp the field and the subsequent auto-claim
-    // would emit a `claim` event without `result`, re-opening the realized-P&L
-    // window-clip loophole this PR is meant to close (Hermes review-PR34).
-    const resultChanged = existing !== undefined && result !== undefined && existing.result !== result;
-    if (existing !== undefined && !riskGrew && !statusChanged && !resultChanged) return; // already caught up — idempotent on no-change
-    if (existing === undefined && !riskGrew) return; // never seen + zero risk — nothing to record
-
-    // Backwards-transition guard runs before the context lookup — it doesn't need it,
-    // and a corrupted state shouldn't trigger a spurious `PositionWithoutCommitment`.
-    // Forward-only: claimed disappears from the API; a settled speculation can't
-    // un-settle on chain — a reversal signals state corruption.
-    if (existing !== undefined && statusChanged && positionStatusRank(apiStatus) < positionStatusRank(existing.status)) {
-      this.eventLog.emit('error', {
-        class: 'BackwardsPositionTransition',
-        detail: `getPositionStatus reports (${p.speculationId}, ${side}) in bucket '${apiStatus}' but local state has it as '${existing.status}' — refusing to revert`,
-        phase: 'position-poll',
-        speculationId: p.speculationId,
-      });
-      return;
-    }
-
-    // Context lookup: contest / sport / teams. When the position exists locally we
-    // use its own denormalized fields (carried over from the commitment that birthed
-    // it) — this is the long-running case where the source commitment has since
-    // been pruned (`pruneTerminalCommitments` deletes filled records after about an
-    // hour, while a position can stay `active` for hours/days until the game scores).
-    // Only a brand-new record needs to look up a source commitment, and a miss there
-    // signals state corruption (the operator can't have positions on a speculation
-    // they never quoted on) — log + skip rather than create incomplete records.
-    let context: { contestId: string; sport: string; awayTeam: string; homeTeam: string };
-    if (existing !== undefined) {
-      context = { contestId: existing.contestId, sport: existing.sport, awayTeam: existing.awayTeam, homeTeam: existing.homeTeam };
-    } else {
-      const sourceCommitment = Object.values(this.state.commitments).find(
-        (r) => r.speculationId === p.speculationId && r.makerSide === side,
-      );
-      if (sourceCommitment === undefined) {
-        this.eventLog.emit('error', {
-          class: 'PositionWithoutCommitment',
-          detail: `getPositionStatus reports a position on (${p.speculationId}, ${side}) but no local commitment with that (speculationId, makerSide) is present — refusing to create an incomplete MakerPositionRecord`,
-          phase: 'position-poll',
-          speculationId: p.speculationId,
-        });
-        return;
-      }
-      context = { contestId: sourceCommitment.contestId, sport: sourceCommitment.sport, awayTeam: sourceCommitment.awayTeam, homeTeam: sourceCommitment.homeTeam };
-    }
-
-    const delta = riskGrew ? apiRiskWei6 - localRiskWei6 : 0n;
-    const counterpartyDelta = existing !== undefined ? apiCounterpartyWei6 - BigInt(existing.counterpartyRiskWei6) : apiCounterpartyWei6;
-    const fromStatus: MakerPositionStatus | undefined = existing?.status;
-
-    if (existing === undefined) {
-      const fresh: MakerPositionRecord = {
-        speculationId: p.speculationId,
-        contestId: context.contestId,
-        sport: context.sport,
-        awayTeam: context.awayTeam,
-        homeTeam: context.homeTeam,
-        side,
-        riskAmountWei6: delta.toString(),
-        counterpartyRiskWei6: counterpartyDelta > 0n ? counterpartyDelta.toString() : '0',
-        status: apiStatus,
-        updatedAtUnixSec: now,
-      };
-      // Settled outcome (`won` / `push` / `void`) becomes known when the API
-      // view advances to `pendingSettle` / `claimable`. Store it so the
-      // auto-claim emit can carry it (closes the realized-P&L window-clip
-      // loophole from Hermes review-PR33).
-      if (result !== undefined) fresh.result = result;
-      this.state.positions[key] = fresh;
-    } else {
-      if (riskGrew) {
-        existing.riskAmountWei6 = (BigInt(existing.riskAmountWei6) + delta).toString();
-        if (counterpartyDelta > 0n) {
-          existing.counterpartyRiskWei6 = (BigInt(existing.counterpartyRiskWei6) + counterpartyDelta).toString();
-        }
-      }
-      if (statusChanged) existing.status = apiStatus;
-      // Always refresh `result` from the latest API view. The field stays
-      // undefined while the speculation is still `active` and gets a value
-      // the moment it advances to `pendingSettle` / `claimable`; we don't
-      // unset it later (settled outcomes don't un-settle).
-      if (result !== undefined) existing.result = result;
-      existing.updatedAtUnixSec = now;
-    }
-
-    if (riskGrew) {
-      const m = this.trackedMarkets.get(context.contestId);
-      if (m !== undefined) m.dirty = true; // a new fill changes the book imbalance; a status-only transition does not
-      this.eventLog.emit('fill', {
-        source: 'position-poll',
-        positionId: p.positionId,
-        speculationId: p.speculationId,
-        contestId: context.contestId,
-        sport: context.sport,
-        awayTeam: context.awayTeam,
-        homeTeam: context.homeTeam,
-        makerSide: side,
-        positionType: p.positionType,
-        newFillWei6: delta.toString(),
-        cumulativeRiskWei6: (localRiskWei6 + delta).toString(),
-      });
-    }
-    if (existing !== undefined && statusChanged) {
-      const payload: Record<string, unknown> = {
-        positionId: p.positionId,
-        speculationId: p.speculationId,
-        contestId: context.contestId,
-        sport: context.sport,
-        awayTeam: context.awayTeam,
-        homeTeam: context.homeTeam,
-        makerSide: side,
-        positionType: p.positionType,
-        fromStatus,
-        toStatus: apiStatus,
-      };
-      if (result !== undefined) payload.result = result;
-      if (predictedWinSide !== undefined) payload.predictedWinSide = predictedWinSide;
-      this.eventLog.emit('position-transition', payload);
-    }
   }
 
   /**
@@ -2767,7 +2412,7 @@ export class Runner {
    *     (info, not error); a recovered inclusion-time revert of ours still bills its
    *     gas (`gasPolWei`) or flags `gasAccountingGap`. No local status flip — the
    *     next `pollPositionStatus` observes the bucket change to `claimable` and runs
-   *     the `position-transition` event through `syncPolledPosition`. Only a genuine
+   *     the `position-transition` event through `reducePolledPositionObservation`. Only a genuine
    *     settle failure (e.g. contest not yet scored) surfaces as `error`
    *     `phase: 'settle'`; the tick continues regardless.
    *   - For each record at `status: 'claimable'` with `settlement.autoClaimOwn`,
@@ -3267,16 +2912,6 @@ export function todayUTCDateString(unixSec: number): string {
 /** Convert a config-supplied float POL value to wei18. POL has 18 decimals; budgets are typically << 1 POL so the `Number → BigInt` round-trip is exact for any realistic input. Exported for the one-shot CLIs (`cancel-stale`) which need to evaluate the same `canSpendGas` verdict. */
 export function polFloatToWei18(p: number): bigint {
   return BigInt(Math.round(p * 1e18));
-}
-
-/** Strict forward-only ordering of `MakerPositionStatus` — used by `pollPositionStatus` to reject a backwards transition (e.g. a `claimable` record reported back in `active`). */
-function positionStatusRank(s: MakerPositionStatus): number {
-  switch (s) {
-    case 'active': return 0;
-    case 'pendingSettle': return 1;
-    case 'claimable': return 2;
-    case 'claimed': return 3;
-  }
 }
 
 /** Compact a `QuoteSide` (a taker offer) for the `quote-intent` event payload — the taker-facing price (tick + implied prob) and size, plus the protocol commitment params it converts to (`toProtocolQuote`: `makerSide` / `makerOddsTick` / `positionType`). `null` for a side the desired quote pulled / refused. */

@@ -11,11 +11,15 @@
  *   `waiting: boolean` — is a `beginWait()` in flight, NOT yet ended?
  *   `pending: boolean` — has a wake fired since the last consumption?
  *
- * `pending` is set by `wake()` regardless of `waiting` and cleared by either:
+ * `pending` is set by `wake()` regardless of `waiting` and cleared by:
  *   1. `beginWait()` Path B (consumes the latched wake by returning an
  *      already-aborted signal — used for the "wake fired between waits" case),
  *   2. `endWait()` (the consumer's post-race observation of `wakeSig.aborted`
- *      IS the wake consumption — clear so the next wait starts fresh).
+ *      IS the wake consumption — clear so the next wait starts fresh),
+ *   3. `clearPending()` (explicit consumption — used by the runner AFTER the
+ *      shadow-drain has covered any wakes that arrived during the debounce
+ *      window OUTSIDE the begin/endWait pair, so the next iteration doesn't
+ *      re-trigger the wake path on stale signals).
  *
  * Because the consumer's post-race check reads `wakeSig.aborted` synchronously
  * (the AbortSignal's `aborted` getter reflects the abort even if its listeners
@@ -100,6 +104,24 @@ export class WakeSignal {
   endWait(): void {
     this.waiting = false;
     this.controller = null;
+    this.pending = false;
+  }
+
+  /**
+   * Explicitly clear the pending wake flag — used by the runner AFTER the
+   * shadow-drain has covered any wakes that arrived OUTSIDE the begin/endWait
+   * pair (e.g. during the debounce window). Without this, a wake fired during
+   * the debounce stays latched and the next `beginWait` returns aborted,
+   * triggering a redundant second debounce + drain even though that drain has
+   * no events to process. Under a sustained-burst SSE producer the redundant
+   * debounces compound, postponing the poll-deadline outcome — the Phase 2
+   * cadence-preservation contract requires that the wait NOT slip forward
+   * indefinitely, so the runner explicitly consumes wakes it has already
+   * drained.
+   *
+   * Idempotent — safe to call when no wake is pending.
+   */
+  clearPending(): void {
     this.pending = false;
   }
 

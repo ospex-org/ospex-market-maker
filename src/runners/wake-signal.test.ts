@@ -86,6 +86,34 @@ describe('WakeSignal — state machine', () => {
     expect(ws.inspectState()).toBe('idle');
   });
 
+  it('clearPending consumes a latched wake — used by the runner after a debounce-drain covers wakes that fired during the debounce window', () => {
+    const ws = new WakeSignal();
+    // Simulate a wake firing during the runner's debounce window (after endWait
+    // closed the original wait, BEFORE the next beginWait starts).
+    ws.wake();
+    expect(ws.inspectState()).toBe('pending');
+    ws.clearPending();
+    expect(ws.inspectState()).toBe('idle');
+    // The next beginWait now starts fresh — NOT Path B'd into another wake outcome.
+    const sig = ws.beginWait();
+    expect(sig.aborted).toBe(false);
+  });
+
+  it('clearPending is idempotent on idle (defensive)', () => {
+    const ws = new WakeSignal();
+    expect(() => ws.clearPending()).not.toThrow();
+    expect(ws.inspectState()).toBe('idle');
+  });
+
+  it('clearPending does NOT cancel an in-flight wait — only clears the pending flag', () => {
+    const ws = new WakeSignal();
+    const sig = ws.beginWait();
+    ws.clearPending();
+    // The waiting signal is unchanged; only the latched-pending flag would be cleared.
+    expect(sig.aborted).toBe(false);
+    expect(ws.inspectState()).toBe('waiting');
+  });
+
   it('full lifecycle: idle → wait → wake → endWait → wait again → endWait → idle', () => {
     const ws = new WakeSignal();
     const sig1 = ws.beginWait();

@@ -763,9 +763,30 @@ export class Runner {
    * loop only sees the wait return when poll-deadline or kill fires.)
    */
   private async waitForNextPollDeadline(): Promise<void> {
-    const pollDeadlineMs = Date.now() + this.sleepMs();
+    // Capture both `pollDeadlineMs` (for subsequent-iteration remaining-time
+    // accounting) and `totalMs` (used unmodified on the first iteration so the
+    // poll-driven sleep value is exactly `sleepMs()` — no `Date.now()` ε
+    // drift, keeps the pre-PR3 `[30000, 30000]` test contract verbatim).
+    const totalMs = this.sleepMs();
+    const pollDeadlineMs = Date.now() + totalMs;
+    let firstIter = true;
     while (!this.stopRequested) {
-      const remainingMs = Math.max(0, pollDeadlineMs - Date.now());
+      let remainingMs: number;
+      if (firstIter) {
+        remainingMs = totalMs;
+        firstIter = false;
+      } else {
+        remainingMs = pollDeadlineMs - Date.now();
+        if (remainingMs <= 0) {
+          // Poll deadline elapsed — possibly overshot during a wake-handling
+          // cycle (debounce + drain). Phase 2 cadence preservation: do NOT
+          // chain another debounce; exit so the outer loop runs the next
+          // tick. Pending wakes that arrived during the wait will be picked
+          // up by the outer loop's pre-tick `drainShadow`.
+          this.wakeSignal.clearPending();
+          return;
+        }
+      }
       const wakeSig = this.wakeSignal.beginWait();
       // Compose wake + kill into a single signal so EITHER firing aborts the
       // sleep early. We then disambiguate the outcome by checking each
@@ -791,6 +812,13 @@ export class Runner {
         await this.deps.sleep(this.config.ownState.debounceMs, this.abortController.signal);
         if (this.abortController.signal.aborted) return;
         this.drainShadow();
+        // Consume any wakes that arrived OUTSIDE the begin/endWait pair (during
+        // the debounce window). Their queue contents are covered by the drain
+        // above; without this clear, the next iteration's `beginWait` would
+        // see `pending: true` and re-trigger the wake path on an empty queue —
+        // under a sustained-burst SSE producer that loop would keep
+        // postponing the poll-deadline outcome indefinitely (Hermes review).
+        this.wakeSignal.clearPending();
         // PR5 wires the comparator hook here.
         continue;
       }

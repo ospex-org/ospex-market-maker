@@ -681,6 +681,54 @@ describe('Runner — wakeable loop (Phase 2 PR3)', () => {
     await runPromise;
   });
 
+  it('a wake during the debounce window is consumed by THAT drain — no redundant second debounce (Hermes PR #67 review)', async () => {
+    // Without `clearPending` after drainShadow, a wake firing during the
+    // debounce window would leave `pending: true` after the drain. The next
+    // iteration's `beginWait` would return an already-aborted signal (Path B),
+    // re-triggering the wake path with NO new events to drain — and under
+    // sustained bursts this would loop forever, postponing the poll-deadline
+    // tick indefinitely. This regression test asserts that wakes-during-debounce
+    // are consumed by the same drain pass and the next iteration starts a
+    // FRESH main-wait sleep (not another debounce).
+    const { sleep, sleepCalls, resolvers } = controllableSleep();
+    let triggerKill!: () => void;
+    const runner = makeRunner({
+      maxTicks: 2,
+      deps: {
+        sleep,
+        registerShutdownSignals: (onSignal) => { triggerKill = onSignal; return () => {}; },
+      },
+    });
+    const runPromise = runner.run();
+
+    await waitFor(() => sleepCalls.length >= 1);
+    expect(sleepCalls[0]).toBe(30_000); // main wait
+
+    runner.wake(); // wake 1: aborts main wait → outcome wake
+    await waitFor(() => sleepCalls.length >= 2);
+    expect(sleepCalls[1]).toBe(500); // debounce 1
+
+    // Fire wake 2 DURING the debounce window — its events would be covered by
+    // the debounce-ending drainShadow (queue is empty in PR3 anyway).
+    runner.wake();
+
+    // Resolve the debounce so the loop proceeds to drainShadow + clearPending.
+    const resolveDebounce = resolvers[1];
+    if (resolveDebounce === undefined) throw new Error('expected debounce resolver');
+    resolveDebounce();
+    await waitFor(() => sleepCalls.length >= 3);
+
+    // Critical: the third sleep is a FRESH remaining-time main wait, NOT a
+    // second debounce. Wake 2 was consumed by the drain's clearPending.
+    expect(sleepCalls[2]).not.toBe(500);
+    expect(sleepCalls[2]).toBeGreaterThan(500);
+    // Equivalently: there's still EXACTLY ONE debounce sleep so far.
+    expect(sleepCalls.filter((ms) => ms === 500)).toHaveLength(1);
+
+    triggerKill();
+    await runPromise;
+  });
+
   it('a poll-deadline outcome (no wake) — drainShadow runs pre+post tick, but no debounce', async () => {
     // With the default synchronous sleep, the loop runs maxTicks=2 without
     // any wake interruption. Each tick triggers 2 drainShadow calls (pre + post).

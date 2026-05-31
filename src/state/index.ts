@@ -23,7 +23,7 @@
  * conversion helpers used at the submit / cancel boundaries (own-state SSE plan §M6).
  */
 
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import type { SignedCommitmentPayload, Hex } from '@ospex/sdk';
@@ -418,12 +418,34 @@ export class StateStore {
     return { state: validated.state, status: { kind: 'loaded' } };
   }
 
-  /** Persist `state` atomically (temp file → `rename`). Creates `dir` if needed; stamps `lastFlushedAt`. Pretty-printed for human inspection. */
+  /**
+   * Persist `state` atomically (temp file → `rename`). Creates `dir` if needed;
+   * stamps `lastFlushedAt`. Pretty-printed for human inspection.
+   *
+   * The temp file is `chmod`'d to `0o600` (owner read/write only) before the
+   * rename, because (post-M6/A) the persisted blob carries the maker's signed
+   * EIP-712 commitment payloads — the same signing material `MatchingModule.matchCommitment`
+   * needs (own-state SSE plan §M6). On POSIX the rename preserves the mode,
+   * so the live state file ends up `0600`. On Windows `chmodSync` only toggles
+   * the read-only bit; full ACL hardening isn't covered here — operators on
+   * Windows must restrict the `state.dir` ACL themselves (`OPERATOR_SAFETY.md`).
+   */
   flush(state: MakerState): void {
     mkdirSync(this.dir, { recursive: true });
     const out: MakerState = { ...state, version: MAKER_STATE_VERSION, lastFlushedAt: new Date().toISOString() };
     const tmp = join(this.dir, STATE_TMP);
     writeFileSync(tmp, `${JSON.stringify(out, null, 2)}\n`, 'utf8');
+    // Lock down before rename. POSIX: mode follows the file across rename →
+    // statePath is 0600. Windows: best-effort (read-only bit only); operator
+    // must restrict the directory ACL themselves.
+    try {
+      chmodSync(tmp, 0o600);
+    } catch {
+      // Some filesystems (FAT, certain network mounts) reject chmod even on
+      // POSIX. We'd rather flush the state than fail the write — the operator
+      // is already warned in OPERATOR_SAFETY.md to host state.dir on a
+      // permission-aware filesystem with a locked-down parent dir.
+    }
     // `rename` over an existing file is atomic on POSIX and works on Windows (Node handles the replace).
     renameSync(tmp, this.statePath);
   }

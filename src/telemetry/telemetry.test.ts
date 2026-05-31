@@ -97,6 +97,73 @@ describe('EventLog', () => {
     log.emit('quote-intent', { side: 'home', oddsTick: 191, sizeUSDC: 0.25, sizes: ['100', '200'], meta: { spread: 0.01 } });
     expect(readLines(log.path)[0]).toMatchObject({ kind: 'quote-intent', side: 'home', oddsTick: 191, sizeUSDC: 0.25, sizes: ['100', '200'], meta: { spread: 0.01 } });
   });
+
+  // ── signing-material denylist (own-state SSE plan §M6/B) ───────────────────
+  //
+  // The MM persists the SDK's canonical `SignedCommitmentPayload` (M6/A) — the
+  // same input `MatchingModule.matchCommitment` needs to fill a commitment. The
+  // wire boundary fails closed on any payload key that could carry that bundle,
+  // at any depth, so a careless `...record` spread of a `MakerCommitmentRecord`
+  // is caught before it lands in the NDJSON event log (or the scorecard
+  // artifact it feeds). The keys are exactly `signature` / `signedPayload` /
+  // `commitment` / `nonce` — names like `commitmentHash` / `commitmentLifecycle`
+  // / `nonceFloor` are unaffected (they don't carry signing material).
+  it('rejects "signature" at the top level (a stray EIP-712 ECDSA signature)', () => {
+    const log = EventLog.open(dir, 'r');
+    expect(() => log.emit('submit', { signature: '0x' + 'a'.repeat(130) })).toThrow(/signing-material/);
+  });
+
+  it('rejects "signedPayload" — the MakerSignedPayload wrapper itself', () => {
+    const log = EventLog.open(dir, 'r');
+    expect(() =>
+      log.emit('submit', {
+        commitmentHash: '0xabc',
+        signedPayload: {
+          commitmentHash: '0xabc',
+          commitment: { maker: '0x1', contestId: '1', scorer: '0x2', lineTicks: 0, positionType: 0, oddsTick: 200, riskAmount: '1', nonce: '1', expiry: '1' },
+          signature: '0xdead',
+        },
+      }),
+    ).toThrow(/signing-material|signedPayload/);
+  });
+
+  it('rejects the bare "commitment" key (the inner EIP-712 typed-data struct)', () => {
+    const log = EventLog.open(dir, 'r');
+    expect(() =>
+      log.emit('submit', {
+        commitment: { maker: '0x1', contestId: '1', scorer: '0x2', lineTicks: 0, positionType: 0, oddsTick: 200, riskAmount: '1', nonce: '1', expiry: '1' },
+      }),
+    ).toThrow(/signing-material|commitment/);
+  });
+
+  it('rejects "nonce" — the EIP-712 nonce, even as a flat top-level field', () => {
+    const log = EventLog.open(dir, 'r');
+    expect(() => log.emit('submit', { nonce: '42' })).toThrow(/signing-material|nonce/);
+  });
+
+  it('rejects denied keys nested inside an array of objects (not just direct child)', () => {
+    const log = EventLog.open(dir, 'r');
+    expect(() => log.emit('candidate', { records: [{ commitmentHash: '0xabc', signature: '0xdead' }] })).toThrow(/signing-material|signature/);
+  });
+
+  it('rejects denied keys nested inside an object multiple levels deep', () => {
+    const log = EventLog.open(dir, 'r');
+    expect(() => log.emit('error', { detail: { meta: { signedPayload: {} } } })).toThrow(/signing-material|signedPayload/);
+  });
+
+  it('does NOT reject "commitmentHash" / "commitmentLifecycle" / "nonceFloor" (substrings of denied keys)', () => {
+    const log = EventLog.open(dir, 'r');
+    // None of these should throw — they're the actual telemetry fields callers use.
+    log.emit('submit', { commitmentHash: '0xabc', commitmentLifecycle: 'visibleOpen', nonceFloor: '5' });
+    expect(readLines(log.path)[0]).toMatchObject({ kind: 'submit', commitmentHash: '0xabc', commitmentLifecycle: 'visibleOpen', nonceFloor: '5' });
+  });
+
+  it('rejects a denied key before reporting wire-safety errors on its nested value (the diagnostic points at the real bug)', () => {
+    const log = EventLog.open(dir, 'r');
+    // commitment.riskAmount is a bigint, which would normally trip the wire-safety check — but the
+    // denied-key check runs first so the operator sees "signing-material" not "bigint".
+    expect(() => log.emit('submit', { commitment: { riskAmount: 5n } })).toThrow(/signing-material|commitment/);
+  });
 });
 
 describe('eventLogsExist', () => {

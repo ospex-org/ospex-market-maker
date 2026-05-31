@@ -24,6 +24,12 @@ jobs:
       - run: yarn build
       - run: yarn lint
       - run: yarn test
+      # secret-scan: fails CI if a 65-byte ECDSA signature or a JSON-shaped
+      # signed-payload field has been committed to a tracked text file. Post
+      # M6/A, the MM persists EIP-712 signing material under state.dir; this
+      # gate stops leaks into the public tree (issues, PRs, docs, log
+      # excerpts). Own-state SSE plan §M6/B.
+      - run: yarn secret-scan
       # smoke: the built CLI runs. (A fuller pack -> install-in-temp-dir -> run
       # `ospex-mm --help` smoke test is a follow-up.)
       - run: node dist/cli/index.js --help

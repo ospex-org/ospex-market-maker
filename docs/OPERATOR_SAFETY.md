@@ -73,6 +73,35 @@ So a pulled quote is *latent* exposure, not gone. The MM tracks this and counts 
 
 - The MM keeps its inventory in JSON files under `state.dir`, including the set of quotes it has soft-cancelled-but-not-yet-expired. That soft-cancelled set is the one thing it can't rebuild from chain/API. **Don't run two MMs against the same state directory.** If the state file is lost or corrupted between runs, the MM will not resume quoting on a blank slate (it would under-count latent exposure) — it reconstructs from telemetry, or waits one `expirySeconds` window, or you pass an explicit override.
 
+## Sensitive local state
+
+The state file under `state.dir/maker-state.json` is **sensitive operator state**. Each commitment record persists the SDK's signed EIP-712 payload — the same input a taker uses to fill that commitment on chain. Anyone with read access to this file can fill your still-matchable commitments until they expire / fill / are cancelled. Treat `state.dir` like a wallet directory, not a log directory.
+
+- **Never paste `maker-state.json` (or any subset of it) into issues, PRs, chat, screenshots, or shared logs.** The signed payload is a bearer credential. Redact `signedPayload` / `signature` / the inner `commitment` struct before sharing anything from this file.
+- **Linux / macOS production.** The MM writes the file with mode `0600` (owner read/write only) automatically. Verify with `ls -l state.dir/`. Run under a dedicated unprivileged user; restrict the parent directory.
+- **Windows production.** The MM cannot set POSIX mode bits — you must restrict the parent directory ACL yourself (e.g. via `icacls`). At minimum: deny `Everyone`, allow only the operator account.
+- **Backups.** If you back up `state.dir`, the backup destination must be encrypted at rest and at least as locked down as the live directory. A copy on an unencrypted cloud drive is a leak.
+- **Disposal.** When retiring a state directory (decommissioning an MM, rotating keys), shred the file — a simple `rm` may leave recoverable signed payloads. Use `shred` (Linux) or `cipher /w` (Windows).
+- **Telemetry / scorecard outputs** under `telemetry.logDir` are projected through allow-list helpers and never carry the signed payload — they're safe to share for debugging. (The MM enforces this at the wire boundary: a careless call site that tried to log a signed bundle would fail closed.) If a third-party tool ever dumps a `MakerCommitmentRecord` to a log of its own, treat that log the same as `state.dir`.
+
+## Migration from a pre-0.5.1 MM (state file with no `signedPayload`)
+
+If you're upgrading from an older release, your existing `maker-state.json` was written before the MM persisted signed payloads. The new MM loads it cleanly — each commitment record gets `signedPayloadStatus: 'missing-legacy'` on first read — but the cancel paths behave differently per commitment lifecycle:
+
+- **`visibleOpen` / `partiallyFilled` (still visible on the API).** Cancel paths fall back to `cancelOnchain({ hash })`: the SDK fetches the row from the public commitments API and reconstructs the signed bundle there. No operator action needed.
+- **`softCancelled` (book-hidden — pulled from the API but still matchable on chain until expiry).** This is the hazardous case. The public commitments API redacts the signed payload for hidden rows, so `cancelOnchain({ hash })` has no recovery path. The MM emits a `cancel-blocked-missing-payload` telemetry event for each such record and waits for operator action.
+
+**What to do for each blocked record:**
+
+1. Check the telemetry: `grep cancel-blocked-missing-payload telemetry.logDir/run-*.ndjson | jq .` — the events carry `commitmentHash` / `speculationId` / `contestId` / `makerSide` / `lifecycle` / `phase` (`shutdown-kill` / `cli-cancel-stale` / unset for the routine recovered-soft-cancel sweep).
+2. Verify the record's expiry: `ospex-mm status` shows the commitment's `expiryUnixSec`. If it's in the past or near-past, the commitment is no longer matchable on chain — no action needed; let the next tick reconcile.
+3. If the expiry is far enough out to matter, your options are:
+   - **Wait it out.** With the recommended `expiryMode: fixed-seconds` + `expirySeconds: 120`, every legacy hidden record is dead within ~2 minutes of the prior MM's last soft-cancel. Confirm by re-running `cancel-stale` after the window passes — the blocked events should stop.
+   - **Raise the nonce floor.** `MatchingModule.raiseMinNonce(newFloor)` invalidates every commitment with nonce < `newFloor` for your address; you can use a block explorer / `cast send` to call it manually. Confirm the floor is above the affected records' nonces (you can get those from the on-chain `Commitment` event log for your address).
+   - **Wait for Phase 2 own-state recovery.** A future SDK release (own-state SSE plan §M4-M5) introduces owner-authenticated `ownState.getCommitment(hash)` that returns the signed payload for the maker's own hidden rows. The MM will use that to recover the bundle and resume the on-chain cancel automatically — no manual intervention. Until that ships, the wait-or-raise-nonce-floor options above are the path.
+
+Once a hidden record is no longer matchable (expired, nonce-invalidated, or filled), it's safe to ignore: the next reconcile transitions it out of `softCancelled` and removes it from the blocked set.
+
 ## If something goes wrong
 
 1. Kill switch (drop the `KILL` file).

@@ -25,6 +25,7 @@
     "dev": "tsx src/cli/index.ts",
     "mm": "node dist/cli/index.js",
     "smoke": "node scripts/smoke.mjs",
+    "secret-scan": "node scripts/secret-scan.mjs",
     "prepack": "yarn build"
   },
   "dependencies": {

@@ -600,34 +600,41 @@ export class Runner {
     // still `visibleOpen` must be on-chain-cancelled BEFORE the off-chain pull,
     // because the SDK's `cancelOnchain({ hash })` fetches the public row, and the
     // off-chain DELETE below would flip `book_visible: false` → SDK's
-    // `requireVisibleCommitment` refuses → the record bricks into BLOCKED. The
-    // touched-by-pre-pass set covers BOTH outcomes:
-    // - On success the record stamps `authoritativelyInvalidated`, which the
-    //   off-chain loop's `lifecycle !== 'visibleOpen'` filter naturally excludes.
-    // - On failure (gas-denied / adapter throw) the record stays `visibleOpen`;
-    //   without the explicit skip the off-chain DELETE would silently hide it
-    //   and turn the next-tick on-chain attempt into BLOCKED. The set lets the
-    //   on-chain leg below retry instead (it dispatches `use-hash` while the
-    //   record is still visible).
-    const touchedByPrePass = new Set<string>();
+    // `requireVisibleCommitment` refuses → the record bricks into BLOCKED.
+    //
+    // CRITICAL (Hermes #63 round 2): populate `touchedByPrePass` with ALL
+    // candidates UPFRONT, before attempting any cancels. A gas-denied verdict
+    // breaks the cancel loop early; if we'd added records inside the loop, later
+    // candidates would lose their off-chain-skip protection and the off-chain
+    // pull below would brick them into BLOCKED — the same failure mode this
+    // pre-pass exists to prevent. Pre-population ensures every candidate gets
+    // its off-chain skip regardless of whether the cancel loop reaches it.
+    const eligibleCandidates = Object.values(this.state.commitments).filter(
+      (r) => r.signedPayloadStatus === 'missing-legacy' && r.lifecycle === 'visibleOpen' && !isExpiredForRelease(r.expiryUnixSec, now, grace),
+    );
+    const touchedByPrePass = new Set<string>(eligibleCandidates.map((r) => r.hash));
     if (mode === 'onchain') {
-      for (const r of Object.values(this.state.commitments)) {
-        if (r.signedPayloadStatus !== 'missing-legacy') continue;
-        if (r.lifecycle !== 'visibleOpen') continue;
-        if (isExpiredForRelease(r.expiryUnixSec, now, grace)) continue;
-        touchedByPrePass.add(r.hash); // mark BEFORE attempting — failure must still skip the off-chain hide
+      for (const r of eligibleCandidates) {
         const result = await this.onchainCancelCommitment(r, now, {
           emitGasDenied: !this.fundingOnchainGasDeniedWarned,
           overrideDispatch: { kind: 'use-hash', hash: r.hash as Hex },
         });
         if (result === 'gas-denied') {
           this.fundingOnchainGasDeniedWarned = true;
-          break; // today's spend only grows — every later attempt would deny too
+          break; // today's spend only grows — every later attempt would deny too; the touched-set above already protects them
         }
         if (result === 'cancelled') this.fundingOnchainGasDeniedWarned = false;
         // 'transient-failure': adapter threw — record left visibleOpen + in `touchedByPrePass`,
         // so the off-chain loop skips and the regular on-chain leg below retries via dispatch.
       }
+    } else {
+      // Even in `offchain` mode we ASSEMBLED the candidate set so the off-chain
+      // pull doesn't have to re-derive it — but we don't pre-populate the skip
+      // set here (offchain mode never authoritatively cancels, so hiding them
+      // is the intended behavior; missing-legacy records ride to expiry as
+      // softCancelled, which is what the operator chose by configuring this
+      // mode). Clear the touched set so the off-chain pull runs normally.
+      touchedByPrePass.clear();
     }
 
     // ── off-chain pull (both `offchain` and `onchain` modes) ──────────────────
@@ -3076,19 +3083,24 @@ export class Runner {
    * touched-set has already protected those records from off-chain hide.
    */
   private async preOnchainKillCancelMissingLegacyVisible(): Promise<Set<string>> {
-    const touched = new Set<string>();
-    if (this.makerAddress === null) return touched; // live-mode invariant
+    if (this.makerAddress === null) return new Set<string>(); // live-mode invariant
     const eligible = Object.values(this.state.commitments).filter(
       (r) => r.signedPayloadStatus === 'missing-legacy' && r.lifecycle === 'visibleOpen',
     );
-    if (eligible.length === 0) return touched;
+    // CRITICAL (Hermes #63 round 2): populate the touched set with ALL
+    // candidates UPFRONT, before attempting any cancels. A gas-denied verdict
+    // breaks the loop early; if we'd added records inside the loop, later
+    // candidates would lose their off-chain-skip protection and offchainKillCancel
+    // would brick them into BLOCKED — the same failure mode this pre-pass exists
+    // to prevent. The skip set guarantees every candidate's off-chain protection
+    // even when the cancel loop only reaches some of them.
+    const touched = new Set<string>(eligible.map((r) => r.hash));
     for (const r of eligible) {
       const now = this.deps.now();
-      touched.add(r.hash); // mark BEFORE attempting — failure must still skip the off-chain hide
       const result = await this.onchainCancelCommitment(r, now, {
         overrideDispatch: { kind: 'use-hash', hash: r.hash as Hex },
       });
-      if (result === 'gas-denied') break; // the regular onchainKillCancel pass below will deny too — touched set already protects these
+      if (result === 'gas-denied') break; // remaining candidates' off-chain protection is already in `touched` from the pre-population above
       // 'cancelled' → record is now authoritativelyInvalidated (lifecycle stamped by onchainCancelCommitment)
       // 'transient-failure' → record stays visibleOpen, touched-skip prevents off-chain hide, regular on-chain retries via dispatch
       // 'blocked-missing-payload' → unreachable here (we overrode dispatch to use-hash explicitly)

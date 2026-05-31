@@ -56,6 +56,8 @@ function rec(hash: string, overrides: Partial<MakerCommitmentRecord> = {}): Make
     expiryUnixSec: T0 + 600,
     postedAtUnixSec: T0 - 60,
     updatedAtUnixSec: T0 - 60,
+    // Phase 2 PR1 — fills[] defaults empty.
+    fills: [],
     ...overrides,
   };
 }

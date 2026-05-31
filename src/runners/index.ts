@@ -1868,6 +1868,10 @@ export class Runner {
       postedAtUnixSec: now,
       updatedAtUnixSec: now,
       signedPayloadStatus: signedPayload === undefined ? 'missing-legacy' : 'present',
+      // fills[] starts empty (Phase 2 PR1 — own-state SSE plan §2.5.3). The
+      // poll path never appends; only the SSE `fill` reducer (Phase 2 PR4)
+      // will populate this array.
+      fills: [],
     };
     if (signedPayload !== undefined) record.signedPayload = signedPayload;
     return record;

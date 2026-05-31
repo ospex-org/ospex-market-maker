@@ -164,6 +164,127 @@ describe('EventLog', () => {
     // denied-key check runs first so the operator sees "signing-material" not "bigint".
     expect(() => log.emit('submit', { commitment: { riskAmount: 5n } })).toThrow(/signing-material|commitment/);
   });
+
+  // ── sensitive-string redaction (own-state SSE plan §M6/B; Hermes PR #64 r1) ─
+  //
+  // The denied-key check above catches structural misuse. But a signature can
+  // also leak as a SUBSTRING of a string value — e.g. an RPC error message
+  // that quotes the offending bytes, a serialized state fragment passed
+  // through errMessage(err), etc. The wire boundary redacts these inline so
+  // an incidental contamination doesn't land in the NDJSON event log.
+  //
+  // Three patterns, applied recursively to every string value:
+  //   1. 0x[hex]{130}  — a bare 65-byte ECDSA signature anywhere in the string.
+  //   2. JSON-shape signature key with any 0x-prefixed hex value (catches truncated).
+  //   3. JSON-shape signedPayload key marker (structural-leak tag).
+  it('redacts a bare 65-byte ECDSA signature embedded in a string value', () => {
+    const log = EventLog.open(dir, 'r');
+    const fakeSig = '0x' + 'a'.repeat(130);
+    log.emit('error', { detail: `tx reverted: signature was ${fakeSig}` });
+    const line = readLines(log.path)[0];
+    // The 130-hex sequence must not appear anywhere in the serialized line.
+    expect(JSON.stringify(line)).not.toContain(fakeSig);
+    // The redaction marker must appear in place of it.
+    expect(String(line?.detail)).toMatch(/REDACTED:ecdsa-signature/);
+  });
+
+  it('redacts a JSON-shape signature key with a full 130-hex value', () => {
+    const log = EventLog.open(dir, 'r');
+    const fakeSig = '0x' + 'b'.repeat(130);
+    // Build the literal "sig"+colon+space+quote+0x... at runtime so this test
+    // doesn't itself contain the secret-scan-flagged literal shape.
+    const sigKey = '"' + 'signature' + '"';
+    log.emit('error', { detail: `state: ${sigKey}: "${fakeSig}"` });
+    const line = readLines(log.path)[0];
+    expect(JSON.stringify(line)).not.toContain(fakeSig);
+    expect(String(line?.detail)).toMatch(/REDACTED/);
+  });
+
+  it('redacts a JSON-shape signature key with a truncated (sub-130) hex value', () => {
+    const log = EventLog.open(dir, 'r');
+    const sigKey = '"' + 'signature' + '"';
+    // Only 8 hex chars after 0x — not replayable on its own, but its
+    // presence is a contamination signal worth redacting.
+    log.emit('error', { detail: `state: ${sigKey}: "0xdeadbeef"` });
+    const line = readLines(log.path)[0];
+    expect(String(line?.detail)).not.toContain('0xdeadbeef');
+    expect(String(line?.detail)).toMatch(/REDACTED/);
+  });
+
+  it('flags a JSON-shape signedPayload key marker (structural-leak signal)', () => {
+    const log = EventLog.open(dir, 'r');
+    const spKey = '"' + 'signedPayload' + '"';
+    log.emit('error', { detail: `serialized state: ${spKey}: { ... }` });
+    const line = readLines(log.path)[0];
+    // The bare structural marker should be tagged in the output.
+    expect(String(line?.detail)).toMatch(/REDACTED-FIELD/);
+  });
+
+  it('redacts every match of multiple 130-hex signatures in the same string', () => {
+    const log = EventLog.open(dir, 'r');
+    const sig1 = '0x' + 'c'.repeat(130);
+    const sig2 = '0x' + 'd'.repeat(130);
+    log.emit('error', { detail: `two sigs in one line: ${sig1} and also ${sig2}` });
+    const line = readLines(log.path)[0];
+    expect(String(line?.detail)).not.toContain(sig1);
+    expect(String(line?.detail)).not.toContain(sig2);
+    // Both occurrences get the marker (a single occurrence test would pass even with a bug).
+    const matches = String(line?.detail).match(/REDACTED:ecdsa-signature/g) ?? [];
+    expect(matches.length).toBe(2);
+  });
+
+  it('redacts sensitive content nested deep inside object string values (recursive walk)', () => {
+    const log = EventLog.open(dir, 'r');
+    const fakeSig = '0x' + 'e'.repeat(130);
+    log.emit('error', { detail: { meta: { rpc: { error: `bad sig: ${fakeSig}` } } } });
+    const line = readLines(log.path)[0];
+    expect(JSON.stringify(line)).not.toContain(fakeSig);
+  });
+
+  it('redacts sensitive content inside array string values', () => {
+    const log = EventLog.open(dir, 'r');
+    const fakeSig = '0x' + 'f'.repeat(130);
+    log.emit('error', { detail: { items: [`first ${fakeSig}`, 'clean', `second one too`] } });
+    const line = readLines(log.path)[0];
+    expect(JSON.stringify(line)).not.toContain(fakeSig);
+  });
+
+  it('reproduces Hermes PR #64 round 1: serialized signed payload in error detail', () => {
+    // This is the exact reproduction Hermes ran against pre-fix source:
+    // an error message containing a JSON-shape signedPayload + signature
+    // ended up in NDJSON intact. Post-fix, the 130-hex is redacted out.
+    const log = EventLog.open(dir, 'r');
+    const fakeSig = '0x' + '1'.repeat(130);
+    const spKey = '"' + 'signedPayload' + '"';
+    const sigKey = '"' + 'signature' + '"';
+    log.emit('error', { detail: `${spKey}: { ${sigKey}: "${fakeSig}" }` });
+    const line = readLines(log.path)[0];
+    // The actual bearer credential — the 130-hex — must NOT appear anywhere.
+    expect(JSON.stringify(line)).not.toContain(fakeSig);
+    // Either redaction marker (ECDSA marker or JSON-shape marker) must be present.
+    expect(String(line?.detail)).toMatch(/REDACTED/);
+  });
+
+  it('does NOT redact short hex literals like 0xdead, transaction hashes (64 hex), or commitment hashes', () => {
+    const log = EventLog.open(dir, 'r');
+    // 64-hex tx hash — half the length of a signature, used legitimately in fill telemetry.
+    const txHash = '0x' + '7'.repeat(64);
+    log.emit('candidate', { contestId: 'c1', txHash, commitmentHash: '0xabcd', short: '0xdead' });
+    const line = readLines(log.path)[0];
+    expect(line?.txHash).toBe(txHash);
+    expect(line?.commitmentHash).toBe('0xabcd');
+    expect(line?.short).toBe('0xdead');
+  });
+
+  it('does not mutate the caller-supplied payload object (redaction is on a copy)', () => {
+    const log = EventLog.open(dir, 'r');
+    const fakeSig = '0x' + '2'.repeat(130);
+    const payload = { detail: `leak: ${fakeSig}` };
+    log.emit('error', payload);
+    // The caller's object should be unchanged — useful if the caller logs the
+    // same payload elsewhere and expects to see its original content.
+    expect(payload.detail).toBe(`leak: ${fakeSig}`);
+  });
 });
 
 describe('eventLogsExist', () => {

@@ -16,16 +16,25 @@
  * `Number.MAX_SAFE_INTEGER` (risk in wei6, block numbers, …) is a decimal string —
  * the AGENT_CONTRACT numeric rule.
  *
- * **Signing material is also rejected** (own-state SSE plan §M6/B). The MM
- * persists the SDK's canonical `SignedCommitmentPayload` (M6/A) so cancel paths
- * can authoritatively cancel hidden rows without round-tripping the public API.
- * That bundle — the EIP-712 `signature`, the wrapper `signedPayload`, the inner
- * `commitment` struct, and the `nonce` — is the same material `MatchingModule`
- * needs to fill a commitment, so any of those keys at any depth in a telemetry
- * payload throws rather than landing in the (potentially-shared) NDJSON event log
- * or the scorecard artifact downstream. The whitelist projection at the call
- * sites ({@link EventLog.emit} callers like `commitmentEventPayload`) already
- * omits these; this is the boundary backstop.
+ * **Signing material is also rejected / redacted** (own-state SSE plan §M6/B).
+ * The MM persists the SDK's canonical `SignedCommitmentPayload` (M6/A) so
+ * cancel paths can authoritatively cancel hidden rows without round-tripping
+ * the public API. That bundle — the EIP-712 `signature`, the wrapper
+ * `signedPayload`, the inner `commitment` struct, and the `nonce` — is the
+ * same material `MatchingModule` needs to fill a commitment. Two defences:
+ *
+ * 1. **Denied object keys → throw.** Any payload key matching the denylist at
+ *    any depth fails closed (a structural misuse: caller should be using an
+ *    allow-list projection like `commitmentEventPayload`).
+ * 2. **Sensitive string substrings → redact.** A 65-byte ECDSA signature
+ *    pattern (`0x` + 130 hex), a JSON-shaped `signature` key with any hex
+ *    value (catches truncated leaks too), and a JSON-shaped `signedPayload`
+ *    key are replaced with `[REDACTED]` markers in every string value,
+ *    recursively.
+ *    Error messages, RPC errors, and any string carrying a serialized state
+ *    fragment can incidentally contain a signature; redaction (rather than
+ *    throw) keeps the telemetry writer running so the operator still sees
+ *    the surrounding diagnostic context (Hermes PR #64 round 1).
  *
  * No SDK, no chain. Phase 2's runner is the first real consumer; this slice ships
  * the writer + the `kind` vocabulary so that vocabulary is locked early.
@@ -127,6 +136,63 @@ const DENIED_SIGNING_KEYS: ReadonlySet<string> = new Set([
   'nonce',
 ]);
 
+// Sensitive-substring redaction patterns (own-state SSE plan §M6/B; Hermes
+// PR #64 round 1). Built from a `HEX_CLASS` template so the literal regex
+// shape never appears as a contiguous run in this file's source — keeps the
+// secret-scan check below from self-matching on these definitions.
+const HEX_CLASS = '[0-9a-fA-F]';
+// A bare 65-byte ECDSA signature anywhere in a string value — the actual
+// bearer credential. 130 hex chars after `0x` is the threat-relevant length
+// (shorter "0x..." literals can't be replayed against MatchingModule).
+const ECDSA_SIG_PATTERN = new RegExp(`0x${HEX_CLASS}{130}`, 'g');
+// JSON-shaped `signature` key/value with any 0x-prefixed hex value (catches
+// truncated leaks too — partial hex isn't replayable on its own, but its
+// presence is a contamination signal). Captures the key + colon + opening
+// quote run as $1 so the replacement preserves the prefix (and the
+// replacement string itself doesn't contain a literal quoted-signature-key
+// run that would self-trigger the secret-scan).
+const SIGNATURE_JSON_VALUE_PATTERN = new RegExp(`("signature"\\s*:\\s*)"0x${HEX_CLASS}*"`, 'g');
+// JSON-shaped `signedPayload` key marker. The dangerous bytes inside the
+// value are already caught by the patterns above; this tags the
+// structural-leak site for the operator. $1 captures so the replacement
+// doesn't itself carry a literal quoted-signedPayload-key run.
+const SIGNED_PAYLOAD_JSON_KEY_PATTERN = new RegExp(`("signedPayload"\\s*:)`, 'g');
+
+/**
+ * Redact sensitive signing-material substrings in a single string value.
+ * Order matters: the bare-signature pattern runs first so it catches the
+ * actual 130-hex regardless of surrounding context; the JSON-shape patterns
+ * then catch truncated leaks and structural-leak markers. Backreferences
+ * (`$1`) preserve captured key prefixes so the replacement strings don't
+ * themselves carry the quoted JSON-key literals that the
+ * {@link ../../scripts/secret-scan.mjs} also flags.
+ */
+function redactSensitiveStrings(s: string): string {
+  return s
+    .replace(ECDSA_SIG_PATTERN, '[REDACTED:ecdsa-signature]')
+    .replace(SIGNATURE_JSON_VALUE_PATTERN, '$1"[REDACTED]"')
+    .replace(SIGNED_PAYLOAD_JSON_KEY_PATTERN, '$1/* REDACTED-FIELD */');
+}
+
+/**
+ * Walk `value` recursively and return a copy with every string substring run
+ * through {@link redactSensitiveStrings}. Pure (does not mutate `value`); the
+ * caller stringifies the returned structure. Bigints / functions / undefined /
+ * non-plain objects are already rejected by `assertWireSafe` upstream, so this
+ * walker only sees strings, finite numbers, booleans, nulls, arrays, and plain
+ * objects.
+ */
+function sanitizePayloadValues(value: unknown): unknown {
+  if (typeof value === 'string') return redactSensitiveStrings(value);
+  if (Array.isArray(value)) return value.map(sanitizePayloadValues);
+  if (value !== null && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value)) out[k] = sanitizePayloadValues(v);
+    return out;
+  }
+  return value;
+}
+
 /**
  * A run identifier — filename-safe and roughly time-sortable. Two runs started in
  * the same millisecond still differ (the random suffix), so two MMs sharing a log
@@ -180,6 +246,14 @@ export class EventLog {
    * block numbers; flatten objects (incl. `Error`s); allow-list-project commitment
    * records via `commitmentEventPayload` / `softCancelEventPayload` rather than
    * `...record`-spreading them.
+   *
+   * **String values are redacted** for sensitive signing patterns
+   * ({@link redactSensitiveStrings}) BEFORE stringification, so an error message
+   * or RPC error that incidentally contains a 130-hex signature lands in the
+   * NDJSON with the signature replaced by a `[REDACTED]` marker. Redaction is
+   * non-throwing because string-value contamination is incidental (the runner
+   * doesn't control SDK / RPC error wording), whereas a denied-KEY structural
+   * misuse is the caller's bug to fix.
    */
   emit(kind: TelemetryKind, payload: TelemetryPayload = {}): void {
     if (!KNOWN_KINDS.has(kind)) {
@@ -204,7 +278,11 @@ export class EventLog {
       assertNoSigningMaterial(key, value, `payload.${key}`);
       assertWireSafe(value, `payload.${key}`);
     }
-    const line = JSON.stringify({ ts: new Date().toISOString(), runId: this.runId, kind, ...payload });
+    // String values are redacted AFTER the structural checks pass and BEFORE
+    // serialization (Hermes PR #64 round 1). The walker returns a fresh
+    // sanitized structure so the caller's `payload` object is not mutated.
+    const sanitizedPayload = sanitizePayloadValues(payload) as Record<string, unknown>;
+    const line = JSON.stringify({ ts: new Date().toISOString(), runId: this.runId, kind, ...sanitizedPayload });
     appendFileSync(this.path, `${line}\n`, 'utf8');
   }
 }

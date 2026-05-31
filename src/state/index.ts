@@ -23,8 +23,9 @@
  * conversion helpers used at the submit / cancel boundaries (own-state SSE plan §M6).
  */
 
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { platform } from 'node:process';
 
 import type { SignedCommitmentPayload, Hex } from '@ospex/sdk';
 
@@ -422,31 +423,81 @@ export class StateStore {
    * Persist `state` atomically (temp file → `rename`). Creates `dir` if needed;
    * stamps `lastFlushedAt`. Pretty-printed for human inspection.
    *
-   * The temp file is `chmod`'d to `0o600` (owner read/write only) before the
-   * rename, because (post-M6/A) the persisted blob carries the maker's signed
-   * EIP-712 commitment payloads — the same signing material `MatchingModule.matchCommitment`
-   * needs (own-state SSE plan §M6). On POSIX the rename preserves the mode,
-   * so the live state file ends up `0600`. On Windows `chmodSync` only toggles
-   * the read-only bit; full ACL hardening isn't covered here — operators on
-   * Windows must restrict the `state.dir` ACL themselves (`OPERATOR_SAFETY.md`).
+   * The persisted blob carries the maker's signed EIP-712 commitment payloads
+   * (M6/A) — the same signing material `MatchingModule.matchCommitment` needs
+   * to fill the commitment — so the temp file is created at `0o600` (owner
+   * read/write only) **at creation time**, not chmod'd after the fact. The
+   * `O_WRONLY|O_CREAT|O_EXCL` (`flag: 'wx'`) sequence below makes the mode
+   * apply at the kernel-level `open` syscall, so there's no window between
+   * "file exists" and "file is locked down" for a concurrent reader to
+   * observe (Hermes PR #64 round 1).
+   *
+   * Three guarantees:
+   * 1. **No stale-temp inheritance** — if a prior crash left the temp at a
+   *    permissive mode, `writeFileSync` on the existing file would silently
+   *    keep the old mode (Node's `mode` option only applies when creating).
+   *    We `unlinkSync` first; `wx` then creates a fresh inode at `0o600`.
+   * 2. **Fresh mode from birth** — `mode: 0o600` is applied via `O_CREAT`. The
+   *    process umask cannot widen owner-only bits (`0o600 & ~umask = 0o600`
+   *    for every conceivable umask), so the file lands at exactly `0o600`.
+   * 3. **POSIX sanity check** — some filesystems (FAT, certain network mounts)
+   *    silently drop mode bits even on Linux. We `statSync` after creation
+   *    and throw if the mode isn't `0o600`; the partial temp is unlinked
+   *    before throwing so the next flush can retry. **No silent fallback to
+   *    a weak-mode publish.** Operators must host `state.dir` on a
+   *    permission-aware filesystem; `OPERATOR_SAFETY.md` calls this out.
+   *
+   * Windows: `mode` bits don't map to ACLs, so the sanity check is skipped
+   * and the operator is responsible for restricting the parent-directory ACL
+   * (`OPERATOR_SAFETY.md`).
    */
   flush(state: MakerState): void {
     mkdirSync(this.dir, { recursive: true });
     const out: MakerState = { ...state, version: MAKER_STATE_VERSION, lastFlushedAt: new Date().toISOString() };
     const tmp = join(this.dir, STATE_TMP);
-    writeFileSync(tmp, `${JSON.stringify(out, null, 2)}\n`, 'utf8');
-    // Lock down before rename. POSIX: mode follows the file across rename →
-    // statePath is 0600. Windows: best-effort (read-only bit only); operator
-    // must restrict the directory ACL themselves.
+
+    // Remove a stale temp file from a prior crash. Without this, the next
+    // writeFileSync would land on an existing file and ignore our mode
+    // option, publishing the new contents at the OLD mode (Hermes #64 r1).
+    // ENOENT is fine — the common case (no prior crash). Any other error
+    // (permissions, busy) is fatal: better to fail the flush than to leave
+    // signing material on a weak-mode file.
     try {
-      chmodSync(tmp, 0o600);
-    } catch {
-      // Some filesystems (FAT, certain network mounts) reject chmod even on
-      // POSIX. We'd rather flush the state than fail the write — the operator
-      // is already warned in OPERATOR_SAFETY.md to host state.dir on a
-      // permission-aware filesystem with a locked-down parent dir.
+      unlinkSync(tmp);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
     }
-    // `rename` over an existing file is atomic on POSIX and works on Windows (Node handles the replace).
+
+    // `flag: 'wx'` = O_WRONLY|O_CREAT|O_EXCL → throw on exists. Paired with
+    // the unlink above, this races safely: if the unlink succeeded the
+    // create is fresh; if someone else creates the temp between our unlink
+    // and write (multi-MM-per-dir, which is already forbidden by DESIGN
+    // §12), we fail loudly rather than truncating their file.
+    writeFileSync(tmp, `${JSON.stringify(out, null, 2)}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+
+    // POSIX-only sanity check. On a filesystem that supports POSIX modes,
+    // mode 0o600 is what the kernel applied — but if the filesystem dropped
+    // the bits silently (FAT, some network mounts) we'd be about to publish
+    // signing material at a weak mode. Fail closed.
+    if (platform !== 'win32') {
+      const stats = statSync(tmp);
+      const actualMode = stats.mode & 0o777;
+      if (actualMode !== 0o600) {
+        // Clean up the bad-mode temp before throwing so a retry can succeed.
+        try {
+          unlinkSync(tmp);
+        } catch {
+          // Best-effort — the throw below is the real signal.
+        }
+        throw new Error(
+          `StateStore.flush: temp file landed at mode 0o${actualMode.toString(8).padStart(3, '0')}; required 0o600. The filesystem under state.dir may not support POSIX permissions (FAT / certain network mounts). Persisted state carries EIP-712 signing material — host state.dir on a permission-aware filesystem (own-state SSE plan §M6/B).`,
+        );
+      }
+    }
+
+    // `rename` over an existing file is atomic on POSIX and works on Windows
+    // (Node handles the replace). POSIX preserves the source's mode across
+    // the rename, so the live statePath lands at 0o600 too.
     renameSync(tmp, this.statePath);
   }
 }

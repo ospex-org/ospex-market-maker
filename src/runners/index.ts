@@ -116,7 +116,7 @@ import type {
 } from '../ospex/index.js';
 import { decimalToTick, inverseOddsTick, isTickInRange, oppositeSide, positionTypeForSide, toProtocolQuote, type ProtocolQuote, type QuoteSide } from '../pricing/index.js';
 import { canSpendGas, requiredPositionModuleAllowanceUSDC, type Market } from '../risk/index.js';
-import { assessStateLoss, dispatchCancel, toMakerSignedPayload, type CommitmentLifecycle, type MakerCommitmentRecord, type MakerPositionRecord, type MakerPositionStatus, type MakerSide, type MakerSignedPayload, type MakerState, type StateLossAssessment, type StateStore } from '../state/index.js';
+import { assessStateLoss, dispatchCancel, toMakerSignedPayload, type CancelDispatch, type CommitmentLifecycle, type MakerCommitmentRecord, type MakerPositionRecord, type MakerPositionStatus, type MakerSide, type MakerSignedPayload, type MakerState, type StateLossAssessment, type StateStore } from '../state/index.js';
 import { EventLog, eventLogsExist } from '../telemetry/index.js';
 
 // ── injectable seams (the defaults are the real impls; tests override) ───────
@@ -595,6 +595,41 @@ export class Runner {
     const now = this.deps.now();
     const grace = this.config.orders.expiryReleaseGraceSeconds;
 
+    // ── M6/A PRE-PASS (Hermes #63) ─────────────────────────────────────────────
+    // For `cancelMode: onchain` only: a pre-M6/A record (`missing-legacy`) that's
+    // still `visibleOpen` must be on-chain-cancelled BEFORE the off-chain pull,
+    // because the SDK's `cancelOnchain({ hash })` fetches the public row, and the
+    // off-chain DELETE below would flip `book_visible: false` → SDK's
+    // `requireVisibleCommitment` refuses → the record bricks into BLOCKED. The
+    // touched-by-pre-pass set covers BOTH outcomes:
+    // - On success the record stamps `authoritativelyInvalidated`, which the
+    //   off-chain loop's `lifecycle !== 'visibleOpen'` filter naturally excludes.
+    // - On failure (gas-denied / adapter throw) the record stays `visibleOpen`;
+    //   without the explicit skip the off-chain DELETE would silently hide it
+    //   and turn the next-tick on-chain attempt into BLOCKED. The set lets the
+    //   on-chain leg below retry instead (it dispatches `use-hash` while the
+    //   record is still visible).
+    const touchedByPrePass = new Set<string>();
+    if (mode === 'onchain') {
+      for (const r of Object.values(this.state.commitments)) {
+        if (r.signedPayloadStatus !== 'missing-legacy') continue;
+        if (r.lifecycle !== 'visibleOpen') continue;
+        if (isExpiredForRelease(r.expiryUnixSec, now, grace)) continue;
+        touchedByPrePass.add(r.hash); // mark BEFORE attempting — failure must still skip the off-chain hide
+        const result = await this.onchainCancelCommitment(r, now, {
+          emitGasDenied: !this.fundingOnchainGasDeniedWarned,
+          overrideDispatch: { kind: 'use-hash', hash: r.hash as Hex },
+        });
+        if (result === 'gas-denied') {
+          this.fundingOnchainGasDeniedWarned = true;
+          break; // today's spend only grows — every later attempt would deny too
+        }
+        if (result === 'cancelled') this.fundingOnchainGasDeniedWarned = false;
+        // 'transient-failure': adapter threw — record left visibleOpen + in `touchedByPrePass`,
+        // so the off-chain loop skips and the regular on-chain leg below retries via dispatch.
+      }
+    }
+
     // ── off-chain pull (both `offchain` and `onchain` modes) ──────────────────
     // Pull every still-matchable `visibleOpen` quote off the relay. `softCancelRecord`
     // only acts on (and re-emits for) `visibleOpen` records, so re-running this every held
@@ -602,6 +637,7 @@ export class Runner {
     // leaves the record `visibleOpen`, retried next held tick.
     let softCancelled = 0;
     for (const r of Object.values(this.state.commitments)) {
+      if (touchedByPrePass.has(r.hash)) continue; // M6/A pre-pass already tried — never off-chain-hide these (would brick them into BLOCKED)
       if (r.lifecycle !== 'visibleOpen') continue;
       if (isExpiredForRelease(r.expiryUnixSec, now, grace)) continue; // dead on chain — not in `required`; ageOut handles it
       if (await this.softCancelRecord(r, 'funding', now)) softCancelled += 1; // true ⟺ pulled (the input is `visibleOpen`); false ⟺ a live cancel threw (stays visible, retried next tick)
@@ -611,7 +647,10 @@ export class Runner {
     // Reduce `required` for real: every still-matchable non-terminal record (the just-pulled
     // `softCancelled` ones, plus any `partiallyFilled` remainders and any `visibleOpen` whose
     // off-chain pull threw) → `authoritativelyInvalidated`. Scanned AFTER the off-chain step so
-    // it sees the freshly-`softCancelled` lifecycles.
+    // it sees the freshly-`softCancelled` lifecycles. Records the M6/A pre-pass already
+    // succeeded on are excluded by the `authoritativelyInvalidated` filter; failed pre-pass
+    // records (still `visibleOpen` thanks to the touched-skip above) reach this loop and
+    // retry via the regular dispatch (which returns `use-hash` while visible).
     let onchainCancelled = 0;
     if (mode === 'onchain') {
       for (const r of Object.values(this.state.commitments)) {
@@ -713,7 +752,18 @@ export class Runner {
       // closes it for good when `killCancelOnChain: true` (DESIGN §6 kill
       // switch; Hermes review-PR29). Maxticks exits and dry-run skip.
       if (this.shutdownReason !== null && !this.config.mode.dryRun) {
-        await this.offchainKillCancel();
+        // M6/A pre-pass (Hermes #63): when `killCancelOnChain` is set, missing-legacy +
+        // visibleOpen records need an on-chain { hash } cancel BEFORE the off-chain
+        // sweep — once the off-chain DELETE flips them book-hidden, the SDK's
+        // public-fetch path refuses (M2 redaction) and they brick into BLOCKED.
+        // `preOnchainKillCancelMissingLegacyVisible` returns the touched hashes
+        // (success OR failure); `offchainKillCancel` skips them so a failed
+        // pre-pass record stays visibleOpen for the regular `onchainKillCancel`
+        // pass to retry via dispatch.
+        const touchedByPrePass = this.config.killCancelOnChain
+          ? await this.preOnchainKillCancelMissingLegacyVisible()
+          : new Set<string>();
+        await this.offchainKillCancel(touchedByPrePass);
         if (this.config.killCancelOnChain) {
           await this.onchainKillCancel();
         }
@@ -1567,12 +1617,19 @@ export class Runner {
    * after the first warning to avoid per-tick spam — see {@link maybeOnchainCancelRecoveredSoftCancels}).
    * The caller owns lifecycle pre-filtering (which records are eligible) and any re-arm.
    */
-  private async onchainCancelCommitment(record: MakerCommitmentRecord, now: number, opts: { emitGasDenied?: boolean; emitMissingPayload?: boolean } = {}): Promise<'cancelled' | 'gas-denied' | 'transient-failure' | 'blocked-missing-payload'> {
+  private async onchainCancelCommitment(record: MakerCommitmentRecord, now: number, opts: { emitGasDenied?: boolean; emitMissingPayload?: boolean; overrideDispatch?: CancelDispatch } = {}): Promise<'cancelled' | 'gas-denied' | 'transient-failure' | 'blocked-missing-payload'> {
     // Dispatch FIRST — before spending the gas-budget check on a record we
     // can't authoritatively cancel anyway. `blocked-missing-payload` is
     // operator-action-required (own-state SSE plan §M6); no point exercising
     // any of the downstream paths.
-    const dispatch = dispatchCancel(record);
+    //
+    // `opts.overrideDispatch` lets the pre-pass for missing-legacy + visibleOpen
+    // records (Hermes #63 — fixing the off-chain-mutation-then-on-chain-block
+    // bug) inject `{ kind: 'use-hash' }` directly without re-computing
+    // `dispatchCancel`. The pre-pass runs BEFORE the off-chain leg's lifecycle
+    // mutation, so the record is genuinely still visibleOpen and the SDK's
+    // public-fetch path resolves cleanly.
+    const dispatch = opts.overrideDispatch ?? dispatchCancel(record);
     if (dispatch.kind === 'blocked-missing-payload') {
       if (opts.emitMissingPayload !== false) {
         this.eventLog.emit('cancel-blocked-missing-payload', {
@@ -2971,7 +3028,7 @@ export class Runner {
    * Per-record failures are logged (`error` `phase: 'cancel'`) and the loop
    * continues — pulling one record doesn't depend on another.
    */
-  private async offchainKillCancel(): Promise<void> {
+  private async offchainKillCancel(skipHashes: Set<string> = new Set()): Promise<void> {
     if (this.makerAddress === null) return; // live-mode invariant (caller already gated on `!dryRun`)
     const records = Object.values(this.state.commitments).filter(
       (r) => r.lifecycle === 'visibleOpen' || r.lifecycle === 'partiallyFilled',
@@ -2980,6 +3037,7 @@ export class Runner {
 
     const now = this.deps.now();
     for (const r of records) {
+      if (skipHashes.has(r.hash)) continue; // M6/A pre-pass already attempted on-chain; never off-chain-hide these (would brick missing-legacy + visibleOpen into BLOCKED on the subsequent on-chain pass)
       if (r.lifecycle === 'partiallyFilled') {
         // Off-chain DELETE is rejected once matched. Retain the remainder — `onchainKillCancel`
         // below (if `killCancelOnChain: true`) authoritatively cancels it; else it rides to expiry.
@@ -2996,6 +3054,46 @@ export class Runner {
       r.updatedAtUnixSec = now;
       this.eventLog.emit('soft-cancel', softCancelEventPayload(r, 'shutdown'));
     }
+  }
+
+  /**
+   * M6/A shutdown pre-pass (Hermes #63 — own-state SSE plan §M6). On-chain-cancel
+   * every missing-legacy + visibleOpen record BEFORE {@link offchainKillCancel}
+   * runs. Otherwise the off-chain DELETE flips `book_visible: false` on the API
+   * row, and the SDK's later `cancelOnchain({ hash })` refuses the public fetch
+   * (M2 redaction), bricking the record into the BLOCKED dispatch path.
+   *
+   * Returns the set of hashes this pre-pass TOUCHED (success or failure). The
+   * caller passes that set into `offchainKillCancel` to keep failed pre-pass
+   * records `visibleOpen` so the regular `onchainKillCancel` dispatch can retry
+   * via `use-hash` (still works while visible). Success records are
+   * `authoritativelyInvalidated`; the existing on-chain sweep filter excludes
+   * them naturally.
+   *
+   * Gas budget mirrors `onchainKillCancel` (`mayUseReserve: true` — kill-switch
+   * is operator-explicit). A verdict denial halts the pre-pass; the regular
+   * on-chain sweep below will hit the same denial and break too — by then the
+   * touched-set has already protected those records from off-chain hide.
+   */
+  private async preOnchainKillCancelMissingLegacyVisible(): Promise<Set<string>> {
+    const touched = new Set<string>();
+    if (this.makerAddress === null) return touched; // live-mode invariant
+    const eligible = Object.values(this.state.commitments).filter(
+      (r) => r.signedPayloadStatus === 'missing-legacy' && r.lifecycle === 'visibleOpen',
+    );
+    if (eligible.length === 0) return touched;
+    for (const r of eligible) {
+      const now = this.deps.now();
+      touched.add(r.hash); // mark BEFORE attempting — failure must still skip the off-chain hide
+      const result = await this.onchainCancelCommitment(r, now, {
+        overrideDispatch: { kind: 'use-hash', hash: r.hash as Hex },
+      });
+      if (result === 'gas-denied') break; // the regular onchainKillCancel pass below will deny too — touched set already protects these
+      // 'cancelled' → record is now authoritativelyInvalidated (lifecycle stamped by onchainCancelCommitment)
+      // 'transient-failure' → record stays visibleOpen, touched-skip prevents off-chain hide, regular on-chain retries via dispatch
+      // 'blocked-missing-payload' → unreachable here (we overrode dispatch to use-hash explicitly)
+    }
+    return touched;
   }
 
   /**

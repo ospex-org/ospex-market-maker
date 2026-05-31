@@ -3750,6 +3750,40 @@ describe('Runner — on-chain kill path / killCancelOnChain (Phase 3 e-ii)', () 
     expect(reloaded.commitments['0xbad']?.lifecycle).toBe('visibleOpen'); // failed pull — original lifecycle
     expect(reloaded.commitments['0xok']?.lifecycle).toBe('softCancelled'); // succeeded
   });
+
+  // ── M6/A pre-pass regression (Hermes #63) ──────────────────────────────────
+  it('killCancelOnChain=true + missing-legacy + visibleOpen → PRE-PASS on-chain { hash } cancel runs BEFORE the off-chain sweep, record → authoritativelyInvalidated, off-chain DELETE never called on it', async () => {
+    const cancel = cancelOnchainRecorder();
+    const legacy: MakerCommitmentRecord = commitmentRecord({
+      hash: '0xlegacy', speculationId: 'spec-9', contestId: '9', makerSide: 'home', oddsTick: 200,
+      riskAmountWei6: '250000', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000,
+      signedPayloadStatus: 'missing-legacy',
+    });
+    delete legacy.signedPayload;
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xlegacy': legacy } });
+    const config = cfg({ mode: { dryRun: false }, killCancelOnChain: true });
+    let offchainCalls = 0;
+    const adapter = liveSpiedAdapter(
+      config,
+      () => Promise.resolve([]),
+      {
+        cancelCommitmentOnchain: cancel.fn,
+        cancelCommitmentOffchain: () => { offchainCalls += 1; return Promise.resolve(); },
+      },
+      undefined,
+      undefined,
+      { getCommitment: () => Promise.reject(new Error('unused')) },
+    );
+    await makeRunner({ config, adapter, maxTicks: 5, deps: { killFileExists: killFileAfterTick(2) } }).run();
+
+    // Pre-pass intercepted the record BEFORE offchainKillCancel could DELETE it.
+    expect(offchainCalls).toBe(0);
+    expect(cancel.calls).toEqual(['0xlegacy']);
+    const reloaded = StateStore.at(stateDir).load().state;
+    expect(reloaded.commitments['0xlegacy']?.lifecycle).toBe('authoritativelyInvalidated');
+    // The blocked-missing-payload event must NOT fire — pre-pass intercepted before brick.
+    expect(readEvents().some((e) => e.kind === 'cancel-blocked-missing-payload')).toBe(false);
+  });
 });
 
 describe('Runner — cancelMode: onchain (D2 — authoritative cancel of retained partial remainders)', () => {
@@ -4254,6 +4288,32 @@ describe('Runner — funding guard', () => {
     expect(cancelOnchain.calls).toEqual(['0xfund']); // then authoritative cancel
     expect(events.some((e) => e.kind === 'onchain-cancel' && e.commitmentHash === '0xfund')).toBe(true);
     expect(StateStore.at(stateDir).load().state.commitments['0xfund']?.lifecycle).toBe('authoritativelyInvalidated');
+  });
+
+  // ── M6/A pre-pass regression (Hermes #63) ──────────────────────────────────
+  it('C1b — onchain + missing-legacy + visibleOpen: PRE-PASS on-chain { hash } cancel runs BEFORE the off-chain pull, off-chain DELETE never called on the record, no BLOCKED telemetry', async () => {
+    // `seedOne` calls flush() immediately, so build the record + flush manually
+    // so the on-disk state is consistent (missing-legacy MUST have no
+    // signedPayload — the validator rejects the inconsistency).
+    const record: MakerCommitmentRecord = commitmentRecord({ hash: '0xfund', contestId: 'contest-fund', speculationId: 'spec-fund', makerSide: 'away', riskAmountWei6: '250000', filledRiskWei6: '0', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 10, updatedAtUnixSec: T0 - 10, signedPayloadStatus: 'missing-legacy' });
+    delete record.signedPayload;
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { [record.hash]: record } });
+    const config = cfg({ mode: { dryRun: false }, fundingGuard: { underfundedCancelMode: 'onchain' } });
+    const offchainCancels: Hex[] = [];
+    const cancelOnchain = cancelOnchainRecorder();
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]),
+      { cancelCommitmentOffchain: (h) => { offchainCancels.push(h); return Promise.resolve(); }, cancelCommitmentOnchain: cancelOnchain.fn },
+      undefined, undefined,
+      { listOpenCommitments: () => Promise.resolve([openFixture(record)]), readBalances: balances(0n) },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    // Off-chain pull was SKIPPED for this record (touched-by-pre-pass set
+    // prevents the hide); the on-chain pre-pass authoritatively invalidated it.
+    expect(offchainCancels).toEqual([]);
+    expect(cancelOnchain.calls).toEqual(['0xfund']);
+    expect(StateStore.at(stateDir).load().state.commitments['0xfund']?.lifecycle).toBe('authoritativelyInvalidated');
+    expect(readEvents().some((e) => e.kind === 'cancel-blocked-missing-payload')).toBe(false);
   });
 
   it('C1b — none: holds but performs NO active cancel (quote rides to expiry)', async () => {

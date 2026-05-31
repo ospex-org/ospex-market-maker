@@ -591,7 +591,16 @@ describe('OspexAdapter — signer / live mode', () => {
 describe('OspexAdapter — write surface', () => {
   it('submitCommitment forwards the protocol tuple to commitments.submitRaw and returns its result', async () => {
     let received: unknown = null;
-    const result = { hash: '0xdeadbeef' as Hex, commitment: SAMPLE_COMMITMENT };
+    // SDK v0.5.1 added `signedPayload` to `SubmitResult` as a required field
+    // (canonical signed bundle for `cancelOnchainSigned`). The MM doesn't
+    // consume it yet (M6/A) — stub with the derived-type cast so the test
+    // typechecks and a future SDK shape change still surfaces here at
+    // compile time, matching the pattern at runner.test.ts:268.
+    const result = {
+      hash: '0xdeadbeef' as Hex,
+      commitment: SAMPLE_COMMITMENT,
+      signedPayload: {} as unknown as Awaited<ReturnType<OspexClientLike['commitments']['submitRaw']>>['signedPayload'],
+    };
     const adapter = liveAdapterWith({
       commitments: {
         submitRaw: (args) => {

@@ -113,7 +113,6 @@ import type {
   OddsSubscribeHandlers,
   OspexAdapter,
   OwnerCommitment,
-  OwnerPosition,
   OwnerStateSnapshot,
   OwnerStateSubscribeHandlers,
   PositionStatus,
@@ -124,6 +123,11 @@ import type {
 import { decimalToTick, inverseOddsTick, isTickInRange, oppositeSide, positionTypeForSide, toProtocolQuote, type ProtocolQuote, type QuoteSide } from '../pricing/index.js';
 import {
   emptyOwnStateShadow,
+  projectOwnerCommitment,
+  projectOwnerPosition,
+  reduceOwnerCommitmentObservation,
+  reduceOwnerFill,
+  reduceOwnerPositionStatus,
   reducePolledCommitmentObservation,
   reducePolledPositionObservation,
   reducePolledSoftCancelledObservation,
@@ -132,14 +136,12 @@ import {
   type PolledCommitmentObservation,
   type PolledPositionInput,
   type ReducerDescriptor,
-  type ShadowCommitment,
-  type ShadowPosition,
   type ShadowTransportStatus,
 } from '../reducers/index.js';
 import { OwnStateQueue } from './own-state-queue.js';
 import { WakeSignal } from './wake-signal.js';
 import { canSpendGas, requiredPositionModuleAllowanceUSDC, type Market } from '../risk/index.js';
-import { assessStateLoss, dispatchCancel, toMakerSignedPayload, type CancelDispatch, type MakerCommitmentRecord, type MakerSide, type MakerSignedPayload, type MakerState, type StateLossAssessment, type StateStore } from '../state/index.js';
+import { assessStateLoss, dispatchCancel, fillDedupKey, toMakerSignedPayload, type CancelDispatch, type MakerCommitmentRecord, type MakerSide, type MakerSignedPayload, type MakerState, type StateLossAssessment, type StateStore } from '../state/index.js';
 import { EventLog, eventLogsExist } from '../telemetry/index.js';
 
 // ── injectable seams (the defaults are the real impls; tests override) ───────
@@ -396,6 +398,19 @@ export class Runner {
    */
   private readonly ownStateQueue = new OwnStateQueue();
   /**
+   * Process-lifetime dedup set for owner-side `fill` events (Phase 2 PR4b —
+   * own-state-sse-plan §2.5.3 restart-safety model). Seeded at the end of
+   * the constructor from `state.commitments[].fills[]`; mutated by
+   * `reduceOwnerFill`. Keys are `(txHash, logIndex)` per the SDK's spec
+   * §2.1.2 dedup contract.
+   *
+   * Phase 2 is shadow-only: `MakerCommitmentRecord.fills[]` is empty (poll
+   * never appends; owner reducer never writes canonical state). So the seed
+   * is empty at boot in Phase 2 — forward-compat infrastructure for Phase 3
+   * cutover when `reduceOwnerFill` starts appending to canonical `fills[]`.
+   */
+  private readonly ownStateDedupSet = new Set<string>();
+  /**
    * Projection of canonical state built from the SSE stream (Phase 2 PR2 type;
    * PR4 wires the SSE feed). Distinct object identity from `this.state` so the
    * source-aware reducers' compile-time guards prevent crossing the canonical /
@@ -491,6 +506,13 @@ export class Runner {
 
     const { state, status } = this.stateStore.load();
     this.state = state;
+    // Phase 2 PR4b — seed the owner-fill dedup-set from canonical persisted
+    // fills (own-state-sse-plan §2.5.3). Phase 2 keeps the canonical
+    // `fills[]` empty (poll never appends; shadow reducer never writes
+    // canonical state); this seed is forward-compat for Phase 3 cutover.
+    for (const c of Object.values(this.state.commitments)) {
+      for (const f of c.fills) this.ownStateDedupSet.add(fillDedupKey(f.txHash, f.logIndex));
+    }
     // Fail closed if a dry-run state directory was reused for live. A `dry:<runId>:<n>`
     // synthetic hash can never be a real on-chain commitment — counting one toward
     // exposure, or trying to off-chain-cancel it, corrupts live accounting and spams the
@@ -893,20 +915,22 @@ export class Runner {
 
   /**
    * Drain the ownState queue, apply owner-source reducers to the shadow, and
-   * handle overflow telemetry (Phase 2 PR3). PR2 stub reducers return `[]`, so
-   * the only side-effect in PR3 is the overflow telemetry path (exercised by
-   * tests). PR4 wires real owner reducers.
+   * handle overflow telemetry.
    *
-   * Overflow telemetry — once per overflow window:
+   * Overflow telemetry — once per overflow window (Phase 2 PR3):
    * - `stream-health-degraded {reason: 'queue-overflow', shadowReady, queueCapacity}` — health flag flipped.
    * - `stream-would-hold {reason: 'queue-overflow', exposureWei6}` — emitted IFF open exposure > 0.
-   *   Documents what Phase 3 would do here (set `fundingHold`). PR3 does NOT
-   *   actually hold — the Phase 2 shadow-only contract forbids altering
-   *   canonical trading behavior.
+   *   Documents what Phase 3 would do here (set `fundingHold`); Phase 2 does
+   *   NOT actually hold — the shadow-only contract forbids altering canonical
+   *   trading behavior. The `streamOverflowDegraded` latch guarantees we emit
+   *   ONCE per overflow window; recovery (Phase 3+) clears the latch via a
+   *   server-side `event: resync`.
    *
-   * The `streamOverflowDegraded` latch guarantees we emit ONCE per overflow
-   * window. Subsequent drains during the same unhealthy window see the latch
-   * set and skip the emit; recovery (Phase 3+) clears the latch.
+   * Event dispatch (Phase 2 PR4b): each queued event is routed by `kind` to
+   * the appropriate owner reducer; the returned descriptors flow through
+   * `applyDescriptors(_, 'owner')`. Unknown kinds emit an error and skip.
+   * Reducers mutate `this.ownStateShadow` (not canonical state) — the type
+   * system enforces this (see `src/reducers/owner.test.ts`).
    */
   private drainShadow(): void {
     const drained = this.ownStateQueue.drain();
@@ -926,10 +950,49 @@ export class Runner {
         });
       }
     }
-    // PR3 stubs: reduceOwner* return []. PR4 wires real bodies + dedup-set against
-    // MakerCommitmentRecord.fills[]. Iterating the empty list is a free no-op.
-    for (const _event of drained.events) {
-      // Owner reducers + applyDescriptors(_, 'owner') wired here in PR4.
+    // Phase 2 PR4b — dispatch by event.kind and apply owner-side reducers.
+    // The reducer module's type system pins the body type per `kind`; the cast
+    // here is the runtime narrowing point (the queue carries `body: unknown`
+    // so PR3 could exercise the descriptor pipeline before SDK types were wired).
+    // Reducer calls are wrapped in try/catch so a single malformed event from
+    // an SDK bug or a synthetic test fixture logs + skips rather than crashing
+    // the loop — defensive at a per-event level (the queue itself is bounded
+    // by `OWN_STATE_QUEUE_MAX`).
+    const now = this.deps.now();
+    for (const event of drained.events) {
+      let descriptors: ReducerDescriptor[];
+      try {
+        switch (event.kind) {
+          case 'commitment':
+            descriptors = reduceOwnerCommitmentObservation(this.ownStateShadow, event.body as OwnerCommitment, now);
+            break;
+          case 'fill':
+            // The reducer needs our address for the maker/taker disambiguation.
+            // When subscribe is true, makerAddress is non-null (boot refuses
+            // otherwise); the empty-string fallback is defensive against a
+            // misconfigured drain path with no subscription.
+            descriptors = reduceOwnerFill(this.ownStateShadow, event.body as Fill, this.ownStateDedupSet, this.makerAddress ?? '', now);
+            break;
+          case 'positionStatus':
+            descriptors = reduceOwnerPositionStatus(this.ownStateShadow, event.body as PositionStatusEvent, now);
+            break;
+          default:
+            this.eventLog.emit('error', {
+              class: 'UnknownOwnStateEventKind',
+              detail: `drainShadow received unrecognized event.kind=${JSON.stringify(event.kind)} — skipping`,
+              phase: 'own-state-stream',
+            });
+            continue;
+        }
+      } catch (err) {
+        this.eventLog.emit('error', {
+          class: errClass(err),
+          detail: `${errMessage(err)} (event.kind=${event.kind})`,
+          phase: 'own-state-stream',
+        });
+        continue;
+      }
+      this.applyDescriptors(descriptors, 'owner');
     }
   }
 
@@ -2507,7 +2570,7 @@ export class Runner {
     }
     for (const p of snapshot.positions) {
       const projected = projectOwnerPosition(p);
-      if (projected !== null) this.ownStateShadow.pendingBaseline.positions[`${p.speculationId}:${projected.side}`] = projected;
+      this.ownStateShadow.pendingBaseline.positions[`${p.speculationId}:${projected.side}`] = projected;
     }
     this.ownStateShadow.lastEventAtMs = Date.now();
     // Don't wake on snapshot pages — wake when `ready` fires (the comparator
@@ -3446,72 +3509,6 @@ function computeOpenExposureWei6(state: MakerState, nowUnixSec: number, graceSec
     total += BigInt(p.riskAmountWei6);
   }
   return total;
-}
-
-/**
- * Project an SDK `OwnerCommitment` (the owner-auth maker view delivered via
- * SSE) to the shadow's narrow `ShadowCommitment` shape (Phase 2 PR4a). The
- * projection maps the SDK's effective `status` + signals to a
- * `CommitmentLifecycle` matching the canonical (`MakerCommitmentRecord`)
- * lifecycle vocabulary so the PR5 comparator can compare apples to apples.
- *
- * Lifecycle routing precedence (mirrors the poll-side `reducePolledCommitmentObservation`):
- *   - FULL fill (`filledRiskAmount >= riskAmount`) → `'filled'`.
- *   - AUTH (`storedStatus === 'cancelled'` || `nonceInvalidated`) → `'authoritativelyInvalidated'`.
- *   - Effective `'expired'` → `'expired'`.
- *   - Effective `'cancelled'` (book-hidden but not AUTH) → `'softCancelled'`.
- *   - Effective `'filled'` (cumulative not at risk yet — unusual; trust the API) → `'filled'`.
- *   - Effective `'open'` or `'partially_filled'` with `filledRiskAmount > 0` → `'partiallyFilled'`.
- *   - Effective `'open'` → `'visibleOpen'`.
- */
-function projectOwnerCommitment(c: OwnerCommitment): ShadowCommitment {
-  const filled = BigInt(c.filledRiskAmount);
-  const risk = BigInt(c.riskAmount);
-  let lifecycle: ShadowCommitment['lifecycle'];
-  if (filled >= risk) {
-    lifecycle = 'filled';
-  } else if (c.storedStatus === 'cancelled' || c.nonceInvalidated) {
-    lifecycle = 'authoritativelyInvalidated';
-  } else if (c.status === 'expired') {
-    lifecycle = 'expired';
-  } else if (c.status === 'cancelled') {
-    lifecycle = 'softCancelled';
-  } else if (c.status === 'filled') {
-    lifecycle = 'filled';
-  } else if (filled > 0n) {
-    lifecycle = 'partiallyFilled';
-  } else {
-    lifecycle = 'visibleOpen';
-  }
-  // OwnerCommitment.expiry is ISO-8601 string or null. Convert to unix seconds;
-  // null → 0 (defensive — the comparator's expiry check will not match canonical).
-  const expiryUnixSec = c.expiry === null ? 0 : Math.floor(new Date(c.expiry).getTime() / 1000);
-  return {
-    hash: c.commitmentHash,
-    lifecycle,
-    filledRiskWei6: c.filledRiskAmount,
-    riskAmountWei6: c.riskAmount,
-    expiryUnixSec,
-  };
-}
-
-/**
- * Project an SDK `OwnerPosition` to the shadow's `ShadowPosition` (Phase 2
- * PR4a). Returns `null` for positions the snapshot intentionally drops
- * (terminal-lost / void — those positions don't appear in `OwnerPosition`
- * unions; defensive fall-through). The status maps 1:1 to
- * `MakerPositionStatus` for the four states the snapshot carries.
- *
- * `positionType` → side: 0=away, 1=home (canonical Ospex protocol mapping).
- */
-function projectOwnerPosition(p: OwnerPosition): ShadowPosition | null {
-  const side: ShadowPosition['side'] = p.positionType === 0 ? 'away' : 'home';
-  return {
-    speculationId: p.speculationId,
-    side,
-    riskAmountWei6: Math.round(p.riskAmountUSDC * 1_000_000).toString(),
-    status: p.status, // type-level guarantee: 'active' | 'pendingSettle' | 'claimable' | 'claimed'
-  };
 }
 
 function errClass(err: unknown): string {

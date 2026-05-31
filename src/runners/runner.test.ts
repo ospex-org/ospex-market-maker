@@ -433,6 +433,9 @@ function commitmentRecord(overrides: Partial<MakerCommitmentRecord>): MakerCommi
     expiryUnixSec: NOW + 100,
     postedAtUnixSec: NOW - 10,
     updatedAtUnixSec: NOW - 10,
+    // Phase 2 PR1 — fills[] defaults empty (poll-path doesn't append; SSE
+    // reducer in PR4 populates it).
+    fills: [],
     ...overrides,
   };
 }

@@ -213,6 +213,44 @@ export function dispatchCancel(record: MakerCommitmentRecord): CancelDispatch {
   return { kind: 'use-hash', hash: record.hash as Hex };
 }
 
+// ── fill history (own-state SSE plan §2.5.3 / Phase 2 PR1) ───────────────────
+
+/**
+ * One observed on-chain fill for the maker — appended to
+ * {@link MakerCommitmentRecord.fills} when the SSE `fill` reducer applies it.
+ * The `(txHash, logIndex)` pair is the canonical dedup key (see
+ * {@link fillDedupKey}); on cold start the runner reconstructs the dedup set by
+ * walking every commitment's `fills[]`, so a replay across restart can't re-emit
+ * fill telemetry or double-count exposure (spec §2.5.3 restart-safety).
+ *
+ * Per Phase 2 plan PR1 (Hermes-endorsed Q1): the **poll path does NOT append**
+ * to this array. Commitment-diff observations don't carry `(txHash, logIndex)`,
+ * and synthetic poll entries would create a false sense of restart-safety
+ * (they don't actually match against SSE replays). Fills accumulate here only
+ * when Phase 2 PR4's owner-fill reducer applies an SSE `fill` event.
+ */
+export interface MakerCommitmentFill {
+  /** The matching transaction hash that produced this fill (`0x`-prefixed hex). */
+  txHash: string;
+  /** The log index within the tx (non-negative integer). */
+  logIndex: number;
+  /** The amount of this fill in USDC wei6 (decimal string). NOT the post-fill cumulative. */
+  amountWei6: string;
+  /** Unix seconds when the MM observed and applied this fill. */
+  ts: number;
+}
+
+/**
+ * The canonical dedup key for a fill event — the pair `(txHash, logIndex)`
+ * uniquely identifies an on-chain `Match` log event in the protocol. Shared
+ * between the SSE `fill` reducer (Phase 2 PR4) and the cold-start dedup-set
+ * reconstruction. Stable, no escaping concerns (both fields are constrained
+ * shape).
+ */
+export function fillDedupKey(txHash: string, logIndex: number): string {
+  return `${txHash}:${logIndex}`;
+}
+
 // ── records ──────────────────────────────────────────────────────────────────
 
 /** One posted commitment, tracked by its EIP-712 hash. */
@@ -262,6 +300,18 @@ export interface MakerCommitmentRecord {
    * {@link SIGNED_PAYLOAD_STATUSES}.
    */
   signedPayloadStatus: SignedPayloadStatus;
+  /**
+   * Observed on-chain fills against this commitment, append-only, in arrival
+   * order. The `(txHash, logIndex)` pair is the canonical dedup key — see
+   * {@link MakerCommitmentFill} and {@link fillDedupKey}. Populated by Phase
+   * 2's SSE `fill` reducer (PR4); the poll path does NOT append to this array
+   * (no `txHash` available, synthetic entries provide no protective value).
+   *
+   * Pre-Phase-2-PR1 state files load with `fills: []` via the validator's
+   * migration default; legacy records (no field present) and new records
+   * without observed fills are indistinguishable on disk.
+   */
+  fills: MakerCommitmentFill[];
 }
 
 /** One position the maker holds (one side of a matched pair on a speculation). */
@@ -623,6 +673,22 @@ function validateCommitmentRecord(
       signedPayload = undefined;
     }
   }
+  // fills[] (Phase 2 PR1 — own-state SSE plan §2.5.3). Migration: a pre-PR1
+  // record has no `fills` field — default to []. Newer records MUST carry a
+  // valid array. Each element validated by `validateMakerCommitmentFill`.
+  let fills: MakerCommitmentFill[];
+  if (value.fills === undefined) {
+    fills = [];
+  } else if (!Array.isArray(value.fills)) {
+    return { ok: false, reason: `fills ${describe(value.fills)} is not an array` };
+  } else {
+    fills = [];
+    for (let i = 0; i < value.fills.length; i++) {
+      const f = validateMakerCommitmentFill(value.fills[i]);
+      if (!f.ok) return { ok: false, reason: `fills[${i}]: ${f.reason}` };
+      fills.push(f.fill);
+    }
+  }
   const record: MakerCommitmentRecord = {
     hash: key,
     speculationId: value.speculationId,
@@ -640,9 +706,36 @@ function validateCommitmentRecord(
     postedAtUnixSec: value.postedAtUnixSec,
     updatedAtUnixSec: value.updatedAtUnixSec,
     signedPayloadStatus,
+    fills,
   };
   if (signedPayload !== undefined) record.signedPayload = signedPayload;
   return { ok: true, record };
+}
+
+/**
+ * Validate a persisted {@link MakerCommitmentFill}. Fail-closed: a malformed
+ * fill rejects the entire commitment record (so a corrupt history can't
+ * silently coexist with otherwise-valid state). Loose on `txHash` shape
+ * (`typeof string`, no hex-length constraint) so the validator accepts both
+ * real `0x[64hex]` mainnet tx hashes and shorter test-fixture stubs.
+ */
+function validateMakerCommitmentFill(
+  value: unknown,
+): { ok: true; fill: MakerCommitmentFill } | { ok: false; reason: string } {
+  if (!isPlainObject(value)) return { ok: false, reason: 'not an object' };
+  if (typeof value.txHash !== 'string') return { ok: false, reason: `txHash ${describe(value.txHash)} must be a string` };
+  if (!isNonNegInt(value.logIndex)) return { ok: false, reason: `logIndex ${describe(value.logIndex)} must be a non-negative integer` };
+  if (!isDecimalString(value.amountWei6)) return { ok: false, reason: `amountWei6 ${describe(value.amountWei6)} must be a non-negative decimal string` };
+  if (!isNonNegInt(value.ts)) return { ok: false, reason: `ts ${describe(value.ts)} must be a non-negative integer` };
+  return {
+    ok: true,
+    fill: {
+      txHash: value.txHash,
+      logIndex: value.logIndex,
+      amountWei6: value.amountWei6,
+      ts: value.ts,
+    },
+  };
 }
 
 /**

@@ -113,6 +113,8 @@ function rec(hash: string, postedAtUnixSec: number, overrides: Partial<MakerComm
     expiryUnixSec: postedAtUnixSec + 600,
     postedAtUnixSec,
     updatedAtUnixSec: postedAtUnixSec,
+    // Phase 2 PR1 — fills[] defaults empty (poll-path cancel-stale doesn't append).
+    fills: [],
     ...overrides,
   };
 }

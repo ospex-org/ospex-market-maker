@@ -38,6 +38,8 @@ function commitmentRecord(overrides: Partial<MakerCommitmentRecord> = {}): Maker
     // M6/A — fixtures for inventory / reconcile tests don't exercise the
     // signed-payload cancel path; 'missing-legacy' is the safe default.
     signedPayloadStatus: 'missing-legacy',
+    // Phase 2 PR1 — fills[] defaults empty.
+    fills: [],
     ...overrides,
   };
 }

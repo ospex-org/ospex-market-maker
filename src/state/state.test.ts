@@ -9,9 +9,11 @@ import {
   COMMITMENT_LIFECYCLE_STATES,
   dispatchCancel,
   emptyMakerState,
+  fillDedupKey,
   StateStore,
   toMakerSignedPayload,
   toSdkSignedPayload,
+  type MakerCommitmentFill,
   type MakerCommitmentRecord,
   type MakerPositionRecord,
   type MakerSignedPayload,
@@ -43,6 +45,9 @@ function commitment(overrides: Partial<MakerCommitmentRecord> = {}): MakerCommit
     // Tests that exercise the present-payload path override this field along
     // with `signedPayload`.
     signedPayloadStatus: 'missing-legacy',
+    // Phase 2 PR1 — fills[] defaults empty; tests that exercise fill history
+    // override with explicit entries.
+    fills: [],
     ...overrides,
   };
 }
@@ -453,5 +458,145 @@ describe('StateStore — signedPayload validator (own-state SSE plan §M6)', () 
     expect(status.kind).toBe('loaded');
     expect(state.commitments['0xabc']?.signedPayloadStatus).toBe('present');
     expect(state.commitments['0xabc']?.signedPayload).toEqual(makerSignedPayload('0xabc'));
+  });
+});
+
+// ── fills history (own-state SSE plan §2.5.3, Phase 2 PR1) ──────────────────
+//
+// The `fills` field on a `MakerCommitmentRecord` is the append-only history of
+// on-chain Match log events observed for that commitment. It exists to enable
+// SSE restart-safety (the dedup-set is reconstructed from these entries on
+// cold start). The poll path NEVER appends to it — only the SSE `fill` reducer
+// (Phase 2 PR4) will populate it.
+describe('fills history validator (Phase 2 PR1 — own-state SSE plan §2.5.3)', () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'ospex-mm-fills-'));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  function fill(over: Partial<MakerCommitmentFill> = {}): MakerCommitmentFill {
+    return { txHash: '0x' + '11'.repeat(32), logIndex: 0, amountWei6: '50000', ts: 1_900_000_000, ...over };
+  }
+
+  function persistAndLoad(record: unknown): ReturnType<StateStore['load']> {
+    const s = emptyMakerState();
+    s.commitments['0xabc'] = record as MakerCommitmentRecord;
+    writeFileSync(join(dir, STATE_FILE), JSON.stringify({ ...s, version: 1, lastFlushedAt: null }), 'utf8');
+    return StateStore.at(dir).load();
+  }
+
+  it('a record with no `fills` field loads with fills: [] (legacy migration)', () => {
+    // Build a record-shaped object WITHOUT the fills field — simulating a
+    // pre-PR1 state file. Strip the field via JSON round-trip.
+    const c = commitment();
+    const raw = JSON.parse(JSON.stringify(c)) as Record<string, unknown>;
+    delete raw.fills;
+    expect(raw.fills).toBeUndefined();
+    const { state, status } = persistAndLoad(raw);
+    expect(status.kind).toBe('loaded');
+    expect(state.commitments['0xabc']?.fills).toEqual([]);
+  });
+
+  it('a record with an explicit empty fills: [] loads identically', () => {
+    const { state, status } = persistAndLoad(commitment({ fills: [] }));
+    expect(status.kind).toBe('loaded');
+    expect(state.commitments['0xabc']?.fills).toEqual([]);
+  });
+
+  it('a record with multiple fills survives a flush + load roundtrip in arrival order', () => {
+    const store = StateStore.at(dir);
+    const fills: MakerCommitmentFill[] = [
+      fill({ txHash: '0xaa', logIndex: 0, amountWei6: '10000', ts: 1_900_000_100 }),
+      fill({ txHash: '0xaa', logIndex: 5, amountWei6: '5000', ts: 1_900_000_200 }),
+      fill({ txHash: '0xbb', logIndex: 0, amountWei6: '30000', ts: 1_900_000_300 }),
+    ];
+    const s = emptyMakerState();
+    s.commitments['0xabc'] = commitment({ fills });
+    store.flush(s);
+    const { state, status } = store.load();
+    expect(status.kind).toBe('loaded');
+    expect(state.commitments['0xabc']?.fills).toEqual(fills);
+  });
+
+  it('rejects a non-array `fills` field → state is "lost"', () => {
+    const { status } = persistAndLoad(commitment({ fills: 'not-an-array' as unknown as MakerCommitmentFill[] }));
+    expect(status.kind).toBe('lost');
+    if (status.kind === 'lost') expect(status.reason).toMatch(/fills/);
+  });
+
+  it('rejects a fill element with non-string txHash → state is "lost"', () => {
+    const { status } = persistAndLoad(commitment({ fills: [{ ...fill(), txHash: 42 as unknown as string }] }));
+    expect(status.kind).toBe('lost');
+    if (status.kind === 'lost') expect(status.reason).toMatch(/txHash/);
+  });
+
+  it('rejects a fill element with negative or non-integer logIndex → state is "lost"', () => {
+    const { status: a } = persistAndLoad(commitment({ fills: [{ ...fill(), logIndex: -1 }] }));
+    expect(a.kind).toBe('lost');
+    if (a.kind === 'lost') expect(a.reason).toMatch(/logIndex/);
+
+    const { status: b } = persistAndLoad(commitment({ fills: [{ ...fill(), logIndex: 1.5 }] }));
+    expect(b.kind).toBe('lost');
+    if (b.kind === 'lost') expect(b.reason).toMatch(/logIndex/);
+  });
+
+  it('rejects a fill element with non-decimal-string amountWei6 → state is "lost"', () => {
+    const { status: a } = persistAndLoad(commitment({ fills: [{ ...fill(), amountWei6: 100 as unknown as string }] }));
+    expect(a.kind).toBe('lost');
+    if (a.kind === 'lost') expect(a.reason).toMatch(/amountWei6/);
+
+    const { status: b } = persistAndLoad(commitment({ fills: [{ ...fill(), amountWei6: '-50' }] }));
+    expect(b.kind).toBe('lost');
+    if (b.kind === 'lost') expect(b.reason).toMatch(/amountWei6/);
+
+    const { status: c } = persistAndLoad(commitment({ fills: [{ ...fill(), amountWei6: '0050' }] }));
+    expect(c.kind).toBe('lost');
+    if (c.kind === 'lost') expect(c.reason).toMatch(/amountWei6/);
+  });
+
+  it('rejects a fill element with negative or non-integer ts → state is "lost"', () => {
+    const { status: a } = persistAndLoad(commitment({ fills: [{ ...fill(), ts: -1 }] }));
+    expect(a.kind).toBe('lost');
+    if (a.kind === 'lost') expect(a.reason).toMatch(/ts/);
+
+    const { status: b } = persistAndLoad(commitment({ fills: [{ ...fill(), ts: 1.5 }] }));
+    expect(b.kind).toBe('lost');
+    if (b.kind === 'lost') expect(b.reason).toMatch(/ts/);
+  });
+
+  it('rejects a fill element that is not a plain object → state is "lost"', () => {
+    const { status } = persistAndLoad(commitment({ fills: ['not-an-object' as unknown as MakerCommitmentFill] }));
+    expect(status.kind).toBe('lost');
+    if (status.kind === 'lost') expect(status.reason).toMatch(/fills\[0\]/);
+  });
+
+  it('the index of a malformed fill is surfaced in the reason (locating the bad entry)', () => {
+    const fills: MakerCommitmentFill[] = [fill(), fill({ logIndex: 1 }), { ...fill(), logIndex: -3 }];
+    const { status } = persistAndLoad(commitment({ fills }));
+    expect(status.kind).toBe('lost');
+    if (status.kind === 'lost') expect(status.reason).toMatch(/fills\[2\]/);
+  });
+});
+
+describe('fillDedupKey (Phase 2 PR1)', () => {
+  it('produces `${txHash}:${logIndex}` for the canonical dedup key', () => {
+    expect(fillDedupKey('0xabc', 0)).toBe('0xabc:0');
+    expect(fillDedupKey('0xdeadbeef', 7)).toBe('0xdeadbeef:7');
+  });
+
+  it('different (txHash, logIndex) pairs produce different keys (collision check)', () => {
+    expect(fillDedupKey('0xabc', 0)).not.toBe(fillDedupKey('0xabc', 1));
+    expect(fillDedupKey('0xabc', 0)).not.toBe(fillDedupKey('0xabd', 0));
+  });
+
+  it('order matters — same hash and index in different order would be a different key', () => {
+    // Sanity check that the key format is unambiguous even if someone confuses
+    // the arg order; this would NOT compile-error today, so the test acts as a
+    // documentation pin.
+    expect(fillDedupKey('0xabc', 5)).toBe('0xabc:5');
+    expect(fillDedupKey('0xabc', 5)).not.toBe('5:0xabc');
   });
 });

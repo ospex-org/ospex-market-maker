@@ -327,6 +327,22 @@ interface MakerCommitmentRecord {
   // M6/A — own-state SSE plan §M6. Bearer-credential material; see §4 warning.
   signedPayload?: MakerSignedPayload;   // present iff signedPayloadStatus === 'present'
   signedPayloadStatus: SignedPayloadStatus; // REQUIRED — authoritative discriminant for the cancel path
+  // Phase 2 PR1 — own-state SSE plan §2.5.3. Observed on-chain fills for this
+  // commitment, append-only, in arrival order. Pre-Phase-2-PR1 state files
+  // load with `fills: []` via validator migration. Populated by Phase 2 PR4's
+  // SSE `fill` reducer; poll path NEVER appends (no txHash/logIndex available).
+  fills: MakerCommitmentFill[];
+}
+
+// One observed on-chain Match log event for the maker. The (txHash, logIndex)
+// pair is the canonical dedup key — see `fillDedupKey`. Used at cold start to
+// reconstruct the SSE fill dedup-set so a replay across restart cannot re-emit
+// fill telemetry or double-count exposure (spec §2.5.3 restart-safety).
+interface MakerCommitmentFill {
+  txHash: string;                   // 0x-prefixed; the matching tx hash
+  logIndex: number;                 // non-negative integer; log index within the tx
+  amountWei6: string;               // delta of this fill (USDC wei6 decimal string); NOT the post-fill cumulative
+  ts: number;                       // unix seconds when the MM observed and applied this fill
 }
 
 // The SDK's canonical SignedCommitmentPayload, persisted with the four bigint

@@ -93,7 +93,7 @@ import {
 } from '../ospex/index.js';
 import { canSpendGas } from '../risk/index.js';
 import { polFloatToWei18, softCancelEventPayload, todayUTCDateString } from '../runners/index.js';
-import { assessStateLoss, StateStore, type MakerState } from '../state/index.js';
+import { assessStateLoss, dispatchCancel, StateStore, type MakerState } from '../state/index.js';
 import { EventLog, eventLogsExist, newRunId } from '../telemetry/index.js';
 
 // ── opts + deps ──────────────────────────────────────────────────────────────
@@ -159,6 +159,8 @@ export interface CancelStaleReport {
   onchainCancelled: number;
   /** Records the gas-budget verdict refused (only meaningful with `--authoritative`). */
   gasDenied: number;
+  /** Records the on-chain cancel sweep BLOCKED because `signedPayloadStatus === 'missing-legacy'` AND `lifecycle === 'softCancelled'` (own-state SSE plan §M6) — the public commitments API redacts the signed fields and there's no captured local bundle, so `cancelOnchain` has no recovery path. Distinct from `gasDenied` (budget can free up) and `errored` (transient throw); these are permanently blocked until the operator manually recovers via owner-auth own-state (Phase 2) or the commitment expires. Always `0` when `--authoritative` was not passed. */
+  blockedMissingPayload: number;
   /** Records whose off-chain or on-chain cancel threw. */
   errored: number;
   /** Total POL gas spent on the command's on-chain cancels (wei18, decimal string). `"0"` without `--authoritative` or when nothing landed on chain. */
@@ -296,6 +298,7 @@ export async function runCancelStale(opts: CancelStaleOpts, deps: CancelStaleDep
     offchainSkippedPartial: 0,
     onchainCancelled: 0,
     gasDenied: 0,
+    blockedMissingPayload: 0,
     errored: 0,
     gasPolWei: '0',
     runId,
@@ -384,9 +387,34 @@ export async function runCancelStale(opts: CancelStaleOpts, deps: CancelStaleDep
         break; // subsequent records would deny the same way; the operator must top up POL and re-run
       }
 
+      // Dispatch on signedPayloadStatus + lifecycle (own-state SSE plan §M6).
+      // A pre-M6/A record that's been book-hidden has no recovery path via
+      // any cancel mechanism the MM owns — emit the blocked telemetry,
+      // increment the dedicated counter (so the report can distinguish this
+      // from `gasDenied` / `errored`), and continue. Note: a `softCancelled`
+      // record without a captured signed payload could be cancelled via
+      // owner-auth own-state recovery, but the CLI's snapshot of that is
+      // queued for Phase 2; M6/A flags it for operator action instead.
+      const dispatch = dispatchCancel(r);
+      if (dispatch.kind === 'blocked-missing-payload') {
+        report.blockedMissingPayload += 1;
+        eventLog.emit('cancel-blocked-missing-payload', {
+          commitmentHash: r.hash,
+          speculationId: r.speculationId,
+          contestId: r.contestId,
+          makerSide: r.makerSide,
+          lifecycle: r.lifecycle,
+          reason: 'missing-legacy-signed-payload-and-hidden',
+          detail: 'cancel-stale --authoritative swept a record that predates M6/A AND is book-hidden; cancelOnchain has no recovery path. The latent exposure rides to expiry — recover the payload via owner-auth own-state if early cancel is needed.',
+          phase: 'cli-cancel-stale',
+        });
+        continue;
+      }
       let result: Awaited<ReturnType<OspexAdapter['cancelCommitmentOnchain']>>;
       try {
-        result = await adapter.cancelCommitmentOnchain(r.hash as Hex);
+        result = await adapter.cancelCommitmentOnchain(
+          dispatch.kind === 'use-signed-payload' ? { signedCommitment: dispatch.payload } : { hash: dispatch.hash },
+        );
       } catch (err) {
         report.errored += 1;
         eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'onchain-cancel', commitmentHash: r.hash });
@@ -424,7 +452,10 @@ export async function runCancelStale(opts: CancelStaleOpts, deps: CancelStaleDep
  * exit code to detect an incomplete sweep without parsing the JSON envelope.
  */
 export function cancelStaleExitCode(report: CancelStaleReport): number {
-  return report.errored > 0 || report.gasDenied > 0 ? 1 : 0;
+  // `blockedMissingPayload` (M6/A) is also an incomplete sweep — the operator
+  // wanted to authoritatively cancel a record but the MM has no recovery
+  // path. Exit 1 so automation detects it just like `errored` / `gasDenied`.
+  return report.errored > 0 || report.gasDenied > 0 || report.blockedMissingPayload > 0 ? 1 : 0;
 }
 
 /** Write the JSON envelope `{ schemaVersion: 1, cancelStale: CancelStaleReport }` to `out`. */
@@ -441,6 +472,7 @@ export function renderCancelStaleReportText(report: CancelStaleReport, out: { wr
   out.write(`off-chain skipped (partiallyFilled — use --authoritative): ${report.offchainSkippedPartial}\n`);
   out.write(`on-chain cancelled:         ${report.onchainCancelled}\n`);
   out.write(`gas-budget denied:          ${report.gasDenied}\n`);
+  out.write(`blocked (missing-legacy + hidden — recover via owner-auth own-state): ${report.blockedMissingPayload}\n`);
   out.write(`errored:                    ${report.errored}\n`);
   out.write(`gas spent (POL wei18):      ${report.gasPolWei}\n`);
 }

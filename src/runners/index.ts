@@ -116,7 +116,7 @@ import type {
 } from '../ospex/index.js';
 import { decimalToTick, inverseOddsTick, isTickInRange, oppositeSide, positionTypeForSide, toProtocolQuote, type ProtocolQuote, type QuoteSide } from '../pricing/index.js';
 import { canSpendGas, requiredPositionModuleAllowanceUSDC, type Market } from '../risk/index.js';
-import { assessStateLoss, type CommitmentLifecycle, type MakerCommitmentRecord, type MakerPositionRecord, type MakerPositionStatus, type MakerSide, type MakerState, type StateLossAssessment, type StateStore } from '../state/index.js';
+import { assessStateLoss, dispatchCancel, toMakerSignedPayload, type CommitmentLifecycle, type MakerCommitmentRecord, type MakerPositionRecord, type MakerPositionStatus, type MakerSide, type MakerSignedPayload, type MakerState, type StateLossAssessment, type StateStore } from '../state/index.js';
 import { EventLog, eventLogsExist } from '../telemetry/index.js';
 
 // ── injectable seams (the defaults are the real impls; tests override) ───────
@@ -334,6 +334,8 @@ export class Runner {
   private nextDiscoveryAtTick = 0;
   /** Hashes of recovered soft-cancels (`softCancelled` with a matched remainder) for which `maybeOnchainCancelRecoveredSoftCancels` has already emitted a `gas-budget-blocks-onchain-cancel` candidate this run — so the denial surfaces ONCE per stuck record rather than every tick (the cancel is still re-attempted each tick, landing when the budget frees). Pruned to currently-eligible hashes each sweep, so it can't grow unbounded. */
   private readonly gasDeniedRecoveredSoftCancelWarned = new Set<string>();
+  /** Hashes of recovered soft-cancels for which the on-chain cancel is BLOCKED — `signedPayloadStatus === 'missing-legacy'` AND `lifecycle === 'softCancelled'` means the public commitments API redacts the signed payload (M2) and there's no captured local bundle (own-state SSE plan §M6). Tracked separately from {@link gasDeniedRecoveredSoftCancelWarned} so the `cancel-blocked-missing-payload` telemetry fires once per stuck record. The cancel WILL stay blocked until the operator manually recovers via owner-auth own-state (Phase 2) or the commitment expires; the warned set is pruned each sweep so a record that expired / was filled drops out and a future re-occurrence re-warns. */
+  private readonly missingPayloadCancelBlockedWarned = new Set<string>();
   /**
    * Funding guard (C1a, DESIGN §6): `true` while the wallet can't back its matchable-
    * commitment exposure. Recomputed by `checkFunding()` (throttled, live-only) and
@@ -1533,15 +1535,20 @@ export class Runner {
     const eligible = Object.values(this.state.commitments).filter(
       (r) => r.lifecycle === 'softCancelled' && BigInt(r.filledRiskWei6) > 0n && r.expiryUnixSec > now,
     );
-    // Prune the warned-set to current eligibility so it can't grow unbounded (a record that was
-    // gas-denied and then expired / was cancelled drops out — its hash is removed here).
+    // Prune BOTH warned-sets to current eligibility so they can't grow unbounded (a record that was
+    // gas-denied / missing-payload-blocked and then expired / was cancelled drops out — its hash
+    // is removed here).
     const eligibleHashes = new Set(eligible.map((r) => r.hash));
     for (const h of this.gasDeniedRecoveredSoftCancelWarned) if (!eligibleHashes.has(h)) this.gasDeniedRecoveredSoftCancelWarned.delete(h);
+    for (const h of this.missingPayloadCancelBlockedWarned) if (!eligibleHashes.has(h)) this.missingPayloadCancelBlockedWarned.delete(h);
     for (const record of eligible) {
       const emitGasDenied = !this.gasDeniedRecoveredSoftCancelWarned.has(record.hash); // surface the denial once per stuck record, not every tick
-      const result = await this.onchainCancelCommitment(record, now, { emitGasDenied }); // best-effort; a throw / gas-denial leaves it softCancelled for the next-tick scan
+      const emitMissingPayload = !this.missingPayloadCancelBlockedWarned.has(record.hash); // same once-per-record discipline for the missing-payload block (own-state SSE plan §M6)
+      const result = await this.onchainCancelCommitment(record, now, { emitGasDenied, emitMissingPayload }); // best-effort; a throw / gas-denial / missing-payload block leaves it softCancelled for the next-tick scan
       if (result === 'gas-denied') this.gasDeniedRecoveredSoftCancelWarned.add(record.hash);
-      else this.gasDeniedRecoveredSoftCancelWarned.delete(record.hash); // cancelled or transient — clear so a later denial re-warns
+      else this.gasDeniedRecoveredSoftCancelWarned.delete(record.hash); // cancelled / transient / blocked-missing-payload — clear so a later denial re-warns
+      if (result === 'blocked-missing-payload') this.missingPayloadCancelBlockedWarned.add(record.hash);
+      else this.missingPayloadCancelBlockedWarned.delete(record.hash); // any other outcome means the block doesn't apply (cancelled, denied, or transient) — clear so a future re-occurrence re-warns
     }
   }
 
@@ -1560,7 +1567,26 @@ export class Runner {
    * after the first warning to avoid per-tick spam — see {@link maybeOnchainCancelRecoveredSoftCancels}).
    * The caller owns lifecycle pre-filtering (which records are eligible) and any re-arm.
    */
-  private async onchainCancelCommitment(record: MakerCommitmentRecord, now: number, opts: { emitGasDenied?: boolean } = {}): Promise<'cancelled' | 'gas-denied' | 'transient-failure'> {
+  private async onchainCancelCommitment(record: MakerCommitmentRecord, now: number, opts: { emitGasDenied?: boolean; emitMissingPayload?: boolean } = {}): Promise<'cancelled' | 'gas-denied' | 'transient-failure' | 'blocked-missing-payload'> {
+    // Dispatch FIRST — before spending the gas-budget check on a record we
+    // can't authoritatively cancel anyway. `blocked-missing-payload` is
+    // operator-action-required (own-state SSE plan §M6); no point exercising
+    // any of the downstream paths.
+    const dispatch = dispatchCancel(record);
+    if (dispatch.kind === 'blocked-missing-payload') {
+      if (opts.emitMissingPayload !== false) {
+        this.eventLog.emit('cancel-blocked-missing-payload', {
+          commitmentHash: record.hash,
+          speculationId: record.speculationId,
+          contestId: record.contestId,
+          makerSide: record.makerSide,
+          lifecycle: record.lifecycle,
+          reason: 'missing-legacy-signed-payload-and-hidden',
+          detail: 'state record predates M6/A (no captured signedPayload) AND is book-hidden (lifecycle=softCancelled); the public commitments API redacts the signed fields, so cancelOnchain has no recovery path. Operator action required: recover the payload via owner-auth own-state or wait for expiry.',
+        });
+      }
+      return 'blocked-missing-payload';
+    }
     const maxDailyGasPolWei = polFloatToWei18(this.config.gas.maxDailyGasPOL);
     const emergencyReservePolWei = polFloatToWei18(this.config.gas.emergencyReservePOL);
     const today = todayUTCDateString(now);
@@ -1585,7 +1611,11 @@ export class Runner {
     }
     let result: Awaited<ReturnType<OspexAdapter['cancelCommitmentOnchain']>>;
     try {
-      result = await this.adapter.cancelCommitmentOnchain(record.hash as Hex);
+      // Pass `{ signedCommitment }` when we hold the captured payload (no API fetch, works for book-hidden rows post M2);
+      // fall back to `{ hash }` for migration records (visible only — the SDK fetches + reconstructs).
+      result = await this.adapter.cancelCommitmentOnchain(
+        dispatch.kind === 'use-signed-payload' ? { signedCommitment: dispatch.payload } : { hash: dispatch.hash },
+      );
     } catch (err) {
       this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'onchain-cancel', commitmentHash: record.hash });
       return 'transient-failure';
@@ -1720,6 +1750,15 @@ export class Runner {
   private async submitQuote(m: TrackedMarket, qs: QuoteSide, now: number, expiryUnixSec: number): Promise<MakerCommitmentRecord | null> {
     const proto = toProtocolQuote({ side: qs.takerSide, oddsTick: qs.quoteTick });
     let hash: string;
+    // The SDK's `submitRaw` returns `SubmitResult.signedPayload` (the canonical
+    // EIP-712 bundle — own-state SSE plan §M6) on every live submit. We
+    // capture + persist it here so the cancel paths can use
+    // `cancelOnchainSigned(payload)` without round-tripping the public API —
+    // critical for book-hidden rows post v0.5.0/M2 redaction. Dry-run skips
+    // the SDK entirely (the synthetic `dry:...` hash never goes on chain), so
+    // the persisted record gets `signedPayloadStatus: 'missing-legacy'` and
+    // cancel paths never reach it (dry-run is self-guarded earlier).
+    let signedPayload: MakerSignedPayload | undefined;
     if (this.config.mode.dryRun) {
       this.syntheticCommitmentSeq += 1;
       hash = `dry:${this.eventLog.runId}:${this.syntheticCommitmentSeq}`;
@@ -1735,19 +1774,20 @@ export class Runner {
           expiry: BigInt(expiryUnixSec),
         });
         hash = result.hash;
+        signedPayload = toMakerSignedPayload(result.signedPayload);
       } catch (err) {
         this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'submit', contestId: m.contestId, takerSide: qs.takerSide });
         return null;
       }
     }
-    const record = this.commitmentRecord(m, qs, now, expiryUnixSec, hash, proto);
+    const record = this.commitmentRecord(m, qs, now, expiryUnixSec, hash, proto, signedPayload);
     this.state.commitments[record.hash] = record;
     return record;
   }
 
-  /** Build a `visibleOpen` `MakerCommitmentRecord` for a taker offer (`qs`) at a given commitment `hash`, with the already-computed protocol params (`proto`) — the maker side + odds tick the risk engine accounts against (so the synthetic dry-run record and the real live one have the identical exposure shape). */
-  private commitmentRecord(m: TrackedMarket, qs: QuoteSide, now: number, expiryUnixSec: number, hash: string, proto: ProtocolQuote): MakerCommitmentRecord {
-    return {
+  /** Build a `visibleOpen` `MakerCommitmentRecord` for a taker offer (`qs`) at a given commitment `hash`, with the already-computed protocol params (`proto`) — the maker side + odds tick the risk engine accounts against (so the synthetic dry-run record and the real live one have the identical exposure shape). `signedPayload` is the canonical EIP-712 bundle captured at submit time (M6/A); undefined on a dry-run record (no signing happened) — in that case the discriminant `signedPayloadStatus` is `'missing-legacy'`. */
+  private commitmentRecord(m: TrackedMarket, qs: QuoteSide, now: number, expiryUnixSec: number, hash: string, proto: ProtocolQuote, signedPayload: MakerSignedPayload | undefined): MakerCommitmentRecord {
+    const record: MakerCommitmentRecord = {
       hash,
       speculationId: m.speculationId,
       contestId: m.contestId,
@@ -1763,7 +1803,10 @@ export class Runner {
       expiryUnixSec,
       postedAtUnixSec: now,
       updatedAtUnixSec: now,
+      signedPayloadStatus: signedPayload === undefined ? 'missing-legacy' : 'present',
     };
+    if (signedPayload !== undefined) record.signedPayload = signedPayload;
+    return record;
   }
 
   /** The protocol-side fields of a tracked commitment record, for an event payload. `takerSide` = the offer side a taker would back by matching it (`oppositeSide(makerSide)`); `makerSide` / `makerOddsTick` / `positionType` are what's on chain. */
@@ -3013,9 +3056,29 @@ export class Runner {
         break;
       }
 
+      // Dispatch on signedPayloadStatus + lifecycle (own-state SSE plan §M6):
+      // pre-M6/A records that are hidden are unreachable here — emit the
+      // blocked telemetry and continue to the next record so the kill sweep
+      // doesn't burn gas on a cancel that's guaranteed to fail.
+      const dispatch = dispatchCancel(r);
+      if (dispatch.kind === 'blocked-missing-payload') {
+        this.eventLog.emit('cancel-blocked-missing-payload', {
+          commitmentHash: r.hash,
+          speculationId: r.speculationId,
+          contestId: r.contestId,
+          makerSide: r.makerSide,
+          lifecycle: r.lifecycle,
+          reason: 'missing-legacy-signed-payload-and-hidden',
+          detail: 'shutdown kill swept a record that predates M6/A AND is book-hidden; cancelOnchain has no recovery path. The latent exposure rides to expiry — operator should recover the payload via owner-auth own-state if early cancel is needed.',
+          phase: 'shutdown-kill',
+        });
+        continue;
+      }
       let result: Awaited<ReturnType<OspexAdapter['cancelCommitmentOnchain']>>;
       try {
-        result = await this.adapter.cancelCommitmentOnchain(r.hash as Hex);
+        result = await this.adapter.cancelCommitmentOnchain(
+          dispatch.kind === 'use-signed-payload' ? { signedCommitment: dispatch.payload } : { hash: dispatch.hash },
+        );
       } catch (err) {
         this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'onchain-cancel', commitmentHash: r.hash });
         continue;

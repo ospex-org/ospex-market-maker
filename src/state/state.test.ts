@@ -6,12 +6,17 @@ import { join } from 'node:path';
 import {
   assessStateLoss,
   COMMITMENT_LIFECYCLE_STATES,
+  dispatchCancel,
   emptyMakerState,
   StateStore,
+  toMakerSignedPayload,
+  toSdkSignedPayload,
   type MakerCommitmentRecord,
   type MakerPositionRecord,
+  type MakerSignedPayload,
   type MakerState,
 } from './index.js';
+import type { SignedCommitmentPayload } from '@ospex/sdk';
 
 const STATE_FILE = 'maker-state.json';
 const STATE_TMP = 'maker-state.json.tmp';
@@ -33,6 +38,10 @@ function commitment(overrides: Partial<MakerCommitmentRecord> = {}): MakerCommit
     expiryUnixSec: 1_900_000_000,
     postedAtUnixSec: 1_899_999_880,
     updatedAtUnixSec: 1_899_999_900,
+    // M6/A — default fixtures are 'missing-legacy' (no payload captured).
+    // Tests that exercise the present-payload path override this field along
+    // with `signedPayload`.
+    signedPayloadStatus: 'missing-legacy',
     ...overrides,
   };
 }
@@ -223,5 +232,182 @@ describe('vocabulary', () => {
     for (const s of ['visibleOpen', 'softCancelled', 'partiallyFilled', 'filled', 'expired', 'authoritativelyInvalidated'] as const) {
       expect(COMMITMENT_LIFECYCLE_STATES).toContain(s);
     }
+  });
+});
+
+// ── M6/A: signedPayload persistence + dispatch ──────────────────────────────
+
+function makerSignedPayload(hash: string): MakerSignedPayload {
+  return {
+    commitmentHash: hash,
+    commitment: {
+      maker: '0x'.padEnd(42, 'a'),
+      contestId: '1',
+      scorer: '0xscorer',
+      lineTicks: 0,
+      positionType: 0,
+      oddsTick: 200,
+      riskAmount: '100',
+      nonce: '1',
+      expiry: '2000000000',
+    },
+    signature: '0x' + 'cc'.repeat(65),
+  };
+}
+
+function sdkSignedPayload(hash: string): SignedCommitmentPayload {
+  return {
+    commitmentHash: hash as `0x${string}`,
+    commitment: {
+      maker: '0x'.padEnd(42, 'a') as `0x${string}`,
+      contestId: 1n,
+      scorer: '0xscorer' as `0x${string}`,
+      lineTicks: 0,
+      positionType: 0,
+      oddsTick: 200,
+      riskAmount: 100n,
+      nonce: 1n,
+      expiry: 2_000_000_000n,
+    },
+    signature: ('0x' + 'cc'.repeat(65)) as `0x${string}`,
+  };
+}
+
+describe('toMakerSignedPayload / toSdkSignedPayload roundtrip', () => {
+  it('SDK → maker → SDK preserves every field (bigints decimal-string-encoded on the wire, but the roundtrip is lossless)', () => {
+    const sdk = sdkSignedPayload('0xabc');
+    const maker = toMakerSignedPayload(sdk);
+    // Wire shape: bigints became strings.
+    expect(maker.commitment.contestId).toBe('1');
+    expect(maker.commitment.riskAmount).toBe('100');
+    expect(maker.commitment.nonce).toBe('1');
+    expect(maker.commitment.expiry).toBe('2000000000');
+    // Other fields pass through.
+    expect(maker.commitmentHash).toBe(sdk.commitmentHash);
+    expect(maker.signature).toBe(sdk.signature);
+    expect(maker.commitment.maker).toBe(sdk.commitment.maker);
+
+    // Roundtrip: maker → SDK restores bigints exactly.
+    const roundtripped = toSdkSignedPayload(maker);
+    expect(roundtripped).toEqual(sdk);
+  });
+});
+
+describe('dispatchCancel (own-state SSE plan §M6)', () => {
+  it("'present' → use-signed-payload path with the SDK-canonical bigint shape", () => {
+    const rec = commitment({ signedPayloadStatus: 'present', signedPayload: makerSignedPayload('0xabc'), lifecycle: 'visibleOpen' });
+    const d = dispatchCancel(rec);
+    expect(d.kind).toBe('use-signed-payload');
+    if (d.kind === 'use-signed-payload') {
+      expect(d.payload.commitmentHash).toBe('0xabc');
+      // bigints, not strings — the SDK canonical shape.
+      expect(typeof d.payload.commitment.contestId).toBe('bigint');
+      expect(d.payload.commitment.riskAmount).toBe(100n);
+    }
+  });
+
+  it("'missing-legacy' + visible lifecycle → use-hash path (SDK fetches via public API + reconstructs)", () => {
+    for (const lc of ['visibleOpen', 'partiallyFilled'] as const) {
+      const rec = commitment({ hash: '0xvis', signedPayloadStatus: 'missing-legacy', lifecycle: lc });
+      const d = dispatchCancel(rec);
+      expect(d.kind).toBe('use-hash');
+      if (d.kind === 'use-hash') expect(d.hash).toBe('0xvis');
+    }
+  });
+
+  it("'missing-legacy' + softCancelled → blocked-missing-payload (no public payload, no local bundle)", () => {
+    const rec = commitment({ signedPayloadStatus: 'missing-legacy', lifecycle: 'softCancelled' });
+    const d = dispatchCancel(rec);
+    expect(d.kind).toBe('blocked-missing-payload');
+  });
+
+  it("'present' + softCancelled → still use-signed-payload (the canonical M6/A path for book-hidden cancel)", () => {
+    const rec = commitment({ hash: '0xhid', signedPayloadStatus: 'present', signedPayload: makerSignedPayload('0xhid'), lifecycle: 'softCancelled' });
+    const d = dispatchCancel(rec);
+    expect(d.kind).toBe('use-signed-payload');
+  });
+});
+
+describe('StateStore — signedPayload validator (own-state SSE plan §M6)', () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'mm-state-m6a-'));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  function persistAndLoad(record: unknown): ReturnType<StateStore['load']> {
+    const blob = {
+      version: 1,
+      lastRunId: null,
+      commitments: { '0xabc': record },
+      positions: {},
+      pnl: { realizedUsdcWei6: '0', unrealizedUsdcWei6: '0', asOfUnixSec: 0 },
+      dailyCounters: {},
+      lastFlushedAt: null,
+    };
+    writeFileSync(join(dir, 'maker-state.json'), JSON.stringify(blob), 'utf8');
+    return StateStore.at(dir).load();
+  }
+
+  it('a pre-M6/A record (no signedPayloadStatus, no signedPayload) loads as "missing-legacy" (migration path)', () => {
+    const legacy = {
+      hash: '0xabc', speculationId: 'spec-1', contestId: 'contest-1', sport: 'mlb',
+      awayTeam: 'NYM', homeTeam: 'LAD', scorer: '0xscorer', makerSide: 'away',
+      oddsTick: 191, riskAmountWei6: '250000', filledRiskWei6: '0', lifecycle: 'visibleOpen',
+      expiryUnixSec: 1_900_000_000, postedAtUnixSec: 1_899_999_880, updatedAtUnixSec: 1_899_999_900,
+    };
+    const { state, status } = persistAndLoad(legacy);
+    expect(status.kind).toBe('loaded');
+    expect(state.commitments['0xabc']?.signedPayloadStatus).toBe('missing-legacy');
+    expect(state.commitments['0xabc']?.signedPayload).toBeUndefined();
+  });
+
+  it("status: 'present' + valid signedPayload that matches the record hash loads cleanly", () => {
+    const rec = commitment({ signedPayloadStatus: 'present', signedPayload: makerSignedPayload('0xabc') });
+    const { state, status } = persistAndLoad(rec);
+    expect(status.kind).toBe('loaded');
+    expect(state.commitments['0xabc']?.signedPayload?.commitmentHash).toBe('0xabc');
+  });
+
+  it("status: 'present' WITHOUT signedPayload → state is 'lost' (internal inconsistency)", () => {
+    const broken = { ...commitment({}), signedPayloadStatus: 'present' };
+    const { status } = persistAndLoad(broken);
+    expect(status.kind).toBe('lost');
+    if (status.kind === 'lost') expect(status.reason).toMatch(/signedPayloadStatus is "present" but signedPayload is missing/);
+  });
+
+  it("status: 'missing-legacy' WITH signedPayload → state is 'lost' (would hide the bundle from cancel paths)", () => {
+    const broken = { ...commitment({}), signedPayloadStatus: 'missing-legacy', signedPayload: makerSignedPayload('0xabc') };
+    const { status } = persistAndLoad(broken);
+    expect(status.kind).toBe('lost');
+    if (status.kind === 'lost') expect(status.reason).toMatch(/internal inconsistency/);
+  });
+
+  it('signedPayload.commitmentHash mismatch with record hash → state is "lost" (defends against marking the wrong on-chain slot)', () => {
+    const drift = commitment({ signedPayloadStatus: 'present', signedPayload: makerSignedPayload('0xdifferent') });
+    const { status } = persistAndLoad(drift);
+    expect(status.kind).toBe('lost');
+    if (status.kind === 'lost') expect(status.reason).toMatch(/signedPayload\.commitmentHash/);
+  });
+
+  it('malformed signedPayload (non-decimal contestId) → state is "lost"', () => {
+    const sp = makerSignedPayload('0xabc');
+    const broken = commitment({ signedPayloadStatus: 'present', signedPayload: { ...sp, commitment: { ...sp.commitment, contestId: 'not-a-number' } } });
+    const { status } = persistAndLoad(broken);
+    expect(status.kind).toBe('lost');
+    if (status.kind === 'lost') expect(status.reason).toMatch(/contestId/);
+  });
+
+  it('roundtrip: flush a "present" record then load — signedPayload survives unchanged', () => {
+    const store = StateStore.at(dir);
+    const s = emptyMakerState();
+    s.commitments['0xabc'] = commitment({ signedPayloadStatus: 'present', signedPayload: makerSignedPayload('0xabc') });
+    store.flush(s);
+    const { state, status } = store.load();
+    expect(status.kind).toBe('loaded');
+    expect(state.commitments['0xabc']?.signedPayloadStatus).toBe('present');
+    expect(state.commitments['0xabc']?.signedPayload).toEqual(makerSignedPayload('0xabc'));
   });
 });

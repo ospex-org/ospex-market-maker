@@ -5,7 +5,7 @@
  *
  * One JSON file under `state.dir`, written atomically (temp + rename), pretty-
  * printed so it's human-inspectable. **NOT multi-process safe — one MM per state
- * directory.** Chain / API is truth; on boot the runner loads this file and
+ * directory.**  Chain / API is truth; on boot the runner loads this file and
  * reconciles the rest against on-chain / API reality — *except* the `softCancelled`
  * set, which is **not** reconstructible from chain/API (an off-chain DELETE pulls a
  * quote from the API but doesn't invalidate the signed payload — a taker holding it
@@ -13,14 +13,20 @@
  * So if this file is lost or corrupt, latent matchable exposure is under-counted →
  * the boot-time fail-safe (`assessStateLoss`) holds quoting.
  *
- * Big numbers (risk in USDC 6-decimal wei, gas in POL wei) are stored as decimal
- * strings — same convention as the SDK's AGENT_CONTRACT (they can exceed
- * `Number.MAX_SAFE_INTEGER`). No SDK import here; the runner (Phase 2) is the first
- * real consumer.
+ * Big numbers (risk in USDC 6-decimal wei, gas in POL wei, the 4 EIP-712
+ * commitment bigints on a persisted `signedPayload`) are stored as decimal strings
+ * — same convention as the SDK's AGENT_CONTRACT (they can exceed
+ * `Number.MAX_SAFE_INTEGER`, and `JSON.stringify` refuses native `bigint`). The SDK
+ * import here is type-only — `SignedCommitmentPayload` (M5/PR2) is the protocol
+ * canonical bigint shape; this module holds its on-disk variant
+ * ({@link MakerSignedPayload}, with bigints as decimal strings) plus the
+ * conversion helpers used at the submit / cancel boundaries (own-state SSE plan §M6).
  */
 
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+
+import type { SignedCommitmentPayload, Hex } from '@ospex/sdk';
 
 // ── commitment lifecycle (DESIGN §9) ─────────────────────────────────────────
 
@@ -54,6 +60,158 @@ export type MakerPositionStatus = (typeof MAKER_POSITION_STATUSES)[number];
 /** Which side of a contest a maker item is on (mirrors `src/risk/`'s `MakerSide`). */
 export type MakerSide = 'away' | 'home';
 
+// ── signed payload (own-state SSE plan §M6) ──────────────────────────────────
+
+/**
+ * Disk-friendly form of {@link SignedCommitmentPayload}. The protocol-canonical
+ * type the SDK returns from `submitRaw` / `submitPrepared` (and consumes on
+ * `cancelOnchainSigned`) uses `bigint` for `contestId` / `riskAmount` / `nonce`
+ * / `expiry`, which `JSON.stringify` rejects. The MM persists those four fields
+ * as decimal strings — same convention as the existing `riskAmountWei6`
+ * etc. — and the {@link toMakerSignedPayload} / {@link toSdkSignedPayload}
+ * helpers below bridge the two shapes at the submit / cancel boundaries.
+ *
+ * Stored verbatim on `MakerCommitmentRecord.signedPayload` so the cancel paths
+ * can authoritatively cancel a book-hidden row WITHOUT round-tripping the
+ * public commitments API (which, post v0.5.0/M2 redaction, refuses to leak the
+ * signed payload for `book_visible=false` rows). The 9 EIP-712 fields plus
+ * `commitmentHash` + `signature` are exactly what
+ * `MatchingModule.cancelCommitment` needs.
+ */
+export interface MakerSignedPayload {
+  commitmentHash: string;
+  commitment: {
+    maker: string;
+    /** uint256 as decimal string. */
+    contestId: string;
+    scorer: string;
+    lineTicks: number;
+    positionType: 0 | 1;
+    oddsTick: number;
+    /** uint256 wei6 as decimal string. */
+    riskAmount: string;
+    /** uint256 as decimal string. */
+    nonce: string;
+    /** uint256 (unix seconds) as decimal string. */
+    expiry: string;
+  };
+  signature: string;
+}
+
+/**
+ * Whether {@link MakerCommitmentRecord.signedPayload} is populated.
+ *
+ * - `'present'`: the record was submitted under v0.5.1+ (M6/A) — the canonical
+ *   signed bundle was captured on `submitQuote` and is available for
+ *   `cancelOnchainSigned`. Cancel paths use the local payload, NO public API
+ *   fetch.
+ * - `'missing-legacy'`: the record predates M6/A (loaded from an older state
+ *   file, OR a dry-run synthetic commitment that never went on chain). Cancel
+ *   paths fall back to the SDK's `cancelOnchain({ hash })` for *visible* rows
+ *   (the SDK fetches + reconstructs from the public API), but for *hidden*
+ *   rows (`lifecycle === 'softCancelled'`) there is no recovery path in M6/A
+ *   scope: the cancel is BLOCKED, telemetry fires
+ *   (`cancel-blocked-missing-payload`), and operator action is required.
+ *   Owner-auth `ownState.getCommitment` recovery is queued for Phase 2 when
+ *   the snapshot is already in flight.
+ */
+export const SIGNED_PAYLOAD_STATUSES = ['present', 'missing-legacy'] as const;
+export type SignedPayloadStatus = (typeof SIGNED_PAYLOAD_STATUSES)[number];
+
+/**
+ * Convert the SDK's canonical {@link SignedCommitmentPayload} (bigints) to the
+ * MM's on-disk {@link MakerSignedPayload} (decimal strings). Called by
+ * `submitQuote` after a successful submit — the bundle is captured verbatim
+ * (no hashing / re-signing) for round-trip-safe persistence.
+ */
+export function toMakerSignedPayload(p: SignedCommitmentPayload): MakerSignedPayload {
+  return {
+    commitmentHash: p.commitmentHash,
+    commitment: {
+      maker: p.commitment.maker,
+      contestId: p.commitment.contestId.toString(),
+      scorer: p.commitment.scorer,
+      lineTicks: p.commitment.lineTicks,
+      positionType: p.commitment.positionType,
+      oddsTick: p.commitment.oddsTick,
+      riskAmount: p.commitment.riskAmount.toString(),
+      nonce: p.commitment.nonce.toString(),
+      expiry: p.commitment.expiry.toString(),
+    },
+    signature: p.signature,
+  };
+}
+
+/**
+ * Convert a persisted {@link MakerSignedPayload} (decimal strings) back to the
+ * SDK's canonical {@link SignedCommitmentPayload} (bigints) for
+ * `cancelOnchainSigned`. The decimal-string fields were last validated at
+ * state-load time ({@link validateMakerSignedPayload}); `BigInt(...)` would
+ * still throw on a corrupt value, but the validator's regex already excluded
+ * that.
+ */
+export function toSdkSignedPayload(p: MakerSignedPayload): SignedCommitmentPayload {
+  return {
+    commitmentHash: p.commitmentHash as Hex,
+    commitment: {
+      maker: p.commitment.maker as Hex,
+      contestId: BigInt(p.commitment.contestId),
+      scorer: p.commitment.scorer as Hex,
+      lineTicks: p.commitment.lineTicks,
+      positionType: p.commitment.positionType,
+      oddsTick: p.commitment.oddsTick,
+      riskAmount: BigInt(p.commitment.riskAmount),
+      nonce: BigInt(p.commitment.nonce),
+      expiry: BigInt(p.commitment.expiry),
+    },
+    signature: p.signature as Hex,
+  };
+}
+
+/**
+ * The cancel-path dispatch for one {@link MakerCommitmentRecord} — what the
+ * runner / CLI should hand to {@link OspexAdapter.cancelCommitmentOnchain},
+ * or `blocked-missing-payload` if the record is unreachable via any cancel
+ * path the MM owns. Centralized here so all three on-chain cancel call sites
+ * (`onchainCancelCommitment`, `onchainKillCancel`, `cli/cancel-stale.ts`)
+ * route identically — own-state SSE plan §M6.
+ *
+ * Decision tree:
+ * 1. `signedPayloadStatus === 'present'` → use the captured signed bundle.
+ *    Skips every public API fetch — works for any `book_visible` state, which
+ *    is the whole point of M6.
+ * 2. `signedPayloadStatus === 'missing-legacy'` AND `lifecycle === 'softCancelled'`
+ *    (book-hidden) → BLOCKED. The public commitments API redacts the signed
+ *    fields for hidden rows (M2), so `cancelOnchain({ hash })` would refuse.
+ *    No local payload, no `ownState.subscribe` snapshot in M6/A scope.
+ *    The cancel is unreachable until the operator manually recovers the
+ *    payload via owner-auth own-state (Phase 2) or the commitment expires.
+ * 3. `signedPayloadStatus === 'missing-legacy'` AND any other lifecycle
+ *    (visible: `visibleOpen` / `partiallyFilled`) → use the bare hash; the
+ *    SDK's `cancelOnchain({ hash })` fetches the visible row from the public
+ *    API and reconstructs the signed bundle there. The migration fallback.
+ */
+export type CancelDispatch =
+  | { kind: 'use-signed-payload'; payload: SignedCommitmentPayload }
+  | { kind: 'use-hash'; hash: Hex }
+  | { kind: 'blocked-missing-payload' };
+
+/**
+ * Compute the {@link CancelDispatch} for `record`. Pure — returns the dispatch
+ * shape; the caller is responsible for the actual `adapter.cancelCommitmentOnchain`
+ * call (or the blocked-telemetry emit). See {@link CancelDispatch} for the
+ * decision tree.
+ */
+export function dispatchCancel(record: MakerCommitmentRecord): CancelDispatch {
+  if (record.signedPayloadStatus === 'present' && record.signedPayload !== undefined) {
+    return { kind: 'use-signed-payload', payload: toSdkSignedPayload(record.signedPayload) };
+  }
+  if (record.lifecycle === 'softCancelled') {
+    return { kind: 'blocked-missing-payload' };
+  }
+  return { kind: 'use-hash', hash: record.hash as Hex };
+}
+
 // ── records ──────────────────────────────────────────────────────────────────
 
 /** One posted commitment, tracked by its EIP-712 hash. */
@@ -85,6 +243,24 @@ export interface MakerCommitmentRecord {
   postedAtUnixSec: number;
   /** Unix seconds — when `lifecycle` last changed. */
   updatedAtUnixSec: number;
+  /**
+   * The signed bundle the SDK returned from `submitRaw` (M6/A, own-state SSE
+   * plan §M6) — captured at submit time so cancel paths can use
+   * `cancelOnchainSigned(payload)` instead of round-tripping the public API
+   * (which redacts the signed payload for book-hidden rows post M2). Absent on
+   * dry-run records (no signing happened) and on records loaded from a pre-
+   * M6/A state file (the migration case). The {@link signedPayloadStatus}
+   * discriminant is authoritative.
+   */
+  signedPayload?: MakerSignedPayload;
+  /**
+   * Whether {@link signedPayload} is populated for this record. `'present'`
+   * iff the record was captured under v0.5.1+ on a live submit; otherwise
+   * `'missing-legacy'` (dry-run synthetic, or a record from an older state
+   * file). Cancel paths dispatch on this discriminant — see
+   * {@link SIGNED_PAYLOAD_STATUSES}.
+   */
+  signedPayloadStatus: SignedPayloadStatus;
 }
 
 /** One position the maker holds (one side of a matched pair on a speculation). */
@@ -336,24 +512,105 @@ function validateCommitmentRecord(
   if (!isNonNegInt(value.expiryUnixSec) || !isNonNegInt(value.postedAtUnixSec) || !isNonNegInt(value.updatedAtUnixSec)) {
     return { ok: false, reason: 'expiryUnixSec / postedAtUnixSec / updatedAtUnixSec must be non-negative integers' };
   }
+  // signedPayload + signedPayloadStatus (M6/A — own-state SSE plan §M6).
+  // Migration: a record from a pre-M6/A state file has neither field — accept
+  // and downgrade to 'missing-legacy' (the discriminant tells cancel paths to
+  // route around the missing bundle). The status / payload pair MUST be
+  // consistent — `'present'` requires a structurally-valid payload, and a
+  // `'missing-legacy'` record must NOT carry a payload (that would be an
+  // internal inconsistency: the bundle exists but the record claims it
+  // doesn't, which would silently hide an authoritative cancel path).
+  const hasStatus = value.signedPayloadStatus !== undefined;
+  const hasPayload = value.signedPayload !== undefined;
+  let signedPayloadStatus: SignedPayloadStatus;
+  let signedPayload: MakerSignedPayload | undefined;
+  if (!hasStatus && !hasPayload) {
+    // Legacy state file (pre-M6/A) — accept and downgrade.
+    signedPayloadStatus = 'missing-legacy';
+    signedPayload = undefined;
+  } else {
+    if (!hasStatus) return { ok: false, reason: 'signedPayload is set but signedPayloadStatus is missing (record is from M6/A or later — both fields must be present together)' };
+    if (typeof value.signedPayloadStatus !== 'string' || !(SIGNED_PAYLOAD_STATUSES as readonly string[]).includes(value.signedPayloadStatus)) {
+      return { ok: false, reason: `signedPayloadStatus ${describe(value.signedPayloadStatus)} is not a known status (expected ${SIGNED_PAYLOAD_STATUSES.map((s) => `"${s}"`).join(' or ')})` };
+    }
+    signedPayloadStatus = value.signedPayloadStatus as SignedPayloadStatus;
+    if (signedPayloadStatus === 'present') {
+      if (!hasPayload) return { ok: false, reason: 'signedPayloadStatus is "present" but signedPayload is missing' };
+      const sp = validateMakerSignedPayload(value.signedPayload);
+      if (!sp.ok) return { ok: false, reason: `signedPayload is malformed: ${sp.reason}` };
+      // Cross-check: the payload's commitmentHash must equal the record's
+      // hash. A drift here means the bundle is for a different commitment —
+      // signing it would mark the wrong slot in MatchingModule's
+      // s_cancelledCommitments.
+      if (sp.payload.commitmentHash !== key) return { ok: false, reason: `signedPayload.commitmentHash ${describe(sp.payload.commitmentHash)} does not match the record hash ${describe(key)}` };
+      signedPayload = sp.payload;
+    } else {
+      // status = 'missing-legacy' — payload MUST be absent.
+      if (hasPayload) return { ok: false, reason: 'signedPayloadStatus is "missing-legacy" but signedPayload is set (internal inconsistency — would hide the bundle from cancel paths)' };
+      signedPayload = undefined;
+    }
+  }
+  const record: MakerCommitmentRecord = {
+    hash: key,
+    speculationId: value.speculationId,
+    contestId: value.contestId,
+    sport: value.sport,
+    awayTeam: value.awayTeam,
+    homeTeam: value.homeTeam,
+    scorer: value.scorer,
+    makerSide: value.makerSide,
+    oddsTick: value.oddsTick,
+    riskAmountWei6: value.riskAmountWei6,
+    filledRiskWei6: value.filledRiskWei6,
+    lifecycle: value.lifecycle as CommitmentLifecycle,
+    expiryUnixSec: value.expiryUnixSec,
+    postedAtUnixSec: value.postedAtUnixSec,
+    updatedAtUnixSec: value.updatedAtUnixSec,
+    signedPayloadStatus,
+  };
+  if (signedPayload !== undefined) record.signedPayload = signedPayload;
+  return { ok: true, record };
+}
+
+/**
+ * Validate a persisted {@link MakerSignedPayload} (decimal-string-encoded
+ * bigints, hex-string-encoded addresses + signature). Returns the validated
+ * payload on success — does NOT cross-check against the parent record (the
+ * caller does the `commitmentHash === record.hash` check). Fail-closed: any
+ * malformed field rejects the whole payload.
+ */
+function validateMakerSignedPayload(
+  value: unknown,
+): { ok: true; payload: MakerSignedPayload } | { ok: false; reason: string } {
+  if (!isPlainObject(value)) return { ok: false, reason: 'not an object' };
+  if (typeof value.commitmentHash !== 'string') return { ok: false, reason: 'commitmentHash must be a string' };
+  if (typeof value.signature !== 'string') return { ok: false, reason: 'signature must be a string' };
+  if (!isPlainObject(value.commitment)) return { ok: false, reason: 'commitment must be an object' };
+  const c = value.commitment;
+  if (typeof c.maker !== 'string' || typeof c.scorer !== 'string') return { ok: false, reason: 'commitment.maker / commitment.scorer must be strings' };
+  if (!isDecimalString(c.contestId)) return { ok: false, reason: `commitment.contestId ${describe(c.contestId)} must be a non-negative decimal string` };
+  if (!isDecimalString(c.riskAmount)) return { ok: false, reason: `commitment.riskAmount ${describe(c.riskAmount)} must be a non-negative decimal string` };
+  if (!isDecimalString(c.nonce)) return { ok: false, reason: `commitment.nonce ${describe(c.nonce)} must be a non-negative decimal string` };
+  if (!isDecimalString(c.expiry)) return { ok: false, reason: `commitment.expiry ${describe(c.expiry)} must be a non-negative decimal string` };
+  if (typeof c.lineTicks !== 'number' || !Number.isInteger(c.lineTicks)) return { ok: false, reason: `commitment.lineTicks ${describe(c.lineTicks)} must be an integer` };
+  if (c.positionType !== 0 && c.positionType !== 1) return { ok: false, reason: `commitment.positionType ${describe(c.positionType)} must be 0 or 1` };
+  if (!isOddsTick(c.oddsTick)) return { ok: false, reason: `commitment.oddsTick ${describe(c.oddsTick)} is not an integer in the protocol's [${MIN_ODDS_TICK}, ${MAX_ODDS_TICK}] range` };
   return {
     ok: true,
-    record: {
-      hash: key,
-      speculationId: value.speculationId,
-      contestId: value.contestId,
-      sport: value.sport,
-      awayTeam: value.awayTeam,
-      homeTeam: value.homeTeam,
-      scorer: value.scorer,
-      makerSide: value.makerSide,
-      oddsTick: value.oddsTick,
-      riskAmountWei6: value.riskAmountWei6,
-      filledRiskWei6: value.filledRiskWei6,
-      lifecycle: value.lifecycle as CommitmentLifecycle,
-      expiryUnixSec: value.expiryUnixSec,
-      postedAtUnixSec: value.postedAtUnixSec,
-      updatedAtUnixSec: value.updatedAtUnixSec,
+    payload: {
+      commitmentHash: value.commitmentHash,
+      commitment: {
+        maker: c.maker,
+        contestId: c.contestId,
+        scorer: c.scorer,
+        lineTicks: c.lineTicks,
+        positionType: c.positionType as 0 | 1,
+        oddsTick: c.oddsTick,
+        riskAmount: c.riskAmount,
+        nonce: c.nonce,
+        expiry: c.expiry,
+      },
+      signature: value.signature,
     },
   };
 }

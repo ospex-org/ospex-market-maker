@@ -635,10 +635,12 @@ describe('OspexAdapter — write surface', () => {
     expect(received).toBe('0xabc');
   });
 
-  it('cancelCommitmentOnchain forwards { hash } to commitments.cancelOnchain and returns its result', async () => {
+  it('cancelCommitmentOnchain forwards { hash } through to commitments.cancelOnchain and returns its result', async () => {
     // SDK v0.5.0 (M5/PR2) made `cancelOnchain` a discriminated overload
-    // (`{ hash } | { signedCommitment }`); the adapter bridges bare-Hex
-    // → `{ hash }` form. Assertion shape reflects the new wire.
+    // (`{ hash } | { signedCommitment }`). M6/A (own-state SSE plan §M6)
+    // re-shaped the MM adapter to accept the same overload too, so the
+    // caller passes the discriminated argument straight through — no more
+    // bare-Hex bridging.
     let received: unknown = null;
     const result = { txHash: '0xtx' as Hex, receipt: {} as unknown as never, commitmentHash: '0xabc' as Hex };
     const adapter = liveAdapterWith({
@@ -649,7 +651,7 @@ describe('OspexAdapter — write surface', () => {
         },
       },
     });
-    expect(await adapter.cancelCommitmentOnchain('0xabc')).toBe(result);
+    expect(await adapter.cancelCommitmentOnchain({ hash: '0xabc' })).toBe(result);
     expect(received).toEqual({ hash: '0xabc' });
   });
 

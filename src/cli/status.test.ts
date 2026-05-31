@@ -49,6 +49,9 @@ function rec(hash: string, overrides: Partial<MakerCommitmentRecord> = {}): Make
     oddsTick: 200,
     riskAmountWei6: '1000000',
     filledRiskWei6: '0',
+    // M6/A — fixture default; status-rendering tests don't exercise the
+    // signed-payload cancel path.
+    signedPayloadStatus: 'missing-legacy',
     lifecycle: 'visibleOpen',
     expiryUnixSec: T0 + 600,
     postedAtUnixSec: T0 - 60,

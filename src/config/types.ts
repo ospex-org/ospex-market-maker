@@ -100,6 +100,18 @@ export interface OddsConfig {
  */
 export interface OwnStateConfig {
   /**
+   * Open the maker's owner-authenticated own-state SSE stream at boot
+   * (Phase 2 PR4a). Default `false` — Phase 2 is opt-in until the comparator
+   * (PR5) is wired and soak-validated. When `true`, the runner refuses to
+   * boot in dry-run / without a `makerAddress` (the SDK's bearer-token mint
+   * needs a signer that owns the configured address).
+   *
+   * Phase 2 shadow-only invariant: when the stream is open, events flow into
+   * `OwnStateShadow` ONLY — canonical `MakerState` writes still come from
+   * the poll path. Phase 3 cutover flips the source.
+   */
+  subscribe: boolean;
+  /**
    * Coalescing window after a wake fires before the loop drains the queue
    * (own-state-sse-plan §2.5.1). Range 250-1000ms; default 500ms.
    * Hermes-endorsed: prevents tight wake-drain churn under burst load while

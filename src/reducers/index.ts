@@ -45,6 +45,7 @@ export type {
   OwnStateShadow,
   ShadowCommitment,
   ShadowPosition,
+  ShadowTransportStatus,
   OwnerCommitmentBody,
   OwnerFillBody,
   OwnerPositionStatusBody,

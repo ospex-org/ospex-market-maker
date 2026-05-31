@@ -38,6 +38,9 @@ export interface ShadowPosition {
   status: MakerPositionStatus;
 }
 
+/** Transport-level status delivered by the SDK's `onStatus` handler. */
+export type ShadowTransportStatus = 'connected' | 'reconnecting' | 'degraded' | 'resync';
+
 /**
  * Projection of canonical state built from the SSE stream. Distinct object identity
  * from `MakerState` (the typed contract): passing `state: MakerState` into an
@@ -46,7 +49,8 @@ export interface ShadowPosition {
  *
  * Phase 2: process-lifetime (no disk persistence — cold restart re-snapshots
  * cleanly; `MakerCommitmentRecord.fills[]` from PR1 covers in-process replay
- * dedup). Shape will be finalized + frozen in PR4.
+ * dedup). Shape extended in PR4a for `lastStatus` / `lastError` (transport
+ * health surface for PR5 comparator preconditions).
  */
 export interface OwnStateShadow {
   /** `false` until `onReady` fires (the snapshot has fully baselined), or while a resync is pending. */
@@ -72,6 +76,20 @@ export interface OwnStateShadow {
   lastReadyAtMs: number;
   /** Surfaced from the latest snapshot (`PR4` `onReady`). */
   truncated: boolean;
+  /**
+   * Last transport status reported by the SDK's `onStatus` handler. `null`
+   * until the first status fires (post-boot). Used by the PR5 comparator
+   * alongside `healthy` + `ready` to decide whether to suppress divergence
+   * telemetry.
+   */
+  lastStatus: ShadowTransportStatus | null;
+  /**
+   * Last transport error reported by the SDK's `onError` handler. `null`
+   * until an error fires; cleared when the next `onStatus: 'connected'`
+   * fires. Carries the error class + detail string; reasons surfaced by
+   * `OspexStreamError` map to the typed field.
+   */
+  lastError: { class: string; detail: string; reason: string; recordedAtMs: number } | null;
 }
 
 /** Owner commitment-body event shape — finalized in PR4 against the SDK's `ownState.subscribe` body types. */
@@ -152,5 +170,7 @@ export function emptyOwnStateShadow(): OwnStateShadow {
     lastHeartbeatAtMs: 0,
     lastReadyAtMs: 0,
     truncated: false,
+    lastStatus: null,
+    lastError: null,
   };
 }

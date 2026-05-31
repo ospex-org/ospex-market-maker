@@ -230,6 +230,7 @@ function makeFakeClient(overrides: DeepPartial<OspexClientLike> = {}): OspexClie
     approvals: { read: notStubbed('approvals.read'), ...overrides.approvals },
     health: { check: notStubbed('health.check'), ...overrides.health },
     odds: { snapshot: notStubbed('odds.snapshot'), subscribe: notStubbed('odds.subscribe'), ...overrides.odds },
+    ownState: { subscribe: () => ({ unsubscribe: () => Promise.reject(new Error('fake.ownState.subscribe: not stubbed in this test')) }), ...overrides.ownState },
   };
 }
 
@@ -427,6 +428,30 @@ describe('OspexAdapter — odds (snapshot + subscribe)', () => {
     expect(capturedHandlers!.onRefresh).toBeUndefined();
     expect(capturedHandlers!.onStatus).toBeUndefined();
     expect(capturedHandlers!.onError).toBeUndefined();
+  });
+});
+
+// ── own-state SSE subscribe passthrough (Phase 2 PR4a) ───────────────────────
+
+describe('OspexAdapter — subscribeOwnState', () => {
+  it('passes through options + handlers to client.ownState.subscribe and returns the Subscription SYNCHRONOUSLY', () => {
+    let capturedOptions: unknown = null;
+    let capturedHandlers: unknown = null;
+    const stubSubscription = { unsubscribe: () => Promise.resolve() };
+    const adapter = adapterWith({
+      ownState: {
+        subscribe: (opts, handlers) => {
+          capturedOptions = opts;
+          capturedHandlers = handlers;
+          return stubSubscription;
+        },
+      },
+    });
+    const handlers = { onReady: () => {} };
+    const sub = adapter.subscribeOwnState({ address: '0xabcdef' as Hex }, handlers);
+    expect(capturedOptions).toEqual({ address: '0xabcdef' });
+    expect(capturedHandlers).toBe(handlers);
+    expect(sub).toBe(stubSubscription);
   });
 });
 

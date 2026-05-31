@@ -17,6 +17,7 @@ describe('parseConfig', () => {
     expect(c.discovery.everyNTicks).toBe(10);
     expect(c.odds.subscribe).toBe(true);
     expect(c.odds.maxRealtimeChannels).toBe(5);
+    expect(c.ownState.subscribe).toBe(false);
     expect(c.ownState.debounceMs).toBe(500);
     expect(c.pricing.mode).toBe('economics');
     expect(c.pricing.quoteBothSides).toBe(true);

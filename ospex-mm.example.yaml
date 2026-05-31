@@ -45,6 +45,10 @@ ownState:
   debounceMs: 500                  # Phase 2 PR3 — coalescing window (250-1000ms) after a wake fires before the runner drains the
                                    #   shadow queue. SSE bursts of N events within this window collapse to a single drain pass.
                                    #   Phase 2 ships shadow-only — no canonical-state writes, no trading-timing changes.
+  divergenceToleranceMs: 5000      # Phase 2 PR5 — comparator suppresses divergences while EITHER the shadow-side last observation
+                                   #   OR the poll-side last observation is within this window (1000-60000ms; default 5000).
+                                   #   Persistent mismatch past this window is emitted regardless. Tune up if your poll interval is
+                                   #   large + SSE-vs-poll skew is expected; tune down for tighter divergence detection.
 
 pricing:
   mode: economics                  # "economics" (derive spread from your return target) or "direct"

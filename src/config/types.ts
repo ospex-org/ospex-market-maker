@@ -118,6 +118,16 @@ export interface OwnStateConfig {
    * keeping shadow-vs-canonical divergence detectable within one poll interval.
    */
   debounceMs: number;
+  /**
+   * Tolerance window for the Phase 2 PR5 shadow-vs-canonical comparator
+   * (own-state-sse-plan §6.3). A divergence is SUPPRESSED while EITHER the
+   * shadow-side last observation OR the poll-side last observation is within
+   * this window — both sides may legitimately see the same on-chain truth at
+   * slightly different walltimes; tolerance suppresses transient skew.
+   * Persistent mismatch (divergence age >= toleranceMs) is emitted regardless.
+   * Range 1000-60000ms; default 5000ms.
+   */
+  divergenceToleranceMs: number;
 }
 
 export interface EconomicsConfig {

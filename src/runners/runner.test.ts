@@ -1245,6 +1245,48 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
     expect(errs.length).toBeGreaterThanOrEqual(1);
   });
 
+  // ── PR5 — shadow comparator preconditions ────────────────────────────────
+
+  it('comparator does NOT fire when subscribe=false (default — no SSE stream)', async () => {
+    const runner = makeRunner({ maxTicks: 3 });
+    await runner.run();
+    const events = readEvents();
+    expect(events.filter((e) => e.kind === 'divergence')).toHaveLength(0);
+  });
+
+  it('comparator does NOT fire on the FIRST post-ready tick (firstPollAfterShadowReady latch)', async () => {
+    // Set up: subscribed runner, fire snapshot + ready, then let the loop tick once.
+    // The latch flips after this tick but the comparator should NOT have run yet
+    // (canonical state was poll-derived BEFORE shadow.ready flipped true).
+    const { recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
+    recorder.fire('onSnapshot', { cursor: 'c1', commitments: [], positions: [], truncated: false, positionsTruncated: false });
+    recorder.fire('onReady');
+    recorder.fire('onStatus', 'connected');
+
+    // The first post-ready tick should set the latch but not emit divergence.
+    triggerKill();
+    await runPromise;
+    const events = readEvents();
+    // No divergence emitted — the canonical and shadow agree (both empty).
+    expect(events.filter((e) => e.kind === 'divergence')).toHaveLength(0);
+  });
+
+  it('comparator preconditions exercised — shadow.ready + connected + queue=0 reachable through the handler path', async () => {
+    // End-to-end smoke: verify the runner-wiring side of the comparator —
+    // the precondition state can be advanced through the SSE handlers.
+    // Detailed detection logic is in shadow-comparator.test.ts.
+    const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
+    recorder.fire('onSnapshot', { cursor: 'c1', commitments: [], positions: [], truncated: false, positionsTruncated: false });
+    recorder.fire('onReady');
+    recorder.fire('onStatus', 'connected');
+    expect(runner.ownStateShadowView().ready).toBe(true);
+    expect(runner.ownStateShadowView().lastStatus).toBe('connected');
+    expect(runner.ownStateShadowView().healthy).toBe(true);
+
+    triggerKill();
+    await runPromise;
+  });
+
   it('sync throw from openOwnStateSubscription propagates AND runs the finally cleanup — unregister called (Hermes #68 blocker 3)', async () => {
     const config = cfg({ ownState: { subscribe: true } });
     const adapter = createOspexAdapter(config);

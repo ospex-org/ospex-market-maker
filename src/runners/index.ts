@@ -139,6 +139,7 @@ import {
   type ShadowTransportStatus,
 } from '../reducers/index.js';
 import { OwnStateQueue } from './own-state-queue.js';
+import { compareShadowVsCanonical, type TrackedDivergence } from './shadow-comparator.js';
 import { WakeSignal } from './wake-signal.js';
 import { canSpendGas, requiredPositionModuleAllowanceUSDC, type Market } from '../risk/index.js';
 import { assessStateLoss, dispatchCancel, fillDedupKey, toMakerSignedPayload, type CancelDispatch, type MakerCommitmentRecord, type MakerSide, type MakerSignedPayload, type MakerState, type StateLossAssessment, type StateStore } from '../state/index.js';
@@ -410,6 +411,26 @@ export class Runner {
    * cutover when `reduceOwnerFill` starts appending to canonical `fills[]`.
    */
   private readonly ownStateDedupSet = new Set<string>();
+  /**
+   * Per-tick comparator state (Phase 2 PR5 — own-state-sse-plan §6.3). Tracks
+   * each persisting divergence so the tolerance window can suppress transient
+   * skew while persistent mismatch is emitted regardless of source-side freshness.
+   */
+  private readonly divergenceTracker = new Map<string, TrackedDivergence>();
+  /**
+   * Wall-clock ms (`Date.now()`) of the last completed post-tick `drainShadow`
+   * — the comparator uses this as "the poll side last observed at..." for the
+   * tolerance window. `0` until the first tick completes.
+   */
+  private lastPollObsAtMs = 0;
+  /**
+   * Latch — `true` once at least one tick has completed AFTER `shadow.ready`
+   * flipped true. The comparator suppresses until this is set so a fresh
+   * shadow isn't compared against stale canonical-state (the comparator would
+   * spuriously report divergence for every row before the next poll refreshes).
+   * Cleared on resync (`shadow.ready = false`).
+   */
+  private firstPollAfterShadowReady = false;
   /**
    * Projection of canonical state built from the SSE stream (Phase 2 PR2 type;
    * PR4 wires the SSE feed). Distinct object identity from `this.state` so the
@@ -1057,6 +1078,11 @@ export class Runner {
         this.drainShadow(); // own-state-sse-plan §"Drain placement" — pre-tick drain
         await this.tick(ticks);
         this.drainShadow(); // §"Drain placement" — post-tick drain catches events that arrived during tick IO
+        // Phase 2 PR5 — comparator pass. Records that this tick completed (lastPollObsAtMs),
+        // latches firstPollAfterShadowReady when applicable, and runs the comparator
+        // when preconditions hold. Phase 2 invariant: comparator is read-only on both
+        // sides — only emits `divergence` telemetry, never alters canonical state.
+        this.runShadowComparator();
         if (this.stopRequested) break;
         if (this.maxTicks !== undefined && ticks >= this.maxTicks) break;
         // Phase 2 PR3 — wakeable wait. A wake interrupts the sleep but does NOT
@@ -2660,6 +2686,11 @@ export class Runner {
       // dispatch real (was a no-op stub in PR3), so this scenario is now a
       // shadow-correctness issue rather than a latent one.
       this.ownStateQueue.clear();
+      // Phase 2 PR5 — reset the firstPollAfterShadowReady latch + drop the
+      // divergence tracker. After resync, the comparator must wait for the
+      // post-resync `onReady` AND at least one poll-tick before re-comparing.
+      this.firstPollAfterShadowReady = false;
+      this.divergenceTracker.clear();
     } else if (status === 'degraded') {
       this.ownStateShadow.healthy = false;
     } else if (status === 'connected') {
@@ -2704,6 +2735,62 @@ export class Runner {
       phase: 'own-state-stream',
     });
     this.wakeSignal.wake();
+  }
+
+  /**
+   * Run the Phase 2 PR5 shadow-vs-canonical comparator (own-state-sse-plan §6.3).
+   * Called once per tick AFTER the post-tick `drainShadow`. Records the
+   * poll-side observation timestamp, latches `firstPollAfterShadowReady`
+   * when appropriate, and runs the comparator when the precondition gate
+   * holds. Comparator output (an aggregated `divergence` payload OR `null`)
+   * drives a single `divergence` telemetry emit per tick.
+   *
+   * Precondition gate (Hermes-required):
+   *   - `config.ownState.subscribe: true` — the stream is even opted in;
+   *   - `shadow.ready` — the snapshot baseline has fully swapped in;
+   *   - `shadow.healthy` — no overflow / fatal / positionsTruncated;
+   *   - `shadow.lastStatus === 'connected'` — transport is settled;
+   *   - `ownStateQueue.size === 0` — no pending events would alter the shadow;
+   *   - `firstPollAfterShadowReady` — at least one tick has completed since
+   *     `shadow.ready` flipped true (otherwise canonical is stale relative
+   *     to a fresh shadow and every row reads as divergent).
+   *
+   * Phase 2 invariant: comparator is read-only on both states. Only `divergence`
+   * telemetry is emitted; no `MakerState` writes; no quote-timing changes.
+   */
+  private runShadowComparator(): void {
+    const nowMs = Date.now();
+    // Record this tick's poll-side observation timestamp regardless of whether
+    // we'll compare — the next compareShadowVsCanonical call needs it.
+    this.lastPollObsAtMs = nowMs;
+    // Latch firstPollAfterShadowReady: this tick just completed a pre+tick+post
+    // drainShadow cycle with `shadow.ready === true`; the canonical side is
+    // now post-ready, so the comparator can fire on the NEXT iteration.
+    if (this.ownStateShadow.ready && !this.firstPollAfterShadowReady) {
+      this.firstPollAfterShadowReady = true;
+      // Don't compare on the same tick the latch first flips — give the next
+      // tick's pre-drainShadow + tick a chance to refresh canonical first.
+      // (The plan's wording: "firstPollAfterReadyDone — need ≥1 poll completed
+      // since shadow became ready". Setting the latch this tick means the
+      // poll completed this tick; the comparator runs FROM the next tick.)
+      return;
+    }
+    if (!this.config.ownState.subscribe) return;
+    if (!this.ownStateShadow.ready) return;
+    if (!this.ownStateShadow.healthy) return;
+    if (this.ownStateShadow.lastStatus !== 'connected') return;
+    if (this.ownStateQueueSizeForTest() !== 0) return;
+    if (!this.firstPollAfterShadowReady) return;
+    const payload = compareShadowVsCanonical(
+      this.state,
+      this.ownStateShadow,
+      this.divergenceTracker,
+      nowMs,
+      this.config.ownState.divergenceToleranceMs,
+      this.lastPollObsAtMs,
+    );
+    if (payload === null) return;
+    this.eventLog.emit('divergence', payload as unknown as Record<string, unknown>);
   }
 
   /**

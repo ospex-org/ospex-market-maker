@@ -287,6 +287,12 @@ ReplaceReason:   'stale' | 'mispriced'
 
 Path: `<state.dir>/maker-state.json`. Atomic write (temp + rename). Single-writer; not multi-process safe. Loaded at boot via `StateStore.load()` which returns `{state, status: {kind: 'loaded' | 'fresh' | 'lost', reason?}}` — `lost` means the file exists but failed validation.
 
+> ⚠️ **Sensitive bearer-credential state (own-state SSE plan §M6).** Post-M6/A, each commitment record persists the SDK's canonical signed bundle (`signedPayload` — EIP-712 signature + the inner typed-data struct). That bundle is exactly what `MatchingModule.matchCommitment` needs to fill the commitment, so anyone with read access to this file can fill the maker's still-matchable commitments until they expire / fill / are cancelled. Agents and scripts parsing this file:
+>
+> - **Must NEVER paste the file (or any record's `signedPayload` / `signature` / `commitment` subtree) into issues, PRs, chat, logs, or any artifact channel.** It's a bearer credential.
+> - The file is created at POSIX mode `0o600` from birth (`StateStore.flush` uses `O_WRONLY|O_CREAT|O_EXCL` + post-create POSIX sanity check) and the operator restricts the `state.dir` parent ACL on Windows. The full operator playbook is in [`docs/OPERATOR_SAFETY.md`](./docs/OPERATOR_SAFETY.md#sensitive-local-state).
+> - The MM's `EventLog.emit` (the NDJSON writer that feeds the scorecard) throws on denied keys (`signature` / `signedPayload` / `commitment` / `nonce`) and redacts 65-byte ECDSA signature substrings and JSON-shape signing-key markers in every string value, so telemetry output stays safe to share even if an upstream error message incidentally quotes a signature. The state file does NOT have this protection — it's the raw bundle.
+
 ### 4.1 Schema
 
 ```typescript
@@ -318,6 +324,31 @@ interface MakerCommitmentRecord {
   expiryUnixSec: number;
   postedAtUnixSec: number;
   updatedAtUnixSec: number;
+  // M6/A — own-state SSE plan §M6. Bearer-credential material; see §4 warning.
+  signedPayload?: MakerSignedPayload;   // present iff signedPayloadStatus === 'present'
+  signedPayloadStatus: SignedPayloadStatus; // REQUIRED — authoritative discriminant for the cancel path
+}
+
+// The SDK's canonical SignedCommitmentPayload, persisted with the four bigint
+// fields encoded as decimal strings (JSON.stringify rejects native bigints).
+// Stored verbatim so cancel paths can call cancelCommitmentOnchain({signedCommitment})
+// without round-tripping the public commitments API (which redacts hidden rows
+// post v0.5.0/M2). The validator cross-checks signedPayload.commitmentHash ===
+// record.hash on load; a drift fails the file as `lost`.
+interface MakerSignedPayload {
+  commitmentHash: string;           // 0x-prefixed; equals the parent record's hash
+  commitment: {
+    maker: string;                  // 0x-prefixed address
+    contestId: string;              // uint256 as decimal string
+    scorer: string;                 // 0x-prefixed address
+    lineTicks: number;              // signed int
+    positionType: 0 | 1;            // 0=home, 1=away (per Ospex protocol)
+    oddsTick: number;               // uint16 in [101, 10100]
+    riskAmount: string;             // uint256 wei6 as decimal string
+    nonce: string;                  // uint256 as decimal string
+    expiry: string;                 // uint256 (unix seconds) as decimal string
+  };
+  signature: string;                // 0x-prefixed 65-byte ECDSA signature (132 chars total)
 }
 
 interface MakerPositionRecord {
@@ -342,6 +373,8 @@ CommitmentLifecycle: 'visibleOpen' | 'softCancelled' | 'partiallyFilled'
                    | 'filled' | 'expired' | 'authoritativelyInvalidated'
 
 MakerPositionStatus: 'active' | 'pendingSettle' | 'claimable' | 'claimed'
+
+SignedPayloadStatus: 'present' | 'missing-legacy'
 ```
 
 **Lifecycle invariants**:
@@ -349,6 +382,10 @@ MakerPositionStatus: 'active' | 'pendingSettle' | 'claimable' | 'claimed'
 - `softCancelled` records are pulled from the API book but **still matchable on chain** until expiry. The risk engine counts their exposure at the *remaining* (`risk − filled`): a soft-cancelled commitment can itself match on chain via its stale signed payload, so `reconcileSoftCancelledFills` converges `filledRiskWei6` from the authoritative cumulative — the record **stays `softCancelled`** (a partial fill does **not** promote it to `partiallyFilled`; promoting a book-hidden row into the visible-commitment set would let `detectFills`'s disappeared-hash path read its effective `cancelled` and wrongly release the remainder). Only a full fill terminalizes it (`filled`).
 - `partiallyFilled` is **never off-chain-cancelled by the MM** — once a commitment has matched, the API rejects the DELETE (`409 COMMITMENT_MATCHED`), so the MM never *pulls* a matched commitment into `softCancelled`. It moves only to `filled` (fully matched), `expired`, or `authoritativelyInvalidated` (on-chain cancel / nonce raise). Off-chain soft-cancel applies to `visibleOpen` only. (Distinct path: if `detectFills` finds a tracked `visibleOpen`/`partiallyFilled` row *already* book-hidden — effective `cancelled`, but `storedStatus` open/`partially_filled` and not nonce-invalidated, e.g. an out-of-band off-chain DELETE — it **adopts** the row as `softCancelled` rather than releasing it, since the signed payload stays matchable on chain.)
 - `filled`, `expired`, `authoritativelyInvalidated` — **terminal**; headroom released. Pruned from state after `max(3600, 10 × orders.expirySeconds)` seconds.
+
+**`signedPayloadStatus` invariants** (own-state SSE plan §M6/A):
+- `'present'` — the SDK's canonical signed bundle is captured locally on submit. Cancel paths use `cancelCommitmentOnchain({signedCommitment: ...})` directly; no public-API round-trip needed. Set on every live submit at and after MM v0.5.1+ pin. Cross-check enforced at state load: `signedPayload.commitmentHash === record.hash` (drift fails the file as `lost`).
+- `'missing-legacy'` — the record predates M6/A (loaded from an older state file) OR is a dry-run synthetic (no signing happened). `signedPayload` is absent. Cancel dispatch (`dispatchCancel(record)` in `src/state/index.ts`) routes by lifecycle: `visibleOpen` / `partiallyFilled` fall back to `cancelCommitmentOnchain({hash})` (the SDK fetches + reconstructs from the public commitments API); `softCancelled` is BLOCKED (the public API redacts hidden rows post v0.5.0/M2) — a `cancel-blocked-missing-payload` telemetry event fires for operator action. Operators upgrading from a pre-0.5.1 MM should consult [`docs/OPERATOR_SAFETY.md`](./docs/OPERATOR_SAFETY.md#migration-from-a-pre-051-mm-state-file-with-no-signedpayload).
 
 ### 4.3 State-loss model
 

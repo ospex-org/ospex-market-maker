@@ -40,6 +40,8 @@ export {
   reduceOwnerFill,
   reduceOwnerPositionStatus,
   emptyOwnStateShadow,
+  projectOwnerCommitment,
+  projectOwnerPosition,
 } from './owner.js';
 export type {
   OwnStateShadow,

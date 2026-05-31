@@ -904,7 +904,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
     const adapter = createOspexAdapter(config);
     vi.spyOn(adapter, 'listContests').mockResolvedValue([]);
     vi.spyOn(adapter, 'subscribeOwnState').mockImplementation(recorder.subscribe);
-    const { sleep, sleepCalls } = controllableSleep();
+    const { sleep, sleepCalls, resolvers } = controllableSleep();
     let triggerKill!: () => void;
     const runner = makeRunner({
       config, adapter, maxTicks: 100,
@@ -916,7 +916,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
     });
     const runPromise = runner.run();
     await waitFor(() => sleepCalls.length >= 1);
-    return { runner, recorder, runPromise, triggerKill: () => triggerKill() };
+    return { runner, recorder, runPromise, sleepCalls, resolvers, triggerKill: () => triggerKill() };
   }
 
   it('multi-page snapshot accumulates into pendingBaseline; onReady atomically swaps into shadow.commitments + shadow.positions', async () => {
@@ -1109,6 +1109,97 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
     expect(runner.ownStateShadowView().healthy).toBe(false);
     triggerKill();
     await runPromise;
+  });
+
+  // ── PR4b — drainShadow dispatch + dedup-set boot construction ───────────
+
+  it('drainShadow dispatches commitment/fill/positionStatus events to owner reducers (Phase 2 PR4b)', async () => {
+    const { runner, recorder, runPromise, sleepCalls, resolvers, triggerKill } = await makePausedSubscribedRunner();
+
+    // Fire a snapshot so the shadow is ready (otherwise the reducer mutations
+    // would happen but be harder to observe without ready=true). Bring up
+    // ready first so the dispatch path is meaningful.
+    recorder.fire('onSnapshot', {
+      cursor: 'c1',
+      commitments: [{
+        ownerAuthorized: true, visibility: 'visible', redacted: false,
+        commitmentHash: '0xabc', maker: DEFAULT_FAKE_MAKER_ADDRESS,
+        contestId: '1', scorer: '0xscorer', lineTicks: 0, positionType: 0, oddsTick: 250,
+        marketType: 'moneyline', riskAmount: '250000', filledRiskAmount: '0',
+        remainingRiskAmount: '250000', nonce: '1',
+        expiry: '2099-01-01T00:00:00.000Z', speculationKey: null, signature: null,
+        status: 'open', storedStatus: 'open', source: 'sse', network: 'polygon',
+        nonceInvalidated: false, isLive: true, createdAt: '2025-01-01T00:00:00.000Z',
+      }],
+      positions: [],
+      truncated: false,
+      positionsTruncated: false,
+    });
+    recorder.fire('onReady');
+
+    // Fire a commitment delta — onCommitment enqueues; we wake to trigger
+    // the loop's drain. The drain dispatches via reduceOwnerCommitmentObservation.
+    recorder.fire('onCommitment', {
+      ownerAuthorized: true, visibility: 'visible', redacted: false,
+      commitmentHash: '0xabc', maker: DEFAULT_FAKE_MAKER_ADDRESS,
+      contestId: '1', scorer: '0xscorer', lineTicks: 0, positionType: 0, oddsTick: 250,
+      marketType: 'moneyline', riskAmount: '250000', filledRiskAmount: '100000',
+      remainingRiskAmount: '150000', nonce: '1',
+      expiry: '2099-01-01T00:00:00.000Z', speculationKey: null, signature: null,
+      status: 'partially_filled', storedStatus: 'partially_filled', source: 'sse',
+      network: 'polygon', nonceInvalidated: false, isLive: true,
+      createdAt: '2025-01-01T00:00:00.000Z',
+    });
+
+    // Fire a fill delta.
+    recorder.fire('onFill', {
+      speculationId: 'spec-1', contestId: 'contest-1', commitmentHash: '0xabc',
+      maker: DEFAULT_FAKE_MAKER_ADDRESS, taker: '0xother',
+      makerPositionType: 0, takerPositionType: 1,
+      makerRiskAmount: '100000', takerRiskAmount: '150000',
+      makerRiskUSDC: 0.1, takerRiskUSDC: 0.15, oddsTick: 250,
+      filledAt: '2025-01-01T00:00:00.000Z', contestStarted: false,
+      txHash: '0xtx1', logIndex: 0,
+    });
+
+    // The handlers fired wake() — the loop's main sleep aborted, debounce
+    // started. Resolve the debounce so the wake-handler completes its
+    // drainShadow → reducer dispatch path.
+    await waitFor(() => sleepCalls.filter((ms) => ms === 500).length >= 1);
+    const idx = sleepCalls.findIndex((ms) => ms === 500);
+    const debounceResolve = resolvers[idx];
+    if (debounceResolve === undefined) throw new Error('expected debounce resolver');
+    debounceResolve();
+    await waitFor(() => runner.ownStateShadowView().commitments['0xabc']?.lifecycle === 'partiallyFilled');
+
+    const shadow = runner.ownStateShadowView();
+    // Commitment delta → projection → lifecycle 'partiallyFilled', filledRiskWei6 = '100000'.
+    expect(shadow.commitments['0xabc']?.lifecycle).toBe('partiallyFilled');
+    expect(shadow.commitments['0xabc']?.filledRiskWei6).toBe('100000');
+    // Fill delta → position created with maker-side risk.
+    expect(shadow.positions['spec-1:away']?.riskAmountWei6).toBe('100000');
+
+    triggerKill();
+    await runPromise;
+  });
+
+  it('drainShadow logs error + skips on unknown event kind (Phase 2 PR4b)', async () => {
+    const runner = makeRunner({ maxTicks: 1 });
+    runner.enqueueOwnStateEvent({ kind: 'made-up-kind', body: {} });
+    await runner.run();
+    const events = readEvents();
+    const errs = events.filter((e) => e.kind === 'error' && e.class === 'UnknownOwnStateEventKind');
+    expect(errs).toHaveLength(1);
+  });
+
+  it('reducer throw logs error + skips (Phase 2 PR4b — malformed body defensive path)', async () => {
+    const runner = makeRunner({ maxTicks: 1 });
+    // Synthetic fill body missing maker/taker — the reducer throws on toLowerCase().
+    runner.enqueueOwnStateEvent({ kind: 'fill', body: { txHash: '0x1', logIndex: 0 } });
+    await runner.run();
+    const events = readEvents();
+    const errs = events.filter((e) => e.kind === 'error' && typeof e.detail === 'string' && e.detail.includes('event.kind=fill'));
+    expect(errs.length).toBeGreaterThanOrEqual(1);
   });
 
   it('sync throw from openOwnStateSubscription propagates AND runs the finally cleanup — unregister called (Hermes #68 blocker 3)', async () => {

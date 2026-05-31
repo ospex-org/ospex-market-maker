@@ -1,31 +1,35 @@
 /**
- * Owner (SSE-source) reducer signatures + `OwnStateShadow` projection type.
+ * Owner (SSE-source) reducer implementations + projection helpers +
+ * `OwnStateShadow` type (Phase 2 PR4b).
  *
- * **Phase 2 PR2 ships SIGNATURES + stub bodies only.** Real implementations land
- * in PR4b alongside the dedup-set construction (PR4a wires the SSE adapter +
- * baseline projection + lifecycle invariant but leaves these reducers as
- * stubs). The signatures are declared here so PR3's wakeable runner can
- * type-check against the `OwnStateShadow` target without waiting for the
- * implementations — the typed separation between canonical (`MakerState`)
- * and shadow (`OwnStateShadow`) targets IS the architectural contract
- * Hermes asked for in `phase2-feedback.md` blocker 5: only `reduceOwnerFill`
- * mutates shadow positions, only `reduceOwnerCommitmentObservation` converges
- * lifecycle/cumulative on shadow commitments. The type system forbids
- * crossing the two state surfaces.
+ * Architectural contract from Hermes review of `phase2-feedback.md` blocker 5:
+ * only `reduceOwnerFill` mutates shadow positions; `reduceOwnerCommitmentObservation`
+ * converges lifecycle/cumulative on shadow commitments but NEVER touches positions
+ * (would double-count `reduceOwnerFill`'s fill-event-driven path). The type
+ * system forbids crossing the canonical `MakerState` and shadow `OwnStateShadow`
+ * surfaces — see `src/reducers/owner.test.ts` for the compile-time guard.
  *
- * Stubs return `[]` and DO NOT mutate the shadow — PR3 wires them through
- * `applyDescriptors(_, 'owner')` so the runner exercises the descriptor
- * pipeline end-to-end before any real owner-side behavior exists. PR4a's
- * `onReady` IS now wired and atomically swaps `pendingBaseline` into the
- * shadow's commitments/positions; PR4b will wire per-event delta application
- * via these reducer bodies.
+ * Layering:
+ *   PR2 — signatures + empty stub bodies + compile-time source-confusion guards.
+ *   PR3 — wakeable runner + queue infra; stubs drain to no-op.
+ *   PR4a — adapter wiring + handlers + snapshot baseline accumulation + atomic
+ *          swap on `onReady` + `projectOwner*` helpers (originally inline in
+ *          the runner; moved here in PR4b so the per-event reducers can reuse).
+ *   PR4b — REAL reducer bodies (this PR): per-event delta application after
+ *          `onReady` lands the baseline. Idempotent on no-change; fills dedupe
+ *          via `(txHash, logIndex)` against the runner's process-lifetime
+ *          dedup-set.
+ *
+ * Phase 2 shadow-only invariant: ALL writes here target `OwnStateShadow`.
+ * No canonical `MakerState` writes — Phase 3 cutover flips the source.
  */
 
-import type { MakerPositionStatus, MakerSide } from '../state/index.js';
+import type { Fill, OwnerCommitment, OwnerPosition, PositionLifecycle, PositionStatusEvent } from '../ospex/index.js';
+import { fillDedupKey, type MakerPositionStatus, type MakerSide } from '../state/index.js';
 
 import type { ReducerDescriptor } from './descriptors.js';
 
-/** A commitment as projected from the SSE `commitment` event body. PR4a projects snapshot pages into this shape via `projectOwnerCommitment`; PR4b's per-event reducer will use it for delta application. */
+/** A commitment as projected from the SSE `commitment` event body. PR4a projects snapshot pages into this shape via `projectOwnerCommitment`; PR4b's `reduceOwnerCommitmentObservation` re-projects on every delta event. */
 export interface ShadowCommitment {
   hash: string;
   lifecycle: 'visibleOpen' | 'softCancelled' | 'partiallyFilled' | 'filled' | 'expired' | 'authoritativelyInvalidated';
@@ -34,7 +38,7 @@ export interface ShadowCommitment {
   expiryUnixSec: number;
 }
 
-/** A position as projected from the SSE `position-status` event body. PR4a projects snapshot pages via `projectOwnerPosition`; PR4b's per-event reducer will use it for delta application. */
+/** A position as projected from the SSE snapshot positions. PR4a projects snapshot pages via `projectOwnerPosition`; PR4b's per-event reducers update incrementally. */
 export interface ShadowPosition {
   speculationId: string;
   side: MakerSide;
@@ -53,17 +57,17 @@ export type ShadowTransportStatus = 'connected' | 'reconnecting' | 'degraded' | 
  *
  * Phase 2: process-lifetime (no disk persistence — cold restart re-snapshots
  * cleanly; `MakerCommitmentRecord.fills[]` from PR1 covers in-process replay
- * dedup). Shape extended in PR4a for `lastStatus` / `lastError` (transport
- * health surface for PR5 comparator preconditions).
+ * dedup). Shape extended in PR4a for `lastStatus` / `lastError` + Hermes #68
+ * round-2 `positionsTruncated`.
  */
 export interface OwnStateShadow {
   /** `false` until `onReady` fires (the snapshot has fully baselined), or while a resync is pending. */
   ready: boolean;
   /** `false` on queue overflow, transport-stale, or token-refresh failure. PR5 comparator preconditions check this. */
   healthy: boolean;
-  /** Hash → projected commitment. PR4a's `onReady` swaps the baseline in; PR4b will apply per-commitment-event deltas. */
+  /** Hash → projected commitment. PR4a's `onReady` swaps the baseline in; PR4b applies per-commitment-event deltas via `reduceOwnerCommitmentObservation`. */
   commitments: Record<string, ShadowCommitment>;
-  /** `${speculationId}:${side}` → projected position. PR4a's `onReady` swaps the baseline in; PR4b will apply per-position-status-event deltas. */
+  /** `${speculationId}:${side}` → projected position. PR4a's `onReady` swaps the baseline in; PR4b applies per-position-status-event deltas via `reduceOwnerPositionStatus` and per-fill mutations via `reduceOwnerFill`. */
   positions: Record<string, ShadowPosition>;
   /**
    * Snapshot pages accumulated before `onReady` fires; merged into
@@ -112,65 +116,261 @@ export interface OwnStateShadow {
   lastError: { class: string; detail: string; reason: string; recordedAtMs: number } | null;
 }
 
-/** Owner commitment-body event shape — finalized in PR4b against the SDK's `ownState.subscribe` body types. */
-export interface OwnerCommitmentBody {
-  // intentionally empty in PR2 — PR4b reads the SDK's exported types and pins fields
-  readonly _placeholder?: never;
-}
+/** Owner commitment-body event shape. PR4b aliases the SDK's `OwnerCommitment` directly. */
+export type OwnerCommitmentBody = OwnerCommitment;
+/** Owner fill-body event shape. PR4b aliases the SDK's `Fill` directly. Dedup key is `(txHash, logIndex)`. */
+export type OwnerFillBody = Fill;
+/** Owner position-status-body event shape. PR4b aliases the SDK's `PositionStatusEvent` directly. */
+export type OwnerPositionStatusBody = PositionStatusEvent;
 
-/** Owner fill-body event shape — finalized in PR4b. Carries `(txHash, logIndex)` for the dedup-set lookup. */
-export interface OwnerFillBody {
-  readonly _placeholder?: never;
-}
+// ── projection helpers (moved from src/runners/index.ts in PR4b) ──────────────
 
-/** Owner position-status-body event shape — finalized in PR4b. */
-export interface OwnerPositionStatusBody {
-  readonly _placeholder?: never;
+/**
+ * Project an SDK `OwnerCommitment` (the owner-auth maker view delivered via
+ * SSE) to the shadow's narrow `ShadowCommitment` shape. The projection maps
+ * the SDK's effective `status` + signals to a `CommitmentLifecycle` matching
+ * the canonical (`MakerCommitmentRecord`) lifecycle vocabulary so the PR5
+ * comparator can compare apples to apples.
+ *
+ * Lifecycle routing precedence (mirrors the poll-side
+ * `reducePolledCommitmentObservation`):
+ *   - FULL fill (`filledRiskAmount >= riskAmount`) → `'filled'`.
+ *   - AUTH (`storedStatus === 'cancelled'` || `nonceInvalidated`) → `'authoritativelyInvalidated'`.
+ *   - Effective `'expired'` → `'expired'`.
+ *   - Effective `'cancelled'` (book-hidden but not AUTH) → `'softCancelled'`.
+ *   - Effective `'filled'` (cumulative not at risk yet — unusual; trust the API) → `'filled'`.
+ *   - Effective `'open'` or `'partially_filled'` with `filledRiskAmount > 0` → `'partiallyFilled'`.
+ *   - Effective `'open'` → `'visibleOpen'`.
+ */
+export function projectOwnerCommitment(c: OwnerCommitment): ShadowCommitment {
+  const filled = BigInt(c.filledRiskAmount);
+  const risk = BigInt(c.riskAmount);
+  let lifecycle: ShadowCommitment['lifecycle'];
+  if (filled >= risk) {
+    lifecycle = 'filled';
+  } else if (c.storedStatus === 'cancelled' || c.nonceInvalidated) {
+    lifecycle = 'authoritativelyInvalidated';
+  } else if (c.status === 'expired') {
+    lifecycle = 'expired';
+  } else if (c.status === 'cancelled') {
+    lifecycle = 'softCancelled';
+  } else if (c.status === 'filled') {
+    lifecycle = 'filled';
+  } else if (filled > 0n) {
+    lifecycle = 'partiallyFilled';
+  } else {
+    lifecycle = 'visibleOpen';
+  }
+  // OwnerCommitment.expiry is ISO-8601 string or null. Convert to unix seconds;
+  // null → 0 (defensive — the comparator's expiry check will not match canonical).
+  const expiryUnixSec = c.expiry === null ? 0 : Math.floor(new Date(c.expiry).getTime() / 1000);
+  return {
+    hash: c.commitmentHash,
+    lifecycle,
+    filledRiskWei6: c.filledRiskAmount,
+    riskAmountWei6: c.riskAmount,
+    expiryUnixSec,
+  };
 }
 
 /**
- * Owner commitment reducer — converges shadow commitment lifecycle / cumulative
- * fill from the SSE commitment-body event. **Never mutates shadow positions**
+ * Project an SDK `OwnerPosition` (from a snapshot page) to the shadow's
+ * `ShadowPosition`. `positionType` 0=away, 1=home (canonical Ospex
+ * protocol mapping). Returns the projection; the SDK's `OwnerPosition`
+ * discriminator excludes `settledLost` / `void`, so the status maps 1:1
+ * to `MakerPositionStatus` for the four states the snapshot carries.
+ */
+export function projectOwnerPosition(p: OwnerPosition): ShadowPosition {
+  const side: MakerSide = p.positionType === 0 ? 'away' : 'home';
+  return {
+    speculationId: p.speculationId,
+    side,
+    riskAmountWei6: Math.round(p.riskAmountUSDC * 1_000_000).toString(),
+    status: p.status,
+  };
+}
+
+/**
+ * Strict forward-only ordering of `MakerPositionStatus` — used by
+ * `reduceOwnerPositionStatus` to reject backwards transitions (e.g. a
+ * `claimable` shadow position being reported back in `active`). Mirrors
+ * the poll-side `positionStatusRank` in `src/reducers/poll.ts`.
+ */
+function positionStatusRank(s: MakerPositionStatus): number {
+  switch (s) {
+    case 'active': return 0;
+    case 'pendingSettle': return 1;
+    case 'claimable': return 2;
+    case 'claimed': return 3;
+  }
+}
+
+/**
+ * Map the SDK's wider `PositionLifecycle` enum to the narrower
+ * `MakerPositionStatus` the shadow tracks. The SDK enum includes terminal
+ * `'settledLost'` and `'void'` states that the snapshot's `OwnerPosition`
+ * discriminator drops (zero-payout rows); the SSE stream's `positionStatus`
+ * events emit those transitions explicitly so consumers close local
+ * lifecycle cleanly. Both terminal-but-not-claimed states collapse to
+ * `'claimed'` for shadow purposes — the position is settled and there's
+ * nothing further to act on.
+ */
+function mapPositionLifecycle(s: PositionLifecycle): MakerPositionStatus {
+  switch (s) {
+    case 'active': return 'active';
+    case 'pendingSettle': return 'pendingSettle';
+    case 'claimable': return 'claimable';
+    case 'claimed': return 'claimed';
+    case 'settledLost': return 'claimed';
+    case 'void': return 'claimed';
+  }
+}
+
+// ── reducers ──────────────────────────────────────────────────────────────────
+
+/**
+ * Apply one SSE `commitment` delta event to the shadow. Re-projects the SDK's
+ * `OwnerCommitment` via {@link projectOwnerCommitment} and inserts/replaces in
+ * `target.commitments[commitmentHash]`. **Never mutates `target.positions`**
  * (blocker 5: position bumps from cumulative deltas would double-count
  * `reduceOwnerFill`'s fill-event-driven path).
  *
- * PR2 stub: returns `[]`, does not touch `target`. PR4b lands the implementation.
+ * Idempotent on no-change — a re-emitted event for the same on-chain state
+ * produces the same projection; the replace is byte-identical.
+ *
+ * Phase 2 invariant: writes target `OwnStateShadow` only. The type system
+ * forbids passing `MakerState` (compile-time guard in `owner.test.ts`).
  */
 export function reduceOwnerCommitmentObservation(
-  _target: OwnStateShadow,
-  _body: OwnerCommitmentBody,
+  target: OwnStateShadow,
+  body: OwnerCommitment,
   _now: number,
 ): ReducerDescriptor[] {
+  target.commitments[body.commitmentHash] = projectOwnerCommitment(body);
   return [];
 }
 
 /**
- * Owner fill reducer — the EXCLUSIVE mutator of shadow positions for the owner
- * path. Dedupes `(txHash, logIndex)` against `dedupSet` (shared with
- * `MakerCommitmentRecord.fills[]` per PR1's restart-safety model).
+ * Apply one SSE `fill` delta event to the shadow. Dedupes against
+ * `(txHash, logIndex)` via {@link fillDedupKey} — a re-delivered fill from
+ * an SDK resume/catchup is a runtime no-op.
  *
- * PR2 stub: returns `[]`, does not touch `target` or `dedupSet`. PR4b lands the
- * implementation.
+ * **Maker side (`body.maker === ourAddress`)**: extends the maker-side
+ * position's `riskAmountWei6`. **Does NOT touch the commitment's
+ * `filledRiskWei6`** — that bump comes from `reduceOwnerCommitmentObservation`
+ * (which the indexer fires for the same on-chain Match). Updating it here
+ * too would double-count the cumulative when both events fire (their
+ * orderings are independent across SSE).
+ *
+ * **Taker side (`body.taker === ourAddress`)**: extends the taker-side
+ * position only. The MM doesn't take in Phase 2 — this branch is defensive.
+ *
+ * **Neither side ours**: emits an `OwnerFillForeignAddress` error descriptor.
+ * The SSE subscription is owner-scoped so this shouldn't happen; if it does,
+ * surface the anomaly rather than silently mis-applying.
+ *
+ * Phase 2 invariant — this reducer is the SOLE shadow-position mutator on the
+ * owner side (blocker 5).
  */
 export function reduceOwnerFill(
-  _target: OwnStateShadow,
-  _body: OwnerFillBody,
-  _dedupSet: Set<string>,
+  target: OwnStateShadow,
+  body: Fill,
+  dedupSet: Set<string>,
+  ourAddress: string,
   _now: number,
 ): ReducerDescriptor[] {
-  return [];
+  const key = fillDedupKey(body.txHash, body.logIndex);
+  if (dedupSet.has(key)) return []; // already applied — idempotent on resume/catchup
+  dedupSet.add(key);
+
+  const descriptors: ReducerDescriptor[] = [];
+  const lowerAddress = ourAddress.toLowerCase();
+  const isMaker = body.maker.toLowerCase() === lowerAddress;
+  const isTaker = body.taker.toLowerCase() === lowerAddress;
+
+  if (!isMaker && !isTaker) {
+    // Anomaly — fill is for an address neither side matches. SDK subscription
+    // is owner-scoped, so this shouldn't fire; emit + skip.
+    descriptors.push({
+      kind: 'emit-error',
+      payload: {
+        class: 'OwnerFillForeignAddress',
+        detail: `fill ${body.txHash}:${body.logIndex} has neither maker (${body.maker}) nor taker (${body.taker}) matching our address (${lowerAddress})`,
+        phase: 'own-state-stream',
+      },
+    });
+    return descriptors;
+  }
+
+  const ourPositionType: 0 | 1 = isMaker ? body.makerPositionType : body.takerPositionType;
+  const ourRiskAmount: string = isMaker ? body.makerRiskAmount : body.takerRiskAmount;
+  const side: MakerSide = ourPositionType === 0 ? 'away' : 'home';
+
+  // Update / insert shadow position on our side.
+  // (Commitment cumulative is owned by `reduceOwnerCommitmentObservation` —
+  // see the JSDoc above; touching `c.filledRiskWei6` here would double-count
+  // when both events fire for the same on-chain Match.)
+  const posKey = `${body.speculationId}:${side}`;
+  const existing = target.positions[posKey];
+  if (existing === undefined) {
+    target.positions[posKey] = {
+      speculationId: body.speculationId,
+      side,
+      riskAmountWei6: ourRiskAmount,
+      status: 'active', // a position created by a fill is `active` until pendingSettle
+    };
+  } else {
+    existing.riskAmountWei6 = (BigInt(existing.riskAmountWei6) + BigInt(ourRiskAmount)).toString();
+  }
+  return descriptors;
 }
 
 /**
- * Owner position-status reducer — updates shadow position status only.
+ * Apply one SSE `positionStatus` delta event to the shadow. Updates only
+ * `target.positions[key].status` — does NOT touch `riskAmountWei6` (positions
+ * are created/extended by `reduceOwnerFill` from the fill stream).
  *
- * PR2 stub: returns `[]`, does not touch `target`. PR4b lands the implementation.
+ * Forward-only: a backwards transition (e.g. a `claimable` shadow reported
+ * back in `active`) emits an `OwnerBackwardsPositionTransition` error and is
+ * refused. Mirrors the poll-side guard in `reducePolledPositionObservation`.
+ *
+ * Unknown-position events (no shadow entry for the `(speculationId, side)`
+ * key) emit `OwnerPositionStatusForUnknownPosition` and skip — the position
+ * will be materialized by the next `reduceOwnerFill` for that speculation
+ * (which carries enough fields to construct the row).
  */
 export function reduceOwnerPositionStatus(
-  _target: OwnStateShadow,
-  _body: OwnerPositionStatusBody,
+  target: OwnStateShadow,
+  body: PositionStatusEvent,
   _now: number,
 ): ReducerDescriptor[] {
+  const side: MakerSide = body.positionType === 0 ? 'away' : 'home';
+  const key = `${body.speculationId}:${side}`;
+  const existing = target.positions[key];
+  const mappedStatus = mapPositionLifecycle(body.status);
+  if (existing === undefined) {
+    return [{
+      kind: 'emit-error',
+      payload: {
+        class: 'OwnerPositionStatusForUnknownPosition',
+        detail: `position-status event for (${body.speculationId}, ${side}) → '${body.status}' but no shadow position exists; the next fill will materialize it`,
+        phase: 'own-state-stream',
+        speculationId: body.speculationId,
+      },
+    }];
+  }
+  if (positionStatusRank(mappedStatus) < positionStatusRank(existing.status)) {
+    return [{
+      kind: 'emit-error',
+      payload: {
+        class: 'OwnerBackwardsPositionTransition',
+        detail: `position-status event reports (${body.speculationId}, ${side}) as '${body.status}' (→ '${mappedStatus}') but shadow has it at '${existing.status}' — refusing to revert`,
+        phase: 'own-state-stream',
+        speculationId: body.speculationId,
+      },
+    }];
+  }
+  existing.status = mappedStatus;
   return [];
 }
 

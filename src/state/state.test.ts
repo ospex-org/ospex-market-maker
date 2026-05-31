@@ -187,12 +187,12 @@ describe('StateStore.load', () => {
   // ── sensitive state hardening (own-state SSE plan §M6/B) ────────────────────
   //
   // The state blob now carries the maker's signed EIP-712 commitment payloads
-  // (M6/A), so the on-disk file should be owner-only (0o600) where the OS
-  // supports it. POSIX: the mode is preserved across the temp+rename so the
-  // live `maker-state.json` ends up 0600. Windows: chmod's mode bits are
-  // largely ignored — we test that flush completes anyway and the file is
-  // written (the actual ACL hardening on Windows is the operator's
-  // responsibility via the parent directory, called out in OPERATOR_SAFETY.md).
+  // (M6/A), so the on-disk file is created at 0o600 (owner read/write only)
+  // from birth via O_WRONLY|O_CREAT|O_EXCL — not chmod'd after the fact. The
+  // POSIX rename preserves the mode, so the live `maker-state.json` lands at
+  // 0o600. Windows: mode bits don't map to ACLs — the test checks file
+  // existence only; the actual ACL hardening on Windows is the operator's
+  // responsibility via the parent directory (OPERATOR_SAFETY.md).
   it('flush writes the state file with mode 0o600 on POSIX (owner read/write only)', () => {
     const store = StateStore.at(dir);
     store.flush(emptyMakerState());
@@ -206,6 +206,25 @@ describe('StateStore.load', () => {
       // 0o777 mask isolates owner / group / other rwx bits.
       expect(stats.mode & 0o777).toBe(0o600);
     }
+  });
+
+  // Hermes PR #64 round 1: pre-existing temp file with permissive mode must
+  // NOT survive into the live state. The old chmod-after-write flow would
+  // truncate the existing temp file (preserving its old mode) and then chmod
+  // (or silently fail to). The new flow unlinks the stale temp first so the
+  // O_EXCL create lands a fresh inode at 0o600.
+  it('unlinks a stale temp file before fresh create — pre-existing 0o644 temp does not leak through (POSIX)', () => {
+    if (platform === 'win32') return; // mode bits don't map; the leak path doesn't apply
+    const store = StateStore.at(dir);
+    // Pre-create the temp file at a permissive mode (simulating a prior crash
+    // that left maker-state.json.tmp behind).
+    writeFileSync(join(dir, STATE_TMP), '{"version":1}', { encoding: 'utf8', mode: 0o644 });
+    expect(statSync(join(dir, STATE_TMP)).mode & 0o777).toBe(0o644);
+    // Flush should unlink the stale temp + recreate at 0o600.
+    store.flush(emptyMakerState());
+    // The temp should be gone (renamed into statePath) and the live file at 0o600.
+    expect(existsSync(join(dir, STATE_TMP))).toBe(false);
+    expect(statSync(store.statePath).mode & 0o777).toBe(0o600);
   });
 });
 

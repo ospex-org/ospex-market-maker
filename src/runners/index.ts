@@ -951,17 +951,19 @@ export class Runner {
    */
   async run(): Promise<void> {
     const unregister = this.deps.registerShutdownSignals(() => this.requestShutdown('signal'));
-    // Phase 2 PR4a — open the owner-authenticated own-state SSE stream BEFORE the
-    // first tick when opted in. The SDK's `subscribe` returns synchronously so the
-    // handle is captured (and identity-checked by every handler) before any
-    // callback can fire. Subscription stays open across ticks; the `finally`
-    // below unsubscribes on every shutdown path.
-    if (this.config.ownState.subscribe && this.makerAddress !== null) {
-      this.openOwnStateSubscription();
-    }
     let ticks = 0;
     let bootApprovalsApplied = false;
     try {
+      // Phase 2 PR4a — open the owner-authenticated own-state SSE stream BEFORE
+      // the first tick when opted in. The SDK's `subscribe` returns synchronously
+      // so the handle is captured (and identity-checked by every handler) before
+      // any callback can fire. Subscription stays open across ticks; the `finally`
+      // below unsubscribes on every shutdown path. INSIDE the `try` so a
+      // synchronous throw from the SDK (auth misconfiguration, network init
+      // failure) still runs `unregister()` + cleanup (Hermes #68 review blocker 3).
+      if (this.config.ownState.subscribe && this.makerAddress !== null) {
+        this.openOwnStateSubscription();
+      }
       while (!this.stopRequested) {
         if (this.deps.killFileExists()) {
           this.requestShutdown('kill-file');
@@ -2485,9 +2487,20 @@ export class Runner {
    */
   private handleOwnerSnapshot(snapshot: OwnerStateSnapshot): void {
     if (this.ownStateShadow.pendingBaseline === null) {
-      this.ownStateShadow.pendingBaseline = { commitments: {}, positions: {}, truncated: snapshot.truncated };
+      this.ownStateShadow.pendingBaseline = {
+        commitments: {},
+        positions: {},
+        truncated: snapshot.truncated,
+        positionsTruncated: snapshot.positionsTruncated,
+      };
     } else {
       this.ownStateShadow.pendingBaseline.truncated = snapshot.truncated;
+      // OR-latch positionsTruncated across pages — once any page reports the
+      // actionable-positions cap was hit, the baseline is incomplete and the
+      // shadow MUST surface that signal to the comparator regardless of
+      // subsequent page outcomes (Hermes #68 review blocker 2 — don't rely
+      // on `onStatus('degraded')` event ordering).
+      if (snapshot.positionsTruncated) this.ownStateShadow.pendingBaseline.positionsTruncated = true;
     }
     for (const c of snapshot.commitments) {
       this.ownStateShadow.pendingBaseline.commitments[c.commitmentHash] = projectOwnerCommitment(c);
@@ -2520,11 +2533,18 @@ export class Runner {
       this.ownStateShadow.commitments = baseline.commitments;
       this.ownStateShadow.positions = baseline.positions;
       this.ownStateShadow.truncated = baseline.truncated;
+      this.ownStateShadow.positionsTruncated = baseline.positionsTruncated;
       this.ownStateShadow.pendingBaseline = null;
     }
     this.ownStateShadow.ready = true;
     this.ownStateShadow.lastReadyAtMs = Date.now();
     this.ownStateShadow.lastEventAtMs = Date.now();
+    // Derive `healthy` from current degradation latches (Hermes #68 review):
+    // a queue overflow OR positionsTruncated baseline means the shadow is
+    // incomplete in ways a transport-recovery alone cannot fix; PR5 comparator
+    // gates on `healthy && ready` so a truncated baseline must NOT mark
+    // healthy=true at swap time.
+    this.ownStateShadow.healthy = !this.streamOverflowDegraded && !this.ownStateShadow.positionsTruncated;
     // No telemetry emit in PR4a — PR5 wires the proper `stream-ready` /
     // comparator-pass shape. Wake the loop so the next iteration drains.
     this.wakeSignal.wake();
@@ -2564,13 +2584,27 @@ export class Runner {
       // `ready` before reading shadow.commitments/positions.
       this.ownStateShadow.ready = false;
       this.ownStateShadow.pendingBaseline = null;
+      // The upcoming fresh snapshot is authoritative — the dropped events
+      // that the queue overflow latched will be re-baselined. Clear the
+      // overflow latch so the next `onReady` can restore healthy (Hermes
+      // #68 review blocker 1 — "after a real resync" is the only authoritative
+      // recovery path for queue overflow in Phase 2).
+      this.streamOverflowDegraded = false;
     } else if (status === 'degraded') {
       this.ownStateShadow.healthy = false;
     } else if (status === 'connected') {
-      // Transport recovered — clear any prior fatal-error mark so the next
-      // comparator pass can re-enable divergence reporting.
-      this.ownStateShadow.healthy = true;
+      // Transport recovered — clear any prior transport-level error mark.
       this.ownStateShadow.lastError = null;
+      // BUT only restore `healthy: true` when no UPSTREAM-incompleteness
+      // latch is still set. A queue overflow dropped events that a transport
+      // reconnect alone can't recover (the SDK's catchup uses Last-Event-ID
+      // from the running cursor; events the runner dropped never made it
+      // into the cursor); positionsTruncated likewise means the baseline
+      // itself is partial. Both need a `resync` → fresh snapshot pair to
+      // clear (Hermes #68 review blocker 1).
+      if (!this.streamOverflowDegraded && !this.ownStateShadow.positionsTruncated) {
+        this.ownStateShadow.healthy = true;
+      }
     }
     this.wakeSignal.wake();
   }
@@ -2627,6 +2661,20 @@ export class Runner {
    */
   setCurrentOwnStateSubscriptionForTest(sub: Subscription | null): void {
     this.currentOwnStateSubscription = sub;
+  }
+
+  /**
+   * Test seam — sets the `streamOverflowDegraded` latch directly so tests can
+   * exercise the connected/resync gating without driving the full overflow
+   * detection path through `drainShadow` (PR4a round 2 / Hermes #68 review).
+   */
+  setStreamOverflowDegradedForTest(value: boolean): void {
+    this.streamOverflowDegraded = value;
+  }
+
+  /** Test seam — reads the `streamOverflowDegraded` latch. */
+  streamOverflowDegradedForTest(): boolean {
+    return this.streamOverflowDegraded;
   }
 
   /**

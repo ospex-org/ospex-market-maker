@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { platform } from 'node:process';
 
 import {
   assessStateLoss,
@@ -181,6 +182,30 @@ describe('StateStore.load', () => {
     expect(status.kind).toBe('loaded');
     expect(state.commitments[c.hash]?.lifecycle).toBe('softCancelled');
     expect(state.commitments[c.hash]?.riskAmountWei6).toBe('100');
+  });
+
+  // ── sensitive state hardening (own-state SSE plan §M6/B) ────────────────────
+  //
+  // The state blob now carries the maker's signed EIP-712 commitment payloads
+  // (M6/A), so the on-disk file should be owner-only (0o600) where the OS
+  // supports it. POSIX: the mode is preserved across the temp+rename so the
+  // live `maker-state.json` ends up 0600. Windows: chmod's mode bits are
+  // largely ignored — we test that flush completes anyway and the file is
+  // written (the actual ACL hardening on Windows is the operator's
+  // responsibility via the parent directory, called out in OPERATOR_SAFETY.md).
+  it('flush writes the state file with mode 0o600 on POSIX (owner read/write only)', () => {
+    const store = StateStore.at(dir);
+    store.flush(emptyMakerState());
+    const stats = statSync(store.statePath);
+    if (platform === 'win32') {
+      // On Windows, file mode bits don't carry the same meaning — just confirm
+      // the file exists. The directory-ACL hardening is the operator's job.
+      expect(existsSync(store.statePath)).toBe(true);
+    } else {
+      // The mode's bottom 9 bits are the perm bits. Mask out the file-type bits.
+      // 0o777 mask isolates owner / group / other rwx bits.
+      expect(stats.mode & 0o777).toBe(0o600);
+    }
   });
 });
 

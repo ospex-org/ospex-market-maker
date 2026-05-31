@@ -16,6 +16,17 @@
  * `Number.MAX_SAFE_INTEGER` (risk in wei6, block numbers, …) is a decimal string —
  * the AGENT_CONTRACT numeric rule.
  *
+ * **Signing material is also rejected** (own-state SSE plan §M6/B). The MM
+ * persists the SDK's canonical `SignedCommitmentPayload` (M6/A) so cancel paths
+ * can authoritatively cancel hidden rows without round-tripping the public API.
+ * That bundle — the EIP-712 `signature`, the wrapper `signedPayload`, the inner
+ * `commitment` struct, and the `nonce` — is the same material `MatchingModule`
+ * needs to fill a commitment, so any of those keys at any depth in a telemetry
+ * payload throws rather than landing in the (potentially-shared) NDJSON event log
+ * or the scorecard artifact downstream. The whitelist projection at the call
+ * sites ({@link EventLog.emit} callers like `commitmentEventPayload`) already
+ * omits these; this is the boundary backstop.
+ *
  * No SDK, no chain. Phase 2's runner is the first real consumer; this slice ships
  * the writer + the `kind` vocabulary so that vocabulary is locked early.
  */
@@ -84,6 +95,39 @@ const RESERVED_KEYS = ['ts', 'runId', 'kind'] as const;
 const KNOWN_KINDS: ReadonlySet<string> = new Set(TELEMETRY_KINDS);
 
 /**
+ * Field names that may carry EIP-712 signing material from a persisted
+ * {@link MakerSignedPayload} / SDK `SignedCommitmentPayload` — rejected at any
+ * depth by {@link assertNoSigningMaterial} (own-state SSE plan §M6/B):
+ *
+ * - `signature` — the ECDSA signature itself; the single field most useful to
+ *   an adversary (combined with the `commitment` struct, it's the entire fill
+ *   input for `MatchingModule.matchCommitment`).
+ * - `signedPayload` — the on-disk wrapper holding `{ commitmentHash, commitment,
+ *   signature }`; rejecting the wrapper catches a careless `...record` spread
+ *   that drags the payload into telemetry.
+ * - `commitment` — the inner EIP-712 typed-data struct (9 fields: `maker` /
+ *   `contestId` / `scorer` / `lineTicks` / `positionType` / `oddsTick` /
+ *   `riskAmount` / `nonce` / `expiry`). Names like `commitmentHash` /
+ *   `commitmentLifecycle` are NOT denied (they don't carry signing material) —
+ *   only the bare `commitment` key.
+ * - `nonce` — the EIP-712 nonce; not sufficient alone to spoof a fill, but
+ *   listed in the spec (§M6) and unused outside the signed struct, so denying
+ *   it everywhere is defense in depth without breaking any caller.
+ *
+ * Per-emit-site allow-list projection (e.g. `commitmentEventPayload`) is the
+ * primary defence — these helpers explicitly omit signing fields. This set is
+ * the boundary backstop: if a future caller bypasses the projector and
+ * `...record`s a `MakerCommitmentRecord` straight into an emit, the writer
+ * throws rather than logging the signed bundle.
+ */
+const DENIED_SIGNING_KEYS: ReadonlySet<string> = new Set([
+  'signature',
+  'signedPayload',
+  'commitment',
+  'nonce',
+]);
+
+/**
  * A run identifier — filename-safe and roughly time-sortable. Two runs started in
  * the same millisecond still differ (the random suffix), so two MMs sharing a log
  * directory won't clobber each other's file (though they must NOT share a state
@@ -128,10 +172,14 @@ export class EventLog {
   /**
    * Append one event line. Fails closed — throws if `kind` isn't a known kind, if
    * `payload` isn't a plain object, if `payload` shadows a reserved key (`ts` /
-   * `runId` / `kind`), or if any (nested) payload value isn't JSON-safe-and-
+   * `runId` / `kind`), if any (nested) payload value isn't JSON-safe-and-
    * deterministic (a `bigint`, a non-finite or unsafe-integer number, `undefined`,
    * a function, a symbol, or a non-plain object like a `Map` / `Date` / class
-   * instance). Stringify wei6 / block numbers; flatten objects (incl. `Error`s).
+   * instance), or if any (nested) payload key is signing material per
+   * {@link DENIED_SIGNING_KEYS} (own-state SSE plan §M6/B). Stringify wei6 /
+   * block numbers; flatten objects (incl. `Error`s); allow-list-project commitment
+   * records via `commitmentEventPayload` / `softCancelEventPayload` rather than
+   * `...record`-spreading them.
    */
   emit(kind: TelemetryKind, payload: TelemetryPayload = {}): void {
     if (!KNOWN_KINDS.has(kind)) {
@@ -145,7 +193,17 @@ export class EventLog {
         throw new Error(`telemetry: payload must not set the reserved key "${k}" (the writer owns ts / runId / kind)`);
       }
     }
-    for (const [key, value] of Object.entries(payload)) assertWireSafe(value, `payload.${key}`);
+    for (const [key, value] of Object.entries(payload)) {
+      // Boundary backstop for the signed-bundle leak (own-state SSE plan §M6/B):
+      // run the denied-key check FIRST so a careless `...record` spread that
+      // drags in `signedPayload` is reported as a sensitive-field violation
+      // (the real bug), not as a wire-safety violation about the nested string
+      // values. Walk the top-level keys with `assertNoSigningMaterial`, then
+      // recurse the value with `assertWireSafe` (which preserves the existing
+      // bigint / undefined / non-plain-object diagnostics).
+      assertNoSigningMaterial(key, value, `payload.${key}`);
+      assertWireSafe(value, `payload.${key}`);
+    }
     const line = JSON.stringify({ ts: new Date().toISOString(), runId: this.runId, kind, ...payload });
     appendFileSync(this.path, `${line}\n`, 'utf8');
   }
@@ -164,6 +222,40 @@ export function eventLogsExist(logDir: string): boolean {
   } catch (err) {
     if ((err as { code?: string }).code === 'ENOENT') return false;
     return true;
+  }
+}
+
+/**
+ * Recursively reject any property name that could carry EIP-712 signing
+ * material — the persisted {@link MakerSignedPayload} keys (own-state SSE plan
+ * §M6/B). Called for `(key, value)` pairs starting at the payload root, then
+ * recursively for every nested object / array. A hit at any depth throws
+ * before the line is written, so a misshapen call site is caught in dev /
+ * CI / Hermes review rather than landing as a leaked signature in the
+ * scorecard NDJSON. Array elements are walked but their numeric index is
+ * never a denied key (only string keys can be).
+ *
+ * The walker visits primitives too (it's a no-op there), so the top-level
+ * caller can pass primitive values without a type-narrowing wrapper.
+ */
+function assertNoSigningMaterial(key: string, value: unknown, path: string): void {
+  if (DENIED_SIGNING_KEYS.has(key)) {
+    throw new Error(
+      `telemetry: ${path} is a signing-material field — never include "${key}" in a telemetry payload (own-state SSE plan §M6/B); use an allow-list projection like commitmentEventPayload(record) instead of spreading the record`,
+    );
+  }
+  if (Array.isArray(value)) {
+    value.forEach((v, i) => {
+      // Array indices are numeric; they can never match a denied key, so we
+      // just recurse into objects nested inside the array.
+      if (v !== null && typeof v === 'object') {
+        for (const [k, nested] of Object.entries(v)) assertNoSigningMaterial(k, nested, `${path}[${i}].${k}`);
+      }
+    });
+    return;
+  }
+  if (value !== null && typeof value === 'object') {
+    for (const [k, nested] of Object.entries(value)) assertNoSigningMaterial(k, nested, `${path}.${k}`);
   }
 }
 

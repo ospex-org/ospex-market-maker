@@ -73,6 +73,8 @@ export const TELEMETRY_KINDS = [
   'settle',
   'claim',
   'degraded', //                   a market's odds channel errored
+  'stream-health-degraded', //     own-state SSE stream queue overflowed / transport stale (Phase 2 PR3). Carries `{reason: 'queue-overflow', shadowReady, queueCapacity}`. Emitted once per overflow window; Phase 2 shadow-only ⇒ does NOT alter trading behavior.
+  'stream-would-hold', //          Phase 2 documentation event — "what Phase 3 cutover would do at this point". Carries `{reason: 'queue-overflow', exposureWei6}`. Emitted iff open exposure > 0 alongside `stream-health-degraded`. Phase 2 does NOT actually set `fundingHold`.
   'error', //                      { class, detail }
   'kill',
 ] as const;

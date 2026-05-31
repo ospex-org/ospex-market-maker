@@ -89,6 +89,25 @@ export interface OddsConfig {
   maxRealtimeChannels: number;
 }
 
+/**
+ * Own-state SSE stream config (Phase 2 PR3 — wakeable runner infrastructure).
+ * Phase 2 PR3 ships the queue + wake-signal primitives only; the SSE
+ * subscription itself lands in PR4 (which will add `subscribe: boolean` to
+ * this section). PR3's runner builds `OwnStateShadow` + drains the (still-empty)
+ * queue at each wake / tick boundary — `debounceMs` governs how long the loop
+ * waits between a `wake()` and the corresponding shadow drain so SSE bursts
+ * coalesce into a single drain pass.
+ */
+export interface OwnStateConfig {
+  /**
+   * Coalescing window after a wake fires before the loop drains the queue
+   * (own-state-sse-plan §2.5.1). Range 250-1000ms; default 500ms.
+   * Hermes-endorsed: prevents tight wake-drain churn under burst load while
+   * keeping shadow-vs-canonical divergence detectable within one poll interval.
+   */
+  debounceMs: number;
+}
+
 export interface EconomicsConfig {
   capitalUSDC: number;
   targetMonthlyReturnPct: number;
@@ -210,6 +229,7 @@ export interface Config {
   marketSelection: MarketSelectionConfig;
   discovery: DiscoveryConfig;
   odds: OddsConfig;
+  ownState: OwnStateConfig;
   pricing: PricingConfig;
   risk: RiskConfig;
   gas: GasConfig;

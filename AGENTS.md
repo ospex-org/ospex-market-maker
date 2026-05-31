@@ -251,6 +251,8 @@ Canonical vocabulary (`TELEMETRY_KINDS` in [`src/telemetry/index.ts`](./src/tele
 | `kind` | Payload |
 |---|---|
 | `degraded` | `{ contestId, referenceGameId, reason: 'channel-error' \| 'subscribe-failed' \| 'channel-cap', detail?: string }` — odds channel issue; the market is treated as stale-reference |
+| `stream-health-degraded` | `{ reason: 'queue-overflow', shadowReady: boolean, queueCapacity: number }` — own-state SSE queue overflowed (Phase 2 PR3). Emitted ONCE per overflow window; Phase 2 shadow-only contract ⇒ does NOT alter trading behavior (no `fundingHold`, no `fundingCancelSweep`). |
+| `stream-would-hold` | `{ reason: 'queue-overflow', exposureWei6: string }` — Phase 2 PR3 documentation event accompanying `stream-health-degraded` IFF open exposure > 0. Documents what Phase 3 cutover would gate `fundingHold` on; Phase 2 does NOT actually hold. |
 
 ### 3.6 Reserved (not yet emitted)
 

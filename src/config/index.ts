@@ -44,6 +44,7 @@ import {
   type ModeConfig,
   type OddsConfig,
   type OrdersConfig,
+  type OwnStateConfig,
   type PricingConfig,
   type RiskConfig,
   type SettlementConfig,
@@ -214,7 +215,7 @@ function def<T>(value: unknown, fallback: T, validate: (v: unknown) => T): T {
 
 // Known keys at every object level — anything else is a misspelling / stale field and fails closed.
 const ROOT_KEYS = [
-  'wallet', 'rpcUrl', 'apiUrl', 'chainId', 'marketSelection', 'discovery', 'odds', 'pricing',
+  'wallet', 'rpcUrl', 'apiUrl', 'chainId', 'marketSelection', 'discovery', 'odds', 'ownState', 'pricing',
   'risk', 'gas', 'approvals', 'orders', 'fundingGuard', 'settlement', 'telemetry', 'state', 'killSwitchFile',
   'killCancelOnChain', 'pollIntervalMs', 'mode',
 ] as const;
@@ -225,6 +226,7 @@ const MARKET_SELECTION_KEYS = [
 ] as const;
 const DISCOVERY_KEYS = ['everyNTicks', 'jitterPct'] as const;
 const ODDS_KEYS = ['subscribe', 'maxRealtimeChannels'] as const;
+const OWN_STATE_KEYS = ['debounceMs'] as const;
 const PRICING_KEYS = ['mode', 'economics', 'direct', 'quoteBothSides', 'minEdgeBps', 'maxPerQuotePctOfCapital'] as const;
 const ECONOMICS_KEYS = [
   'capitalUSDC', 'targetMonthlyReturnPct', 'daysHorizon', 'estGamesPerDay', 'fillRateAssumption',
@@ -325,6 +327,13 @@ export function parseConfig(raw: unknown, env: EnvLike = {}): Config {
   const odds: OddsConfig = {
     subscribe: def(o.subscribe, true, (v) => asBoolean(v, 'odds.subscribe')),
     maxRealtimeChannels: def(o.maxRealtimeChannels, 5, (v) => asPositiveInt(v, 'odds.maxRealtimeChannels')),
+  };
+
+  const ownStateObj = section(root, 'ownState', OWN_STATE_KEYS);
+  const ownState: OwnStateConfig = {
+    debounceMs: def(ownStateObj.debounceMs, 500, (v) =>
+      asNumberInRange(v, 'ownState.debounceMs', 250, 1000, { minInclusive: true, maxInclusive: true }),
+    ),
   };
 
   const p = section(root, 'pricing', PRICING_KEYS);
@@ -432,6 +441,7 @@ export function parseConfig(raw: unknown, env: EnvLike = {}): Config {
     marketSelection,
     discovery,
     odds,
+    ownState,
     pricing,
     risk,
     gas,

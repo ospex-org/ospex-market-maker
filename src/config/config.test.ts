@@ -17,6 +17,7 @@ describe('parseConfig', () => {
     expect(c.discovery.everyNTicks).toBe(10);
     expect(c.odds.subscribe).toBe(true);
     expect(c.odds.maxRealtimeChannels).toBe(5);
+    expect(c.ownState.debounceMs).toBe(500);
     expect(c.pricing.mode).toBe('economics');
     expect(c.pricing.quoteBothSides).toBe(true);
     expect(c.pricing.economics.capitalUSDC).toBe(50);
@@ -95,6 +96,15 @@ describe('parseConfig', () => {
     expect(() => parseConfig({ rpcUrl: 'x', mode: 'oops' }, {})).toThrow(/mode/);
     expect(() => parseConfig('not an object', {})).toThrow(/must be an object/);
     expect(() => parseConfig(undefined, {})).toThrow(/must be an object/);
+    expect(() => parseConfig({ rpcUrl: 'x', ownState: { debounceMs: 100 } }, {})).toThrow(/ownState\.debounceMs/);
+    expect(() => parseConfig({ rpcUrl: 'x', ownState: { debounceMs: 5000 } }, {})).toThrow(/ownState\.debounceMs/);
+    expect(() => parseConfig({ rpcUrl: 'x', ownState: { wrong: 1 } }, {})).toThrow(/wrong/);
+  });
+
+  it('ownState.debounceMs accepts in-range values', () => {
+    expect(parseConfig({ rpcUrl: 'x', ownState: { debounceMs: 250 } }, {}).ownState.debounceMs).toBe(250);
+    expect(parseConfig({ rpcUrl: 'x', ownState: { debounceMs: 750 } }, {}).ownState.debounceMs).toBe(750);
+    expect(parseConfig({ rpcUrl: 'x', ownState: { debounceMs: 1000 } }, {}).ownState.debounceMs).toBe(1000);
   });
 
   it('accepts string-or-number amounts and partial sections (merging over defaults)', () => {

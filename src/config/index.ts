@@ -226,7 +226,7 @@ const MARKET_SELECTION_KEYS = [
 ] as const;
 const DISCOVERY_KEYS = ['everyNTicks', 'jitterPct'] as const;
 const ODDS_KEYS = ['subscribe', 'maxRealtimeChannels'] as const;
-const OWN_STATE_KEYS = ['debounceMs'] as const;
+const OWN_STATE_KEYS = ['subscribe', 'debounceMs'] as const;
 const PRICING_KEYS = ['mode', 'economics', 'direct', 'quoteBothSides', 'minEdgeBps', 'maxPerQuotePctOfCapital'] as const;
 const ECONOMICS_KEYS = [
   'capitalUSDC', 'targetMonthlyReturnPct', 'daysHorizon', 'estGamesPerDay', 'fillRateAssumption',
@@ -331,6 +331,7 @@ export function parseConfig(raw: unknown, env: EnvLike = {}): Config {
 
   const ownStateObj = section(root, 'ownState', OWN_STATE_KEYS);
   const ownState: OwnStateConfig = {
+    subscribe: def(ownStateObj.subscribe, false, (v) => asBoolean(v, 'ownState.subscribe')),
     debounceMs: def(ownStateObj.debounceMs, 500, (v) =>
       asNumberInRange(v, 'ownState.debounceMs', 250, 1000, { minInclusive: true, maxInclusive: true }),
     ),

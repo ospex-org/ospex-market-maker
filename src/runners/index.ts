@@ -98,6 +98,7 @@ import { existsSync } from 'node:fs';
 
 import { DEFAULT_PER_IP_STREAM_CAP, POLL_INTERVAL_FLOOR_MS, RESERVED_OWN_STATE_STREAMS, type Config } from '../config/index.js';
 import { buildDesiredQuote, inventoryFromState, isExpiredForRelease, matchableCommitmentRiskWei6, reconcileBook, type BookReconciliation, type DesiredQuote, type RetainedPartial, type RetainedPartialReason, type SoftCancelReason } from '../orders/index.js';
+import { OspexStreamError } from '../ospex/index.js';
 import type {
   ApproveResult,
   ApproveUSDCAmount,
@@ -106,11 +107,17 @@ import type {
   PublicVisibleCommitment,
   ContestOddsSnapshot,
   ContestView,
+  Fill,
   Hex,
   MoneylineOdds,
   OddsSubscribeHandlers,
   OspexAdapter,
+  OwnerCommitment,
+  OwnerPosition,
+  OwnerStateSnapshot,
+  OwnerStateSubscribeHandlers,
   PositionStatus,
+  PositionStatusEvent,
   SpeculationView,
   Subscription,
 } from '../ospex/index.js';
@@ -125,6 +132,9 @@ import {
   type PolledCommitmentObservation,
   type PolledPositionInput,
   type ReducerDescriptor,
+  type ShadowCommitment,
+  type ShadowPosition,
+  type ShadowTransportStatus,
 } from '../reducers/index.js';
 import { OwnStateQueue } from './own-state-queue.js';
 import { WakeSignal } from './wake-signal.js';
@@ -401,6 +411,19 @@ export class Runner {
    * (never clear) since the SSE handlers PR4 will own the recovery path.
    */
   private streamOverflowDegraded = false;
+  /**
+   * The currently-active own-state SSE subscription (Phase 2 PR4a). `null`
+   * when `config.ownState.subscribe` is false OR while the runner is
+   * resubscribing (resync path lands in PR4b). All event handlers re-check
+   * `subscription === this.currentOwnStateSubscription` before any side-effect
+   * — per `[[feedback_async_lifecycle_invariant]]` an aborted subscription's
+   * callbacks MUST NOT mutate shadow state, enqueue events, or call `wake()`.
+   *
+   * The SDK guarantees handlers don't fire after `await unsubscribe()`, but
+   * the in-flight `Subscription` identity is the load-bearing check inside
+   * the runner — belt-and-braces.
+   */
+  private currentOwnStateSubscription: Subscription | null = null;
 
   constructor(opts: RunnerOptions) {
     this.config = opts.config;
@@ -410,6 +433,16 @@ export class Runner {
     if (!this.config.mode.dryRun && !this.adapter.isLive()) {
       throw new Error(
         'Runner: live mode (config.mode.dryRun=false) requires a signed adapter — build it with createLiveOspexAdapter(config, signer), not createOspexAdapter(config)',
+      );
+    }
+    // Own-state SSE subscription (Phase 2 PR4a) is opt-in via `config.ownState.subscribe`.
+    // Boot refuses if the operator asked for the stream but provided no maker address
+    // (dry-run, or live without `runRun` resolving the signer's address): the SDK's
+    // bearer-token mint signs with the signer's key and the token's `address` claim
+    // must match — without a maker address there's no `address` to scope the subscription.
+    if (this.config.ownState.subscribe && opts.makerAddress === undefined) {
+      throw new Error(
+        'Runner: `config.ownState.subscribe: true` requires a `makerAddress` — the own-state SSE stream is owner-authenticated, scoped to the signer\'s address. Set `mode.dryRun: false` AND `wallet.keystorePath` so `runRun` can resolve the signer.',
       );
     }
     // Live mode needs the maker address (fill detection + competitiveness self-exclusion).
@@ -918,6 +951,14 @@ export class Runner {
    */
   async run(): Promise<void> {
     const unregister = this.deps.registerShutdownSignals(() => this.requestShutdown('signal'));
+    // Phase 2 PR4a — open the owner-authenticated own-state SSE stream BEFORE the
+    // first tick when opted in. The SDK's `subscribe` returns synchronously so the
+    // handle is captured (and identity-checked by every handler) before any
+    // callback can fire. Subscription stays open across ticks; the `finally`
+    // below unsubscribes on every shutdown path.
+    if (this.config.ownState.subscribe && this.makerAddress !== null) {
+      this.openOwnStateSubscription();
+    }
     let ticks = 0;
     let bootApprovalsApplied = false;
     try {
@@ -962,6 +1003,12 @@ export class Runner {
       }
     } finally {
       unregister();
+      // Phase 2 PR4a — close the own-state SSE subscription on EVERY exit path
+      // (kill, signal, maxTicks, exception). Per the SDK contract `await
+      // unsubscribe()` guarantees no handler fires after it returns; combined
+      // with the runner's identity-guarded handlers this means a re-subscribe
+      // after this point starts from a clean slate.
+      await this.closeOwnStateSubscription();
       // Shutdown sweep — on EVERY actual operator-triggered shutdown
       // (`shutdownReason !== null`, live mode), pull every visible quote off
       // chain (gasless `cancelCommitmentOffchain`). This is the soft-stop
@@ -2347,6 +2394,241 @@ export class Runner {
     return result;
   }
 
+  // ── own-state SSE subscription (Phase 2 PR4a) ────────────────────────────
+
+  /**
+   * Open the owner-authenticated own-state SSE stream. Captures the
+   * `Subscription` SYNCHRONOUSLY before any handler can fire so the
+   * identity-guard inside the handlers can compare against
+   * `this.currentOwnStateSubscription` correctly on the very first event.
+   *
+   * Phase 2 invariant — shadow-only: the handlers project SSE bodies into
+   * `this.ownStateShadow` ONLY. Canonical `MakerState` writes still come
+   * from the poll path. Owner-reducer event-application is stubbed in
+   * PR4a (queue events drain to no-op reducers); PR4b lands the real
+   * reducer bodies.
+   */
+  private openOwnStateSubscription(): void {
+    if (this.makerAddress === null) return; // guarded by caller; defensive
+    if (this.currentOwnStateSubscription !== null) return; // already open
+    // Build the handlers up front. Each handler captures a `mySub` LOCAL ref
+    // assigned after `subscribe` returns; the runtime identity check
+    // `mySub === this.currentOwnStateSubscription` rejects late-fired
+    // handlers from an unsubscribed prior subscription (belt-and-braces on
+    // the SDK's own no-fire-after-unsubscribe contract).
+    let mySub: Subscription | null = null;
+    const sameSub = (): boolean => mySub !== null && mySub === this.currentOwnStateSubscription;
+    const handlers: OwnerStateSubscribeHandlers = {
+      onSnapshot: (snapshot) => {
+        if (!sameSub()) return;
+        this.handleOwnerSnapshot(snapshot);
+      },
+      onReady: () => {
+        if (!sameSub()) return;
+        this.handleOwnerReady();
+      },
+      onCommitment: (commitment) => {
+        if (!sameSub()) return;
+        this.handleOwnerCommitment(commitment);
+      },
+      onFill: (fill) => {
+        if (!sameSub()) return;
+        this.handleOwnerFill(fill);
+      },
+      onPositionStatus: (event) => {
+        if (!sameSub()) return;
+        this.handleOwnerPositionStatus(event);
+      },
+      onStatus: (status) => {
+        if (!sameSub()) return;
+        this.handleOwnerStatus(status);
+      },
+      onError: (error) => {
+        if (!sameSub()) return;
+        this.handleOwnerError(error);
+      },
+    };
+    mySub = this.adapter.subscribeOwnState({ address: this.makerAddress }, handlers);
+    this.currentOwnStateSubscription = mySub;
+  }
+
+  /**
+   * Close the current own-state SSE subscription. Awaiting `unsubscribe()`
+   * is the SDK's contract for "no handler will fire after this returns".
+   * Idempotent — safe to call when no subscription is open.
+   *
+   * Sets `currentOwnStateSubscription` to `null` BEFORE the await so that
+   * any in-flight handler that happened to fire on the same microtask sees
+   * `mySub !== current` (=== null) and no-ops via the identity guard.
+   */
+  private async closeOwnStateSubscription(): Promise<void> {
+    const sub = this.currentOwnStateSubscription;
+    if (sub === null) return;
+    this.currentOwnStateSubscription = null;
+    try {
+      await sub.unsubscribe();
+    } catch (err) {
+      this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'own-state-unsubscribe' });
+    }
+  }
+
+  /**
+   * Handle one snapshot page from the SSE cold-connect (inline) or REST
+   * paging (when the first inline page was `truncated: true`). Each call
+   * accumulates the page's commitments + positions into
+   * `shadow.pendingBaseline`. The final page (`truncated: false`) is
+   * followed by `onReady`, which atomically swaps `pendingBaseline` into
+   * `shadow.commitments` / `shadow.positions`.
+   *
+   * Phase 2 invariant — shadow-only: writes are to `pendingBaseline` (a
+   * shadow projection), NOT to canonical `MakerState`.
+   */
+  private handleOwnerSnapshot(snapshot: OwnerStateSnapshot): void {
+    if (this.ownStateShadow.pendingBaseline === null) {
+      this.ownStateShadow.pendingBaseline = { commitments: {}, positions: {}, truncated: snapshot.truncated };
+    } else {
+      this.ownStateShadow.pendingBaseline.truncated = snapshot.truncated;
+    }
+    for (const c of snapshot.commitments) {
+      this.ownStateShadow.pendingBaseline.commitments[c.commitmentHash] = projectOwnerCommitment(c);
+    }
+    for (const p of snapshot.positions) {
+      const projected = projectOwnerPosition(p);
+      if (projected !== null) this.ownStateShadow.pendingBaseline.positions[`${p.speculationId}:${projected.side}`] = projected;
+    }
+    this.ownStateShadow.lastEventAtMs = Date.now();
+    // Don't wake on snapshot pages — wake when `ready` fires (the comparator
+    // shouldn't run against a partial baseline; the SDK still buffers deltas
+    // internally until `ready`, but we belt-and-braces by deferring drain).
+  }
+
+  /**
+   * Handle the `onReady` signal — fires after the final untruncated snapshot
+   * page (cold start) OR after server catchup completes (resume reconnect).
+   * Atomically swaps `pendingBaseline` into `shadow.commitments` /
+   * `shadow.positions`; sets `ready: true`; wakes the loop so the next
+   * drain sees `ready: true` (PR5 comparator uses this).
+   */
+  private handleOwnerReady(): void {
+    const baseline = this.ownStateShadow.pendingBaseline;
+    if (baseline !== null) {
+      // Atomic swap — replace shadow's commitments/positions wholesale rather
+      // than merging. The pendingBaseline accumulated EVERY commitment/position
+      // visible at snapshot time; anything in shadow.commitments from a prior
+      // resync MUST NOT survive (a resync explicitly clears pendingBaseline +
+      // ready=false beforehand — see `handleOwnerStatus`).
+      this.ownStateShadow.commitments = baseline.commitments;
+      this.ownStateShadow.positions = baseline.positions;
+      this.ownStateShadow.truncated = baseline.truncated;
+      this.ownStateShadow.pendingBaseline = null;
+    }
+    this.ownStateShadow.ready = true;
+    this.ownStateShadow.lastReadyAtMs = Date.now();
+    this.ownStateShadow.lastEventAtMs = Date.now();
+    // No telemetry emit in PR4a — PR5 wires the proper `stream-ready` /
+    // comparator-pass shape. Wake the loop so the next iteration drains.
+    this.wakeSignal.wake();
+  }
+
+  private handleOwnerCommitment(commitment: OwnerCommitment): void {
+    this.ownStateShadow.lastEventAtMs = Date.now();
+    this.ownStateQueue.enqueue({ kind: 'commitment', body: commitment, arrivedAtMs: Date.now() });
+    this.wakeSignal.wake();
+  }
+
+  private handleOwnerFill(fill: Fill): void {
+    this.ownStateShadow.lastEventAtMs = Date.now();
+    this.ownStateQueue.enqueue({ kind: 'fill', body: fill, arrivedAtMs: Date.now() });
+    this.wakeSignal.wake();
+  }
+
+  private handleOwnerPositionStatus(event: PositionStatusEvent): void {
+    this.ownStateShadow.lastEventAtMs = Date.now();
+    this.ownStateQueue.enqueue({ kind: 'positionStatus', body: event, arrivedAtMs: Date.now() });
+    this.wakeSignal.wake();
+  }
+
+  /**
+   * Handle a transport status change. `resync` clears the prior baseline +
+   * `ready: false` so the next snapshot fully replaces shadow state.
+   * `degraded` sets `healthy: false` — the PR5 comparator's precondition
+   * `healthy && ready` suppresses divergence telemetry until the transport
+   * recovers (`connected` clears it).
+   */
+  private handleOwnerStatus(status: ShadowTransportStatus): void {
+    this.ownStateShadow.lastStatus = status;
+    this.ownStateShadow.lastEventAtMs = Date.now();
+    if (status === 'resync') {
+      // Drop the running baseline + mark not-ready so a partial pre-resync
+      // snapshot doesn't accidentally swap in. Reducers downstream check
+      // `ready` before reading shadow.commitments/positions.
+      this.ownStateShadow.ready = false;
+      this.ownStateShadow.pendingBaseline = null;
+    } else if (status === 'degraded') {
+      this.ownStateShadow.healthy = false;
+    } else if (status === 'connected') {
+      // Transport recovered — clear any prior fatal-error mark so the next
+      // comparator pass can re-enable divergence reporting.
+      this.ownStateShadow.healthy = true;
+      this.ownStateShadow.lastError = null;
+    }
+    this.wakeSignal.wake();
+  }
+
+  /**
+   * Handle a non-fatal transport error from the SDK. Records the error
+   * details on the shadow; sets `healthy: false` for fatal errors (SDK
+   * surfaces fatality via `OspexStreamError.reason === 'fatal'`).
+   * Pre-existing shadow state is PRESERVED — the PR5 comparator's
+   * `healthy && ready` precondition is what suppresses divergence telemetry.
+   */
+  private handleOwnerError(error: OspexStreamError): void {
+    const reason = error.reason;
+    this.ownStateShadow.lastError = {
+      class: error.constructor.name,
+      detail: error.message,
+      reason: reason ?? 'unknown',
+      recordedAtMs: Date.now(),
+    };
+    this.ownStateShadow.lastEventAtMs = Date.now();
+    if (reason === 'fatal') {
+      this.ownStateShadow.healthy = false;
+    }
+    this.eventLog.emit('error', {
+      class: error.constructor.name,
+      detail: error.message,
+      phase: 'own-state-stream',
+    });
+    this.wakeSignal.wake();
+  }
+
+  /**
+   * Test seam — exposes the shadow projection for assertions in
+   * `runner.test.ts`. Returns the live reference; tests must not mutate it.
+   */
+  ownStateShadowView(): Readonly<OwnStateShadow> {
+    return this.ownStateShadow;
+  }
+
+  /**
+   * Test seam — exposes the current subscription handle for adversarial
+   * lifecycle-invariant tests (PR4a). Tests swap this out and verify that
+   * the prior subscription's callbacks no-op.
+   */
+  currentOwnStateSubscriptionForTest(): Subscription | null {
+    return this.currentOwnStateSubscription;
+  }
+
+  /**
+   * Test seam — sets `this.currentOwnStateSubscription` to a sentinel value
+   * for the lifecycle-invariant adversarial test (PR4a). The sentinel makes
+   * the identity check `mySub === current` false from the prior subscription's
+   * point of view, so its handlers must no-op.
+   */
+  setCurrentOwnStateSubscriptionForTest(sub: Subscription | null): void {
+    this.currentOwnStateSubscription = sub;
+  }
+
   /**
    * Live-mode soft-cancelled-fill convergence (DESIGN §9, §10). A commitment the MM
    * soft-cancelled off-chain (`lifecycle: 'softCancelled'`) is API-*hidden* from
@@ -3116,6 +3398,72 @@ function computeOpenExposureWei6(state: MakerState, nowUnixSec: number, graceSec
     total += BigInt(p.riskAmountWei6);
   }
   return total;
+}
+
+/**
+ * Project an SDK `OwnerCommitment` (the owner-auth maker view delivered via
+ * SSE) to the shadow's narrow `ShadowCommitment` shape (Phase 2 PR4a). The
+ * projection maps the SDK's effective `status` + signals to a
+ * `CommitmentLifecycle` matching the canonical (`MakerCommitmentRecord`)
+ * lifecycle vocabulary so the PR5 comparator can compare apples to apples.
+ *
+ * Lifecycle routing precedence (mirrors the poll-side `reducePolledCommitmentObservation`):
+ *   - FULL fill (`filledRiskAmount >= riskAmount`) → `'filled'`.
+ *   - AUTH (`storedStatus === 'cancelled'` || `nonceInvalidated`) → `'authoritativelyInvalidated'`.
+ *   - Effective `'expired'` → `'expired'`.
+ *   - Effective `'cancelled'` (book-hidden but not AUTH) → `'softCancelled'`.
+ *   - Effective `'filled'` (cumulative not at risk yet — unusual; trust the API) → `'filled'`.
+ *   - Effective `'open'` or `'partially_filled'` with `filledRiskAmount > 0` → `'partiallyFilled'`.
+ *   - Effective `'open'` → `'visibleOpen'`.
+ */
+function projectOwnerCommitment(c: OwnerCommitment): ShadowCommitment {
+  const filled = BigInt(c.filledRiskAmount);
+  const risk = BigInt(c.riskAmount);
+  let lifecycle: ShadowCommitment['lifecycle'];
+  if (filled >= risk) {
+    lifecycle = 'filled';
+  } else if (c.storedStatus === 'cancelled' || c.nonceInvalidated) {
+    lifecycle = 'authoritativelyInvalidated';
+  } else if (c.status === 'expired') {
+    lifecycle = 'expired';
+  } else if (c.status === 'cancelled') {
+    lifecycle = 'softCancelled';
+  } else if (c.status === 'filled') {
+    lifecycle = 'filled';
+  } else if (filled > 0n) {
+    lifecycle = 'partiallyFilled';
+  } else {
+    lifecycle = 'visibleOpen';
+  }
+  // OwnerCommitment.expiry is ISO-8601 string or null. Convert to unix seconds;
+  // null → 0 (defensive — the comparator's expiry check will not match canonical).
+  const expiryUnixSec = c.expiry === null ? 0 : Math.floor(new Date(c.expiry).getTime() / 1000);
+  return {
+    hash: c.commitmentHash,
+    lifecycle,
+    filledRiskWei6: c.filledRiskAmount,
+    riskAmountWei6: c.riskAmount,
+    expiryUnixSec,
+  };
+}
+
+/**
+ * Project an SDK `OwnerPosition` to the shadow's `ShadowPosition` (Phase 2
+ * PR4a). Returns `null` for positions the snapshot intentionally drops
+ * (terminal-lost / void — those positions don't appear in `OwnerPosition`
+ * unions; defensive fall-through). The status maps 1:1 to
+ * `MakerPositionStatus` for the four states the snapshot carries.
+ *
+ * `positionType` → side: 0=away, 1=home (canonical Ospex protocol mapping).
+ */
+function projectOwnerPosition(p: OwnerPosition): ShadowPosition | null {
+  const side: ShadowPosition['side'] = p.positionType === 0 ? 'away' : 'home';
+  return {
+    speculationId: p.speculationId,
+    side,
+    riskAmountWei6: Math.round(p.riskAmountUSDC * 1_000_000).toString(),
+    status: p.status, // type-level guarantee: 'active' | 'pendingSettle' | 'claimable' | 'claimed'
+  };
 }
 
 function errClass(err: unknown): string {

@@ -38,6 +38,10 @@ odds:
                                    #   the server cap. The runner warns at boot if the budget would be exceeded.
 
 ownState:
+  subscribe: false                 # Phase 2 PR4a — opt-in to the owner-authenticated own-state SSE stream. Default false until
+                                   #   the PR5 comparator is wired + soak-validated. `true` requires `mode.dryRun: false` AND a
+                                   #   `wallet.keystorePath` (the SDK mints a bearer token signed by the maker's key).
+                                   #   Phase 2 invariant: shadow-only — never alters canonical trading state or quote timing.
   debounceMs: 500                  # Phase 2 PR3 — coalescing window (250-1000ms) after a wake fires before the runner drains the
                                    #   shadow queue. SSE bursts of N events within this window collapse to a single drain pass.
                                    #   Phase 2 ships shadow-only — no canonical-state writes, no trading-timing changes.

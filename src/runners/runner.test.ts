@@ -117,6 +117,40 @@ function makeRunner(opts: { config?: Config; adapter?: OspexAdapter; runId?: str
 /** The fake signer's address used across the live-mode tests (`liveSpiedAdapter` → `fakeSigner` → this). Re-exported as `SIGNER_ADDRESS` inside the `live execution` describe for symmetry with earlier test additions. */
 const DEFAULT_FAKE_MAKER_ADDRESS = '0x9999999999999999999999999999999999999999';
 
+// ── async loop test harness (used by PR3 wakeable-loop + PR4a SSE wiring tests) ─
+
+/** A controllable sleep harness: each call pushes the requested ms to
+ * `sleepCalls` and returns a pending Promise that resolves on either signal
+ * abort OR a manual `resolvers[i]()`. Tests advance the loop by either
+ * triggering a wake (aborts the composed signal → resolves the pending
+ * sleep) or calling `resolvers[i]()`. */
+function controllableSleep() {
+  const sleepCalls: number[] = [];
+  const resolvers: Array<() => void> = [];
+  const sleep = (ms: number, signal: AbortSignal): Promise<void> =>
+    new Promise<void>((resolve) => {
+      sleepCalls.push(ms);
+      if (signal.aborted) {
+        resolve();
+        return;
+      }
+      resolvers.push(resolve);
+      signal.addEventListener('abort', () => resolve(), { once: true });
+    });
+  return { sleep, sleepCalls, resolvers };
+}
+
+/** Wait until `predicate()` is true. Yields setImmediate between checks so
+ * the runner's loop advances through its tick() awaits and into the next
+ * `deps.sleep` call. Times out after ~1s to keep tests deterministic. */
+async function waitFor(predicate: () => boolean): Promise<void> {
+  for (let i = 0; i < 200; i++) {
+    if (predicate()) return;
+    await new Promise<void>((r) => setImmediate(r));
+  }
+  throw new Error('waitFor: predicate did not become true within ~1s');
+}
+
 // ── discovery fixtures ───────────────────────────────────────────────────────
 
 const FUTURE_ISO = '2099-01-01T00:00:00Z'; // far after the test clock (T0 ≈ 2030-03)
@@ -587,36 +621,7 @@ describe('Runner — tick loop', () => {
 // ── wakeable loop (Phase 2 PR3) ──────────────────────────────────────────────
 
 describe('Runner — wakeable loop (Phase 2 PR3)', () => {
-  // A controllable sleep harness: each call pushes the requested ms to `sleepCalls`
-  // and returns a pending Promise that resolves on either signal abort OR a manual
-  // `resolvers[i]()`. Tests advance the loop by either triggering a wake (aborts
-  // the composed signal → resolves the pending sleep) or calling `resolvers[i]()`.
-  function controllableSleep() {
-    const sleepCalls: number[] = [];
-    const resolvers: Array<() => void> = [];
-    const sleep = (ms: number, signal: AbortSignal): Promise<void> =>
-      new Promise<void>((resolve) => {
-        sleepCalls.push(ms);
-        if (signal.aborted) {
-          resolve();
-          return;
-        }
-        resolvers.push(resolve);
-        signal.addEventListener('abort', () => resolve(), { once: true });
-      });
-    return { sleep, sleepCalls, resolvers };
-  }
-
-  // Wait until `predicate()` is true. Yields a microtask + setImmediate between
-  // checks so the runner's loop advances through its tick() awaits and into
-  // the next `deps.sleep` call. Times out after ~1s to keep tests deterministic.
-  async function waitFor(predicate: () => boolean): Promise<void> {
-    for (let i = 0; i < 200; i++) {
-      if (predicate()) return;
-      await new Promise<void>((r) => setImmediate(r));
-    }
-    throw new Error('waitFor: predicate did not become true within ~1s');
-  }
+  // Hoisted to module scope below — used by PR3 and PR4a tests.
 
   it('a wake during the poll-deadline wait does NOT increment ticks (drain-only outcome)', async () => {
     const { sleep, sleepCalls, resolvers } = controllableSleep();
@@ -789,6 +794,239 @@ describe('Runner — own-state queue overflow telemetry (Phase 2 PR3)', () => {
     await runner.run();
     const events = readEvents();
     expect(events.some((e) => e.kind === 'funding-hold')).toBe(false);
+  });
+});
+
+// ── own-state SSE subscription wiring (Phase 2 PR4a) ─────────────────────────
+
+describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
+  // Recorder that captures the handler set passed to subscribeOwnState +
+  // exposes a `fire(...)` API so tests can simulate SDK callbacks. Typed
+  // loosely (`unknown` body / handlers indexed by string) to keep the test
+  // ergonomic — the runner-side types are checked by the production code.
+  function makeOwnStateRecorder() {
+    let capturedHandlers: Record<string, ((arg?: unknown) => void) | undefined> = {};
+    let unsubscribed = false;
+    const sub = { unsubscribe: () => { unsubscribed = true; return Promise.resolve(); } };
+    const subscribe = ((_opts: unknown, handlers: unknown) => {
+      capturedHandlers = handlers as Record<string, (arg?: unknown) => void>;
+      return sub;
+    }) as unknown as OspexAdapter['subscribeOwnState'];
+    return {
+      sub,
+      subscribe,
+      get isUnsubscribed(): boolean { return unsubscribed; },
+      fire(name: string, arg?: unknown): void {
+        const h = capturedHandlers[name];
+        if (h === undefined) throw new Error(`recorder.fire: no handler for ${name}`);
+        h(arg);
+      },
+      handler(name: string): ((arg?: unknown) => void) | undefined { return capturedHandlers[name]; },
+    };
+  }
+
+  it('does NOT open the SSE subscription when config.ownState.subscribe=false (default)', async () => {
+    const config = cfg(); // subscribe defaults false
+    const recorder = makeOwnStateRecorder();
+    const adapter = createOspexAdapter(config);
+    vi.spyOn(adapter, 'listContests').mockResolvedValue([]);
+    vi.spyOn(adapter, 'subscribeOwnState').mockImplementation(recorder.subscribe);
+    const runner = makeRunner({ config, adapter, maxTicks: 1 });
+    await runner.run();
+    expect(recorder.handler('onReady')).toBeUndefined();
+  });
+
+  it('opens the SSE subscription on boot when config.ownState.subscribe=true', async () => {
+    const config = cfg({ ownState: { subscribe: true } });
+    const recorder = makeOwnStateRecorder();
+    const adapter = createOspexAdapter(config);
+    vi.spyOn(adapter, 'listContests').mockResolvedValue([]);
+    vi.spyOn(adapter, 'subscribeOwnState').mockImplementation(recorder.subscribe);
+    const runner = makeRunner({ config, adapter, maxTicks: 1, makerAddress: DEFAULT_FAKE_MAKER_ADDRESS as Hex });
+    await runner.run();
+    expect(recorder.handler('onReady')).toBeDefined();
+    // Shutdown sweeps unsubscribe
+    expect(recorder.isUnsubscribed).toBe(true);
+  });
+
+  it('boot refuses subscribe=true without a maker address (dry-run can\'t mint the bearer token)', () => {
+    const config = cfg({ ownState: { subscribe: true } }); // mode.dryRun stays true by default
+    expect(() => makeRunner({ config })).toThrow(/own-state SSE stream is owner-authenticated/);
+  });
+
+  it('lifecycle invariant — a stale-sub handler must NOT mutate shadow / enqueue / wake (adversarial)', async () => {
+    const config = cfg({ ownState: { subscribe: true } });
+    const recorder = makeOwnStateRecorder();
+    const adapter = createOspexAdapter(config);
+    vi.spyOn(adapter, 'listContests').mockResolvedValue([]);
+    vi.spyOn(adapter, 'subscribeOwnState').mockImplementation(recorder.subscribe);
+    const runner = makeRunner({ config, adapter, maxTicks: 1, makerAddress: DEFAULT_FAKE_MAKER_ADDRESS as Hex });
+    const runPromise = runner.run();
+
+    // Wait until the subscription has been opened (synchronous on the recorder,
+    // but the runner enters run() async — flush a microtask).
+    await new Promise<void>((r) => setImmediate(r));
+
+    // Swap out currentOwnStateSubscription with a sentinel so the prior
+    // subscription's handlers see `mySub !== current` and must no-op.
+    const sentinelSub: Subscription = { unsubscribe: () => Promise.resolve() };
+    runner.setCurrentOwnStateSubscriptionForTest(sentinelSub);
+
+    const shadowBefore = JSON.parse(JSON.stringify(runner.ownStateShadowView()));
+
+    // Fire every kind of handler with realistic-shaped payloads.
+    recorder.fire('onSnapshot', { cursor: 'c1', commitments: [], positions: [], truncated: false, positionsTruncated: false });
+    recorder.fire('onReady');
+    recorder.fire('onCommitment', { commitmentHash: '0xstale', filledRiskAmount: '0', riskAmount: '100', expiry: null, status: 'open', storedStatus: 'open', nonceInvalidated: false });
+    recorder.fire('onPositionStatus', { address: '0xstale', speculationId: 'spec', positionType: 0, status: 'active', sourceUpdatedAt: '2025-01-01T00:00:00Z' });
+    recorder.fire('onStatus', 'resync');
+    recorder.fire('onError', { reason: 'fatal', message: 'simulated', constructor: { name: 'OspexStreamError' } });
+
+    // Shadow must be byte-identical (no stale handler mutation).
+    expect(JSON.parse(JSON.stringify(runner.ownStateShadowView()))).toEqual(shadowBefore);
+
+    // Restore so shutdown unsubscribes cleanly.
+    runner.setCurrentOwnStateSubscriptionForTest(recorder.sub);
+    await runPromise;
+  });
+
+  /**
+   * Builds a runner with ownState.subscribe wired against the recorder + a
+   * controllable sleep + a trigger-kill seam. Returns the runner + a way to
+   * wait for tick 1 to complete (subscription open + loop in
+   * waitForNextPollDeadline) so tests can fire events while the loop is
+   * paused mid-wait. Tests must call `triggerKill()` and `await runPromise`
+   * to clean up.
+   */
+  async function makePausedSubscribedRunner() {
+    const config = cfg({ ownState: { subscribe: true } });
+    const recorder = makeOwnStateRecorder();
+    const adapter = createOspexAdapter(config);
+    vi.spyOn(adapter, 'listContests').mockResolvedValue([]);
+    vi.spyOn(adapter, 'subscribeOwnState').mockImplementation(recorder.subscribe);
+    const { sleep, sleepCalls } = controllableSleep();
+    let triggerKill!: () => void;
+    const runner = makeRunner({
+      config, adapter, maxTicks: 100,
+      makerAddress: DEFAULT_FAKE_MAKER_ADDRESS as Hex,
+      deps: {
+        sleep,
+        registerShutdownSignals: (onSignal) => { triggerKill = onSignal; return () => {}; },
+      },
+    });
+    const runPromise = runner.run();
+    await waitFor(() => sleepCalls.length >= 1);
+    return { runner, recorder, runPromise, triggerKill: () => triggerKill() };
+  }
+
+  it('multi-page snapshot accumulates into pendingBaseline; onReady atomically swaps into shadow.commitments + shadow.positions', async () => {
+    const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
+
+    // Page 1 (truncated=true) — accumulate commitment A + position P1
+    recorder.fire('onSnapshot', {
+      cursor: 'c1',
+      commitments: [{ commitmentHash: '0xa', filledRiskAmount: '0', riskAmount: '100', expiry: null, status: 'open', storedStatus: 'open', nonceInvalidated: false }],
+      positions: [{ speculationId: 'spec-1', positionType: 0, riskAmountUSDC: 0.1, profitAmountUSDC: 0, status: 'active' }],
+      truncated: true,
+      positionsTruncated: false,
+    });
+
+    let shadow = runner.ownStateShadowView();
+    expect(shadow.ready).toBe(false);
+    expect(shadow.pendingBaseline).not.toBeNull();
+    expect(Object.keys(shadow.pendingBaseline!.commitments)).toEqual(['0xa']);
+    expect(Object.keys(shadow.pendingBaseline!.positions)).toEqual(['spec-1:away']);
+    expect(shadow.commitments).toEqual({}); // not yet swapped
+    expect(shadow.positions).toEqual({});
+
+    // Page 2 (truncated=false) — accumulate commitment B
+    recorder.fire('onSnapshot', {
+      cursor: 'c2',
+      commitments: [{ commitmentHash: '0xb', filledRiskAmount: '0', riskAmount: '200', expiry: null, status: 'open', storedStatus: 'open', nonceInvalidated: false }],
+      positions: [],
+      truncated: false,
+      positionsTruncated: false,
+    });
+
+    shadow = runner.ownStateShadowView();
+    expect(Object.keys(shadow.pendingBaseline!.commitments).sort()).toEqual(['0xa', '0xb']);
+
+    // onReady: atomic swap.
+    recorder.fire('onReady');
+    shadow = runner.ownStateShadowView();
+    expect(shadow.ready).toBe(true);
+    expect(shadow.pendingBaseline).toBeNull();
+    expect(Object.keys(shadow.commitments).sort()).toEqual(['0xa', '0xb']);
+    expect(Object.keys(shadow.positions)).toEqual(['spec-1:away']);
+
+    triggerKill();
+    await runPromise;
+  });
+
+  it('onStatus(\'resync\') drops pendingBaseline + sets ready=false so a partial pre-resync snapshot does not swap in', async () => {
+    const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
+
+    recorder.fire('onSnapshot', {
+      cursor: 'c1',
+      commitments: [{ commitmentHash: '0xpre', filledRiskAmount: '0', riskAmount: '100', expiry: null, status: 'open', storedStatus: 'open', nonceInvalidated: false }],
+      positions: [],
+      truncated: false,
+      positionsTruncated: false,
+    });
+    recorder.fire('onReady');
+    expect(runner.ownStateShadowView().ready).toBe(true);
+    expect(Object.keys(runner.ownStateShadowView().commitments)).toEqual(['0xpre']);
+
+    // resync mid-stream — drops the in-flight baseline + flags not-ready
+    recorder.fire('onStatus', 'resync');
+    const shadow = runner.ownStateShadowView();
+    expect(shadow.ready).toBe(false);
+    expect(shadow.pendingBaseline).toBeNull();
+    expect(shadow.lastStatus).toBe('resync');
+    // Pre-resync shadow.commitments PRESERVED — comparator suppresses via `ready` precondition.
+    expect(Object.keys(shadow.commitments)).toEqual(['0xpre']);
+
+    triggerKill();
+    await runPromise;
+  });
+
+  it('onError(fatal) sets healthy=false; pre-existing shadow state PRESERVED (comparator suppression is PR5\'s job)', async () => {
+    const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
+
+    recorder.fire('onSnapshot', {
+      cursor: 'c1',
+      commitments: [{ commitmentHash: '0xpre', filledRiskAmount: '0', riskAmount: '100', expiry: null, status: 'open', storedStatus: 'open', nonceInvalidated: false }],
+      positions: [],
+      truncated: false,
+      positionsTruncated: false,
+    });
+    recorder.fire('onReady');
+
+    // Simulate a fatal error.
+    recorder.fire('onError', Object.assign(new Error('boom'), { reason: 'fatal' }));
+    const shadow = runner.ownStateShadowView();
+    expect(shadow.healthy).toBe(false);
+    expect(shadow.lastError?.reason).toBe('fatal');
+    // Shadow state preserved as STALE — PR5 comparator's `healthy && ready` precondition is the suppression.
+    expect(Object.keys(shadow.commitments)).toEqual(['0xpre']);
+
+    triggerKill();
+    await runPromise;
+  });
+
+  it('onCommitment / onFill / onPositionStatus enqueue events + wake the loop', async () => {
+    const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
+
+    // Fire each delta type — they enqueue + wake; queue is drained at next iter or pre-tick.
+    recorder.fire('onCommitment', { commitmentHash: '0xc', filledRiskAmount: '0', riskAmount: '100', expiry: null, status: 'open', storedStatus: 'open', nonceInvalidated: false });
+    recorder.fire('onFill', { txHash: '0xtx', logIndex: 0, commitmentHash: '0xc', makerRiskAmount: '50' });
+    recorder.fire('onPositionStatus', { address: '0xabc', speculationId: 'spec-1', positionType: 0, status: 'active', sourceUpdatedAt: '2025-01-01T00:00:00Z' });
+
+    // No direct assertion on queue contents (private); but lastEventAtMs advanced.
+    expect(runner.ownStateShadowView().lastEventAtMs).toBeGreaterThan(0);
+
+    triggerKill();
+    await runPromise;
   });
 });
 

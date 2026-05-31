@@ -68,13 +68,21 @@ import {
   type OddsSubscribeHandlers,
   type OspexClientOptions,
   type OspexAddresses,
+  type OwnerCommitment,
+  type OwnerPosition,
+  type OwnerStateSnapshot,
+  type OwnerStateSubscribeHandlers,
+  type OwnStateSubscribeOptions,
+  type PositionLifecycle,
   type PositionStatus,
+  type PositionStatusEvent,
   type Signer,
   type Speculation,
   type SpeculationsListOptions,
   type SpreadOdds,
   type Subscription,
   type TotalOdds,
+  type Fill,
 } from '@ospex/sdk';
 // Imported from a subpath, not the package root: the SDK deliberately keeps
 // KeystoreSigner (and its ethers + scrypt dependency) off the main entry point.
@@ -103,12 +111,20 @@ export type {
   OddsSubscribeHandlers,
   OspexAddresses,
   OspexClientOptions,
+  OwnerCommitment,
+  OwnerPosition,
+  OwnerStateSnapshot,
+  OwnerStateSubscribeHandlers,
+  OwnStateSubscribeOptions,
+  PositionLifecycle,
   PositionStatus,
+  PositionStatusEvent,
   Signer,
   SpeculationsListOptions,
   SpreadOdds,
   Subscription,
   TotalOdds,
+  Fill,
 };
 
 export {
@@ -183,6 +199,7 @@ export type OspexClientLike = {
   approvals: Pick<OspexClient['approvals'], 'read'>;
   health: Pick<OspexClient['health'], 'check'>;
   odds: OspexClient['odds'];
+  ownState: Pick<OspexClient['ownState'], 'subscribe'>;
 };
 
 // ── write-method arg/result shapes (derived from the SDK — no deep imports) ───
@@ -338,6 +355,27 @@ export class OspexAdapter {
     handlers: OddsSubscribeHandlers<OddsForMarket<M>>,
   ): Promise<Subscription> {
     return this.client.odds.subscribe(args, handlers);
+  }
+
+  /**
+   * Open the maker's owner-authenticated own-state SSE stream (Phase 2 PR4a —
+   * own-state-sse-plan §2.4 / §2.5.1). SYNCHRONOUS return — the SDK's
+   * `client.ownState.subscribe` opens the SSE connection asynchronously but
+   * returns the `Subscription` handle right away, so the caller can wire its
+   * lifecycle (`unsubscribe`) BEFORE any handler can fire (per
+   * `[[feedback_async_lifecycle_invariant]]` Hermes blocker 4 nuance from the
+   * Phase 2 plan v2 review).
+   *
+   * Bearer-token minting / refresh / Last-Event-ID reconnect / resync —
+   * all internal to the SDK. The runner just consumes the handlers + holds
+   * the returned subscription so it can `unsubscribe()` on shutdown. Pass-
+   * through — no field mapping at this layer.
+   */
+  subscribeOwnState(
+    options: OwnStateSubscribeOptions,
+    handlers: OwnerStateSubscribeHandlers,
+  ): Subscription {
+    return this.client.ownState.subscribe(options, handlers);
   }
 
   // ── commitments ───────────────────────────────────────────────────────

@@ -5,7 +5,7 @@ import { join } from 'node:path';
 
 import { parseConfig, type Config } from '../config/index.js';
 import { createLiveOspexAdapter, type CancelOnchainResult, type Hex, type OspexAdapter, type Signer } from '../ospex/index.js';
-import { StateStore, emptyMakerState, type MakerCommitmentRecord, type MakerState } from '../state/index.js';
+import { StateStore, emptyMakerState, type MakerCommitmentRecord, type MakerSignedPayload, type MakerState } from '../state/index.js';
 import { CancelStaleRefused, cancelStaleExitCode, runCancelStale, type CancelStaleReport } from './cancel-stale.js';
 
 // ── harness ──────────────────────────────────────────────────────────────────
@@ -59,7 +59,41 @@ function liveAdapter(config: Config, signer: Signer): OspexAdapter {
   return adapter;
 }
 
-/** Build a maker-commitment record at `postedAtUnixSec`; everything else defaulted. */
+/**
+ * Synthesize a structurally-valid {@link MakerSignedPayload} for `hash` (own-state
+ * SSE plan §M6) — used in tests that exercise the present-payload cancel
+ * dispatch. The bigint-encoded fields are decimal strings; content matches the
+ * fixture record's protocol-tuple defaults closely enough that an SDK
+ * `cancelOnchainSigned` call would hash back consistently in a real harness.
+ * The MM's cancel paths just pass the payload through, so fidelity beyond
+ * structural validity isn't exercised here.
+ */
+function stubSignedPayload(hash: string): MakerSignedPayload {
+  return {
+    commitmentHash: hash,
+    commitment: {
+      maker: '0x'.padEnd(42, 'a'),
+      contestId: '1',
+      scorer: '0xscorer',
+      lineTicks: 0,
+      positionType: 0,
+      oddsTick: 200,
+      riskAmount: '100',
+      nonce: '1',
+      expiry: '2000000000',
+    },
+    signature: '0x' + 'cc'.repeat(65),
+  };
+}
+
+/**
+ * Build a maker-commitment record at `postedAtUnixSec`; everything else
+ * defaulted. M6/A — defaults to `signedPayloadStatus: 'present'` with a
+ * synthesized {@link stubSignedPayload}, mirroring the M6/A submit path
+ * (every live submit captures the canonical bundle). Tests that exercise
+ * the migration / blocked-missing-payload path override `signedPayloadStatus`
+ * to `'missing-legacy'` AND drop the `signedPayload` field.
+ */
 function rec(hash: string, postedAtUnixSec: number, overrides: Partial<MakerCommitmentRecord> = {}): MakerCommitmentRecord {
   return {
     hash,
@@ -73,6 +107,8 @@ function rec(hash: string, postedAtUnixSec: number, overrides: Partial<MakerComm
     oddsTick: 200,
     riskAmountWei6: '100',
     filledRiskWei6: '0',
+    signedPayloadStatus: 'present',
+    signedPayload: stubSignedPayload(hash),
     lifecycle: 'visibleOpen',
     expiryUnixSec: postedAtUnixSec + 600,
     postedAtUnixSec,
@@ -424,7 +460,11 @@ describe('runCancelStale — --authoritative (on-chain leg)', () => {
     );
     expect(report).toMatchObject({ inspected: 1, offchainCancelled: 0, offchainSkippedAlready: 1, onchainCancelled: 1, errored: 0 });
     expect(captured!.cancelCommitmentOffchain).not.toHaveBeenCalled();
-    expect(captured!.cancelCommitmentOnchain).toHaveBeenCalledWith('0xaa');
+    // M6/A — the default fixture has `signedPayloadStatus: 'present'`, so
+    // dispatch routes through the canonical signed-payload path (`{ signedCommitment }`).
+    expect(captured!.cancelCommitmentOnchain).toHaveBeenCalledWith(
+      expect.objectContaining({ signedCommitment: expect.objectContaining({ commitmentHash: '0xaa' }) }),
+    );
     expect(StateStore.at(stateDir).load().state.commitments['0xaa']!.lifecycle).toBe('authoritativelyInvalidated');
   });
 
@@ -442,7 +482,12 @@ describe('runCancelStale — --authoritative (on-chain leg)', () => {
     );
     expect(report).toMatchObject({ inspected: 1, offchainCancelled: 0, offchainSkippedAlready: 1, onchainCancelled: 1, errored: 0 });
     expect(captured!.cancelCommitmentOffchain).not.toHaveBeenCalled(); // already off-book
-    expect(captured!.cancelCommitmentOnchain).toHaveBeenCalledWith('0xrsc'); // authoritative cancel kills the still-matchable remainder
+    // M6/A — present payload → signed-cancel path (the captured bundle works
+    // for book-hidden softCancelled rows; the public-fetch fallback would
+    // be refused via M2 redaction).
+    expect(captured!.cancelCommitmentOnchain).toHaveBeenCalledWith(
+      expect.objectContaining({ signedCommitment: expect.objectContaining({ commitmentHash: '0xrsc' }) }),
+    );
     const state = StateStore.at(stateDir).load().state;
     expect(state.commitments['0xrsc']!.lifecycle).toBe('authoritativelyInvalidated');
     expect(state.commitments['0xrsc']!.filledRiskWei6).toBe('60'); // the matched portion is preserved
@@ -462,7 +507,10 @@ describe('runCancelStale — --authoritative (on-chain leg)', () => {
     );
     expect(report).toMatchObject({ inspected: 1, offchainCancelled: 0, offchainSkippedPartial: 1, onchainCancelled: 1, errored: 0 });
     expect(captured!.cancelCommitmentOffchain).not.toHaveBeenCalled(); // off-chain DELETE never attempted for the matched commitment
-    expect(captured!.cancelCommitmentOnchain).toHaveBeenCalledWith('0xpf'); // authoritative cancel still kills its remaining capacity
+    // M6/A — present payload → signed-cancel path; the partiallyFilled remainder is killed authoritatively.
+    expect(captured!.cancelCommitmentOnchain).toHaveBeenCalledWith(
+      expect.objectContaining({ signedCommitment: expect.objectContaining({ commitmentHash: '0xpf' }) }),
+    );
     const state = StateStore.at(stateDir).load().state;
     expect(state.commitments['0xpf']!.lifecycle).toBe('authoritativelyInvalidated');
     expect(state.commitments['0xpf']!.filledRiskWei6).toBe('40');
@@ -527,7 +575,7 @@ describe('runCancelStale — --authoritative (on-chain leg)', () => {
 describe('cancelStaleExitCode', () => {
   const baseReport: CancelStaleReport = {
     inspected: 0, offchainCancelled: 0, offchainSkippedAlready: 0, offchainSkippedPartial: 0, onchainCancelled: 0,
-    gasDenied: 0, errored: 0, gasPolWei: '0', runId: 'r',
+    gasDenied: 0, blockedMissingPayload: 0, errored: 0, gasPolWei: '0', runId: 'r',
   };
   it('clean run → 0', () => {
     expect(cancelStaleExitCode(baseReport)).toBe(0);

@@ -54,6 +54,7 @@ import {
   type ChainId,
   type Commitment,
   type PublicVisibleCommitment,
+  type SignedCommitmentPayload,
   type CommitmentsListOptions,
   type CommitmentStatus,
   type Contest,
@@ -89,6 +90,7 @@ export type {
   ChainId,
   Commitment,
   PublicVisibleCommitment,
+  SignedCommitmentPayload,
   CommitmentsListOptions,
   CommitmentStatus,
   ContestOddsSnapshot,
@@ -421,21 +423,29 @@ export class OspexAdapter {
    * Authoritative: once set, `matchCommitment` reverts with
    * `MatchingModule__CommitmentCancelled`. No `AlreadyCancelled` revert path, so
    * re-cancelling a hash succeeds — don't infer "first cancel" from tx success.
-   * Needs all 9 EIP-712 fields populated on the row (indexer-only rows with nulls
-   * can't be reconstructed → the SDK throws).
+   *
+   * Discriminated overload (own-state SSE plan §M6 — adopted from SDK v0.5.0's
+   * `cancelOnchain` shape):
+   * - `{ signedCommitment }` — the canonical path. The MM holds the captured
+   *   bundle from `submitQuote` (`MakerCommitmentRecord.signedPayload`), so the
+   *   SDK hashes the struct against the configured chain's MatchingModule
+   *   domain, asserts it matches `commitmentHash`, and broadcasts. **No public
+   *   API fetch** — works regardless of `book_visible`, which is the whole
+   *   point for book-hidden rows post v0.5.0/M2 redaction.
+   * - `{ hash }` — fallback. The SDK fetches via `commitments.get(hash)` →
+   *   narrows to `PublicVisibleCommitment` via `requireVisibleCommitment` (a
+   *   book-hidden row throws `OspexValidationError` BEFORE signer/RPC access)
+   *   → reconstructs `SignedCommitmentPayload` from the visible row →
+   *   delegates. Only usable for `book_visible=true` rows; the runner's
+   *   cancel-dispatch routes `missing-legacy` records that are visible here.
+   *
+   * Needs all 9 EIP-712 fields populated on the row (indexer-only rows with
+   * nulls can't be reconstructed → the SDK throws).
    */
-  async cancelCommitmentOnchain(hash: Hex): Promise<CancelOnchainResult> {
-    // SDK v0.5.0 (M5/PR2) made `cancelOnchain` a discriminated overload
-    // (`{ hash } | { signedCommitment }`) so the canonical signed-payload
-    // primitive can pass through without an API fetch. The MM adapter
-    // keeps the bare-`Hex` external shape (no on-chain payload caching
-    // here yet) and bridges to the new `{ hash }` form. Migrating this
-    // adapter to surface `signedCommitment` is queued for the future
-    // `MakerCommitmentRecord.signedPayload` persistence work (own-state
-    // SSE plan §M6) — until then, `{ hash }` still routes through the
-    // SDK's redaction-aware refusal helper, so a book-hidden public row
-    // is rejected pre-signer per the M5/PR1 contract.
-    return this.client.commitments.cancelOnchain({ hash });
+  async cancelCommitmentOnchain(
+    arg: { hash: Hex } | { signedCommitment: SignedCommitmentPayload },
+  ): Promise<CancelOnchainResult> {
+    return this.client.commitments.cancelOnchain(arg);
   }
 
   /**

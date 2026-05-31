@@ -271,20 +271,33 @@ function submitRecorder(): { fn: (args: SubmitCommitmentArgs) => Promise<SubmitC
     calls,
     fn: (args) => {
       calls.push(args);
+      const hash = `0xlive${calls.length}` as Hex;
       // `SubmitCommitmentResult.commitment` is `PublicVisibleCommitment` after
       // the SDK v0.5.0 defensive narrow (M5/PR1) — `submitRaw` inserts
-      // `book_visible=true` by construction, so the public visible branch is
-      // the canonical return type. Derive the cast from the result type so
-      // future SDK signature changes surface as a compile error here.
-      // `signedPayload` (SDK v0.5.1) is a required field but its content is
-      // not exercised by any existing test — M6/A will introduce a real
-      // persistence path. Stubbed with the same derived-type-cast pattern
-      // so a future SDK shape change to the canonical payload still
-      // surfaces here at compile time.
+      // `book_visible=true` by construction. Derive the cast from the result
+      // type so future SDK signature changes surface as a compile error
+      // here. `signedPayload` (SDK v0.5.1) must be STRUCTURALLY VALID — the
+      // runner pipes it through `toMakerSignedPayload` (`.toString()` on the
+      // four bigint fields) on every successful submit (M6/A persistence
+      // path), so an empty cast would crash with TypeError.
       return Promise.resolve({
-        hash: `0xlive${calls.length}` as Hex,
+        hash,
         commitment: {} as unknown as SubmitCommitmentResult['commitment'],
-        signedPayload: {} as unknown as SubmitCommitmentResult['signedPayload'],
+        signedPayload: {
+          commitmentHash: hash,
+          commitment: {
+            maker: '0x'.padEnd(42, 'a') as Hex,
+            contestId: BigInt(args.contestId),
+            scorer: args.scorer,
+            lineTicks: args.lineTicks,
+            positionType: args.positionType,
+            oddsTick: args.oddsTick,
+            riskAmount: BigInt(args.riskAmount),
+            nonce: 1n,
+            expiry: args.expiry ?? 2_000_000_000n,
+          },
+          signature: ('0x' + 'cc'.repeat(65)) as Hex,
+        },
       });
     },
   };
@@ -383,8 +396,9 @@ const EMPTY_POSITION_STATUS: PositionStatus = {
 
 function commitmentRecord(overrides: Partial<MakerCommitmentRecord>): MakerCommitmentRecord {
   const NOW = 1_900_000_000;
+  const hash = overrides.hash ?? '0xabc';
   return {
-    hash: '0xabc',
+    hash,
     speculationId: 'spec-1',
     contestId: 'contest-1',
     sport: 'mlb',
@@ -395,6 +409,26 @@ function commitmentRecord(overrides: Partial<MakerCommitmentRecord>): MakerCommi
     oddsTick: 250,
     riskAmountWei6: '250000',
     filledRiskWei6: '0',
+    // M6/A — default fixture is `'present'` with a synthesized stub bundle
+    // (most M6/A-era records carry the canonical payload from submitQuote).
+    // Tests that exercise the migration / blocked-missing-payload path
+    // override `signedPayloadStatus: 'missing-legacy'` AND drop `signedPayload`.
+    signedPayloadStatus: 'present',
+    signedPayload: {
+      commitmentHash: hash,
+      commitment: {
+        maker: '0x'.padEnd(42, 'a'),
+        contestId: '1',
+        scorer: '0xscorer',
+        lineTicks: 0,
+        positionType: 0,
+        oddsTick: 250,
+        riskAmount: '250000',
+        nonce: '1',
+        expiry: String(NOW + 100),
+      },
+      signature: '0x' + 'cc'.repeat(65),
+    },
     lifecycle: 'visibleOpen',
     expiryUnixSec: NOW + 100,
     postedAtUnixSec: NOW - 10,
@@ -3483,7 +3517,9 @@ describe('Runner — on-chain kill path / killCancelOnChain (Phase 3 e-ii)', () 
     return {
       calls,
       gasPolWeiPerCall: gasUsed * effectiveGasPrice,
-      fn: (hash: Hex) => {
+      // M6/A — adapter signature is `{ hash } | { signedCommitment }`.
+      fn: (arg) => {
+        const hash = ('hash' in arg ? arg.hash : arg.signedCommitment.commitmentHash) as Hex;
         calls.push(hash);
         const receipt = { gasUsed, effectiveGasPrice } as unknown as CancelOnchainResult['receipt'];
         return Promise.resolve({ txHash: '0xkilltx', receipt, commitmentHash: hash });
@@ -3644,8 +3680,10 @@ describe('Runner — on-chain kill path / killCancelOnChain (Phase 3 e-ii)', () 
     });
     const config = cfg({ mode: { dryRun: false }, killCancelOnChain: true });
     const adapter = liveSpiedAdapter(config, () => Promise.resolve([]), {
-      cancelCommitmentOnchain: (hash) => {
+      cancelCommitmentOnchain: (arg) => {
         calls += 1;
+        // M6/A — adapter signature is `{ hash } | { signedCommitment }`.
+        const hash = ('hash' in arg ? arg.hash : arg.signedCommitment.commitmentHash) as Hex;
         if (hash === '0xbad') return Promise.reject(new Error('NotCommitmentMaker'));
         const receipt = { gasUsed: 60_000n, effectiveGasPrice: 30_000_000_000n } as unknown as CancelOnchainResult['receipt'];
         return Promise.resolve({ txHash: '0xtx', receipt, commitmentHash: hash });
@@ -3725,7 +3763,9 @@ describe('Runner — cancelMode: onchain (D2 — authoritative cancel of retaine
     return {
       calls,
       gasPolWeiPerCall: gasUsed * effectiveGasPrice,
-      fn: (hash: Hex) => {
+      // M6/A — adapter signature is `{ hash } | { signedCommitment }`.
+      fn: (arg) => {
+        const hash = ('hash' in arg ? arg.hash : arg.signedCommitment.commitmentHash) as Hex;
         calls.push(hash);
         const receipt = { gasUsed, effectiveGasPrice } as unknown as CancelOnchainResult['receipt'];
         return Promise.resolve({ txHash: '0xcanceltx' as Hex, commitmentHash: hash, receipt });
@@ -3888,7 +3928,11 @@ describe('Runner — cancelMode: onchain (PR3 — authoritative cancel of recove
     return {
       calls,
       gasPolWeiPerCall: gasUsed * effectiveGasPrice,
-      fn: (hash: Hex) => {
+      // M6/A: adapter signature is now `{ hash } | { signedCommitment }`.
+      // The recorder normalizes both shapes to the hash for assertion
+      // simplicity — most tests just check "the right hash got cancelled".
+      fn: (arg) => {
+        const hash = ('hash' in arg ? arg.hash : arg.signedCommitment.commitmentHash) as Hex;
         calls.push(hash);
         const receipt = { gasUsed, effectiveGasPrice } as unknown as CancelOnchainResult['receipt'];
         return Promise.resolve({ txHash: '0xrecoverytx' as Hex, commitmentHash: hash, receipt });
@@ -3993,6 +4037,46 @@ describe('Runner — cancelMode: onchain (PR3 — authoritative cancel of recove
     expect(readEvents().filter((e) => e.kind === 'error' && e.phase === 'onchain-cancel' && e.commitmentHash === '0xsc')).toHaveLength(2); // one error per attempt
   });
 
+  // M6/A — own-state SSE plan §M6: a softCancelled record without a captured
+  // signed payload (legacy pre-M6/A) cannot be cancelled via the on-chain
+  // path. The public commitments API redacts the signed payload for hidden
+  // rows (M2), and `ownState.getCommitment` recovery is Phase 2 work. The
+  // sweep emits `cancel-blocked-missing-payload` ONCE per stuck record
+  // across ticks and never burns gas on a doomed adapter call.
+  it('cancelMode:onchain: a recovered soft-cancel with signedPayloadStatus=missing-legacy is BLOCKED — emits cancel-blocked-missing-payload once across ticks, no cancel attempted, lifecycle stays softCancelled', async () => {
+    // The default fixture is `present` with a stub payload — override to
+    // `missing-legacy` and drop the payload to model the pre-M6/A record.
+    const legacy: MakerCommitmentRecord = commitmentRecord({
+      hash: '0xlegacy', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200,
+      riskAmountWei6: '500000', filledRiskWei6: '200000', lifecycle: 'softCancelled',
+      expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 5, updatedAtUnixSec: T0 - 5,
+      signedPayloadStatus: 'missing-legacy',
+    });
+    delete legacy.signedPayload; // shouldn't be set on 'missing-legacy' per the validator's consistency rule
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xlegacy': legacy } });
+    const config = cfg({ mode: { dryRun: false }, orders: { expirySeconds: 120, cancelMode: 'onchain' }, gas: { maxDailyGasPOL: 1, emergencyReservePOL: 0.2 } });
+    const cancel = cancelOnchainRecorder();
+    // `getCommitment` mock is required so `reconcileSoftCancelledFills` (runs
+    // BEFORE the recovered-soft-cancel sweep) can converge the on-chain
+    // status; without it the runner short-circuits and the cancel sweep
+    // never gets to dispatch. Same harness pattern as the sibling tests.
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([]), { cancelCommitmentOnchain: cancel.fn }, undefined, undefined, { getCommitment: (h) => (h === '0xlegacy' ? Promise.resolve(recoveredScApi('200000')) : Promise.reject(new Error('unknown hash'))) });
+    await makeRunner({ config, adapter, maxTicks: 3 }).run();
+
+    expect(cancel.calls).toEqual([]); // dispatch short-circuits BEFORE the adapter — no wasted gas / RPC on a doomed cancel
+    const blocked = readEvents().filter((e) => e.kind === 'cancel-blocked-missing-payload');
+    expect(blocked).toHaveLength(1); // warn-once across 3 ticks, like the sibling gas-denied throttle
+    expect(blocked[0]).toMatchObject({
+      commitmentHash: '0xlegacy',
+      speculationId: 'spec-1234',
+      contestId: '1234',
+      makerSide: 'home',
+      lifecycle: 'softCancelled',
+      reason: 'missing-legacy-signed-payload-and-hidden',
+    });
+    expect(StateStore.at(stateDir).load().state.commitments['0xlegacy']?.lifecycle).toBe('softCancelled'); // unchanged — rides to expiry pending operator action
+  });
+
   it('dry-run: never on-chain-cancels a recovered soft-cancel even under cancelMode:onchain', async () => {
     const sc = commitmentRecord({ hash: '0xsc', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '500000', filledRiskWei6: '200000', lifecycle: 'softCancelled', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 5, updatedAtUnixSec: T0 - 5 });
     StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xsc': sc } });
@@ -4039,7 +4123,10 @@ describe('Runner — funding guard', () => {
     const calls: Hex[] = [];
     return {
       calls,
-      fn: (hash: Hex) => {
+      // M6/A — see the sibling cancelOnchainRecorder above for the
+      // discriminated-arg normalization.
+      fn: (arg) => {
+        const hash = ('hash' in arg ? arg.hash : arg.signedCommitment.commitmentHash) as Hex;
         calls.push(hash);
         const receipt = { gasUsed, effectiveGasPrice } as unknown as CancelOnchainResult['receipt'];
         return Promise.resolve({ txHash: '0xkilltx', receipt, commitmentHash: hash });

@@ -43,6 +43,7 @@ export const TELEMETRY_KINDS = [
   'replace',
   'would-replace',
   'onchain-cancel',
+  'cancel-blocked-missing-payload', // an on-chain cancel sweep encountered a pre-M6/A record (`signedPayloadStatus: 'missing-legacy'`) that's also book-hidden (`lifecycle: 'softCancelled'`) — the public commitments API redacts the signed payload (M2) so `cancelOnchain` has no recovery path. Emitted once per stuck record per run; carries `commitmentHash` / `speculationId` / `contestId` / `makerSide` / `lifecycle` / `reason` / `detail` / `phase` (`shutdown-kill` / `cli-cancel-stale` / unset for the routine recovered-soft-cancel sweep). Operator action required: recover the payload via owner-auth own-state (Phase 2) or wait for expiry. Own-state SSE plan §M6.
   'nonce-floor-raise',
   'expire', //                     a tracked commitment hit expiry — headroom released
   'approval', //                   { purpose, spender, currentAllowance, requiredAggregateAllowance, amountSetTo }

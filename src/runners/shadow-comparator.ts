@@ -85,6 +85,18 @@ function divergenceKey(field: DivergenceField, identifyingKey: string): string {
 }
 
 /**
+ * Is the commitment lifecycle terminal? Terminal commitments are pruned from
+ * canonical `MakerState` after the retention window (`pruneTerminalCommitments`)
+ * and the SSE reducer does NOT auto-drop them in Phase 2 — so canonical-only
+ * AND shadow-only terminal commitments are both expected lifecycle drift, not
+ * real divergence. The comparator exempts both directions symmetrically
+ * (Hermes #70 round 2 — shadow-only side was the missing one).
+ */
+function isTerminalCommitmentLifecycle(lifecycle: string): boolean {
+  return lifecycle === 'filled' || lifecycle === 'expired' || lifecycle === 'authoritativelyInvalidated';
+}
+
+/**
  * The comparator's main entry point. Walks both states' commitments + positions,
  * updates the tracker, decides which divergences to emit per the tolerance rules,
  * and returns an aggregated payload OR `null` for "nothing to emit".
@@ -115,19 +127,21 @@ export function compareShadowVsCanonical(
     const canonical: MakerCommitmentRecord | undefined = state.commitments[hash];
     const shadowRow: ShadowCommitment | undefined = shadow.commitments[hash];
     if (canonical !== undefined && shadowRow === undefined) {
-      // Canonical has it; shadow doesn't.
-      // EXCEPTION: terminal canonical records may have been pruned from the
-      // shadow side (or never delivered if they terminated before the
-      // snapshot). The PR4b reducer doesn't preserve terminal commitments,
-      // and the poll path retains them for the retention window. Don't
-      // report terminal-only-canonical as divergence — it's expected drift.
-      if (canonical.lifecycle === 'filled' || canonical.lifecycle === 'expired' || canonical.lifecycle === 'authoritativelyInvalidated') {
-        continue;
-      }
+      // Canonical has it; shadow doesn't. EXEMPT terminal-only-canonical: the
+      // SSE reducer doesn't preserve terminal commitments and the poll path
+      // retains them for the retention window — expected drift, not divergence.
+      if (isTerminalCommitmentLifecycle(canonical.lifecycle)) continue;
       const key = divergenceKey('missing-in-stream', hash);
       detected.set(key, { observation: { field: 'missing-in-stream', key: hash, canonical: canonical.lifecycle, shadow: null } });
     } else if (canonical === undefined && shadowRow !== undefined) {
-      // Shadow has it; canonical doesn't.
+      // Shadow has it; canonical doesn't. SYMMETRIC EXEMPTION (Hermes #70
+      // round 2): the SSE reducer doesn't auto-drop terminal commitments and
+      // canonical prunes them after the retention window — terminal-only-shadow
+      // is the same expected drift as terminal-only-canonical, just in the
+      // other direction. Without this, a long-running stream would report
+      // every filled/expired commitment as persistent `missing-in-poll`
+      // divergence ~1 hour after it terminated, poisoning the soak signal.
+      if (isTerminalCommitmentLifecycle(shadowRow.lifecycle)) continue;
       const key = divergenceKey('missing-in-poll', hash);
       detected.set(key, { observation: { field: 'missing-in-poll', key: hash, canonical: null, shadow: shadowRow.lifecycle } });
     } else if (canonical !== undefined && shadowRow !== undefined) {

@@ -187,10 +187,24 @@ describe('compareShadowVsCanonical — missing-side', () => {
     expect(payload).toBeNull();
   });
 
-  it('shadow-only commitment → missing-in-poll', () => {
+  it('shadow-only NON-TERMINAL commitment → missing-in-poll', () => {
     const shadow = shadowWithCommitment(shadowCommitment());
     const payload = compareShadowVsCanonical(emptyMakerState(), shadow, new Map(), NOW, TOLERANCE, SETTLED);
     expect(payload?.byField['missing-in-poll']).toBe(1);
+  });
+
+  it('shadow-only TERMINAL commitment → NOT reported (Hermes #70 round 2 — symmetric to canonical-only terminal exemption)', () => {
+    // Long-running stream scenario: a commitment terminates (filled/expired/
+    // authoritativelyInvalidated). The SSE reducer doesn't auto-drop it from
+    // shadow. Canonical's pruneTerminalCommitments deletes it after the
+    // retention window (~1 hour). Without the symmetric exemption this would
+    // be reported as persistent missing-in-poll divergence forever, poisoning
+    // the Phase 2 soak signal.
+    for (const lifecycle of ['filled', 'expired', 'authoritativelyInvalidated'] as const) {
+      const shadow = shadowWithCommitment(shadowCommitment({ lifecycle }));
+      const payload = compareShadowVsCanonical(emptyMakerState(), shadow, new Map(), NOW, TOLERANCE, SETTLED);
+      expect(payload, `expected no divergence for shadow-only ${lifecycle}`).toBeNull();
+    }
   });
 
   it('canonical-only CLAIMED position → NOT reported (terminal drift)', () => {

@@ -1028,6 +1028,117 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
     triggerKill();
     await runPromise;
   });
+
+  // ── Hermes #68 round-2 regressions ───────────────────────────────────────
+
+  it('queue overflow latches healthy=false; subsequent onStatus(\'connected\') does NOT restore healthy (Hermes #68 blocker 1)', async () => {
+    const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
+    // Simulate a queue-overflow drain via the test seam (the production path
+    // through `drainShadow` requires running the loop past the overflow).
+    runner.setStreamOverflowDegradedForTest(true);
+    // Mirror what `drainShadow` does on overflow:
+    // (the explicit seam exercises the gating logic; the integration test
+    // path is in "Runner — own-state queue overflow telemetry" above.)
+    recorder.fire('onStatus', 'degraded');
+    expect(runner.ownStateShadowView().healthy).toBe(false);
+    recorder.fire('onStatus', 'connected');
+    // Transport reconnected, but the overflow latch survives — healthy stays false.
+    expect(runner.ownStateShadowView().healthy).toBe(false);
+    expect(runner.streamOverflowDegradedForTest()).toBe(true);
+    triggerKill();
+    await runPromise;
+  });
+
+  it('onStatus(\'resync\') clears the overflow latch — the upcoming fresh snapshot is authoritative (Hermes #68 blocker 1)', async () => {
+    const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
+    runner.setStreamOverflowDegradedForTest(true);
+    recorder.fire('onStatus', 'resync');
+    expect(runner.streamOverflowDegradedForTest()).toBe(false);
+    // Ready also flips off — the next onReady restores healthy after a fresh baseline.
+    expect(runner.ownStateShadowView().ready).toBe(false);
+    triggerKill();
+    await runPromise;
+  });
+
+  it('snapshot with positionsTruncated:true → shadow.positionsTruncated stays true after onReady; healthy=false (Hermes #68 blocker 2)', async () => {
+    const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
+    recorder.fire('onSnapshot', {
+      cursor: 'c1',
+      commitments: [{ commitmentHash: '0xa', filledRiskAmount: '0', riskAmount: '100', expiry: null, status: 'open', storedStatus: 'open', nonceInvalidated: false }],
+      positions: [],
+      truncated: false,
+      positionsTruncated: true, // server signaled the 200-row position cap
+    });
+    recorder.fire('onReady');
+    const shadow = runner.ownStateShadowView();
+    expect(shadow.ready).toBe(true);
+    expect(shadow.positionsTruncated).toBe(true);
+    // The truncated baseline must NOT be marked healthy — PR5 comparator's
+    // `healthy && ready` precondition is the suppression.
+    expect(shadow.healthy).toBe(false);
+    // A subsequent `connected` status doesn't restore healthy until a
+    // non-truncated baseline lands.
+    recorder.fire('onStatus', 'connected');
+    expect(runner.ownStateShadowView().healthy).toBe(false);
+    triggerKill();
+    await runPromise;
+  });
+
+  it('OR-latch positionsTruncated across snapshot pages — once any page reports it, the latch survives the final page (Hermes #68 blocker 2)', async () => {
+    const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
+    // Page 1: positionsTruncated=true (server signaled the cap WAS hit, but
+    // commitments still page).
+    recorder.fire('onSnapshot', {
+      cursor: 'c1',
+      commitments: [{ commitmentHash: '0xa', filledRiskAmount: '0', riskAmount: '100', expiry: null, status: 'open', storedStatus: 'open', nonceInvalidated: false }],
+      positions: [],
+      truncated: true,
+      positionsTruncated: true,
+    });
+    // Page 2: positionsTruncated=false (later page doesn't repeat the flag,
+    // but the upstream incompleteness is real).
+    recorder.fire('onSnapshot', {
+      cursor: 'c2',
+      commitments: [{ commitmentHash: '0xb', filledRiskAmount: '0', riskAmount: '200', expiry: null, status: 'open', storedStatus: 'open', nonceInvalidated: false }],
+      positions: [],
+      truncated: false,
+      positionsTruncated: false,
+    });
+    recorder.fire('onReady');
+    expect(runner.ownStateShadowView().positionsTruncated).toBe(true);
+    expect(runner.ownStateShadowView().healthy).toBe(false);
+    triggerKill();
+    await runPromise;
+  });
+
+  it('sync throw from openOwnStateSubscription propagates AND runs the finally cleanup — unregister called (Hermes #68 blocker 3)', async () => {
+    const config = cfg({ ownState: { subscribe: true } });
+    const adapter = createOspexAdapter(config);
+    vi.spyOn(adapter, 'listContests').mockResolvedValue([]);
+    // SDK throws on subscribe (auth misconfiguration / network init failure).
+    vi.spyOn(adapter, 'subscribeOwnState').mockImplementation((() => {
+      throw new Error('synthetic subscribe failure');
+    }) as unknown as OspexAdapter['subscribeOwnState']);
+
+    let registered = false;
+    let unregistered = false;
+    const runner = makeRunner({
+      config, adapter, maxTicks: 1,
+      makerAddress: DEFAULT_FAKE_MAKER_ADDRESS as Hex,
+      deps: {
+        registerShutdownSignals: (_onSignal) => {
+          registered = true;
+          return () => { unregistered = true; };
+        },
+      },
+    });
+    await expect(runner.run()).rejects.toThrow('synthetic subscribe failure');
+    expect(registered).toBe(true);
+    // The finally block ran — unregister was called even though `subscribeOwnState`
+    // threw before the loop started. Without the fix, this would be `false`
+    // because openOwnStateSubscription was OUTSIDE the try/finally.
+    expect(unregistered).toBe(true);
+  });
 });
 
 // ── discovery (DESIGN §10) ───────────────────────────────────────────────────

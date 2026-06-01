@@ -29,7 +29,7 @@
     "prepack": "yarn build"
   },
   "dependencies": {
-    "@ospex/sdk": "https://github.com/ospex-org/ospex-sdk/releases/download/v0.5.1/ospex-sdk-0.5.1.tgz",
+    "@ospex/sdk": "https://github.com/ospex-org/ospex-sdk/releases/download/v0.5.2/ospex-sdk-0.5.2.tgz",
     "commander": "^14.0.3",
     "js-yaml": "^4.1.0"
   },

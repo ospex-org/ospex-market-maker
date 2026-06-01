@@ -45,6 +45,12 @@ function ownerCommitment(overrides: Partial<OwnerCommitment> = {}): OwnerCommitm
     nonceInvalidated: false,
     isLive: true,
     createdAt: '2025-01-01T00:00:00.000Z',
+    speculationId: null,
+    sport: 'baseball_mlb',
+    awayTeam: 'NYM',
+    homeTeam: 'LAD',
+    updatedAtUnixSec: 1735689600,
+    signedPayload: null,
     ...overrides,
   };
 }
@@ -152,14 +158,14 @@ describe('projectOwnerCommitment — lifecycle routing', () => {
 
 describe('projectOwnerPosition', () => {
   it('positionType 0 → away', () => {
-    const p = projectOwnerPosition({ positionId: 'p1', speculationId: 'spec-1', positionType: 0, team: 'NYM', opponent: 'LAD', market: 'moneyline', oddsDecimal: 2.5, riskAmountUSDC: 0.1, profitAmountUSDC: 0.15, status: 'active' });
+    const p = projectOwnerPosition({ positionId: 'p1', speculationId: 'spec-1', positionType: 0, team: 'NYM', opponent: 'LAD', market: 'moneyline', oddsDecimal: 2.5, riskAmountUSDC: 0.1, profitAmountUSDC: 0.15, contestId: '1', sport: 'baseball_mlb', awayTeam: 'NYM', homeTeam: 'LAD', riskAmountWei6: '100000', counterpartyRiskWei6: '150000', updatedAtUnixSec: 1735689600, status: 'active' });
     expect(p.side).toBe('away');
     expect(p.riskAmountWei6).toBe('100000');
     expect(p.status).toBe('active');
   });
 
   it('positionType 1 → home', () => {
-    const p = projectOwnerPosition({ positionId: 'p1', speculationId: 'spec-1', positionType: 1, team: 'LAD', opponent: 'NYM', market: 'moneyline', oddsDecimal: 1.8, riskAmountUSDC: 0.05, profitAmountUSDC: 0.04, status: 'claimable', result: 'won', estimatedPayoutUSDC: 0.09, estimatedPayoutWei6: '90000' });
+    const p = projectOwnerPosition({ positionId: 'p1', speculationId: 'spec-1', positionType: 1, team: 'LAD', opponent: 'NYM', market: 'moneyline', oddsDecimal: 1.8, riskAmountUSDC: 0.05, profitAmountUSDC: 0.04, contestId: '1', sport: 'baseball_mlb', awayTeam: 'NYM', homeTeam: 'LAD', riskAmountWei6: '50000', counterpartyRiskWei6: '40000', updatedAtUnixSec: 1735689600, status: 'claimable', result: 'won', estimatedPayoutUSDC: 0.09, estimatedPayoutWei6: '90000' });
     expect(p.side).toBe('home');
     expect(p.status).toBe('claimable');
   });

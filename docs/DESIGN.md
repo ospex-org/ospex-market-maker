@@ -147,7 +147,7 @@ The MM depends on `@ospex/sdk` and nothing else from the Ospex side. It does **n
 
 **Dependency installation.** The MM pins `@ospex/sdk` to an *exact* version (a money-moving bot must not float SDK behaviour):
 
-- **Preferred (now):** the exact GitHub Release tarball URL — e.g. `"@ospex/sdk": "https://github.com/ospex-org/ospex-sdk/releases/download/v0.2.1/ospex-sdk-0.2.1.tgz"`. Matches the SDK's distribution direction (Releases first; npm maybe later).
+- **Preferred (now):** the exact GitHub Release tarball URL — e.g. `"@ospex/sdk": "https://github.com/ospex-org/ospex-sdk/releases/download/vX.Y.Z/ospex-sdk-X.Y.Z.tgz"` (the live pin is in `package.json`). Matches the SDK's distribution direction (Releases first; npm maybe later).
 - **Later / optional:** npm, *if* Ospex adds it as a secondary channel — still pinned to an exact version, never a caret range.
 - **Fallback:** a `vendor/` directory plus a `scripts/fetch-sdk` step documented in the README — only if neither of the above is available.
 - **Never:** commit the SDK tarball into this repo.

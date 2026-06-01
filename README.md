@@ -105,7 +105,7 @@ This is **experimental software**, provided **without warranty**. Wagering and o
 ```bash
 yarn smoke          # runs install / build / typecheck / lint / test / mm --help in series; fails fast on first error
                     # — or run the steps individually:
-yarn install        # pulls @ospex/sdk from its v0.2.1 GitHub Release tarball + transitive deps
+yarn install        # pulls @ospex/sdk from its pinned GitHub Release tarball (see package.json) + transitive deps
 yarn build          # tsc -> dist/
 yarn typecheck      # tsc --noEmit
 yarn test           # vitest

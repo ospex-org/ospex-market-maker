@@ -79,7 +79,7 @@ function fakeAdapter(client: ClientOverrides = {}, ctx = { chainId: 137 as const
     approvals: { read: notStubbed('approvals.read'), ...client.approvals },
     health: { check: notStubbed('health.check'), ...client.health },
     odds: { snapshot: notStubbed('odds.snapshot'), subscribe: notStubbed('odds.subscribe'), ...client.odds },
-    ownState: { subscribe: () => ({ unsubscribe: () => Promise.reject(new Error('fake.ownState.subscribe: not stubbed')) }), ...client.ownState },
+    ownState: { subscribe: () => ({ unsubscribe: () => Promise.reject(new Error('fake.ownState.subscribe: not stubbed')) }), health: notStubbed('ownState.health'), ...client.ownState },
   };
   return new OspexAdapter(full, ctx);
 }

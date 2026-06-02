@@ -63,7 +63,21 @@ export type ShadowTransportStatus = 'connected' | 'reconnecting' | 'degraded' | 
 export interface OwnStateShadow {
   /** `false` until `onReady` fires (the snapshot has fully baselined), or while a resync is pending. */
   ready: boolean;
-  /** `false` on queue overflow, transport-stale, or token-refresh failure. PR5 comparator preconditions check this. */
+  /**
+   * Instantaneous latch-health MIRROR, re-derived by the runner's
+   * `recomputeOwnStateHealth()` at every latch-mutation site (Phase 3 PR2). It is
+   * the conjunction of the available §5 latches — `ready` (a durable baseline is
+   * swapped in), `lastStatus === 'connected'`, `!streamOverflowDegraded`,
+   * `!positionsTruncated`, and `lastError.reason !== 'fatal'` — with the
+   * not-yet-wired §5 latches (transportFresh / indexerLag / auditDivergence /
+   * tokenRefresh) defaulting healthy until PR2b/PR2c. It does NOT include the
+   * time-dependent recovery hold (latch 8); that lives in the runner's composite
+   * GATE `ownStateHealthy()`, which the posting gate + PR5 comparator read.
+   * The factory default is `false` — a fresh, never-baselined shadow (`ready:
+   * false`, `lastStatus: null`) is not healthy, matching what the conjunction
+   * derives. The runner's `recomputeOwnStateHealth()` keeps it in sync from the
+   * first latch mutation on.
+   */
   healthy: boolean;
   /** Hash → projected commitment. PR4a's `onReady` swaps the baseline in; PR4b applies per-commitment-event deltas via `reduceOwnerCommitmentObservation`. */
   commitments: Record<string, ShadowCommitment>;
@@ -382,7 +396,7 @@ export function reduceOwnerPositionStatus(
 export function emptyOwnStateShadow(): OwnStateShadow {
   return {
     ready: false,
-    healthy: true,
+    healthy: false,
     commitments: {},
     positions: {},
     pendingBaseline: null,

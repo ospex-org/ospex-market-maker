@@ -9,10 +9,13 @@
  * latched. The next `drain()` reports `overflowed: true` once; the runner's
  * `drainShadow` translates that into `stream-health-degraded {reason:
  * 'queue-overflow'}` + (conditionally) `stream-would-hold {reason, exposureWei6}`
- * telemetry, sets `shadow.healthy = false`, and continues — it does NOT alter
- * canonical trading state, does NOT set `fundingHold`, does NOT trigger
- * `fundingCancelSweep`. That's the Phase 2 shadow-only contract (`phase2-plan.md`
- * § Phase 2 contract). Phase 3 cutover will harden the response.
+ * telemetry, sets the `streamOverflowDegraded` latch and re-derives composite
+ * own-state health via `recomputeOwnStateHealth()` (the overflow latch keeps
+ * `shadow.healthy` false until a fresh rebaseline clears it — Phase 3 PR2), and
+ * continues — it does NOT alter canonical trading state, does NOT set
+ * `fundingHold`, does NOT trigger `fundingCancelSweep`. That was the Phase 2
+ * shadow-only contract (`phase2-plan.md` § Phase 2 contract); Phase 3 hardens the
+ * response via the §5.1 posting gate (live + subscribe only).
  *
  * Bound: {@link OWN_STATE_QUEUE_MAX} = 10_000 events. At 1-event-per-fill, this
  * is ~10k filled commitments of buffer before degradation — far above any

@@ -20,6 +20,10 @@ describe('parseConfig', () => {
     expect(c.ownState.subscribe).toBe(false);
     expect(c.ownState.debounceMs).toBe(500);
     expect(c.ownState.divergenceToleranceMs).toBe(5000);
+    expect(c.ownState.auditPollIntervalMs).toBe(60000);
+    expect(c.ownState.indexerLagMaxSeconds).toBe(30);
+    expect(c.ownState.staleMaxMs).toBe(60000);
+    expect(c.ownState.recoveryHoldMs).toBe(30000);
     expect(c.pricing.mode).toBe('economics');
     expect(c.pricing.quoteBothSides).toBe(true);
     expect(c.pricing.economics.capitalUSDC).toBe(50);
@@ -101,6 +105,20 @@ describe('parseConfig', () => {
     expect(() => parseConfig({ rpcUrl: 'x', ownState: { debounceMs: 100 } }, {})).toThrow(/ownState\.debounceMs/);
     expect(() => parseConfig({ rpcUrl: 'x', ownState: { debounceMs: 5000 } }, {})).toThrow(/ownState\.debounceMs/);
     expect(() => parseConfig({ rpcUrl: 'x', ownState: { wrong: 1 } }, {})).toThrow(/wrong/);
+    // Phase 3 PR2 health-gate knobs — out-of-range rejected.
+    expect(() => parseConfig({ rpcUrl: 'x', ownState: { auditPollIntervalMs: 9999 } }, {})).toThrow(/auditPollIntervalMs/);
+    expect(() => parseConfig({ rpcUrl: 'x', ownState: { indexerLagMaxSeconds: 4 } }, {})).toThrow(/indexerLagMaxSeconds/);
+    expect(() => parseConfig({ rpcUrl: 'x', ownState: { indexerLagMaxSeconds: 301 } }, {})).toThrow(/indexerLagMaxSeconds/);
+    expect(() => parseConfig({ rpcUrl: 'x', ownState: { staleMaxMs: 9999 } }, {})).toThrow(/staleMaxMs/);
+    expect(() => parseConfig({ rpcUrl: 'x', ownState: { recoveryHoldMs: 300001 } }, {})).toThrow(/recoveryHoldMs/);
+  });
+
+  it('ownState PR2 health-gate knobs accept in-range values (and recoveryHoldMs accepts 0)', () => {
+    const c = parseConfig({ rpcUrl: 'x', ownState: { auditPollIntervalMs: 10000, indexerLagMaxSeconds: 5, staleMaxMs: 300000, recoveryHoldMs: 0 } }, {});
+    expect(c.ownState.auditPollIntervalMs).toBe(10000);
+    expect(c.ownState.indexerLagMaxSeconds).toBe(5);
+    expect(c.ownState.staleMaxMs).toBe(300000);
+    expect(c.ownState.recoveryHoldMs).toBe(0);
   });
 
   it('ownState.debounceMs accepts in-range values', () => {

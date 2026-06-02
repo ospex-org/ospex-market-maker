@@ -109,15 +109,15 @@ describe('parseConfig', () => {
     expect(() => parseConfig({ rpcUrl: 'x', ownState: { auditPollIntervalMs: 9999 } }, {})).toThrow(/auditPollIntervalMs/);
     expect(() => parseConfig({ rpcUrl: 'x', ownState: { indexerLagMaxSeconds: 4 } }, {})).toThrow(/indexerLagMaxSeconds/);
     expect(() => parseConfig({ rpcUrl: 'x', ownState: { indexerLagMaxSeconds: 301 } }, {})).toThrow(/indexerLagMaxSeconds/);
-    expect(() => parseConfig({ rpcUrl: 'x', ownState: { staleMaxMs: 9999 } }, {})).toThrow(/staleMaxMs/);
+    expect(() => parseConfig({ rpcUrl: 'x', ownState: { staleMaxMs: 29999 } }, {})).toThrow(/staleMaxMs/); // floor is 30000 (above the ~20s server heartbeat)
     expect(() => parseConfig({ rpcUrl: 'x', ownState: { recoveryHoldMs: 300001 } }, {})).toThrow(/recoveryHoldMs/);
   });
 
   it('ownState PR2 health-gate knobs accept in-range values (and recoveryHoldMs accepts 0)', () => {
-    const c = parseConfig({ rpcUrl: 'x', ownState: { auditPollIntervalMs: 10000, indexerLagMaxSeconds: 5, staleMaxMs: 300000, recoveryHoldMs: 0 } }, {});
+    const c = parseConfig({ rpcUrl: 'x', ownState: { auditPollIntervalMs: 10000, indexerLagMaxSeconds: 5, staleMaxMs: 30000, recoveryHoldMs: 0 } }, {});
     expect(c.ownState.auditPollIntervalMs).toBe(10000);
     expect(c.ownState.indexerLagMaxSeconds).toBe(5);
-    expect(c.ownState.staleMaxMs).toBe(300000);
+    expect(c.ownState.staleMaxMs).toBe(30000); // floor (≥ the ~20s server heartbeat)
     expect(c.ownState.recoveryHoldMs).toBe(0);
   });
 

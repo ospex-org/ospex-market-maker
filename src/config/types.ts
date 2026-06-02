@@ -145,7 +145,10 @@ export interface OwnStateConfig {
    * Transport-freshness window (ms): the composite health predicate's
    * `transportFresh` latch requires a frame (`onFrame`, including heartbeats)
    * within this window — `now - lastFrameAt < staleMaxMs` (own-state SSE plan
-   * §5, latch 2). Range 10000-300000ms; default 60000ms. (Latch wired in PR2b.)
+   * §5, latch 2). MUST stay above the server's own-state heartbeat cadence (~20s)
+   * — a value at/under it would mark a healthy idle connection stale every cycle
+   * and permanently hold posting. Range 30000-300000ms (floor keeps margin above
+   * the heartbeat); default 60000ms (≈3 heartbeats). (Latch wired in PR2b.)
    */
   staleMaxMs: number;
   /**

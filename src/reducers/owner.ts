@@ -64,15 +64,22 @@ export interface OwnStateShadow {
   /** `false` until `onReady` fires (the snapshot has fully baselined), or while a resync is pending. */
   ready: boolean;
   /**
-   * Instantaneous latch-health MIRROR, re-derived by the runner's
+   * Instantaneous EDGE-latch health MIRROR, re-derived by the runner's
    * `recomputeOwnStateHealth()` at every latch-mutation site (Phase 3 PR2). It is
-   * the conjunction of the available §5 latches — `ready` (a durable baseline is
-   * swapped in), `lastStatus === 'connected'`, `!streamOverflowDegraded`,
-   * `!positionsTruncated`, and `lastError.reason !== 'fatal'` — with the
-   * not-yet-wired §5 latches (transportFresh / indexerLag / auditDivergence /
-   * tokenRefresh) defaulting healthy until PR2b/PR2c. It does NOT include the
-   * time-dependent recovery hold (latch 8); that lives in the runner's composite
-   * GATE `ownStateHealthy()`, which the posting gate + PR5 comparator read.
+   * the conjunction of the EVENT-DRIVEN (non-time-dependent) §5 latches — `ready`
+   * (a durable baseline is swapped in), `lastStatus === 'connected'`,
+   * `!streamOverflowDegraded`, `!positionsTruncated`, `lastError.reason !==
+   * 'fatal'`, and `!tokenRefreshFailureInFlight` (latch 7, PR2b) — with the
+   * still-deferred §5 latches (indexerLag / auditDivergence) defaulting healthy
+   * until PR2c.
+   *
+   * It deliberately does NOT include the TIME-dependent latches, which decay with
+   * no SDK event and so cannot live as a stored bit: latch 2 `transportFresh`
+   * (PR2b — a frame within `staleMaxMs`) and the recovery hold (latch 8). Both are
+   * evaluated at READ time in the runner: the divergence comparator gates on
+   * `instantOwnStateHealthy()` (this mirror AND `transportFresh`), while only the
+   * posting gate `ownStateHealthy()` additionally applies the recovery hold.
+   *
    * The factory default is `false` — a fresh, never-baselined shadow (`ready:
    * false`, `lastStatus: null`) is not healthy, matching what the conjunction
    * derives. The runner's `recomputeOwnStateHealth()` keeps it in sync from the

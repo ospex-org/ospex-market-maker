@@ -1034,8 +1034,16 @@ export class Runner {
     // model). We promote the event's carried cursor, never the SDK's.
     let promotionStopped = false;
     for (const event of drained.events) {
-      let descriptors: ReducerDescriptor[];
+      // Reducer dispatch AND descriptor application share ONE try/catch so the
+      // cursor-promotion gate has a SINGLE freeze site: promotion happens iff
+      // BOTH the reducer and `applyDescriptors` succeed, and any throw/skip
+      // freezes the rest of the batch identically ([[feedback_enforce_invariant_every_site]]).
+      // A malformed event from an SDK bug / synthetic fixture logs + skips
+      // rather than crashing the loop (defensive; the queue is bounded by
+      // OWN_STATE_QUEUE_MAX). `applyDescriptors` is pure IO and won't realistically
+      // throw, but is inside the try so promotion can't outrun a descriptor failure.
       try {
+        let descriptors: ReducerDescriptor[];
         switch (event.kind) {
           case 'commitment':
             descriptors = reduceOwnerCommitmentObservation(this.ownStateShadow, event.body as OwnerCommitment, now);
@@ -1061,25 +1069,11 @@ export class Runner {
             promotionStopped = true;
             continue;
         }
-      } catch (err) {
-        this.eventLog.emit('error', {
-          class: errClass(err),
-          detail: `${errMessage(err)} (event.kind=${event.kind})`,
-          phase: 'own-state-stream',
-        });
-        promotionStopped = true;
-        continue;
-      }
-      // `applyDescriptors` is wrapped too: cursor promotion must gate on BOTH the
-      // reducer AND descriptor application succeeding, and a descriptor throw
-      // should degrade like a reducer throw (log + freeze + skip) rather than
-      // crash the loop.
-      try {
         this.applyDescriptors(descriptors, 'owner');
       } catch (err) {
         this.eventLog.emit('error', {
           class: errClass(err),
-          detail: `applyDescriptors failed (event.kind=${event.kind}): ${errMessage(err)}`,
+          detail: `${errMessage(err)} (event.kind=${event.kind})`,
           phase: 'own-state-stream',
         });
         promotionStopped = true;
@@ -2715,6 +2709,17 @@ export class Runner {
    * Atomically swaps `pendingBaseline` into `shadow.commitments` /
    * `shadow.positions`; sets `ready: true`; wakes the loop so the next
    * drain sees `ready: true` (PR5 comparator uses this).
+   *
+   * INTENTIONAL DIVERGENCE from plan §4.3's single-queue promotion model:
+   * snapshot + ready are processed OUT-OF-BAND (synchronously, here + in
+   * `handleOwnerSnapshot`), NOT enqueued into `ownStateQueue` alongside deltas.
+   * This is safe because the SDK buffers deltas until `onReady` when a snapshot
+   * is being delivered, so at swap time the delta queue holds no pre-baseline
+   * events; and the `baseline !== null` gate means a reconnect's `onReady`
+   * (baseline already swapped) promotes nothing while catchup deltas stay queued
+   * and promote in-order in `drainShadow`. The synchronous swap is a plain
+   * object assignment and cannot throw, so §4.4's "swap throws → cursor not
+   * advanced" case is N/A. No leapfrog path exists.
    */
   private handleOwnerReady(cursor: string): void {
     const baseline = this.ownStateShadow.pendingBaseline;
@@ -2750,13 +2755,23 @@ export class Runner {
       this.ownStateShadow.positionsTruncated = baseline.positionsTruncated;
       this.ownStateShadow.pendingBaseline = null;
       // §4.3 cursor promotion: the baseline is now live in the shadow, so the
-      // cursor that pairs with it is safe to persist. Prefer the staged
-      // untruncated-page cursor; fall back to the onReady cursor only if no page
-      // staged one. The tick's existing atomic flush writes it alongside the
-      // rest of MakerState. A cursor is promoted ONLY here (with a real
-      // baseline) — never on the baseline-less path the empty-baseline guard
-      // above intercepts, where a resume delivered no snapshot and a cursor
-      // alone is not state.
+      // cursor that pairs with it is safe to persist. The tick's existing atomic
+      // flush writes it alongside the rest of MakerState. A cursor is promoted
+      // ONLY here (with a real baseline) — never on the baseline-less path the
+      // empty-baseline guard above intercepts, where a resume delivered no
+      // snapshot and a cursor alone is not state.
+      //
+      // PREFERENCE: follows plan §4.3 (`pendingBaselineCursor || event.cursor`)
+      // — prefer the staged final-untruncated-page cursor, fall back to the
+      // onReady cursor. ⚠️ The SDK's OwnStateEventMeta doc says the opposite:
+      // "persist only the cursor that lands on onReady". The two AGREE in
+      // practice for a cold start (onReady fires right after the final page, no
+      // deltas between, so the two cursors coincide), and PR1 is fail-SAFE
+      // either way (shadow-only; the empty-baseline guard cold-restarts every
+      // boot-resume so the persisted cursor is never actually resumed from).
+      // RECONFIRM before PR3b makes the cursor load-bearing: if the snapshot-page
+      // SSE-frame id is NOT a valid Last-Event-ID, flip to prefer the onReady
+      // cursor (likely dropping pendingBaselineCursor staging entirely).
       const promoted = this.pendingBaselineCursor ?? (cursor || undefined);
       if (promoted) this.state.ownStateCursor = promoted;
       this.pendingBaselineCursor = undefined;
@@ -2850,6 +2865,11 @@ export class Runner {
    *   is not state). Cleared persisted cursor is written on the next flush.
    * - `resumedFromPersistedCursor=false` — the next connect's snapshot (or a
    *   reopen) re-arms it as appropriate.
+   * - `ownStateColdRestartRequested=false` — consume any pending cold-restart
+   *   request at this drain site ([[feedback_consume_latched_signal_at_drain_site]]):
+   *   a server-driven resync already re-baselines on the LIVE socket, so it
+   *   supersedes a not-yet-performed MM-driven cold restart (which would
+   *   pointlessly close + reopen the connection the resync is already healing).
    * - `firstPollAfterShadowReady` + `divergenceTracker` — the comparator must
    *   wait for the post-rebaseline `onReady` AND one poll-tick before comparing.
    */
@@ -2861,6 +2881,7 @@ export class Runner {
     this.pendingBaselineCursor = undefined;
     this.state.ownStateCursor = undefined;
     this.resumedFromPersistedCursor = false;
+    this.ownStateColdRestartRequested = false;
     this.firstPollAfterShadowReady = false;
     this.divergenceTracker.clear();
   }

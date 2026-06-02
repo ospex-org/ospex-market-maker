@@ -1820,6 +1820,60 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
       expect(submit.calls).toHaveLength(0); // submit-site gate refused after the mid-reconcile degradation
       expect(events.filter((e) => e.kind === 'stream-health-hold' && e.state === 'entered')).toHaveLength(1);
     });
+
+    it('§5.1 race 3: own-state degrading INSIDE the SDK submit (the beforePost boundary) refuses the POST (Hermes #73 r3)', async () => {
+      StateStore.at(stateDir).flush(emptyMakerState()); // clean state → no boot/funding hold; isolate the §5.1 gate
+      const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: true, recoveryHoldMs: 0 } });
+      const submit = submitRecorder();
+      const recorder = makeOwnStateRecorder();
+      let healthyFired = false;
+      let injected = false;
+      // Faithfully model the SDK's submitRaw: it AWAITs getAddress / allowance / nonce /
+      // signing, THEN runs `beforePost` synchronously immediately before the POST. Here
+      // own-state degrades during those "awaits" (an overflow), so when the SDK calls
+      // beforePost the §5.1 hook throws → no POST. `submit.fn` (the real POST) must never
+      // run. Without the beforePost wiring, submitCommitment would POST anyway (the
+      // race-3 leak). The submitQuote-start gate does NOT catch this — own-state was
+      // healthy when that gate ran; it degrades only after, inside the submit.
+      const submitCommitment: OspexAdapter['submitCommitment'] = async (args) => {
+        if (!injected) {
+          injected = true;
+          const cap = 10_000;
+          for (let i = 0; i < cap; i++) runner.enqueueOwnStateEvent({ kind: 'commitment', body: MINIMAL_COMMITMENT(`0xc${i}`) });
+          runner.enqueueOwnStateEvent({ kind: 'commitment', body: MINIMAL_COMMITMENT('0xover') }); // overflow degrades own-state mid-submit
+        }
+        args.beforePost?.(); // the SDK's just-in-time boundary — throws when degraded, so the POST below never runs
+        return submit.fn(args);
+      };
+      const adapter = liveSpiedAdapter(
+        config,
+        () => Promise.resolve([contestView({ contestId: '1234' })]), // a quotable market
+        { submitCommitment },
+        undefined,
+        undefined,
+        {
+          // The position poll runs BEFORE reconcileMarkets: establish a HEALTHY shadow so
+          // both the top gate and the submitQuote-start early-out pass — the degradation
+          // happens only later, inside the submit, which only beforePost can catch.
+          getPositionStatus: () => {
+            if (!healthyFired) {
+              healthyFired = true;
+              recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: false }, { cursor: 's1' });
+              recorder.fire('onReady', undefined, { cursor: 'r1' });
+              recorder.fire('onStatus', 'connected');
+            }
+            return Promise.resolve(EMPTY_POSITION_STATUS);
+          },
+        },
+      );
+      vi.spyOn(adapter, 'subscribeOwnState').mockImplementation(recorder.subscribe);
+      const runner = makeRunner({ config, adapter, maxTicks: 1, makerAddress: DEFAULT_FAKE_MAKER_ADDRESS as Hex });
+      await runner.run();
+      const events = readEvents();
+      expect(submit.calls).toHaveLength(0); // beforePost aborted the POST — no commitment posted
+      expect(events.filter((e) => e.kind === 'stream-health-hold' && e.state === 'entered')).toHaveLength(1);
+      expect(events.some((e) => e.kind === 'error' && e.phase === 'submit')).toBe(false); // the §5.1 refusal is NOT logged as a submit error
+    });
   });
 
   it('sync throw from openOwnStateSubscription propagates AND runs the finally cleanup — unregister called (Hermes #68 blocker 3)', async () => {

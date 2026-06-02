@@ -35,6 +35,17 @@ export interface OwnStateEvent {
   body: unknown;
   /** Wall-clock arrival time (ms since epoch) — used by transport-fresh checks (§2.6). */
   arrivedAtMs: number;
+  /**
+   * The opaque `OwnStateEventMeta.cursor` the SDK delivered alongside this event
+   * (own-state SSE plan §4.1, Phase 3 PR1). Rides with the event into the drain
+   * so the §4.3 promotion contract can advance `MakerState.ownStateCursor` ONLY
+   * after this event's reducer + descriptors apply cleanly — never the SDK's
+   * running cursor (the SDK advances its internal cursor when the handler
+   * returns at enqueue time, BEFORE the deferred reducer runs in `drainShadow`).
+   * Empty string when no resumable cursor is available; an empty cursor is never
+   * promoted.
+   */
+  cursor: string;
 }
 
 export interface DrainResult {

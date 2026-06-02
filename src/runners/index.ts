@@ -460,6 +460,17 @@ export class Runner {
    * the runner — belt-and-braces.
    */
   private currentOwnStateSubscription: Subscription | null = null;
+  /**
+   * The opaque resume cursor of the FINAL untruncated snapshot page accumulated
+   * into `shadow.pendingBaseline` (own-state SSE plan §4.3, Phase 3 PR1). Staged
+   * by `handleOwnerSnapshot` ONLY from an untruncated page — a truncated page's
+   * cursor is a non-resumable page marker the SDK 400s on as Last-Event-ID, so
+   * it must NEVER become the persisted resume point (a cursor alone is not
+   * state, and a truncated page is not a complete baseline). Promoted into
+   * `state.ownStateCursor` by `handleOwnerReady` ONLY after the baseline swap
+   * succeeds; cleared on resync (the fresh snapshot re-stages it).
+   */
+  private pendingBaselineCursor: string | undefined = undefined;
 
   constructor(opts: RunnerOptions) {
     this.config = opts.config;
@@ -926,11 +937,15 @@ export class Runner {
    * the SSE adapter handlers to call this + `wake()`; PR3 exposes it so the
    * queue can be exercised by tests without the SSE adapter present.
    */
-  enqueueOwnStateEvent(event: { kind: string; body: unknown; arrivedAtMs?: number }): 'enqueued' | 'overflow' {
+  enqueueOwnStateEvent(event: { kind: string; body: unknown; arrivedAtMs?: number; cursor?: string }): 'enqueued' | 'overflow' {
     return this.ownStateQueue.enqueue({
       kind: event.kind,
       body: event.body,
       arrivedAtMs: event.arrivedAtMs ?? Date.now(),
+      // PR1 (own-state SSE plan §4.1): default to '' (no resumable cursor) for
+      // the test/external entry point — an empty cursor is never promoted by
+      // `drainShadow`. The SSE handlers below pass the real `meta.cursor`.
+      cursor: event.cursor ?? '',
     });
   }
 
@@ -980,6 +995,18 @@ export class Runner {
     // the loop — defensive at a per-event level (the queue itself is bounded
     // by `OWN_STATE_QUEUE_MAX`).
     const now = this.deps.now();
+    // §4.3 delta cursor track (Phase 3 PR1): promote `state.ownStateCursor` to a
+    // delta's `meta.cursor` ONLY after that delta's reducer + descriptors apply
+    // cleanly, and ONLY for the contiguous-success PREFIX of this drain batch.
+    // `promotionStopped` latches on the FIRST failure/skip so a later success
+    // can't leapfrog a failed/skipped event (which would persist a cursor past
+    // an effect we never applied). This MM-side freeze is the SOLE cursor guard
+    // for deferred reducer throws: the SDK already returned success when the
+    // handler enqueued the event, so it advanced its own running cursor and will
+    // NOT abort the connection for a throw that happens later, here, in the
+    // drain ([[feedback_dont_promote_partial_resume_cursor]] + the FM3 two-layer
+    // model). We promote the event's carried cursor, never the SDK's.
+    let promotionStopped = false;
     for (const event of drained.events) {
       let descriptors: ReducerDescriptor[];
       try {
@@ -1003,6 +1030,9 @@ export class Runner {
               detail: `drainShadow received unrecognized event.kind=${JSON.stringify(event.kind)} — skipping`,
               phase: 'own-state-stream',
             });
+            // An unrecognized event is NOT applied — freeze cursor promotion so
+            // we never advance past an effect we skipped.
+            promotionStopped = true;
             continue;
         }
       } catch (err) {
@@ -1011,9 +1041,29 @@ export class Runner {
           detail: `${errMessage(err)} (event.kind=${event.kind})`,
           phase: 'own-state-stream',
         });
+        promotionStopped = true;
         continue;
       }
-      this.applyDescriptors(descriptors, 'owner');
+      // `applyDescriptors` is wrapped too: cursor promotion must gate on BOTH the
+      // reducer AND descriptor application succeeding, and a descriptor throw
+      // should degrade like a reducer throw (log + freeze + skip) rather than
+      // crash the loop.
+      try {
+        this.applyDescriptors(descriptors, 'owner');
+      } catch (err) {
+        this.eventLog.emit('error', {
+          class: errClass(err),
+          detail: `applyDescriptors failed (event.kind=${event.kind}): ${errMessage(err)}`,
+          phase: 'own-state-stream',
+        });
+        promotionStopped = true;
+        continue;
+      }
+      // Success — promote the event's carried cursor (a no-op for the empty-
+      // string sentinel) unless the batch already froze on an earlier failure.
+      if (!promotionStopped && event.cursor) {
+        this.state.ownStateCursor = event.cursor;
+      }
     }
   }
 
@@ -2510,25 +2560,25 @@ export class Runner {
     let mySub: Subscription | null = null;
     const sameSub = (): boolean => mySub !== null && mySub === this.currentOwnStateSubscription;
     const handlers: OwnerStateSubscribeHandlers = {
-      onSnapshot: (snapshot) => {
+      onSnapshot: (snapshot, meta) => {
         if (!sameSub()) return;
-        this.handleOwnerSnapshot(snapshot);
+        this.handleOwnerSnapshot(snapshot, meta.cursor);
       },
-      onReady: () => {
+      onReady: (meta) => {
         if (!sameSub()) return;
-        this.handleOwnerReady();
+        this.handleOwnerReady(meta.cursor);
       },
-      onCommitment: (commitment) => {
+      onCommitment: (commitment, meta) => {
         if (!sameSub()) return;
-        this.handleOwnerCommitment(commitment);
+        this.handleOwnerCommitment(commitment, meta.cursor);
       },
-      onFill: (fill) => {
+      onFill: (fill, meta) => {
         if (!sameSub()) return;
-        this.handleOwnerFill(fill);
+        this.handleOwnerFill(fill, meta.cursor);
       },
-      onPositionStatus: (event) => {
+      onPositionStatus: (event, meta) => {
         if (!sameSub()) return;
-        this.handleOwnerPositionStatus(event);
+        this.handleOwnerPositionStatus(event, meta.cursor);
       },
       onStatus: (status) => {
         if (!sameSub()) return;
@@ -2574,7 +2624,17 @@ export class Runner {
    * Phase 2 invariant — shadow-only: writes are to `pendingBaseline` (a
    * shadow projection), NOT to canonical `MakerState`.
    */
-  private handleOwnerSnapshot(snapshot: OwnerStateSnapshot): void {
+  private handleOwnerSnapshot(snapshot: OwnerStateSnapshot, cursor: string): void {
+    // §4.3 cursor track (Phase 3 PR1): stage the baseline cursor ONLY from an
+    // untruncated page. A truncated page's cursor is a non-resumable page marker
+    // (the SDK 400s on it as Last-Event-ID), and a truncated page is not a
+    // complete baseline — promoting it would persist a cursor that no durable
+    // baseline pairs with. The final (untruncated) page carries the cursor that
+    // pairs with the complete baseline; `handleOwnerReady` promotes it after the
+    // swap. (positionsTruncated is handled separately via the `healthy` gate.)
+    if (!snapshot.truncated && cursor) {
+      this.pendingBaselineCursor = cursor;
+    }
     if (this.ownStateShadow.pendingBaseline === null) {
       this.ownStateShadow.pendingBaseline = {
         commitments: {},
@@ -2611,7 +2671,7 @@ export class Runner {
    * `shadow.positions`; sets `ready: true`; wakes the loop so the next
    * drain sees `ready: true` (PR5 comparator uses this).
    */
-  private handleOwnerReady(): void {
+  private handleOwnerReady(cursor: string): void {
     const baseline = this.ownStateShadow.pendingBaseline;
     if (baseline !== null) {
       // Atomic swap — replace shadow's commitments/positions wholesale rather
@@ -2624,6 +2684,17 @@ export class Runner {
       this.ownStateShadow.truncated = baseline.truncated;
       this.ownStateShadow.positionsTruncated = baseline.positionsTruncated;
       this.ownStateShadow.pendingBaseline = null;
+      // §4.3 cursor promotion: the baseline is now live in the shadow, so the
+      // cursor that pairs with it is safe to persist. Prefer the staged
+      // untruncated-page cursor; fall back to the onReady cursor only if no page
+      // staged one. The tick's existing atomic flush writes it alongside the
+      // rest of MakerState. A cursor is promoted ONLY here (with a real
+      // baseline) — never on the `baseline === null` path below, where a resume
+      // delivered no snapshot and a cursor alone is not state (commit 3 turns
+      // that path into the empty-baseline cold-restart guard).
+      const promoted = this.pendingBaselineCursor ?? (cursor || undefined);
+      if (promoted) this.state.ownStateCursor = promoted;
+      this.pendingBaselineCursor = undefined;
     }
     this.ownStateShadow.ready = true;
     this.ownStateShadow.lastReadyAtMs = Date.now();
@@ -2639,21 +2710,21 @@ export class Runner {
     this.wakeSignal.wake();
   }
 
-  private handleOwnerCommitment(commitment: OwnerCommitment): void {
+  private handleOwnerCommitment(commitment: OwnerCommitment, cursor: string): void {
     this.ownStateShadow.lastEventAtMs = Date.now();
-    this.ownStateQueue.enqueue({ kind: 'commitment', body: commitment, arrivedAtMs: Date.now() });
+    this.ownStateQueue.enqueue({ kind: 'commitment', body: commitment, arrivedAtMs: Date.now(), cursor });
     this.wakeSignal.wake();
   }
 
-  private handleOwnerFill(fill: Fill): void {
+  private handleOwnerFill(fill: Fill, cursor: string): void {
     this.ownStateShadow.lastEventAtMs = Date.now();
-    this.ownStateQueue.enqueue({ kind: 'fill', body: fill, arrivedAtMs: Date.now() });
+    this.ownStateQueue.enqueue({ kind: 'fill', body: fill, arrivedAtMs: Date.now(), cursor });
     this.wakeSignal.wake();
   }
 
-  private handleOwnerPositionStatus(event: PositionStatusEvent): void {
+  private handleOwnerPositionStatus(event: PositionStatusEvent, cursor: string): void {
     this.ownStateShadow.lastEventAtMs = Date.now();
-    this.ownStateQueue.enqueue({ kind: 'positionStatus', body: event, arrivedAtMs: Date.now() });
+    this.ownStateQueue.enqueue({ kind: 'positionStatus', body: event, arrivedAtMs: Date.now(), cursor });
     this.wakeSignal.wake();
   }
 
@@ -2686,6 +2757,15 @@ export class Runner {
       // dispatch real (was a no-op stub in PR3), so this scenario is now a
       // shadow-correctness issue rather than a latent one.
       this.ownStateQueue.clear();
+      // §4.3 + [[feedback_reset_event_clears_dependent_buffers]] (Phase 3 PR1):
+      // a resync drops the baseline, so the resume cursor that indexed it is
+      // stale — clear BOTH the staged baseline cursor AND the persisted cursor
+      // at the SAME site as every other dependent buffer. The upcoming fresh
+      // snapshot re-establishes both; the cleared persisted cursor is written on
+      // the next flush (a stale cursor surviving a resync could resume a future
+      // boot onto a baseline the snapshot replaced — cursor alone is not state).
+      this.pendingBaselineCursor = undefined;
+      this.state.ownStateCursor = undefined;
       // Phase 2 PR5 — reset the firstPollAfterShadowReady latch + drop the
       // divergence tracker. After resync, the comparator must wait for the
       // post-resync `onReady` AND at least one poll-tick before re-comparing.
@@ -2837,6 +2917,11 @@ export class Runner {
   /** Test seam — current `ownStateQueue` occupancy (PR4b round 2 / Hermes #69). */
   ownStateQueueSizeForTest(): number {
     return this.ownStateQueue.size;
+  }
+
+  /** Test seam — the in-memory `state.ownStateCursor` (own-state SSE plan §4.1, Phase 3 PR1). */
+  ownStateCursorForTest(): string | undefined {
+    return this.state.ownStateCursor;
   }
 
   /**

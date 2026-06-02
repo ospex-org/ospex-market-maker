@@ -1332,6 +1332,88 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
     expect(runner.ownStateCursorForTest()).toBe('k1');
   });
 
+  // ── PR1 — boot resume wiring + empty-baseline guard (§4.2) ───────────────
+
+  it('boot WITH a persisted cursor passes it as initialCursor (§4.2)', async () => {
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), ownStateCursor: 'boot-cursor' });
+    const { recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
+    expect(recorder.options).toEqual({ address: DEFAULT_FAKE_MAKER_ADDRESS, initialCursor: 'boot-cursor' });
+    triggerKill();
+    await runPromise;
+  });
+
+  it('boot WITHOUT a persisted cursor omits initialCursor (cold subscribe)', async () => {
+    const { recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
+    expect(recorder.options).toEqual({ address: DEFAULT_FAKE_MAKER_ADDRESS });
+    triggerKill();
+    await runPromise;
+  });
+
+  it('empty-baseline guard: a resume that delivers no snapshot does NOT flip ready and drops the cursor (cursor alone is not state)', async () => {
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), ownStateCursor: 'boot-cursor' });
+    const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
+    expect(recorder.options).toEqual({ address: DEFAULT_FAKE_MAKER_ADDRESS, initialCursor: 'boot-cursor' });
+    // Resume delivers onReady with NO snapshot → baseline-less resume → guard.
+    recorder.fire('onReady', undefined, { cursor: 'ready-x' });
+    // Synchronous guard effects: NOT ready, cursor dropped.
+    expect(runner.ownStateShadowView().ready).toBe(false);
+    expect(runner.ownStateCursorForTest()).toBeUndefined();
+    triggerKill();
+    await runPromise;
+    expect(readEvents().filter((e) => e.kind === 'stream-cold-restart' && e.reason === 'resume-without-baseline')).toHaveLength(1);
+  });
+
+  it('empty-baseline guard performs the async cold restart — reopens the subscription CURSOR-LESS', async () => {
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), ownStateCursor: 'boot-cursor' });
+    const { runner, recorder, runPromise, sleepCalls, resolvers, triggerKill } = await makePausedSubscribedRunner();
+    expect((recorder.options as { initialCursor?: string }).initialCursor).toBe('boot-cursor');
+    recorder.fire('onReady', undefined, { cursor: 'ready-x' }); // baseline-less → guard wakes
+    // Resolve the debounce so the wake path reaches performOwnStateColdRestart.
+    await waitFor(() => sleepCalls.filter((ms) => ms === 500).length >= 1);
+    const idx = sleepCalls.findIndex((ms) => ms === 500);
+    resolvers[idx]?.();
+    // The reopen is CURSOR-LESS (the guard cleared the cursor → no initialCursor).
+    await waitFor(() => recorder.options !== undefined && (recorder.options as { initialCursor?: string }).initialCursor === undefined);
+    expect(recorder.options).toEqual({ address: DEFAULT_FAKE_MAKER_ADDRESS });
+    expect(runner.ownStateCursorForTest()).toBeUndefined();
+    triggerKill();
+    await runPromise;
+  });
+
+  it('a baseline-less onReady on a mid-session reconnect does NOT cold-restart (in-memory baseline still live)', async () => {
+    const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
+    // Cold connect (no boot cursor): snapshot + ready establishes the baseline.
+    recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: false }, { cursor: 'snap-1' });
+    recorder.fire('onReady', undefined, { cursor: 'ready-1' });
+    expect(runner.ownStateShadowView().ready).toBe(true);
+    expect(runner.ownStateCursorForTest()).toBe('snap-1');
+    // A reconnect delivers catchup + ready with NO new snapshot. resumedFromPersistedCursor
+    // is false (cold connect), so the guard must NOT trip — the in-memory baseline backs it.
+    recorder.fire('onReady', undefined, { cursor: 'ready-2' });
+    expect(runner.ownStateShadowView().ready).toBe(true); // still ready
+    expect(runner.ownStateCursorForTest()).toBe('snap-1'); // unchanged — no new baseline → no promote
+    triggerKill();
+    await runPromise;
+    expect(readEvents().filter((e) => e.kind === 'stream-cold-restart')).toHaveLength(0);
+  });
+
+  it('resync clears the persisted cursor AND a subsequent cold-start re-establishes it (shared rebaseline reset)', async () => {
+    const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
+    recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: false }, { cursor: 'snap-1' });
+    recorder.fire('onReady', undefined, { cursor: 'ready-1' });
+    expect(runner.ownStateCursorForTest()).toBe('snap-1');
+    recorder.fire('onStatus', 'resync');
+    expect(runner.ownStateCursorForTest()).toBeUndefined();
+    expect(runner.ownStateShadowView().ready).toBe(false);
+    // Fresh snapshot after resync re-establishes the cursor.
+    recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: false }, { cursor: 'snap-2' });
+    recorder.fire('onReady', undefined, { cursor: 'ready-2' });
+    expect(runner.ownStateCursorForTest()).toBe('snap-2');
+    expect(runner.ownStateShadowView().ready).toBe(true);
+    triggerKill();
+    await runPromise;
+  });
+
   it('drainShadow logs error + skips on unknown event kind (Phase 2 PR4b)', async () => {
     const runner = makeRunner({ maxTicks: 1 });
     runner.enqueueOwnStateEvent({ kind: 'made-up-kind', body: {} });

@@ -471,6 +471,28 @@ export class Runner {
    * succeeds; cleared on resync (the fresh snapshot re-stages it).
    */
   private pendingBaselineCursor: string | undefined = undefined;
+  /**
+   * Whether the CURRENT own-state subscription was opened with a persisted
+   * `initialCursor` (a resume), and no snapshot page has arrived on it yet
+   * (own-state SSE plan §4.2, Phase 3 PR1). Set when `openOwnStateSubscription`
+   * passes an `initialCursor`; cleared the moment a snapshot page arrives
+   * (`handleOwnerSnapshot`) or `onReady` confirms a baseline. The empty-baseline
+   * guard reads it: an `onReady` with `pendingBaseline === null` AND this flag
+   * still set means the resume delivered NO snapshot — there is no durable
+   * baseline for the cursor (a cursor alone is not state), so it cold-restarts.
+   * It does NOT trip on a mid-session reconnect (the in-memory baseline is still
+   * live there, and the flag is already false).
+   */
+  private resumedFromPersistedCursor = false;
+  /**
+   * Set by the empty-baseline guard (`handleOwnerReady`) to request an async
+   * cold restart of the own-state subscription — close + reopen CURSOR-LESS so
+   * the SDK cold-connects with a fresh snapshot. Acted on (and cleared) by
+   * `performOwnStateColdRestart`, which the run loop invokes right after the
+   * wake-path / post-tick `drainShadow`. The guard cannot do the async
+   * close/reopen itself (it runs inside a synchronous SDK handler).
+   */
+  private ownStateColdRestartRequested = false;
 
   constructor(opts: RunnerOptions) {
     this.config = opts.config;
@@ -899,6 +921,10 @@ export class Runner {
         await this.deps.sleep(this.config.ownState.debounceMs, this.abortController.signal);
         if (this.abortController.signal.aborted) return;
         this.drainShadow();
+        // §4.2 (Phase 3 PR1) — the empty-baseline guard wakes the loop after
+        // requesting a cold restart; perform it here, off the wake, now that
+        // we're in an async context. No-op unless requested.
+        await this.performOwnStateColdRestart();
         // Consume any wakes that arrived OUTSIDE the begin/endWait pair (during
         // the debounce window). Their queue contents are covered by the drain
         // above; without this clear, the next iteration's `beginWait` would
@@ -1128,6 +1154,9 @@ export class Runner {
         this.drainShadow(); // own-state-sse-plan §"Drain placement" — pre-tick drain
         await this.tick(ticks);
         this.drainShadow(); // §"Drain placement" — post-tick drain catches events that arrived during tick IO
+        // §4.2 (Phase 3 PR1) — belt-and-braces cold-restart hook for a guard
+        // that tripped during tick IO (before the loop returned to the wait).
+        await this.performOwnStateColdRestart();
         // Phase 2 PR5 — comparator pass. Records that this tick completed (lastPollObsAtMs),
         // latches firstPollAfterShadowReady when applicable, and runs the comparator
         // when preconditions hold. Phase 2 invariant: comparator is read-only on both
@@ -2589,7 +2618,19 @@ export class Runner {
         this.handleOwnerError(error);
       },
     };
-    mySub = this.adapter.subscribeOwnState({ address: this.makerAddress }, handlers);
+    // §4.2 (Phase 3 PR1) — offer the persisted resume cursor as Last-Event-ID
+    // when present. `resumedFromPersistedCursor` arms the empty-baseline guard
+    // for THIS subscription: if the resume delivers no snapshot, `onReady` will
+    // cold-restart cursor-less (a cursor alone is not state). A cursor-less
+    // open (cold start, or the reopen AFTER a cold restart) leaves the flag
+    // false. Built conditionally so `initialCursor: undefined` is never passed
+    // (exactOptionalPropertyTypes).
+    const initialCursor = this.state.ownStateCursor;
+    this.resumedFromPersistedCursor = initialCursor !== undefined;
+    mySub = this.adapter.subscribeOwnState(
+      initialCursor !== undefined ? { address: this.makerAddress, initialCursor } : { address: this.makerAddress },
+      handlers,
+    );
     this.currentOwnStateSubscription = mySub;
   }
 
@@ -2625,6 +2666,10 @@ export class Runner {
    * shadow projection), NOT to canonical `MakerState`.
    */
   private handleOwnerSnapshot(snapshot: OwnerStateSnapshot, cursor: string): void {
+    // A snapshot page means the SDK IS delivering a baseline on this connect
+    // (even a resume that re-snapshots) — so this is no longer a baseline-less
+    // resume; disarm the empty-baseline guard (own-state SSE plan §4.2).
+    this.resumedFromPersistedCursor = false;
     // §4.3 cursor track (Phase 3 PR1): stage the baseline cursor ONLY from an
     // untruncated page. A truncated page's cursor is a non-resumable page marker
     // (the SDK 400s on it as Last-Event-ID), and a truncated page is not a
@@ -2673,6 +2718,26 @@ export class Runner {
    */
   private handleOwnerReady(cursor: string): void {
     const baseline = this.ownStateShadow.pendingBaseline;
+    // EMPTY-BASELINE GUARD (own-state SSE plan §4.2, "a cursor alone is not
+    // state", Phase 3 PR1): a resume seeded from a persisted cursor that
+    // reaches `onReady` with NO snapshot (`baseline === null`) has no durable
+    // baseline to pair the cursor with — in Phase 2 the shadow is in-memory
+    // only, so a process restart left it empty. Flipping `ready` here would
+    // publish an empty baseline to the comparator (false divergence) and
+    // persisting the cursor would compound it. Drop the cursor and request a
+    // cold restart (close + reopen cursor-less → the SDK sends a fresh
+    // snapshot). Does NOT trip on a mid-session reconnect (in-memory baseline
+    // still live → `resumedFromPersistedCursor` already false). The actual
+    // close/reopen is async, done by `performOwnStateColdRestart` off the wake.
+    if (baseline === null && this.resumedFromPersistedCursor) {
+      this.eventLog.emit('stream-cold-restart', { reason: 'resume-without-baseline' });
+      this.state.ownStateCursor = undefined;
+      this.pendingBaselineCursor = undefined;
+      this.resumedFromPersistedCursor = false;
+      this.ownStateColdRestartRequested = true;
+      this.wakeSignal.wake(); // so the loop's wake path performs the restart promptly
+      return; // do NOT set ready — an empty shadow must not look ready
+    }
     if (baseline !== null) {
       // Atomic swap — replace shadow's commitments/positions wholesale rather
       // than merging. The pendingBaseline accumulated EVERY commitment/position
@@ -2689,13 +2754,17 @@ export class Runner {
       // untruncated-page cursor; fall back to the onReady cursor only if no page
       // staged one. The tick's existing atomic flush writes it alongside the
       // rest of MakerState. A cursor is promoted ONLY here (with a real
-      // baseline) — never on the `baseline === null` path below, where a resume
-      // delivered no snapshot and a cursor alone is not state (commit 3 turns
-      // that path into the empty-baseline cold-restart guard).
+      // baseline) — never on the baseline-less path the empty-baseline guard
+      // above intercepts, where a resume delivered no snapshot and a cursor
+      // alone is not state.
       const promoted = this.pendingBaselineCursor ?? (cursor || undefined);
       if (promoted) this.state.ownStateCursor = promoted;
       this.pendingBaselineCursor = undefined;
     }
+    // A real baseline was swapped, OR this is a mid-session reconnect whose
+    // in-memory baseline is still live — either way a baseline now backs the
+    // shadow, so the resume guard is satisfied.
+    this.resumedFromPersistedCursor = false;
     this.ownStateShadow.ready = true;
     this.ownStateShadow.lastReadyAtMs = Date.now();
     this.ownStateShadow.lastEventAtMs = Date.now();
@@ -2739,38 +2808,11 @@ export class Runner {
     this.ownStateShadow.lastStatus = status;
     this.ownStateShadow.lastEventAtMs = Date.now();
     if (status === 'resync') {
-      // Drop the running baseline + mark not-ready so a partial pre-resync
-      // snapshot doesn't accidentally swap in. Reducers downstream check
-      // `ready` before reading shadow.commitments/positions.
-      this.ownStateShadow.ready = false;
-      this.ownStateShadow.pendingBaseline = null;
-      // The upcoming fresh snapshot is authoritative — the dropped events
-      // that the queue overflow latched will be re-baselined. Clear the
-      // overflow latch so the next `onReady` can restore healthy (Hermes
-      // #68 review blocker 1 — "after a real resync" is the only authoritative
-      // recovery path for queue overflow in Phase 2).
-      this.streamOverflowDegraded = false;
-      // Drop any pre-resync deltas still queued — the upcoming fresh snapshot
-      // is authoritative for all on-chain state up to its timestamp; applying
-      // pre-resync events on top of the post-resync baseline would
-      // double-count (Hermes #69 review). PR4b made drainShadow's reducer
-      // dispatch real (was a no-op stub in PR3), so this scenario is now a
-      // shadow-correctness issue rather than a latent one.
-      this.ownStateQueue.clear();
-      // §4.3 + [[feedback_reset_event_clears_dependent_buffers]] (Phase 3 PR1):
-      // a resync drops the baseline, so the resume cursor that indexed it is
-      // stale — clear BOTH the staged baseline cursor AND the persisted cursor
-      // at the SAME site as every other dependent buffer. The upcoming fresh
-      // snapshot re-establishes both; the cleared persisted cursor is written on
-      // the next flush (a stale cursor surviving a resync could resume a future
-      // boot onto a baseline the snapshot replaced — cursor alone is not state).
-      this.pendingBaselineCursor = undefined;
-      this.state.ownStateCursor = undefined;
-      // Phase 2 PR5 — reset the firstPollAfterShadowReady latch + drop the
-      // divergence tracker. After resync, the comparator must wait for the
-      // post-resync `onReady` AND at least one poll-tick before re-comparing.
-      this.firstPollAfterShadowReady = false;
-      this.divergenceTracker.clear();
+      // The upcoming fresh snapshot is authoritative — drop every buffer the
+      // prior baseline seeded. Centralized in `resetShadowForRebaseline` so the
+      // resync path and the empty-baseline cold-restart path clear the SAME set
+      // ([[feedback_enforce_invariant_every_site]] + [[feedback_reset_event_clears_dependent_buffers]]).
+      this.resetShadowForRebaseline();
     } else if (status === 'degraded') {
       this.ownStateShadow.healthy = false;
     } else if (status === 'connected') {
@@ -2788,6 +2830,63 @@ export class Runner {
       }
     }
     this.wakeSignal.wake();
+  }
+
+  /**
+   * Clear every shadow/cursor buffer that a RE-BASELINE invalidates — shared by
+   * the server-driven resync path (`handleOwnerStatus('resync')`) and the
+   * MM-driven empty-baseline cold restart (`performOwnStateColdRestart`). The
+   * upcoming fresh snapshot is authoritative, so all of these MUST be dropped at
+   * one site or stale state double-applies onto the new baseline:
+   * - `ready=false` / `pendingBaseline=null` — a partial pre-rebaseline snapshot
+   *   must not swap in; reducers gate reads on `ready`.
+   * - `streamOverflowDegraded=false` — a fresh snapshot re-baselines the events
+   *   the overflow dropped, so the latch may clear (Hermes #68 blocker 1).
+   * - `ownStateQueue.clear()` — pre-rebaseline deltas would double-count on the
+   *   fresh baseline (Hermes #69).
+   * - `pendingBaselineCursor` + `state.ownStateCursor` — the resume cursor that
+   *   indexed the dropped baseline is stale; a stale cursor surviving could
+   *   resume a future boot onto a baseline the snapshot replaced (a cursor alone
+   *   is not state). Cleared persisted cursor is written on the next flush.
+   * - `resumedFromPersistedCursor=false` — the next connect's snapshot (or a
+   *   reopen) re-arms it as appropriate.
+   * - `firstPollAfterShadowReady` + `divergenceTracker` — the comparator must
+   *   wait for the post-rebaseline `onReady` AND one poll-tick before comparing.
+   */
+  private resetShadowForRebaseline(): void {
+    this.ownStateShadow.ready = false;
+    this.ownStateShadow.pendingBaseline = null;
+    this.streamOverflowDegraded = false;
+    this.ownStateQueue.clear();
+    this.pendingBaselineCursor = undefined;
+    this.state.ownStateCursor = undefined;
+    this.resumedFromPersistedCursor = false;
+    this.firstPollAfterShadowReady = false;
+    this.divergenceTracker.clear();
+  }
+
+  /**
+   * Act on a cold-restart request raised by the empty-baseline guard (own-state
+   * SSE plan §4.2, Phase 3 PR1). The guard runs inside a synchronous SDK
+   * handler, so it can only set `ownStateColdRestartRequested` + wake; this
+   * async method (invoked off the wake-path / post-tick `drainShadow`) does the
+   * close + reopen. Order matters: close FIRST (the SDK contract + the runner's
+   * identity guard mean no handler fires after `await unsubscribe()`), THEN
+   * reset the rebaseline buffers (so no event delivered between the guard and
+   * the close survives), THEN reopen — cursor-less, because the guard already
+   * cleared `state.ownStateCursor`, so `openOwnStateSubscription` omits
+   * `initialCursor` and the SDK cold-connects with a fresh snapshot. Skips if
+   * the runner is shutting down. The flag is consumed up front so a redundant
+   * call (it's invoked after every drain) is a no-op; the reopen is cursor-less
+   * so its own `onReady` can't re-trip the guard.
+   */
+  private async performOwnStateColdRestart(): Promise<void> {
+    if (!this.ownStateColdRestartRequested) return;
+    this.ownStateColdRestartRequested = false;
+    if (this.stopRequested || this.abortController.signal.aborted) return;
+    await this.closeOwnStateSubscription();
+    this.resetShadowForRebaseline();
+    if (this.makerAddress !== null) this.openOwnStateSubscription();
   }
 
   /**

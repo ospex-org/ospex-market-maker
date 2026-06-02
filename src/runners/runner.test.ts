@@ -1349,6 +1349,21 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
     await runPromise;
   });
 
+  it('boot resume that DOES deliver a snapshot disarms the guard and promotes the fresh cursor over the boot cursor (§4.2 happy path)', async () => {
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), ownStateCursor: 'boot-cursor' });
+    const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
+    expect((recorder.options as { initialCursor?: string }).initialCursor).toBe('boot-cursor');
+    // The SDK re-snapshots on resume → handleOwnerSnapshot disarms the guard
+    // (resumedFromPersistedCursor=false), so onReady swaps a real baseline.
+    recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: false }, { cursor: 'snap-new' });
+    recorder.fire('onReady', undefined, { cursor: 'ready-new' });
+    expect(runner.ownStateShadowView().ready).toBe(true); // guard did NOT trip
+    expect(runner.ownStateCursorForTest()).toBe('snap-new'); // fresh cursor promoted, boot cursor replaced
+    triggerKill();
+    await runPromise;
+    expect(readEvents().filter((e) => e.kind === 'stream-cold-restart')).toHaveLength(0); // no cold restart
+  });
+
   it('empty-baseline guard: a resume that delivers no snapshot does NOT flip ready and drops the cursor (cursor alone is not state)', async () => {
     StateStore.at(stateDir).flush({ ...emptyMakerState(), ownStateCursor: 'boot-cursor' });
     const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();

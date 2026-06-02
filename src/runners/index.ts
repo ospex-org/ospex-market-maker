@@ -493,6 +493,25 @@ export class Runner {
    * close/reopen itself (it runs inside a synchronous SDK handler).
    */
   private ownStateColdRestartRequested = false;
+  /**
+   * Recovery-hold anchor (own-state SSE plan §5, latch 8 — Phase 3 PR2). The
+   * unix-second time at which the composite latch conjunction (see
+   * {@link recomputeOwnStateHealth}) first became healthy in the current healthy
+   * episode; `null` whenever any latch is tripped. The posting gate only trusts
+   * own-state once the latches have been continuously healthy for
+   * `ownState.recoveryHoldMs` — `(now - this) * 1000 >= recoveryHoldMs` (the
+   * clock is unix SECONDS, the config is MILLISECONDS, mirroring the funding
+   * guard's `checkIntervalMs` comparison). Prevents flapping the posting gate on
+   * a brief recovery blip.
+   */
+  private healthyEligibleSinceSec: number | null = null;
+  /**
+   * Transition latch for the §5.1 own-state-health posting gate's telemetry
+   * (Phase 3 PR2). `true` while {@link updateStreamHealthHold} is holding; used
+   * to emit `stream-health-hold` ONLY on an enter/clear edge (a sustained hold
+   * must not spam the log), exactly as {@link setFundingHold} gates `funding-hold`.
+   */
+  private streamHealthHolding = false;
 
   constructor(opts: RunnerOptions) {
     this.config = opts.config;
@@ -998,7 +1017,7 @@ export class Runner {
     const drained = this.ownStateQueue.drain();
     if (drained.overflowed && !this.streamOverflowDegraded) {
       this.streamOverflowDegraded = true;
-      this.ownStateShadow.healthy = false;
+      this.recomputeOwnStateHealth(); // overflow latch tripped — re-derive composite health
       this.eventLog.emit('stream-health-degraded', {
         reason: 'queue-overflow',
         shadowReady: this.ownStateShadow.ready,
@@ -1645,9 +1664,19 @@ export class Runner {
    *      `partiallyFilled` — a retained partial relies on (1)/(2)/(3) or natural expiry.
    */
   private async reconcileMarkets(): Promise<void> {
+    const now = this.deps.now();
+    // §5.1 own-state-health posting gate (Phase 3 PR2). Evaluated at the TOP of
+    // every reconcile pass — above the funding / boot early-returns below — so its
+    // enter/clear telemetry edge stays accurate even when one of those holds would
+    // return first. (It is NOT evaluated on a tick that fails closed upstream on
+    // lost fill-visibility and never reaches reconcileMarkets; the latch is
+    // eventually consistent — it flips on the next reconcile that runs, and posting
+    // is independently halted on a fail-closed tick anyway.) Inert (always false)
+    // in dry-run and poll-only mode; dormant until PR3b flips subscribe.
+    const streamHealthHold = this.updateStreamHealthHold(now);
     if (this.isHoldingQuoting()) return; // DESIGN §12 — must not resume quoting on a blank slate
     if (this.fundingHold) return; // DESIGN §6 funding guard (C1a) — wallet can't back its matchable-commitment exposure; halt NEW posting until a successful funding re-read clears it
-    const now = this.deps.now();
+    if (streamHealthHold) return; // own-state SSE §5.1 — composite own-state health degraded; we can't trust our own commitment/fill view, so halt NEW posting (active cancel-sweep posture lands in PR3b)
     for (const m of this.trackedMarkets.values()) {
       if (!this.needsReconcile(m, now)) continue;
       m.dirty = false; // read-and-clear BEFORE reconciling, so a dirty re-armed DURING the reconcile (a success re-quote, a concurrent onChange) survives to the next tick instead of being clobbered
@@ -2783,12 +2812,12 @@ export class Runner {
     this.ownStateShadow.ready = true;
     this.ownStateShadow.lastReadyAtMs = Date.now();
     this.ownStateShadow.lastEventAtMs = Date.now();
-    // Derive `healthy` from current degradation latches (Hermes #68 review):
-    // a queue overflow OR positionsTruncated baseline means the shadow is
-    // incomplete in ways a transport-recovery alone cannot fix; PR5 comparator
-    // gates on `healthy && ready` so a truncated baseline must NOT mark
-    // healthy=true at swap time.
-    this.ownStateShadow.healthy = !this.streamOverflowDegraded && !this.ownStateShadow.positionsTruncated;
+    // Re-derive the composite latch health (Phase 3 PR2): `ready` just flipped
+    // true and a fresh baseline (possibly `positionsTruncated`) swapped in, both
+    // composite inputs. A queue overflow OR positionsTruncated baseline means the
+    // shadow is incomplete in ways a transport-recovery alone cannot fix, so the
+    // recompute keeps `healthy` false until a clean rebaseline clears them.
+    this.recomputeOwnStateHealth();
     // No telemetry emit in PR4a — PR5 wires the proper `stream-ready` /
     // comparator-pass shape. Wake the loop so the next iteration drains.
     this.wakeSignal.wake();
@@ -2828,22 +2857,25 @@ export class Runner {
       // resync path and the empty-baseline cold-restart path clear the SAME set
       // ([[feedback_enforce_invariant_every_site]] + [[feedback_reset_event_clears_dependent_buffers]]).
       this.resetShadowForRebaseline();
-    } else if (status === 'degraded') {
-      this.ownStateShadow.healthy = false;
     } else if (status === 'connected') {
-      // Transport recovered — clear any prior transport-level error mark.
+      // Transport recovered — clear any prior transport-level error mark
+      // (including the fatal-error input the recompute below reads). A queue
+      // overflow / positionsTruncated baseline are NOT cleared here: they
+      // dropped/omitted events a transport reconnect alone can't recover (the
+      // SDK's catchup resumes from the running cursor, never replaying the
+      // events the runner dropped), so they need a `resync` → fresh snapshot
+      // to clear (Hermes #68 review blocker 1). The recompute below keeps
+      // `healthy` false while either latch is still set.
       this.ownStateShadow.lastError = null;
-      // BUT only restore `healthy: true` when no UPSTREAM-incompleteness
-      // latch is still set. A queue overflow dropped events that a transport
-      // reconnect alone can't recover (the SDK's catchup uses Last-Event-ID
-      // from the running cursor; events the runner dropped never made it
-      // into the cursor); positionsTruncated likewise means the baseline
-      // itself is partial. Both need a `resync` → fresh snapshot pair to
-      // clear (Hermes #68 review blocker 1).
-      if (!this.streamOverflowDegraded && !this.ownStateShadow.positionsTruncated) {
-        this.ownStateShadow.healthy = true;
-      }
     }
+    // Single derivation site for ALL status transitions (connected / degraded /
+    // reconnecting / resync): re-derive the composite latch health from every
+    // input rather than a per-branch single-path set, so a recovery on one
+    // signal can't mask a different still-tripped latch
+    // ([[feedback_health_predicate_composite_inputs]]). `degraded` /
+    // `reconnecting` fall through here with `lastStatus !== 'connected'`, which
+    // the recompute reads as unhealthy.
+    this.recomputeOwnStateHealth();
     this.wakeSignal.wake();
   }
 
@@ -2884,6 +2916,12 @@ export class Runner {
     this.ownStateColdRestartRequested = false;
     this.firstPollAfterShadowReady = false;
     this.divergenceTracker.clear();
+    // The rebaseline cleared `ready` + the overflow latch, so re-derive composite
+    // health (it goes unhealthy on `ready=false`, which also clears the recovery
+    // hold so the fresh baseline must re-earn `recoveryHoldMs` of stability before
+    // the posting gate trusts it again). Covers both callers — the resync path
+    // and `performOwnStateColdRestart`.
+    this.recomputeOwnStateHealth();
   }
 
   /**
@@ -2926,15 +2964,131 @@ export class Runner {
       recordedAtMs: Date.now(),
     };
     this.ownStateShadow.lastEventAtMs = Date.now();
-    if (reason === 'fatal') {
-      this.ownStateShadow.healthy = false;
-    }
+    // Re-derive composite health: a `fatal` error is a latch input (the recompute
+    // reads `lastError.reason === 'fatal'`); a non-fatal error leaves the
+    // conjunction unchanged, preserving the Phase-2 "only fatal flips healthy"
+    // behavior. The fatal input clears when `onStatus('connected')` nulls lastError.
+    this.recomputeOwnStateHealth();
     this.eventLog.emit('error', {
       class: error.constructor.name,
       detail: error.message,
       phase: 'own-state-stream',
     });
     this.wakeSignal.wake();
+  }
+
+  /**
+   * Re-derive the composite own-state latch health (own-state SSE plan §5,
+   * Phase 3 PR2) and maintain the recovery-hold anchor. MUST be called at EVERY
+   * latch-mutation site — `handleOwnerReady` (ready / positionsTruncated),
+   * `handleOwnerStatus` (lastStatus / lastError-clear), `handleOwnerError`
+   * (fatal), `drainShadow` (overflow set), `resetShadowForRebaseline` (overflow
+   * clear + ready clear) — so the conjunction is re-derived from ALL inputs and
+   * a recovery on one signal can never mask a different still-tripped latch
+   * ([[feedback_health_predicate_composite_inputs]] + the every-site discipline
+   * of [[feedback_enforce_invariant_every_site]]).
+   *
+   * `latchesHealthy` is the INSTANTANEOUS conjunction mirrored onto
+   * `shadow.healthy` (what tests inspect AND the divergence comparator gates on).
+   * It captures the TRANSPORT/BASELINE health — the inputs that say "the shadow is
+   * a current, complete view of the maker's own state". Latches wired in PR2a:
+   *   - `ready` — a durable baseline is swapped in (no baseline ⇒ untrustworthy);
+   *   - `lastStatus === 'connected'` (latch 1) — transport settled;
+   *   - `!streamOverflowDegraded` (latch 3) — no dropped events;
+   *   - `!positionsTruncated` (latch 4) — the baseline's positions are complete;
+   *   - `lastError.reason !== 'fatal'` — the preserved Phase-2 fatal-stream input.
+   * PR2b folds in the remaining TRANSPORT-health latches — 2 (`transportFresh`) and
+   * 7 (`tokenRefreshFailureInFlight`) — which the comparator also needs (a stale /
+   * unauthenticated transport means a stale shadow), so they belong HERE in the
+   * mirror.
+   *
+   * The POSTING-only latches do NOT go here: the recovery hold (latch 8) lives in
+   * {@link ownStateHealthy} (a posting anti-flap delay — suppressing the audit
+   * comparator for it would hide divergences), and §5 latch 5
+   * (`auditDivergenceUnresolved`, PR2c) MUST stay out of this mirror because the
+   * comparator gates on the mirror and ALSO produces latch 5 — folding it in would
+   * self-deadlock (a latched divergence would suppress the comparator that clears
+   * it). Latch 6 (`indexerLagDegraded`, PR2c) is likewise a posting-safety latch
+   * for {@link ownStateHealthy}, not a shadow-freshness signal. See the comparator
+   * read site in {@link runShadowComparator}.
+   *
+   * The recovery-hold anchor `healthyEligibleSinceSec` is set to `deps.now()` on
+   * the false→true edge and cleared to `null` whenever the conjunction is false,
+   * so a rebaseline / any latch trip restarts the hold.
+   */
+  private recomputeOwnStateHealth(): void {
+    const latchesHealthy =
+      this.ownStateShadow.ready &&
+      this.ownStateShadow.lastStatus === 'connected' &&
+      !this.streamOverflowDegraded &&
+      !this.ownStateShadow.positionsTruncated &&
+      this.ownStateShadow.lastError?.reason !== 'fatal';
+    this.ownStateShadow.healthy = latchesHealthy;
+    if (latchesHealthy) {
+      if (this.healthyEligibleSinceSec === null) this.healthyEligibleSinceSec = this.deps.now();
+    } else {
+      this.healthyEligibleSinceSec = null;
+    }
+  }
+
+  /**
+   * The composite own-state health GATE for the §5.1 POSTING decision (own-state
+   * SSE plan §5, Phase 3 PR2): the instantaneous latch mirror
+   * ({@link recomputeOwnStateHealth}) AND the recovery hold (latch 8) — the latches
+   * have been continuously healthy for at least `ownState.recoveryHoldMs`. The
+   * recovery hold is a posting-only anti-flap delay, which is why the divergence
+   * comparator gates on the bare mirror instead (see {@link runShadowComparator}).
+   *
+   * Clock note: `deps.now()` is unix SECONDS and `recoveryHoldMs` is MILLISECONDS,
+   * so the comparison scales the seconds delta by 1000 (mirrors the funding guard's
+   * `checkIntervalMs` math). Because the clock is whole-seconds, the effective hold
+   * is quantized to whole seconds in production — e.g. any `recoveryHoldMs` in
+   * 1..1000 yields a 1s hold, and the window can open up to ~1s early relative to
+   * the nominal ms (the anchor second was already in progress when it was stamped).
+   * `recoveryHoldMs: 0` is immediate. PR2c's posting-only latches 5/6 AND in here.
+   */
+  private ownStateHealthy(): boolean {
+    if (!this.ownStateShadow.healthy) return false;
+    if (this.healthyEligibleSinceSec === null) return false;
+    return (this.deps.now() - this.healthyEligibleSinceSec) * 1000 >= this.config.ownState.recoveryHoldMs;
+  }
+
+  /**
+   * §5.1 own-state-health posting gate (own-state SSE plan, Hermes-locked).
+   * Returns `true` — meaning {@link reconcileMarkets} must refuse NEW posting —
+   * when the runner is LIVE and SUBSCRIBED and the composite own-state health is
+   * degraded: we can't trust our own commitment/fill/position view, so adding (or
+   * compounding) exposure is unsafe. Inert in dry-run (nothing posts) and in
+   * poll-only mode (`subscribe: false` ⇒ no SSE health to assess), mirroring the
+   * funding guard's live-only hold; the gate therefore stays DORMANT until PR3b
+   * flips `subscribe: true`.
+   *
+   * Emits `stream-health-hold` ONLY on an enter/clear transition (a sustained
+   * hold must not spam the log — same discipline as {@link setFundingHold}),
+   * with `severity: 'high'` iff there is open exposure to protect, `'low'`
+   * otherwise. The active cancel-sweep posture for `exposure > 0` (§5.1) lands in
+   * PR3b alongside the source cutover, when the gate first goes live; PR2a halts
+   * new posting and surfaces the high-severity signal that documents the posture.
+   */
+  private updateStreamHealthHold(nowSec: number): boolean {
+    const holding = !this.config.mode.dryRun && this.config.ownState.subscribe && !this.ownStateHealthy();
+    if (holding === this.streamHealthHolding) return holding; // no transition — stay quiet
+    this.streamHealthHolding = holding;
+    if (holding) {
+      const exposureWei6 = computeOpenExposureWei6(this.state, nowSec, this.config.orders.expiryReleaseGraceSeconds);
+      this.eventLog.emit('stream-health-hold', {
+        state: 'entered',
+        severity: exposureWei6 > 0n ? 'high' : 'low',
+        exposureWei6: exposureWei6.toString(),
+      });
+      this.deps.log(`[runner] own-state health hold ENTERED — halting new posting (open exposure ${exposureWei6} wei6)`);
+    } else {
+      this.eventLog.emit('stream-health-hold', { state: 'cleared' });
+      // Matches the setFundingHold log style — no unconditional "posting resumes"
+      // claim, since a boot / funding hold may still gate this same reconcile pass.
+      this.deps.log('[runner] own-state health hold cleared (posting may resume unless another hold is active)');
+    }
+    return holding;
   }
 
   /**
@@ -2947,9 +3101,12 @@ export class Runner {
    *
    * Precondition gate (Hermes-required):
    *   - `config.ownState.subscribe: true` — the stream is even opted in;
-   *   - `shadow.ready` — the snapshot baseline has fully swapped in;
-   *   - `shadow.healthy` — no overflow / fatal / positionsTruncated;
-   *   - `shadow.lastStatus === 'connected'` — transport is settled;
+   *   - `shadow.healthy` — the INSTANTANEOUS latch mirror (a durable baseline is
+   *     ready, transport is `connected`, no overflow / fatal / positionsTruncated
+   *     latch is tripped). Deliberately NOT the posting gate `ownStateHealthy()`:
+   *     the audit path must not inherit the posting recovery hold (latch 8) nor be
+   *     gated by the audit-divergence latch (latch 5, PR2c) it produces — see the
+   *     decoupling note at the read site below (Phase 3 PR2);
    *   - `ownStateQueue.size === 0` — no pending events would alter the shadow;
    *   - `firstPollAfterShadowReady` — at least one tick has completed since
    *     `shadow.ready` flipped true (otherwise canonical is stale relative
@@ -2976,9 +3133,16 @@ export class Runner {
       return;
     }
     if (!this.config.ownState.subscribe) return;
-    if (!this.ownStateShadow.ready) return;
+    // Gate on the INSTANTANEOUS latch mirror (ready + connected + no overflow /
+    // truncation / fatal), NOT the posting gate `ownStateHealthy()`. The
+    // comparator is the AUDIT path: it must NOT inherit the recovery hold (latch
+    // 8 — a posting-only anti-flap delay; suppressing audit for 30s after every
+    // blip would hide a real divergence), and it must NOT be gated by the
+    // audit-divergence latch (§5 latch 5, PR2c) that it itself produces — doing
+    // so would self-deadlock (a latched divergence suppresses the comparator that
+    // would clear it). So latch 5 + the recovery hold live ONLY in
+    // `ownStateHealthy()` (posting); the mirror feeds this audit gate.
     if (!this.ownStateShadow.healthy) return;
-    if (this.ownStateShadow.lastStatus !== 'connected') return;
     if (this.ownStateQueueSizeForTest() !== 0) return;
     if (!this.firstPollAfterShadowReady) return;
     const payload = compareShadowVsCanonical(
@@ -2999,6 +3163,17 @@ export class Runner {
    */
   ownStateShadowView(): Readonly<OwnStateShadow> {
     return this.ownStateShadow;
+  }
+
+  /**
+   * Test seam — evaluates the composite §5 health GATE ({@link ownStateHealthy})
+   * at the current `deps.now()`, so PR2 tests can assert the recovery-hold timing
+   * (latch-healthy but gate-false until `recoveryHoldMs` elapses) by advancing the
+   * injected clock. Distinct from `ownStateShadowView().healthy`, which is the
+   * instantaneous latch mirror WITHOUT the recovery hold.
+   */
+  ownStateHealthyForTest(): boolean {
+    return this.ownStateHealthy();
   }
 
   /**
@@ -3024,9 +3199,14 @@ export class Runner {
    * Test seam — sets the `streamOverflowDegraded` latch directly so tests can
    * exercise the connected/resync gating without driving the full overflow
    * detection path through `drainShadow` (PR4a round 2 / Hermes #68 review).
+   * Re-derives composite health (Phase 3 PR2) so the seam mirrors the production
+   * latch-mutation sites — directly setting the latch without recomputing would
+   * leave `shadow.healthy` / the recovery-hold anchor stale and the seam would
+   * silently fail to model production ([[feedback_enforce_invariant_every_site]]).
    */
   setStreamOverflowDegradedForTest(value: boolean): void {
     this.streamOverflowDegraded = value;
+    this.recomputeOwnStateHealth();
   }
 
   /** Test seam — reads the `streamOverflowDegraded` latch. */

@@ -915,18 +915,30 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
    * paused mid-wait. Tests must call `triggerKill()` and `await runPromise`
    * to clean up.
    */
-  async function makePausedSubscribedRunner() {
-    const config = cfg({ ownState: { subscribe: true } });
+  async function makePausedSubscribedRunner(
+    opts: { config?: Config; adapter?: OspexAdapter; deps?: Partial<RunnerDeps>; seedState?: MakerState } = {},
+  ) {
+    const config = opts.config ?? cfg({ ownState: { subscribe: true } });
     const recorder = makeOwnStateRecorder();
-    const adapter = createOspexAdapter(config);
-    vi.spyOn(adapter, 'listContests').mockResolvedValue([]);
+    let adapter = opts.adapter;
+    if (adapter === undefined) {
+      adapter = createOspexAdapter(config);
+      vi.spyOn(adapter, 'listContests').mockResolvedValue([]);
+    }
     vi.spyOn(adapter, 'subscribeOwnState').mockImplementation(recorder.subscribe);
+    // Seed state BEFORE the runner boots (the ctor loads it). A clean
+    // `emptyMakerState()` flush avoids the live boot-loss hold so a live gate
+    // test isolates the §5.1 stream-health hold as the sole posting halt.
+    if (opts.seedState !== undefined) StateStore.at(config.state.dir).flush(opts.seedState);
     const { sleep, sleepCalls, resolvers } = controllableSleep();
     let triggerKill!: () => void;
     const runner = makeRunner({
       config, adapter, maxTicks: 100,
       makerAddress: DEFAULT_FAKE_MAKER_ADDRESS as Hex,
+      // opts.deps first so the controllable sleep + kill seam below always win
+      // (a caller can override `now` for the recovery-hold clock without losing them).
       deps: {
+        ...opts.deps,
         sleep,
         registerShutdownSignals: (onSignal) => { triggerKill = onSignal; return () => {}; },
       },
@@ -1488,6 +1500,238 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
 
     triggerKill();
     await runPromise;
+  });
+
+  // ── Phase 3 PR2a — composite own-state health gate (own-state SSE plan §5) ──
+
+  describe('own-state health gate (§5)', () => {
+    /** A clean baseline + settled transport — drives the shadow to latch-healthy. */
+    function fireHealthyBaseline(recorder: ReturnType<typeof makeOwnStateRecorder>): void {
+      recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: false }, { cursor: 's1' });
+      recorder.fire('onReady', undefined, { cursor: 'r1' });
+      recorder.fire('onStatus', 'connected');
+    }
+
+    it('shadow.healthy mirror now requires lastStatus===connected (latch 1 folded into the conjunction)', async () => {
+      const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
+      // A clean baseline swaps in, but transport status has not settled yet.
+      recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: false }, { cursor: 's1' });
+      recorder.fire('onReady', undefined, { cursor: 'r1' });
+      expect(runner.ownStateShadowView().ready).toBe(true);
+      expect(runner.ownStateShadowView().healthy).toBe(false); // ready, but not 'connected'
+      recorder.fire('onStatus', 'connected');
+      expect(runner.ownStateShadowView().healthy).toBe(true);
+      triggerKill();
+      await runPromise;
+    });
+
+    it('ownStateHealthy() gate is false until the latches stay healthy for recoveryHoldMs, then true', async () => {
+      let t = T0;
+      const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner({
+        config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 30000 } }),
+        deps: { now: () => t },
+      });
+      fireHealthyBaseline(recorder); // eligibility anchored at t === T0
+      expect(runner.ownStateShadowView().healthy).toBe(true); // latch mirror healthy immediately
+      expect(runner.ownStateHealthyForTest()).toBe(false); // ...but the recovery hold is not satisfied
+      t = T0 + 29; // 29s < 30s
+      expect(runner.ownStateHealthyForTest()).toBe(false);
+      t = T0 + 30; // 30s * 1000 >= 30000ms
+      expect(runner.ownStateHealthyForTest()).toBe(true);
+      triggerKill();
+      await runPromise;
+    });
+
+    it('recoveryHoldMs:0 → the gate is satisfied the instant the latches are healthy', async () => {
+      const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner({
+        config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 0 } }),
+      });
+      fireHealthyBaseline(recorder);
+      expect(runner.ownStateHealthyForTest()).toBe(true);
+      triggerKill();
+      await runPromise;
+    });
+
+    it('a latch trip mid-hold resets the recovery hold — recovery must re-earn the full window', async () => {
+      let t = T0;
+      const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner({
+        config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 30000 } }),
+        deps: { now: () => t },
+      });
+      fireHealthyBaseline(recorder); // anchored at T0
+      t = T0 + 30;
+      expect(runner.ownStateHealthyForTest()).toBe(true); // hold earned
+      // Transport degrades — the latch trips: gate + mirror false, anchor cleared.
+      recorder.fire('onStatus', 'degraded');
+      expect(runner.ownStateShadowView().healthy).toBe(false);
+      expect(runner.ownStateHealthyForTest()).toBe(false);
+      // Recover — the hold RESTARTS from here (T0+30), not from the original anchor.
+      recorder.fire('onStatus', 'connected');
+      expect(runner.ownStateHealthyForTest()).toBe(false); // 0s into the new hold
+      t = T0 + 59; // 29s into the new hold
+      expect(runner.ownStateHealthyForTest()).toBe(false);
+      t = T0 + 60; // 30s into the new hold
+      expect(runner.ownStateHealthyForTest()).toBe(true);
+      triggerKill();
+      await runPromise;
+    });
+
+    it('a fatal stream error trips the mirror; onStatus(connected) clears it (Phase-2 fatal input preserved)', async () => {
+      const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner({
+        config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 0 } }),
+      });
+      fireHealthyBaseline(recorder);
+      expect(runner.ownStateShadowView().healthy).toBe(true);
+      recorder.fire('onError', Object.assign(new Error('boom'), { reason: 'fatal' }));
+      expect(runner.ownStateShadowView().healthy).toBe(false);
+      recorder.fire('onStatus', 'connected'); // clears lastError → the fatal input is gone
+      expect(runner.ownStateShadowView().healthy).toBe(true);
+      triggerKill();
+      await runPromise;
+    });
+
+    // ── §5.1 posting gate (live + subscribe only) ──────────────────────────
+
+    it('§5.1 dry-run is dormant — subscribe:true + unhealthy own-state emits NO stream-health-hold', async () => {
+      const { runPromise, triggerKill } = await makePausedSubscribedRunner(); // dry-run default
+      triggerKill();
+      await runPromise;
+      expect(readEvents().some((e) => e.kind === 'stream-health-hold')).toBe(false);
+    });
+
+    it('§5.1 live gate halts NEW posting while own-state is unhealthy (no submit, even with a quotable market)', async () => {
+      StateStore.at(stateDir).flush(emptyMakerState()); // clean state → no boot-loss hold; isolate the §5.1 gate as the sole halt
+      const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: true } });
+      const submit = submitRecorder();
+      const recorder = makeOwnStateRecorder();
+      const adapter = liveSpiedAdapter(config, () => Promise.resolve([contestView({ contestId: '1234' })]), { submitCommitment: submit.fn });
+      vi.spyOn(adapter, 'subscribeOwnState').mockImplementation(recorder.subscribe); // stream opens but fires NO events → own-state unhealthy
+      await makeRunner({ config, adapter, maxTicks: 1 }).run();
+      const events = readEvents();
+      expect(events.filter((e) => e.kind === 'stream-health-hold' && e.state === 'entered')).toHaveLength(1);
+      expect(submit.calls).toHaveLength(0); // posting halted by the §5.1 gate
+      expect(events.some((e) => e.kind === 'submit')).toBe(false);
+      expect(events.some((e) => e.kind === 'funding-hold')).toBe(false); // isolation: no other hold was active
+    });
+
+    it('§5.1 entered telemetry: severity LOW when there is no open exposure', async () => {
+      const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: true } });
+      const adapter = liveSpiedAdapter(config, () => Promise.resolve([]));
+      const { runPromise, triggerKill } = await makePausedSubscribedRunner({ config, adapter, seedState: emptyMakerState() });
+      triggerKill();
+      await runPromise;
+      const entered = readEvents().filter((e) => e.kind === 'stream-health-hold' && e.state === 'entered');
+      expect(entered).toHaveLength(1);
+      expect(entered[0]).toMatchObject({ severity: 'low', exposureWei6: '0' });
+    });
+
+    it('§5.1 entered telemetry: severity HIGH when there is open exposure to protect', async () => {
+      const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: true } });
+      const record = commitmentRecord({ hash: '0xexposed' }); // visibleOpen, 250000 wei6, future expiry
+      const adapter = liveSpiedAdapter(
+        config, () => Promise.resolve([]), undefined, undefined, undefined,
+        // Keep the seeded record live through detectFills (still on the book → still counts toward exposure).
+        { listOpenCommitments: () => Promise.resolve([orderbookEntry({ commitmentHash: record.hash, maker: DEFAULT_FAKE_MAKER_ADDRESS as Hex, status: 'open', storedStatus: 'open', isLive: true, riskAmount: '250000', filledRiskAmount: '0', remainingRiskAmount: '250000' })]) },
+      );
+      const seedState = { ...emptyMakerState(), commitments: { [record.hash]: record } };
+      const { runPromise, triggerKill } = await makePausedSubscribedRunner({ config, adapter, seedState });
+      triggerKill();
+      await runPromise;
+      const entered = readEvents().filter((e) => e.kind === 'stream-health-hold' && e.state === 'entered');
+      expect(entered).toHaveLength(1);
+      expect(entered[0]).toMatchObject({ severity: 'high', exposureWei6: '250000' });
+    });
+
+    it('§5.1 live gate clears + resumes posting once own-state becomes healthy', async () => {
+      StateStore.at(stateDir).flush(emptyMakerState());
+      const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: true, recoveryHoldMs: 0 } });
+      const submit = submitRecorder();
+      const adapter = liveSpiedAdapter(config, () => Promise.resolve([contestView({ contestId: '1234' })]), { submitCommitment: submit.fn });
+      const { runner, recorder, runPromise, resolvers, triggerKill } = await makePausedSubscribedRunner({ config, adapter });
+      // Tick 1 ran with own-state unhealthy → gate held → no submit yet.
+      expect(submit.calls).toHaveLength(0);
+      expect(readEvents().filter((e) => e.kind === 'stream-health-hold' && e.state === 'entered')).toHaveLength(1);
+      // Drive own-state healthy (recoveryHoldMs:0 → immediate).
+      fireHealthyBaseline(recorder);
+      expect(runner.ownStateHealthyForTest()).toBe(true);
+      // Advance the loop (resolve pending sleeps each poll) until the next full tick posts.
+      await waitFor(() => { resolvers.forEach((r) => r?.()); return submit.calls.length > 0; });
+      expect(readEvents().filter((e) => e.kind === 'stream-health-hold' && e.state === 'cleared')).toHaveLength(1);
+      triggerKill();
+      await runPromise;
+    });
+
+    it('setStreamOverflowDegradedForTest recomputes composite health with NO intervening event (seam mirrors every production latch site)', async () => {
+      const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner({
+        config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 0 } }),
+      });
+      fireHealthyBaseline(recorder);
+      expect(runner.ownStateShadowView().healthy).toBe(true);
+      expect(runner.ownStateHealthyForTest()).toBe(true);
+      // Trip the overflow latch via the seam with NO follow-up event: the seam
+      // itself must recompute (it did NOT before this fix — the every-site lesson).
+      runner.setStreamOverflowDegradedForTest(true);
+      expect(runner.ownStateShadowView().healthy).toBe(false);
+      expect(runner.ownStateHealthyForTest()).toBe(false);
+      triggerKill();
+      await runPromise;
+    });
+
+    it('a REAL queue overflow through drainShadow flips a previously-healthy mirror false (production recompute path, not the seam)', async () => {
+      const { runner, recorder, runPromise, resolvers, triggerKill } = await makePausedSubscribedRunner({
+        config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 0 } }),
+      });
+      fireHealthyBaseline(recorder);
+      expect(runner.ownStateShadowView().healthy).toBe(true);
+      // Force a genuine overflow into the delta queue, then let the loop drain it.
+      const cap = 10_000;
+      for (let i = 0; i < cap; i++) runner.enqueueOwnStateEvent({ kind: 'commitment', body: MINIMAL_COMMITMENT(`0xc${i}`) });
+      expect(runner.enqueueOwnStateEvent({ kind: 'commitment', body: MINIMAL_COMMITMENT('0xover') })).toBe('overflow');
+      // Advance the loop until drainShadow runs the overflow branch (latch + recompute).
+      await waitFor(() => { resolvers.forEach((r) => r?.()); return runner.streamOverflowDegradedForTest(); });
+      expect(runner.ownStateShadowView().healthy).toBe(false); // the production drainShadow recompute flipped it
+      expect(runner.ownStateHealthyForTest()).toBe(false);
+      triggerKill();
+      await runPromise;
+    });
+
+    it('§5.1 + funding: the stream-health-hold edge still emits when fundingHold ALSO halts the same pass (above-dispatch placement)', async () => {
+      const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: true }, fundingGuard: { underfundedCancelMode: 'none' } });
+      const record = commitmentRecord({ hash: '0xfund' }); // visibleOpen, 250000 wei6 → required > 0
+      StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { [record.hash]: record } });
+      const recorder = makeOwnStateRecorder();
+      const adapter = liveSpiedAdapter(
+        config, () => Promise.resolve([]), undefined, undefined, undefined,
+        {
+          listOpenCommitments: () => Promise.resolve([orderbookEntry({ commitmentHash: record.hash, maker: DEFAULT_FAKE_MAKER_ADDRESS as Hex, status: 'open', storedStatus: 'open', isLive: true, riskAmount: '250000', filledRiskAmount: '0', remainingRiskAmount: '250000' })]),
+          readBalances: (owner: Hex) => Promise.resolve({ owner, chainId: 137, native: 10n ** 18n, usdc: 100_000n, link: 0n, usdcAddress: '0xusdc' as Hex, linkAddress: '0xlink' as Hex }), // 0.10 USDC < required 0.25 → fundingHold
+        },
+      );
+      vi.spyOn(adapter, 'subscribeOwnState').mockImplementation(recorder.subscribe); // no events → own-state unhealthy
+      await makeRunner({ config, adapter, maxTicks: 1 }).run();
+      const events = readEvents();
+      expect(events.filter((e) => e.kind === 'funding-hold' && e.state === 'entered')).toHaveLength(1);
+      // The §5.1 edge STILL fires even though `if (fundingHold) return` precedes it in reconcileMarkets:
+      // updateStreamHealthHold runs ABOVE the dispatch, so its enter/clear telemetry never desyncs.
+      expect(events.filter((e) => e.kind === 'stream-health-hold' && e.state === 'entered')).toHaveLength(1);
+    });
+
+    it('the recovery-hold gate stays true past the boundary and rejects a backward clock step', async () => {
+      let t = T0;
+      const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner({
+        config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 30000 } }),
+        deps: { now: () => t },
+      });
+      fireHealthyBaseline(recorder); // anchored at T0
+      t = T0 + 30;
+      expect(runner.ownStateHealthyForTest()).toBe(true);
+      t = T0 + 100; // stays true well past the boundary
+      expect(runner.ownStateHealthyForTest()).toBe(true);
+      t = T0 - 10; // a backward clock step → negative delta → false (never wraps healthy)
+      expect(runner.ownStateHealthyForTest()).toBe(false);
+      triggerKill();
+      await runPromise;
+    });
   });
 
   it('sync throw from openOwnStateSubscription propagates AND runs the finally cleanup — unregister called (Hermes #68 blocker 3)', async () => {

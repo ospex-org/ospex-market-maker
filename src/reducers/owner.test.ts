@@ -94,7 +94,7 @@ describe('emptyOwnStateShadow', () => {
   it('returns a fresh non-ready shadow with empty maps and zero timestamps', () => {
     const shadow = emptyOwnStateShadow();
     expect(shadow.ready).toBe(false);
-    expect(shadow.healthy).toBe(true);
+    expect(shadow.healthy).toBe(false); // a fresh, never-baselined shadow is not healthy (Phase 3 PR2 — matches the derived conjunction)
     expect(shadow.commitments).toEqual({});
     expect(shadow.positions).toEqual({});
     expect(shadow.pendingBaseline).toBeNull();

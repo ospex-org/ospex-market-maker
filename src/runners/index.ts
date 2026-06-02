@@ -392,10 +392,11 @@ export class Runner {
    */
   private readonly wakeSignal = new WakeSignal();
   /**
-   * Bounded buffer for SSE events between drains (Phase 2 PR3 — spec §2.5.2).
-   * Empty until PR4 wires the SSE adapter handlers. Overflow is telemetry-only
-   * per the Phase 2 shadow-only contract — does NOT trigger `fundingHold`,
-   * does NOT alter canonical state.
+   * Bounded buffer for SSE events between drains (spec §2.5.2). An overflow drops
+   * an owner event, so it degrades composite own-state health (latched at enqueue
+   * via `noteOwnStateOverflow`, Phase 3 PR2): in live + `ownState.subscribe: true`
+   * the §5.1 posting gate then halts NEW posting; in dry-run / poll-only it stays
+   * telemetry-only. Never alters canonical state directly / never sets `fundingHold`.
    */
   private readonly ownStateQueue = new OwnStateQueue();
   /**
@@ -1037,17 +1038,20 @@ export class Runner {
   }
 
   /**
-   * Drain the ownState queue, apply owner-source reducers to the shadow, and
-   * handle overflow telemetry.
+   * Drain the ownState queue and apply owner-source reducers to the shadow.
+   * Overflow is normally already latched + telemetered at ENQUEUE time
+   * (`noteOwnStateOverflow`, Hermes #73); this drain only belt-and-braces it.
    *
-   * Overflow telemetry — once per overflow window (Phase 2 PR3):
-   * - `stream-health-degraded {reason: 'queue-overflow', shadowReady, queueCapacity}` — health flag flipped.
-   * - `stream-would-hold {reason: 'queue-overflow', exposureWei6}` — emitted IFF open exposure > 0.
-   *   Documents what Phase 3 would do here (set `fundingHold`); Phase 2 does
-   *   NOT actually hold — the shadow-only contract forbids altering canonical
-   *   trading behavior. The `streamOverflowDegraded` latch guarantees we emit
-   *   ONCE per overflow window; recovery (Phase 3+) clears the latch via a
-   *   server-side `event: resync`.
+   * Overflow telemetry — once per overflow window (`streamOverflowDegraded` latch;
+   * cleared on a server-driven `resync` rebaseline):
+   * - `stream-health-degraded {reason: 'queue-overflow', shadowReady, queueCapacity}` — the composite-health overflow latch tripped (a dropped owner event).
+   * - `stream-would-hold {reason: 'queue-overflow', exposureWei6}` — emitted IFF open exposure > 0; informational marker that the overflow happened with exposure at risk.
+   *   The overflow degrades composite own-state health (`recomputeOwnStateHealth`).
+   *   In **live + `ownState.subscribe: true`** the §5.1 posting gate then halts NEW
+   *   posting and emits `stream-health-hold` (top-of-`reconcileMarkets` early-out +
+   *   the authoritative `submitQuote` re-check). In **dry-run / poll-only** the gate
+   *   is inert, so this stays telemetry-only and never alters canonical trading
+   *   state (never sets `fundingHold` / runs `fundingCancelSweep`).
    *
    * Event dispatch (Phase 2 PR4b): each queued event is routed by `kind` to
    * the appropriate owner reducer; the returned descriptors flow through
@@ -1698,18 +1702,21 @@ export class Runner {
    */
   private async reconcileMarkets(): Promise<void> {
     const now = this.deps.now();
-    // §5.1 own-state-health posting gate (Phase 3 PR2). Evaluated at the TOP of
-    // every reconcile pass — above the funding / boot early-returns below — so its
-    // enter/clear telemetry edge stays accurate even when one of those holds would
-    // return first. (It is NOT evaluated on a tick that fails closed upstream on
+    // §5.1 own-state-health posting gate (Phase 3 PR2) — the cheap EARLY-OUT.
+    // Evaluated at the TOP of every reconcile pass (above the funding / boot
+    // early-returns) so its enter/clear telemetry edge stays accurate even when one
+    // of those holds would return first, and so a tick that's already unhealthy at
+    // its start skips pricing/planning entirely. This is NOT the safety boundary:
+    // own-state health can degrade DURING the per-market awaited work below (an SSE
+    // overflow mid-`getSpeculation`), so the AUTHORITATIVE gate is re-checked
+    // synchronously right before the only new-exposure write in `submitQuote`
+    // (Hermes #73 r2). (Also not evaluated on a tick that fails closed upstream on
     // lost fill-visibility and never reaches reconcileMarkets; the latch is
-    // eventually consistent — it flips on the next reconcile that runs, and posting
-    // is independently halted on a fail-closed tick anyway.) Inert (always false)
-    // in dry-run and poll-only mode; dormant until PR3b flips subscribe.
+    // eventually consistent.) Inert in dry-run / poll-only; dormant until PR3b.
     const streamHealthHold = this.updateStreamHealthHold(now);
     if (this.isHoldingQuoting()) return; // DESIGN §12 — must not resume quoting on a blank slate
     if (this.fundingHold) return; // DESIGN §6 funding guard (C1a) — wallet can't back its matchable-commitment exposure; halt NEW posting until a successful funding re-read clears it
-    if (streamHealthHold) return; // own-state SSE §5.1 — composite own-state health degraded; we can't trust our own commitment/fill view, so halt NEW posting (active cancel-sweep posture lands in PR3b)
+    if (streamHealthHold) return; // own-state SSE §5.1 early-out — degraded at pass start; submitQuote re-checks for mid-pass degradation (active cancel-sweep posture lands in PR3b)
     for (const m of this.trackedMarkets.values()) {
       if (!this.needsReconcile(m, now)) continue;
       m.dirty = false; // read-and-clear BEFORE reconciling, so a dirty re-armed DURING the reconcile (a success re-quote, a concurrent onChange) survives to the next tick instead of being clobbered
@@ -2297,6 +2304,20 @@ export class Runner {
    * corresponding `submit` / `replace` event).
    */
   private async submitQuote(m: TrackedMarket, qs: QuoteSide, now: number, expiryUnixSec: number): Promise<MakerCommitmentRecord | null> {
+    // §5.1 AUTHORITATIVE own-state posting gate (Hermes #73 round 2). The
+    // top-of-reconcileMarkets gate is sampled ONCE per pass, but own-state health
+    // can degrade DURING the awaited per-market reconcile work — an SSE queue
+    // overflow while `getSpeculation` (or any other read) is in flight, AFTER the
+    // top gate already passed. `submitQuote` is the SOLE new-exposure write
+    // (`adapter.submitCommitment`), and there is NO `await` between this check and
+    // that call below, so re-checking here is the race-free last line of defense:
+    // a late degradation refuses the submit (→ `transient-failure` → the side
+    // re-quotes next tick, where the top gate then holds until health recovers)
+    // and `updateStreamHealthHold` emits the `stream-health-hold` enter edge.
+    // Inert in dry-run / poll-only (updateStreamHealthHold returns false), so
+    // dry-run still prices + records its synthetic `would-submit`. The top gate
+    // stays as the cheap early-out + steady-state telemetry; THIS is the boundary.
+    if (this.updateStreamHealthHold(this.deps.now())) return null;
     const proto = toProtocolQuote({ side: qs.takerSide, oddsTick: qs.quoteTick });
     let hash: string;
     // The SDK's `submitRaw` returns `SubmitResult.signedPayload` (the canonical
@@ -3481,6 +3502,12 @@ export class Runner {
       return;
     }
 
+    // NB: deliberately NOT behind the §5.1 own-state posting gate. `approveUSDC`
+    // raises the PositionModule USDC allowance CEILING (raise-only — see the
+    // `currentAllowance >= target` skip above); it creates no matchable commitment
+    // and no position, so it is not "new exposure" under §5.1 (matchability comes
+    // only from `submitCommitment`). Whether the wallet can BACK its exposure is
+    // the funding guard's concern (`fundingHold`), not the own-state health gate's.
     let result: ApproveResult;
     try {
       result = await this.adapter.approveUSDC(amount);
@@ -4007,9 +4034,10 @@ export class Runner {
 
 /**
  * Sum the maker's currently-at-risk USDC across non-released commitments +
- * non-claimed positions, in wei6. Used by Phase 2 PR3 overflow telemetry
- * (`stream-would-hold {exposureWei6}`) — the exposure figure Phase 3 would gate
- * `fundingHold` on. Identical accounting to `inventoryFromState` minus the
+ * non-claimed positions, in wei6. Used by the own-state overflow telemetry
+ * (`stream-would-hold {exposureWei6}`) and the §5.1 `stream-health-hold` severity
+ * (`high` iff > 0) — the exposure the Phase 3 PR2a posting gate protects when it
+ * halts new posting on degraded own-state. Identical accounting to `inventoryFromState` minus the
  * per-item shape; keep the predicates in lockstep with `RELEASED_LIFECYCLES`
  * and `isExpiredForRelease` over there if either changes.
  */

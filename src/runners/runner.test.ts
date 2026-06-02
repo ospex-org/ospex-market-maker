@@ -1777,6 +1777,49 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
       expect(events.filter((e) => e.kind === 'stream-health-hold' && e.state === 'entered')).toHaveLength(1);
       expect(events.some((e) => e.kind === 'stream-health-degraded')).toBe(true); // overflow surfaced immediately
     });
+
+    it('§5.1 race 2: an overflow AFTER the top reconcile gate (mid-getSpeculation, before submit) is refused at the submit site (Hermes #73 r2)', async () => {
+      StateStore.at(stateDir).flush(emptyMakerState()); // clean state → no boot/funding hold; isolate the §5.1 gate
+      const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: true, recoveryHoldMs: 0 } });
+      const submit = submitRecorder();
+      const recorder = makeOwnStateRecorder();
+      let healthyFired = false;
+      const adapter = liveSpiedAdapter(
+        config,
+        () => Promise.resolve([contestView({ contestId: '1234' })]), // a quotable market
+        { submitCommitment: submit.fn },
+        undefined,
+        {
+          // getSpeculation runs mid-reconcile — AFTER the top §5.1 gate passed, BEFORE submitQuote.
+          // Inject an own-state overflow here: the authoritative submit-site gate must refuse the
+          // submit even though the top gate already let this pass through.
+          getSpeculation: (speculationId) => {
+            const cap = 10_000;
+            for (let i = 0; i < cap; i++) runner.enqueueOwnStateEvent({ kind: 'commitment', body: MINIMAL_COMMITMENT(`0xc${i}`) });
+            runner.enqueueOwnStateEvent({ kind: 'commitment', body: MINIMAL_COMMITMENT('0xover') }); // overflow → enqueue-time latch degrades health
+            return Promise.resolve(speculationView(speculationId));
+          },
+        },
+        {
+          // The position poll runs BEFORE reconcileMarkets: establish a HEALTHY shadow so the top gate passes.
+          getPositionStatus: () => {
+            if (!healthyFired) {
+              healthyFired = true;
+              recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: false }, { cursor: 's1' });
+              recorder.fire('onReady', undefined, { cursor: 'r1' });
+              recorder.fire('onStatus', 'connected');
+            }
+            return Promise.resolve(EMPTY_POSITION_STATUS);
+          },
+        },
+      );
+      vi.spyOn(adapter, 'subscribeOwnState').mockImplementation(recorder.subscribe);
+      const runner = makeRunner({ config, adapter, maxTicks: 1, makerAddress: DEFAULT_FAKE_MAKER_ADDRESS as Hex });
+      await runner.run();
+      const events = readEvents();
+      expect(submit.calls).toHaveLength(0); // submit-site gate refused after the mid-reconcile degradation
+      expect(events.filter((e) => e.kind === 'stream-health-hold' && e.state === 'entered')).toHaveLength(1);
+    });
   });
 
   it('sync throw from openOwnStateSubscription propagates AND runs the finally cleanup — unregister called (Hermes #68 blocker 3)', async () => {

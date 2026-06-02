@@ -128,6 +128,34 @@ export interface OwnStateConfig {
    * Range 1000-60000ms; default 5000ms.
    */
   divergenceToleranceMs: number;
+  /**
+   * Cadence (ms) of the own-state health poll (`client.ownState.health()`) that
+   * drives the `indexerLagDegraded` health latch (own-state SSE plan §5/A4).
+   * Selected only when `subscribe: true`. Range 10000-300000ms; default 60000ms.
+   * (Phase 3 PR2 ships the knob; the poll itself lands in PR2c.)
+   */
+  auditPollIntervalMs: number;
+  /**
+   * The `/v1/health/own-state` `indexerLagSeconds` threshold at/above which the
+   * `indexerLagDegraded` latch trips, gating posting (own-state SSE plan §5,
+   * latch 6). Range 5-300s; default 30s. (Knob ships in PR2; latch in PR2c.)
+   */
+  indexerLagMaxSeconds: number;
+  /**
+   * Transport-freshness window (ms): the composite health predicate's
+   * `transportFresh` latch requires a frame (`onFrame`, including heartbeats)
+   * within this window — `now - lastFrameAt < staleMaxMs` (own-state SSE plan
+   * §5, latch 2). Range 10000-300000ms; default 60000ms. (Latch wired in PR2b.)
+   */
+  staleMaxMs: number;
+  /**
+   * Recovery hold (ms): after all other health latches read healthy, the
+   * composite predicate stays UNhealthy until they have been continuously
+   * healthy for this long — prevents flapping the posting gate on a brief
+   * recovery blip (own-state SSE plan §5, latch 8). Range 0-300000ms; default
+   * 30000ms.
+   */
+  recoveryHoldMs: number;
 }
 
 export interface EconomicsConfig {

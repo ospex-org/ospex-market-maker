@@ -49,6 +49,16 @@ ownState:
                                    #   OR the poll-side last observation is within this window (1000-60000ms; default 5000).
                                    #   Persistent mismatch past this window is emitted regardless. Tune up if your poll interval is
                                    #   large + SSE-vs-poll skew is expected; tune down for tighter divergence detection.
+  auditPollIntervalMs: 60000       # Phase 3 PR2 — cadence (10000-300000ms) of the own-state health poll that drives the
+                                   #   indexerLagDegraded health latch. Selected only when subscribe:true. Knob ships in PR2; the
+                                   #   poll itself lands in PR2c.
+  indexerLagMaxSeconds: 30         # Phase 3 PR2 — /v1/health/own-state indexerLagSeconds threshold (5-300s) at/above which the
+                                   #   indexerLagDegraded latch trips and gates posting. (Knob in PR2; latch in PR2c.)
+  staleMaxMs: 60000                # Phase 3 PR2 — transport-freshness window (10000-300000ms): the composite health predicate
+                                   #   requires a frame (onFrame, incl. heartbeats) within this window. (Latch wired in PR2b.)
+  recoveryHoldMs: 30000            # Phase 3 PR2 — recovery hold (0-300000ms): after all health latches read healthy, the composite
+                                   #   stays UNhealthy until they've been continuously healthy this long — prevents flapping the
+                                   #   posting gate on a brief recovery blip.
 
 pricing:
   mode: economics                  # "economics" (derive spread from your return target) or "direct"

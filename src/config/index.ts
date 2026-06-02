@@ -226,7 +226,7 @@ const MARKET_SELECTION_KEYS = [
 ] as const;
 const DISCOVERY_KEYS = ['everyNTicks', 'jitterPct'] as const;
 const ODDS_KEYS = ['subscribe', 'maxRealtimeChannels'] as const;
-const OWN_STATE_KEYS = ['subscribe', 'debounceMs', 'divergenceToleranceMs'] as const;
+const OWN_STATE_KEYS = ['subscribe', 'debounceMs', 'divergenceToleranceMs', 'auditPollIntervalMs', 'indexerLagMaxSeconds', 'staleMaxMs', 'recoveryHoldMs'] as const;
 const PRICING_KEYS = ['mode', 'economics', 'direct', 'quoteBothSides', 'minEdgeBps', 'maxPerQuotePctOfCapital'] as const;
 const ECONOMICS_KEYS = [
   'capitalUSDC', 'targetMonthlyReturnPct', 'daysHorizon', 'estGamesPerDay', 'fillRateAssumption',
@@ -337,6 +337,18 @@ export function parseConfig(raw: unknown, env: EnvLike = {}): Config {
     ),
     divergenceToleranceMs: def(ownStateObj.divergenceToleranceMs, 5000, (v) =>
       asNumberInRange(v, 'ownState.divergenceToleranceMs', 1000, 60000, { minInclusive: true, maxInclusive: true }),
+    ),
+    auditPollIntervalMs: def(ownStateObj.auditPollIntervalMs, 60000, (v) =>
+      asNumberInRange(v, 'ownState.auditPollIntervalMs', 10000, 300000, { minInclusive: true, maxInclusive: true }),
+    ),
+    indexerLagMaxSeconds: def(ownStateObj.indexerLagMaxSeconds, 30, (v) =>
+      asNumberInRange(v, 'ownState.indexerLagMaxSeconds', 5, 300, { minInclusive: true, maxInclusive: true }),
+    ),
+    staleMaxMs: def(ownStateObj.staleMaxMs, 60000, (v) =>
+      asNumberInRange(v, 'ownState.staleMaxMs', 10000, 300000, { minInclusive: true, maxInclusive: true }),
+    ),
+    recoveryHoldMs: def(ownStateObj.recoveryHoldMs, 30000, (v) =>
+      asNumberInRange(v, 'ownState.recoveryHoldMs', 0, 300000, { minInclusive: true, maxInclusive: true }),
     ),
   };
 

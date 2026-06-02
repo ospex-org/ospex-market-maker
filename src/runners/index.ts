@@ -316,6 +316,17 @@ type DegradedReason =
   | 'stream-reconnecting' //  the SSE transport dropped and is retrying with backoff (subscription kept alive)
   | 'stream-degraded'; //     the upstream odds source fell behind; live updates paused until the next snapshot
 
+/**
+ * Sentinel thrown by `submitQuote`'s `beforePost` hook (the SDK's just-in-time
+ * §5.1 boundary, own-state SSE plan / Hermes #73 r3) when own-state health has
+ * degraded by the time the SDK is about to `POST /v1/commitments`. The SDK
+ * re-throws it unchanged out of `submitRaw`, and `submitQuote`'s catch
+ * identity-compares it so the refusal returns `null` (a clean transient-failure →
+ * re-quote next tick) WITHOUT logging a spurious submit `error` — the
+ * `stream-health-hold` enter edge was already emitted by `updateStreamHealthHold`.
+ */
+const OWN_STATE_HOLD_ABORT = new Error('own-state degraded — §5.1 posting gate refused the submit at the POST boundary');
+
 export class Runner {
   readonly config: Config;
   /** The boot-time state-loss assessment (DESIGN §12), computed in the constructor — `holdQuoting`, the reason, and (when holding) `suggestedWaitSeconds`. */
@@ -2304,19 +2315,14 @@ export class Runner {
    * corresponding `submit` / `replace` event).
    */
   private async submitQuote(m: TrackedMarket, qs: QuoteSide, now: number, expiryUnixSec: number): Promise<MakerCommitmentRecord | null> {
-    // §5.1 AUTHORITATIVE own-state posting gate (Hermes #73 round 2). The
-    // top-of-reconcileMarkets gate is sampled ONCE per pass, but own-state health
-    // can degrade DURING the awaited per-market reconcile work — an SSE queue
-    // overflow while `getSpeculation` (or any other read) is in flight, AFTER the
-    // top gate already passed. `submitQuote` is the SOLE new-exposure write
-    // (`adapter.submitCommitment`), and there is NO `await` between this check and
-    // that call below, so re-checking here is the race-free last line of defense:
-    // a late degradation refuses the submit (→ `transient-failure` → the side
-    // re-quotes next tick, where the top gate then holds until health recovers)
-    // and `updateStreamHealthHold` emits the `stream-health-hold` enter edge.
-    // Inert in dry-run / poll-only (updateStreamHealthHold returns false), so
-    // dry-run still prices + records its synthetic `would-submit`. The top gate
-    // stays as the cheap early-out + steady-state telemetry; THIS is the boundary.
+    // §5.1 own-state posting gate — EARLY-OUT (Hermes #73 r2). Skip the SDK
+    // round-trip entirely if own-state is already degraded at submit time. This is
+    // NOT the boundary: the SDK's `submitRaw` awaits getAddress / allowance / nonce
+    // / signing before the irreversible `POST /v1/commitments`, and own-state can
+    // degrade during those awaits (Hermes #73 r3). The AUTHORITATIVE re-check is the
+    // `beforePost` hook below, which the SDK runs synchronously immediately before
+    // the POST. Inert in dry-run / poll-only (updateStreamHealthHold returns false),
+    // so dry-run still prices + records its synthetic `would-submit`.
     if (this.updateStreamHealthHold(this.deps.now())) return null;
     const proto = toProtocolQuote({ side: qs.takerSide, oddsTick: qs.quoteTick });
     let hash: string;
@@ -2342,10 +2348,24 @@ export class Runner {
           oddsTick: proto.makerOddsTick,
           riskAmount: BigInt(qs.sizeWei6),
           expiry: BigInt(expiryUnixSec),
+          // §5.1 AUTHORITATIVE own-state boundary (Hermes #73 r3): the SDK runs this
+          // SYNCHRONOUSLY immediately before the irreversible POST /v1/commitments
+          // (after its getAddress / allowance / nonce / signing awaits, during which
+          // own-state can degrade). Throwing aborts the POST — the SDK re-throws
+          // OWN_STATE_HOLD_ABORT unchanged, caught below. MUST be synchronous (the
+          // SDK fail-closes a thenable-returning hook), so this only reads + throws.
+          beforePost: () => {
+            if (this.updateStreamHealthHold(this.deps.now())) throw OWN_STATE_HOLD_ABORT;
+          },
         });
         hash = result.hash;
         signedPayload = toMakerSignedPayload(result.signedPayload);
       } catch (err) {
+        // §5.1 refusal at the POST boundary — the `stream-health-hold` enter edge
+        // was already emitted by `updateStreamHealthHold` inside `beforePost`; this
+        // is not a submit failure, so return null (→ transient-failure → re-quote
+        // next tick) WITHOUT logging a spurious `error`.
+        if (err === OWN_STATE_HOLD_ABORT) return null;
         this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'submit', contestId: m.contestId, takerSide: qs.takerSide });
         return null;
       }

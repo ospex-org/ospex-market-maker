@@ -233,6 +233,76 @@ describe('StateStore.load', () => {
   });
 });
 
+// ── ownStateCursor persistence (own-state SSE plan §4.1, Phase 3 PR1) ────────
+//
+// The resume cursor is a DISPOSABLE optimization, not exposure-relevant state.
+// It round-trips through flush+load, a legacy/absent cursor migrates to
+// undefined, and — crucially — a malformed cursor degrades GRACEFULLY (cold
+// restart) rather than marking the whole state `lost`. The fail-closed posture
+// protects the under-countable soft-cancelled set (DESIGN §12), which a cursor
+// has no bearing on; a bad cursor → cold subscribe is the fail-SAFE outcome.
+describe('ownStateCursor persistence (own-state SSE plan §4.1, Phase 3 PR1)', () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'ospex-mm-cursor-'));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('round-trips a persisted cursor through flush + load', () => {
+    const store = StateStore.at(dir);
+    store.flush(stateWith({ ownStateCursor: 'evt-000123' }));
+    const { state, status } = store.load();
+    expect(status.kind).toBe('loaded');
+    expect(state.ownStateCursor).toBe('evt-000123');
+  });
+
+  it('a fresh / pre-PR1 state file (no ownStateCursor) loads clean with cursor undefined', () => {
+    // A legacy blob with every required section but no cursor field.
+    const legacy = { ...emptyMakerState(), version: 1, lastFlushedAt: null };
+    const raw = JSON.parse(JSON.stringify(legacy)) as Record<string, unknown>;
+    delete raw.ownStateCursor; // emptyMakerState omits it, but be explicit
+    writeFileSync(join(dir, STATE_FILE), JSON.stringify(raw), 'utf8');
+    const { state, status } = StateStore.at(dir).load();
+    expect(status.kind).toBe('loaded');
+    expect(state.ownStateCursor).toBeUndefined();
+  });
+
+  it('an empty-string cursor (the SDK "no resumable cursor" sentinel) is treated as absent', () => {
+    writeFileSync(join(dir, STATE_FILE), JSON.stringify(stateWith({ ownStateCursor: '' })), 'utf8');
+    const { state, status } = StateStore.at(dir).load();
+    expect(status.kind).toBe('loaded');
+    expect(state.ownStateCursor).toBeUndefined();
+  });
+
+  it('a MALFORMED (non-string) cursor degrades gracefully — state still LOADS (not "lost"), cursor omitted', () => {
+    // The whole point of [[cursor-needs-durable-baseline]]: a disposable cursor
+    // must not nuke the precious soft-cancelled set. A bad cursor → cold
+    // restart, which is fail-SAFE; the rest of the state is trusted.
+    writeFileSync(
+      join(dir, STATE_FILE),
+      JSON.stringify(stateWith({ ownStateCursor: 42 as unknown as string, lastRunId: 'r1' })),
+      'utf8',
+    );
+    const { state, status } = StateStore.at(dir).load();
+    expect(status.kind).toBe('loaded'); // NOT 'lost' — graceful degradation
+    expect(state.ownStateCursor).toBeUndefined();
+    expect(state.lastRunId).toBe('r1'); // the rest of the state survives intact
+  });
+
+  it('a cursor coexists with a full state (commitments + positions) through a round trip', () => {
+    const store = StateStore.at(dir);
+    const c = commitment();
+    const p = position();
+    store.flush(stateWith({ ownStateCursor: 'evt-999', commitments: { [c.hash]: c }, positions: { 'spec-1:away': p } }));
+    const { state, status } = store.load();
+    expect(status.kind).toBe('loaded');
+    expect(state.ownStateCursor).toBe('evt-999');
+    expect(state.commitments['0xabc']).toEqual(c);
+  });
+});
+
 describe('assessStateLoss (the boot-time fail-safe — DESIGN §12)', () => {
   const base = { hasPriorTelemetry: false, ignoreMissingStateOverride: false, expirySeconds: 120 };
 

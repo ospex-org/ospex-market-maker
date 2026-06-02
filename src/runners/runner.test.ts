@@ -805,23 +805,40 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
   // loosely (`unknown` body / handlers indexed by string) to keep the test
   // ergonomic — the runner-side types are checked by the production code.
   function makeOwnStateRecorder() {
-    let capturedHandlers: Record<string, ((arg?: unknown) => void) | undefined> = {};
+    let capturedHandlers: Record<string, ((...args: unknown[]) => void) | undefined> = {};
     let unsubscribed = false;
+    let capturedOptions: unknown;
     const sub = { unsubscribe: () => { unsubscribed = true; return Promise.resolve(); } };
-    const subscribe = ((_opts: unknown, handlers: unknown) => {
-      capturedHandlers = handlers as Record<string, (arg?: unknown) => void>;
+    const subscribe = ((opts: unknown, handlers: unknown) => {
+      capturedOptions = opts;
+      capturedHandlers = handlers as Record<string, (...args: unknown[]) => void>;
       return sub;
     }) as unknown as OspexAdapter['subscribeOwnState'];
     return {
       sub,
       subscribe,
       get isUnsubscribed(): boolean { return unsubscribed; },
-      fire(name: string, arg?: unknown): void {
+      /** The options object the runner passed to subscribeOwnState — e.g. `{ address, initialCursor }`. */
+      get options(): unknown { return capturedOptions; },
+      /**
+       * Simulate an SDK callback. The SDK delivers `OwnStateEventMeta` as the
+       * ONLY arg to `onReady` and as the 2nd arg to the body-carrying handlers
+       * (`onSnapshot`/`onCommitment`/`onFill`/`onPositionStatus`); `onStatus`/
+       * `onError` carry no meta. `meta` defaults to `{ cursor: '' }` so callers
+       * that don't exercise cursor promotion need not supply it.
+       */
+      fire(name: string, arg?: unknown, meta: { cursor: string } = { cursor: '' }): void {
         const h = capturedHandlers[name];
         if (h === undefined) throw new Error(`recorder.fire: no handler for ${name}`);
-        h(arg);
+        if (name === 'onReady') {
+          h(meta);
+        } else if (name === 'onSnapshot' || name === 'onCommitment' || name === 'onFill' || name === 'onPositionStatus') {
+          h(arg, meta);
+        } else {
+          h(arg);
+        }
       },
-      handler(name: string): ((arg?: unknown) => void) | undefined { return capturedHandlers[name]; },
+      handler(name: string): ((...args: unknown[]) => void) | undefined { return capturedHandlers[name]; },
     };
   }
 
@@ -1224,6 +1241,95 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
 
     triggerKill();
     await runPromise;
+  });
+
+  // ── PR1 — cursor promotion contract (own-state SSE plan §4.3) ────────────
+  //
+  // The resume cursor (`state.ownStateCursor`) advances ONLY when paired with a
+  // real applied effect: a snapshot baseline whose `onReady` swap succeeded
+  // (promoting the untruncated-page cursor), or a delta whose reducer applied
+  // cleanly (contiguous-success prefix only). A truncated page, a baseline-less
+  // onReady, a reducer throw, and a resync all leave (or clear) the cursor.
+
+  const MINIMAL_COMMITMENT = (hash: string) => ({
+    commitmentHash: hash, filledRiskAmount: '0', riskAmount: '100', expiry: null,
+    status: 'open', storedStatus: 'open', nonceInvalidated: false,
+  });
+
+  it('promotes the untruncated-page cursor on a successful onReady baseline swap (§4.3)', async () => {
+    const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
+    expect(runner.ownStateCursorForTest()).toBeUndefined();
+    recorder.fire('onSnapshot', { commitments: [MINIMAL_COMMITMENT('0xa')], positions: [], truncated: false, positionsTruncated: false }, { cursor: 'snap-1' });
+    // Before ready, the cursor is NOT yet promoted (only staged internally).
+    expect(runner.ownStateCursorForTest()).toBeUndefined();
+    recorder.fire('onReady', undefined, { cursor: 'ready-1' });
+    // The staged baseline cursor wins over the onReady cursor.
+    expect(runner.ownStateCursorForTest()).toBe('snap-1');
+    triggerKill();
+    await runPromise;
+  });
+
+  it('a truncated page does NOT stage a cursor; the final untruncated page does (§4.3)', async () => {
+    const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
+    // Page 1 truncated — its cursor must NOT become the resume point.
+    recorder.fire('onSnapshot', { commitments: [MINIMAL_COMMITMENT('0xa')], positions: [], truncated: true, positionsTruncated: false }, { cursor: 'page-1-truncated' });
+    // Page 2 untruncated — this cursor pairs with the complete baseline.
+    recorder.fire('onSnapshot', { commitments: [MINIMAL_COMMITMENT('0xb')], positions: [], truncated: false, positionsTruncated: false }, { cursor: 'page-2-final' });
+    recorder.fire('onReady', undefined, { cursor: 'ready-x' });
+    expect(runner.ownStateCursorForTest()).toBe('page-2-final');
+    triggerKill();
+    await runPromise;
+  });
+
+  it('does NOT promote a cursor on a baseline-less onReady (resume delivered no snapshot — cursor alone is not state)', async () => {
+    const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
+    // onReady with NO prior snapshot → pendingBaseline is null → no durable
+    // baseline → the cursor must NOT be promoted. (Commit 3 turns this branch
+    // into the empty-baseline cold-restart guard.)
+    recorder.fire('onReady', undefined, { cursor: 'ready-no-baseline' });
+    expect(runner.ownStateCursorForTest()).toBeUndefined();
+    triggerKill();
+    await runPromise;
+  });
+
+  it('resync clears the staged + persisted cursor (a stale resume point must not survive a re-baseline)', async () => {
+    const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
+    recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: false }, { cursor: 'snap-1' });
+    recorder.fire('onReady', undefined, { cursor: 'ready-1' });
+    expect(runner.ownStateCursorForTest()).toBe('snap-1');
+    recorder.fire('onStatus', 'resync');
+    expect(runner.ownStateCursorForTest()).toBeUndefined();
+    triggerKill();
+    await runPromise;
+  });
+
+  it('promotes a delta cursor after its reducer applies (§4.3 delta track)', async () => {
+    const runner = makeRunner({ maxTicks: 1 });
+    runner.enqueueOwnStateEvent({ kind: 'commitment', body: MINIMAL_COMMITMENT('0xc'), cursor: 'delta-1' });
+    await runner.run();
+    expect(runner.ownStateCursorForTest()).toBe('delta-1');
+  });
+
+  it('freezes cursor promotion at the first reducer throw — a later success cannot leapfrog the failed event (contiguous-success, FM3)', async () => {
+    const runner = makeRunner({ maxTicks: 1 });
+    // Good → promote 'g1'.
+    runner.enqueueOwnStateEvent({ kind: 'commitment', body: MINIMAL_COMMITMENT('0xg1'), cursor: 'g1' });
+    // Bad fill (no maker/taker) → reducer throws → freeze promotion.
+    runner.enqueueOwnStateEvent({ kind: 'fill', body: { txHash: '0x1', logIndex: 0 }, cursor: 'g2' });
+    // Good → reduces cleanly, BUT promotion is frozen → its cursor is NOT taken.
+    runner.enqueueOwnStateEvent({ kind: 'commitment', body: MINIMAL_COMMITMENT('0xg3'), cursor: 'g3' });
+    await runner.run();
+    // Cursor stays at the last CONTIGUOUS success before the throw, never 'g3'.
+    expect(runner.ownStateCursorForTest()).toBe('g1');
+  });
+
+  it('an unknown event kind also freezes promotion (never advance past a skipped effect)', async () => {
+    const runner = makeRunner({ maxTicks: 1 });
+    runner.enqueueOwnStateEvent({ kind: 'commitment', body: MINIMAL_COMMITMENT('0xk1'), cursor: 'k1' });
+    runner.enqueueOwnStateEvent({ kind: 'made-up-kind', body: {}, cursor: 'k2' });
+    runner.enqueueOwnStateEvent({ kind: 'commitment', body: MINIMAL_COMMITMENT('0xk3'), cursor: 'k3' });
+    await runner.run();
+    expect(runner.ownStateCursorForTest()).toBe('k1');
   });
 
   it('drainShadow logs error + skips on unknown event kind (Phase 2 PR4b)', async () => {

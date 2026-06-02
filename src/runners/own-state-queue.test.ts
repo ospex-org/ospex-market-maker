@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest';
 import { OWN_STATE_QUEUE_MAX, OwnStateEvent, OwnStateQueue } from './own-state-queue.js';
 
 function ev(kind: string, n: number): OwnStateEvent {
-  return { kind, body: { n }, arrivedAtMs: n };
+  return { kind, body: { n }, arrivedAtMs: n, cursor: `evt-${n}` };
 }
 
 describe('OwnStateQueue', () => {

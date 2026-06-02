@@ -344,8 +344,16 @@ export function parseConfig(raw: unknown, env: EnvLike = {}): Config {
     indexerLagMaxSeconds: def(ownStateObj.indexerLagMaxSeconds, 30, (v) =>
       asNumberInRange(v, 'ownState.indexerLagMaxSeconds', 5, 300, { minInclusive: true, maxInclusive: true }),
     ),
+    // Floor is 30000, NOT below the server's own-state SSE heartbeat cadence
+    // (~20s): `transportFresh` requires a frame within `staleMaxMs`, and on a
+    // quiet wallet the only frames are heartbeats. A value at/under the heartbeat
+    // would mark a perfectly healthy idle connection stale every cycle, resetting
+    // the recovery-hold anchor before it can accrue → posting permanently held
+    // (own-state SSE plan §5 latch 2, PR2b). 30000 keeps a comfortable margin
+    // above the heartbeat; default 60000 (≈3 heartbeats) tolerates a couple of
+    // missed beats. If the server heartbeat cadence changes, revisit this floor.
     staleMaxMs: def(ownStateObj.staleMaxMs, 60000, (v) =>
-      asNumberInRange(v, 'ownState.staleMaxMs', 10000, 300000, { minInclusive: true, maxInclusive: true }),
+      asNumberInRange(v, 'ownState.staleMaxMs', 30000, 300000, { minInclusive: true, maxInclusive: true }),
     ),
     recoveryHoldMs: def(ownStateObj.recoveryHoldMs, 30000, (v) =>
       asNumberInRange(v, 'ownState.recoveryHoldMs', 0, 300000, { minInclusive: true, maxInclusive: true }),

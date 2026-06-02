@@ -1505,8 +1505,18 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
   // ── Phase 3 PR2a — composite own-state health gate (own-state SSE plan §5) ──
 
   describe('own-state health gate (§5)', () => {
-    /** A clean baseline + settled transport — drives the shadow to latch-healthy. */
+    /**
+     * A clean baseline + settled transport + a live frame — drives the shadow to
+     * FULLY healthy (the §5 composite gate, not just the edge mirror). The
+     * `onFrame` is load-bearing for PR2b: latch 2 (`transportFresh`) requires a
+     * frame within `staleMaxMs`, so without it `ownStateHealthy()` stays false.
+     * The frame is stamped at the current `deps.now()` (clock-advancing recovery-
+     * hold tests bump `staleMaxMs` so this single frame stays fresh across the
+     * advance — see those tests). Models the SDK, which fires frames before every
+     * typed dispatch.
+     */
     function fireHealthyBaseline(recorder: ReturnType<typeof makeOwnStateRecorder>): void {
+      recorder.fire('onFrame', { receivedAtMs: 0, kind: 'heartbeat' });
       recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: false }, { cursor: 's1' });
       recorder.fire('onReady', undefined, { cursor: 'r1' });
       recorder.fire('onStatus', 'connected');
@@ -1555,7 +1565,10 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
     it('a latch trip mid-hold resets the recovery hold — recovery must re-earn the full window', async () => {
       let t = T0;
       const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner({
-        config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 30000 } }),
+        // Large staleMaxMs: the single fireHealthyBaseline frame must stay fresh
+        // across the clock advance to T0+60 so transportFresh (latch 2) doesn't
+        // confound what this test isolates — the recovery hold (latch 8).
+        config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 30000, staleMaxMs: 300000 } }),
         deps: { now: () => t },
       });
       fireHealthyBaseline(recorder); // anchored at T0
@@ -1719,7 +1732,9 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
     it('the recovery-hold gate stays true past the boundary and rejects a backward clock step', async () => {
       let t = T0;
       const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner({
-        config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 30000 } }),
+        // Large staleMaxMs so the fireHealthyBaseline frame stays fresh across the
+        // advance to T0+100 — isolates the recovery hold from transportFresh.
+        config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 30000, staleMaxMs: 300000 } }),
         deps: { now: () => t },
       });
       fireHealthyBaseline(recorder); // anchored at T0
@@ -1739,6 +1754,14 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
       const submit = submitRecorder();
       const recorder = makeOwnStateRecorder();
       let injected = false;
+      // Capture the precondition outcomes into OUTER flags and assert them POST-run:
+      // the inline expects here run inside getPositionStatus, which pollPositionStatus
+      // wraps in a try/catch that swallows ANY throw (incl. an AssertionError) — so an
+      // inline `expect` could never fail the test. Capturing + asserting after run()
+      // makes the healthy-then-degraded precondition load-bearing (drop the frame and
+      // `healthyAtInject` becomes false → the test fails, instead of passing vacuously).
+      let healthyAtInject: boolean | undefined;
+      let degradedAfterOverflow: boolean | undefined;
       const adapter = liveSpiedAdapter(
         config,
         () => Promise.resolve([contestView({ contestId: '1234' })]), // a quotable market (would post both sides absent the gate)
@@ -1754,14 +1777,15 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
           getPositionStatus: () => {
             if (!injected) {
               injected = true;
+              recorder.fire('onFrame', { receivedAtMs: 0, kind: 'heartbeat' }); // latch 2: without a frame transportFresh is false → never healthy → the race wouldn't be exercised
               recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: false }, { cursor: 's1' });
               recorder.fire('onReady', undefined, { cursor: 'r1' });
               recorder.fire('onStatus', 'connected');
-              expect(runner.ownStateHealthyForTest()).toBe(true); // healthy at this instant...
+              healthyAtInject = runner.ownStateHealthyForTest(); // healthy at this instant...
               const cap = 10_000;
               for (let i = 0; i < cap; i++) runner.enqueueOwnStateEvent({ kind: 'commitment', body: MINIMAL_COMMITMENT(`0xc${i}`) });
               expect(runner.enqueueOwnStateEvent({ kind: 'commitment', body: MINIMAL_COMMITMENT('0xover') })).toBe('overflow');
-              expect(runner.ownStateHealthyForTest()).toBe(false); // ...degraded by the enqueue-time overflow latch
+              degradedAfterOverflow = runner.ownStateHealthyForTest(); // ...degraded by the enqueue-time overflow latch
             }
             return Promise.resolve(EMPTY_POSITION_STATUS);
           },
@@ -1773,6 +1797,8 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
       const runner = makeRunner({ config, adapter, maxTicks: 1, makerAddress: DEFAULT_FAKE_MAKER_ADDRESS as Hex });
       await runner.run();
       const events = readEvents();
+      expect(healthyAtInject).toBe(true); // precondition: the shadow WAS gate-healthy before the overflow
+      expect(degradedAfterOverflow).toBe(false); // the enqueue-time overflow latch degraded it same-tick
       expect(submit.calls).toHaveLength(0); // posting halted — the enqueue-time latch closed the same-tick race
       expect(events.filter((e) => e.kind === 'stream-health-hold' && e.state === 'entered')).toHaveLength(1);
       expect(events.some((e) => e.kind === 'stream-health-degraded')).toBe(true); // overflow surfaced immediately
@@ -1784,6 +1810,12 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
       const submit = submitRecorder();
       const recorder = makeOwnStateRecorder();
       let healthyFired = false;
+      // getSpeculation runs ONLY if reconcileMarkets got past its top §5.1 gate, i.e.
+      // own-state was gate-healthy at the top. Capturing this proves the healthy
+      // precondition: drop the establishing frame and the top gate holds, getSpeculation
+      // never runs, `getSpecReached` stays false → the test fails instead of passing
+      // for the wrong reason (gated at the top, the mid-reconcile race never exercised).
+      let getSpecReached = false;
       const adapter = liveSpiedAdapter(
         config,
         () => Promise.resolve([contestView({ contestId: '1234' })]), // a quotable market
@@ -1794,6 +1826,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
           // Inject an own-state overflow here: the authoritative submit-site gate must refuse the
           // submit even though the top gate already let this pass through.
           getSpeculation: (speculationId) => {
+            getSpecReached = true;
             const cap = 10_000;
             for (let i = 0; i < cap; i++) runner.enqueueOwnStateEvent({ kind: 'commitment', body: MINIMAL_COMMITMENT(`0xc${i}`) });
             runner.enqueueOwnStateEvent({ kind: 'commitment', body: MINIMAL_COMMITMENT('0xover') }); // overflow → enqueue-time latch degrades health
@@ -1805,6 +1838,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
           getPositionStatus: () => {
             if (!healthyFired) {
               healthyFired = true;
+              recorder.fire('onFrame', { receivedAtMs: 0, kind: 'heartbeat' }); // latch 2: without a frame transportFresh is false → never healthy → the race wouldn't be exercised
               recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: false }, { cursor: 's1' });
               recorder.fire('onReady', undefined, { cursor: 'r1' });
               recorder.fire('onStatus', 'connected');
@@ -1817,6 +1851,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
       const runner = makeRunner({ config, adapter, maxTicks: 1, makerAddress: DEFAULT_FAKE_MAKER_ADDRESS as Hex });
       await runner.run();
       const events = readEvents();
+      expect(getSpecReached).toBe(true); // precondition: the top gate passed (own-state was healthy), so the mid-reconcile race was actually exercised
       expect(submit.calls).toHaveLength(0); // submit-site gate refused after the mid-reconcile degradation
       expect(events.filter((e) => e.kind === 'stream-health-hold' && e.state === 'entered')).toHaveLength(1);
     });
@@ -1858,6 +1893,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
           getPositionStatus: () => {
             if (!healthyFired) {
               healthyFired = true;
+              recorder.fire('onFrame', { receivedAtMs: 0, kind: 'heartbeat' }); // latch 2: without a frame transportFresh is false → never healthy → the race wouldn't be exercised
               recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: false }, { cursor: 's1' });
               recorder.fire('onReady', undefined, { cursor: 'r1' });
               recorder.fire('onStatus', 'connected');
@@ -1870,9 +1906,261 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
       const runner = makeRunner({ config, adapter, maxTicks: 1, makerAddress: DEFAULT_FAKE_MAKER_ADDRESS as Hex });
       await runner.run();
       const events = readEvents();
+      // `injected` flips only inside submitCommitment — reached ONLY if reconcile got
+      // past the top gate AND the submitQuote-start early-out (both saw a healthy shadow)
+      // AND entered the SDK submit. Asserting it proves the healthy precondition: drop
+      // the establishing frame and the gate holds, submitCommitment never runs, `injected`
+      // stays false → the test fails rather than passing for the wrong reason.
+      expect(injected).toBe(true); // precondition: the submit was actually attempted (both gates passed healthy)
       expect(submit.calls).toHaveLength(0); // beforePost aborted the POST — no commitment posted
       expect(events.filter((e) => e.kind === 'stream-health-hold' && e.state === 'entered')).toHaveLength(1);
       expect(events.some((e) => e.kind === 'error' && e.phase === 'submit')).toBe(false); // the §5.1 refusal is NOT logged as a submit error
+    });
+
+    // ── §5 latches 2 + 7 — transportFresh + tokenRefresh (Phase 3 PR2b) ──────
+
+    describe('latch 2 — transportFresh + latch 7 — tokenRefreshFailureInFlight', () => {
+      it('the edge mirror is healthy without a frame, but the gate is NOT (transportFresh is gate-only, not a stored mirror bit)', async () => {
+        const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner({
+          config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 0 } }),
+        });
+        // Baseline + connected, but NO frame — exercises the deliberate split.
+        recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: false }, { cursor: 's1' });
+        recorder.fire('onReady', undefined, { cursor: 'r1' });
+        recorder.fire('onStatus', 'connected');
+        expect(runner.ownStateShadowView().healthy).toBe(true); // edge mirror healthy
+        expect(runner.lastFrameAtSecForTest()).toBeNull(); // no frame yet
+        expect(runner.ownStateHealthyForTest()).toBe(false); // gate false — transportFresh requires a frame
+        // A frame flips the gate healthy (recoveryHoldMs:0 → immediate).
+        recorder.fire('onFrame', { receivedAtMs: 0, kind: 'heartbeat' });
+        expect(runner.ownStateHealthyForTest()).toBe(true);
+        triggerKill();
+        await runPromise;
+      });
+
+      it('latch 2: the gate goes false when no frame arrives within staleMaxMs — while the edge mirror stays healthy', async () => {
+        let t = T0;
+        const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner({
+          config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 0, staleMaxMs: 60000 } }),
+          deps: { now: () => t },
+        });
+        fireHealthyBaseline(recorder); // frame + baseline + connected at T0
+        expect(runner.ownStateHealthyForTest()).toBe(true);
+        t = T0 + 60; // (60s)*1000 = 60000 NOT < 60000 → stale
+        expect(runner.transportFreshForTest(t)).toBe(false);
+        expect(runner.ownStateHealthyForTest()).toBe(false); // gate halts on a silent transport
+        expect(runner.ownStateShadowView().healthy).toBe(true); // edge mirror unchanged — transportFresh isn't folded in
+        // Just under the boundary stays fresh.
+        t = T0 + 59;
+        expect(runner.transportFreshForTest(t)).toBe(true);
+        expect(runner.ownStateHealthyForTest()).toBe(true);
+        triggerKill();
+        await runPromise;
+      });
+
+      it('latch 2 gap-detect: a frame after a staleness gap (with NO intervening read) RESTARTS the recovery hold', async () => {
+        let t = T0;
+        const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner({
+          config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 30000, staleMaxMs: 60000 } }),
+          deps: { now: () => t },
+        });
+        fireHealthyBaseline(recorder); // frame + healthy, anchored at T0
+        t = T0 + 31;
+        expect(runner.ownStateHealthyForTest()).toBe(true); // hold earned, still fresh
+        // Transport silent for a long window — and we deliberately do NOT read the
+        // gate during it (so read-time decay can't be what resets the anchor).
+        t = T0 + 200;
+        recorder.fire('onFrame', { receivedAtMs: 0, kind: 'heartbeat' }); // gap (200s) > staleMaxMs → anchor reset
+        expect(runner.transportFreshForTest(t)).toBe(true); // fresh again
+        expect(runner.ownStateHealthyForTest()).toBe(false); // ...but 0s into the RESTARTED hold
+        t = T0 + 230;
+        expect(runner.ownStateHealthyForTest()).toBe(true); // 30s into the new hold
+        triggerKill();
+        await runPromise;
+      });
+
+      it('latch 2 gap-detect boundary: a frame at EXACTLY gap == staleMaxMs resets the hold (inclusive >=, paired with transportFresh\'s exclusive <)', async () => {
+        let t = T0;
+        const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner({
+          config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 30000, staleMaxMs: 60000 } }),
+          deps: { now: () => t },
+        });
+        fireHealthyBaseline(recorder); // frame + healthy, anchored at T0
+        t = T0 + 31;
+        expect(runner.ownStateHealthyForTest()).toBe(true); // hold earned
+        // Advance to EXACTLY the boundary with NO intervening read, then a frame.
+        // gap == staleMaxMs (60000) → gap-detect's inclusive `>=` fires → anchor reset.
+        // (This is the instant transportFresh's exclusive `<` would read false, so the
+        // streak was broken — resetting is correct; the boundary is the seam between
+        // the two predicates.)
+        t = T0 + 91; // gap since the T0 frame == 60s
+        recorder.fire('onFrame', { receivedAtMs: 0, kind: 'heartbeat' });
+        expect(runner.ownStateHealthyForTest()).toBe(false); // 0s into the RESTARTED hold (anchor was reset at the boundary)
+        t = T0 + 121; // 30s into the new hold
+        expect(runner.ownStateHealthyForTest()).toBe(true);
+        triggerKill();
+        await runPromise;
+      });
+
+      it('latch 2 read-time decay: reading the gate during a staleness window clears the recovery-hold anchor', async () => {
+        let t = T0;
+        const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner({
+          config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 30000, staleMaxMs: 60000 } }),
+          deps: { now: () => t },
+        });
+        fireHealthyBaseline(recorder);
+        t = T0 + 31;
+        expect(runner.ownStateHealthyForTest()).toBe(true);
+        t = T0 + 100; // stale — and we READ the gate here (the other half of the belt-and-braces)
+        expect(runner.ownStateHealthyForTest()).toBe(false); // read detects staleness → anchor cleared
+        recorder.fire('onFrame', { receivedAtMs: 0, kind: 'heartbeat' }); // recover
+        expect(runner.ownStateHealthyForTest()).toBe(false); // 0s into the new hold
+        t = T0 + 130;
+        expect(runner.ownStateHealthyForTest()).toBe(true);
+        triggerKill();
+        await runPromise;
+      });
+
+      it('latch 2: a heartbeat frame keeps transportFresh alive on a quiet wallet (no domain event needed)', async () => {
+        let t = T0;
+        const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner({
+          config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 0, staleMaxMs: 60000 } }),
+          deps: { now: () => t },
+        });
+        fireHealthyBaseline(recorder); // frame at T0
+        t = T0 + 59;
+        expect(runner.ownStateHealthyForTest()).toBe(true); // still fresh
+        recorder.fire('onFrame', { receivedAtMs: 0, kind: 'heartbeat' }); // heartbeat at T0+59 refreshes the window
+        t = T0 + 118; // 59s after the heartbeat — still fresh
+        expect(runner.transportFreshForTest(t)).toBe(true);
+        expect(runner.ownStateHealthyForTest()).toBe(true);
+        t = T0 + 119; // 60s after the heartbeat → stale (no further frame)
+        expect(runner.ownStateHealthyForTest()).toBe(false);
+        triggerKill();
+        await runPromise;
+      });
+
+      it('latch 7: a token-refresh stream error trips the mirror; a frame clears it (auth recovered)', async () => {
+        const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner({
+          config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 0 } }),
+        });
+        fireHealthyBaseline(recorder);
+        expect(runner.ownStateShadowView().healthy).toBe(true);
+        expect(runner.tokenRefreshFailureForTest()).toBe(false);
+        // Non-fatal connection_failed in the token-refresh phase: re-mint for a
+        // reconnect on an active subscription failed.
+        recorder.fire('onError', new OspexStreamError('refresh failed', { reason: 'connection_failed', phase: 'token-refresh' }));
+        expect(runner.tokenRefreshFailureForTest()).toBe(true);
+        expect(runner.ownStateShadowView().healthy).toBe(false); // folded into the edge mirror
+        expect(runner.ownStateHealthyForTest()).toBe(false);
+        // A frame proves the transport re-authenticated (frames only flow on an
+        // open, authed connection) → latch clears.
+        recorder.fire('onFrame', { receivedAtMs: 0, kind: 'heartbeat' });
+        expect(runner.tokenRefreshFailureForTest()).toBe(false);
+        expect(runner.ownStateShadowView().healthy).toBe(true);
+        triggerKill();
+        await runPromise;
+      });
+
+      it('latch 7: a token-MINT error (initial connect) does NOT trip latch 7 — only token-refresh does', async () => {
+        const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner({
+          config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 0 } }),
+        });
+        fireHealthyBaseline(recorder);
+        recorder.fire('onError', new OspexStreamError('mint failed', { reason: 'connection_failed', phase: 'token-mint' }));
+        expect(runner.tokenRefreshFailureForTest()).toBe(false); // token-mint is covered by the `ready` latch, not latch 7
+        expect(runner.ownStateShadowView().healthy).toBe(true); // unaffected
+        triggerKill();
+        await runPromise;
+      });
+
+      it('latch 7 backstop: onStatus(connected) clears the token-refresh latch even with no frame', async () => {
+        const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner({
+          config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 0 } }),
+        });
+        fireHealthyBaseline(recorder);
+        recorder.fire('onError', new OspexStreamError('refresh failed', { reason: 'connection_failed', phase: 'token-refresh' }));
+        expect(runner.tokenRefreshFailureForTest()).toBe(true);
+        recorder.fire('onStatus', 'connected'); // backstop clear (guards against onFrame being optional in the SDK)
+        expect(runner.tokenRefreshFailureForTest()).toBe(false);
+        triggerKill();
+        await runPromise;
+      });
+
+      it('latch 7: a resync rebaseline clears the token-refresh latch (fresh connection, independent auth)', async () => {
+        const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner({
+          config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 0 } }),
+        });
+        fireHealthyBaseline(recorder);
+        recorder.fire('onError', new OspexStreamError('refresh failed', { reason: 'connection_failed', phase: 'token-refresh' }));
+        expect(runner.tokenRefreshFailureForTest()).toBe(true);
+        recorder.fire('onStatus', 'resync'); // rebaseline clears dependent latches
+        expect(runner.tokenRefreshFailureForTest()).toBe(false);
+        triggerKill();
+        await runPromise;
+      });
+
+      // The comparator (runShadowComparator) gates the audit on
+      // `instantOwnStateHealthy(now)` (the edge mirror AND transportFresh), NOT the
+      // bare `shadow.healthy`. These two tests pin that decouple at the comparator's
+      // CALL SITE — the headline PR2b behavioral change — via the divergence-tracker
+      // seam (populated only when `compareShadowVsCanonical` actually ran). The
+      // baseline carries a commitment the poll side never has → a `missing-in-poll`
+      // divergence the comparator detects + tracks once it runs.
+      function fireDivergentBaseline(recorder: ReturnType<typeof makeOwnStateRecorder>): void {
+        recorder.fire('onFrame', { receivedAtMs: 0, kind: 'heartbeat' });
+        recorder.fire('onSnapshot', { commitments: [{ commitmentHash: '0xdiv', filledRiskAmount: '0', riskAmount: '100', expiry: null, status: 'open', storedStatus: 'open', nonceInvalidated: false }], positions: [], truncated: false, positionsTruncated: false }, { cursor: 's1' });
+        recorder.fire('onReady', undefined, { cursor: 'r1' });
+        recorder.fire('onStatus', 'connected');
+      }
+
+      it('comparator RUNS the audit when transport is fresh (tracker populated for a real divergence)', async () => {
+        const t = T0; // fixed injected clock → the baseline frame stays fresh regardless of real wall-clock
+        const adapter = createOspexAdapter(cfg({ ownState: { subscribe: true } }));
+        vi.spyOn(adapter, 'listContests').mockResolvedValue([]);
+        vi.spyOn(adapter, 'listOpenCommitments').mockResolvedValue([]); // canonical stays empty → the shadow's commitment is missing-in-poll
+        const { runner, recorder, runPromise, resolvers, triggerKill } = await makePausedSubscribedRunner({
+          config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 0, staleMaxMs: 60000 } }),
+          adapter,
+          deps: { now: () => t },
+        });
+        fireDivergentBaseline(recorder);
+        expect(runner.ownStateShadowView().healthy).toBe(true);
+        // Drive ticks (the loop sleeps >1×/tick, so resolve-until-condition, not a
+        // fixed count): tick N latches firstPollAfterShadowReady, tick N+1 runs the
+        // audit. Transport is fresh, so the comparator populates the tracker.
+        await waitFor(() => { resolvers.forEach((r) => r?.()); return runner.divergenceTrackerSizeForTest() > 0; });
+        expect(runner.divergenceTrackerSizeForTest()).toBeGreaterThan(0); // comparator ran — transport fresh
+        triggerKill();
+        await runPromise;
+      });
+
+      it('comparator SKIPS the audit when transport is STALE even though the edge mirror is healthy (gates on instantOwnStateHealthy, not shadow.healthy)', async () => {
+        let t = T0;
+        const adapter = createOspexAdapter(cfg({ ownState: { subscribe: true } }));
+        vi.spyOn(adapter, 'listContests').mockResolvedValue([]);
+        vi.spyOn(adapter, 'listOpenCommitments').mockResolvedValue([]);
+        const { runner, recorder, runPromise, sleepCalls, resolvers, triggerKill } = await makePausedSubscribedRunner({
+          config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 0, staleMaxMs: 60000 } }),
+          adapter,
+          deps: { now: () => t },
+        });
+        fireDivergentBaseline(recorder); // frame at T0
+        t = T0 + 60; // transport stale (no frame within staleMaxMs) BEFORE any compare — edge mirror UNCHANGED
+        // Drive well past the firstPoll-latch tick so the comparator gate is reached
+        // (and skipped) on multiple ticks — the fresh test above is the positive
+        // control proving this same setup DOES populate the tracker when fresh.
+        const target = sleepCalls.length + 8;
+        await waitFor(() => { resolvers.forEach((r) => r?.()); return sleepCalls.length >= target; });
+        expect(runner.ownStateShadowView().healthy).toBe(true); // edge mirror STILL healthy...
+        expect(runner.transportFreshForTest(t)).toBe(false); // ...but transport is stale
+        // Tracker empty ⇒ compareShadowVsCanonical never ran ⇒ the gate read
+        // instantOwnStateHealthy (false), NOT shadow.healthy (true). A regression
+        // reverting the gate to shadow.healthy would populate this → the test fails.
+        expect(runner.divergenceTrackerSizeForTest()).toBe(0);
+        triggerKill();
+        await runPromise;
+      });
     });
   });
 

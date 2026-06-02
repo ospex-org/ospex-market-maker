@@ -115,6 +115,7 @@ import type {
   OwnerCommitment,
   OwnerStateSnapshot,
   OwnerStateSubscribeHandlers,
+  OwnStateFrameMeta,
   PositionStatus,
   PositionStatusEvent,
   SpeculationView,
@@ -517,6 +518,42 @@ export class Runner {
    * a brief recovery blip.
    */
   private healthyEligibleSinceSec: number | null = null;
+  /**
+   * §5 latch 2 (`transportFresh`) source — the unix-second time of the most
+   * recent own-state SSE frame (ANY frame, including heartbeats), recorded by
+   * {@link handleOwnerFrame} from the SDK's `onFrame` callback (Phase 3 PR2b).
+   * `null` until the first frame. Transport freshness is `(now - this) * 1000 <
+   * ownState.staleMaxMs` — see {@link transportFresh}.
+   *
+   * Stamped with `deps.now()` (unix SECONDS, the injected clock) — NOT the
+   * SDK's `OwnStateFrameMeta.receivedAtMs` (`Date.now()` ms) — so freshness is
+   * in the SAME units + clock as the recovery-hold anchor and is testable with
+   * the injected clock.
+   *
+   * Unlike the event-driven latches, `transportFresh` is TIME-DEPENDENT — it
+   * decays to false purely by the passage of time with NO SDK event — so it
+   * canNOT be a stored bit on `shadow.healthy` (which would go stale). It is
+   * evaluated at READ time and AND-ed onto the edge mirror by
+   * {@link instantOwnStateHealthy}; the recovery-hold anchor is therefore
+   * re-maintained at read time too (see {@link ownStateHealthy}).
+   */
+  private lastFrameAtSec: number | null = null;
+  /**
+   * §5 latch 7 (`tokenRefreshFailureInFlight`) — an EDGE latch (Phase 3 PR2b).
+   * `true` between a `token-refresh` stream error (the SDK failed to re-mint the
+   * bearer for a reconnect during an ALREADY-CONNECTED subscription — see
+   * `OspexStreamError.phase`) and the next proof the transport re-authenticated.
+   * A `token-mint` failure (initial connect, before any baseline) is NOT latched
+   * here — it leaves `ready` false, which the mirror already reads as unhealthy.
+   *
+   * Cleared on {@link handleOwnerFrame} (a frame can only arrive on an open,
+   * successfully-authed connection — the bearer is consumed at connect-time — so
+   * a frame is the earliest robust "auth recovered" signal, and the SDK never
+   * fires `token-refresh` while frames are flowing because it only re-mints at
+   * reconnect), with backstops on `onStatus('connected')` and rebaseline. Folds
+   * into the edge mirror `shadow.healthy` via {@link recomputeOwnStateHealth}.
+   */
+  private tokenRefreshFailureInFlight = false;
   /**
    * Transition latch for the §5.1 own-state-health posting gate's telemetry
    * (Phase 3 PR2). `true` while {@link updateStreamHealthHold} is holding; used
@@ -2714,6 +2751,10 @@ export class Runner {
         if (!sameSub()) return;
         this.handleOwnerError(error);
       },
+      onFrame: (meta) => {
+        if (!sameSub()) return;
+        this.handleOwnerFrame(meta);
+      },
     };
     // §4.2 (Phase 3 PR1) — offer the persisted resume cursor as Last-Event-ID
     // when present. `resumedFromPersistedCursor` arms the empty-baseline guard
@@ -2916,6 +2957,53 @@ export class Runner {
   }
 
   /**
+   * Handle a wire-level SSE frame (own-state SSE plan §5, Phase 3 PR2b). Fires
+   * for EVERY parsed frame INCLUDING heartbeats (`OwnStateFrameMeta.kind ===
+   * 'heartbeat'`), so a quiet wallet that produces no domain events still keeps
+   * the `transportFresh` latch (latch 2) alive — the whole point of the SDK's
+   * `onFrame` callback. Drives three things off one frame:
+   *
+   *   1. Records `lastFrameAtSec` (the latch-2 freshness source) at `deps.now()`
+   *      — the injected clock in unix SECONDS, NOT `meta.receivedAtMs`, so it
+   *      shares units + clock with the recovery-hold anchor and is test-driveable.
+   *   2. Gap-detect: if the inter-frame gap exceeded `staleMaxMs`, the transport
+   *      was STALE during the gap (and a read may not have observed it, since
+   *      `transportFresh` decays with no event), so the continuous-healthy streak
+   *      is broken → clear the recovery-hold anchor. This is the belt-and-braces
+   *      half of the read-time decay check in {@link ownStateHealthy}: it closes
+   *      the case where NO read happened during the stale window, degrading at the
+   *      SOURCE rather than only at the next read
+   *      ([[feedback_enforce_invariant_every_site]]).
+   *   3. Clears latch 7 (`tokenRefreshFailureInFlight`): a frame can only arrive
+   *      on an open, successfully-authenticated connection (the bearer is consumed
+   *      at connect-time and the SDK never re-mints mid-stream — it only re-mints
+   *      at reconnect, when frames are NOT flowing), so a frame after a
+   *      `token-refresh` failure proves the transport re-authenticated.
+   *
+   * Does NOT `wake()` — heartbeats arrive on a fixed cadence and waking per frame
+   * would spin the loop. Freshness is consumed at read time (the per-tick posting
+   * gate + comparator); domain events wake via their own handlers. A
+   * transport-recovery resume is gated by the recovery hold anyway, so the next
+   * natural tick picking it up is fine.
+   */
+  private handleOwnerFrame(_meta: OwnStateFrameMeta): void {
+    const nowSec = this.deps.now();
+    if (
+      this.lastFrameAtSec !== null &&
+      (nowSec - this.lastFrameAtSec) * 1000 >= this.config.ownState.staleMaxMs
+    ) {
+      // Transport was stale across this gap — restart the recovery hold on
+      // recovery (recompute below re-anchors it at this fresh frame).
+      this.healthyEligibleSinceSec = null;
+    }
+    this.lastFrameAtSec = nowSec;
+    this.tokenRefreshFailureInFlight = false;
+    // Re-derive composite health (transport just went fresh; latch 7 may have
+    // cleared) + maintain the recovery-hold anchor at THIS frame's timestamp.
+    this.recomputeOwnStateHealth(nowSec);
+  }
+
+  /**
    * Handle a transport status change. `resync` clears the prior baseline +
    * `ready: false` so the next snapshot fully replaces shadow state.
    * `degraded` sets `healthy: false` — the PR5 comparator's precondition
@@ -2941,6 +3029,12 @@ export class Runner {
       // to clear (Hermes #68 review blocker 1). The recompute below keeps
       // `healthy` false while either latch is still set.
       this.ownStateShadow.lastError = null;
+      // Latch 7 backstop (Phase 3 PR2b): `connected` proves the transport
+      // re-authenticated. `onFrame` is the primary clear (it precedes
+      // `connected`), but `onFrame` is optional in the SDK contract — clearing
+      // here too guards against latch 7 sticking (a permanent posting hold) if a
+      // future SDK ever stops firing frames.
+      this.tokenRefreshFailureInFlight = false;
     }
     // Single derivation site for ALL status transitions (connected / degraded /
     // reconnecting / resync): re-derive the composite latch health from every
@@ -2963,6 +3057,14 @@ export class Runner {
    *   must not swap in; reducers gate reads on `ready`.
    * - `streamOverflowDegraded=false` — a fresh snapshot re-baselines the events
    *   the overflow dropped, so the latch may clear (Hermes #68 blocker 1).
+   * - `tokenRefreshFailureInFlight=false` (latch 7, PR2b) — a rebaseline opens a
+   *   fresh connection whose auth is independent of the prior refresh failure;
+   *   a new failure re-latches ([[feedback_reset_event_clears_dependent_buffers]]).
+   * - `lastFrameAtSec=null` (latch 2 source, PR2b) — transport freshness must be
+   *   re-earned on the new connection's first frame, not carried over from the old
+   *   subscription's last frame. Harmless either way (`ready=false` dominates the
+   *   mirror until the new baseline), but resetting removes a cross-subscription
+   *   dependence on the SDK's onFrame-before-onReady ordering.
    * - `ownStateQueue.clear()` — pre-rebaseline deltas would double-count on the
    *   fresh baseline (Hermes #69).
    * - `pendingBaselineCursor` + `state.ownStateCursor` — the resume cursor that
@@ -2983,6 +3085,8 @@ export class Runner {
     this.ownStateShadow.ready = false;
     this.ownStateShadow.pendingBaseline = null;
     this.streamOverflowDegraded = false;
+    this.tokenRefreshFailureInFlight = false;
+    this.lastFrameAtSec = null;
     this.ownStateQueue.clear();
     this.pendingBaselineCursor = undefined;
     this.state.ownStateCursor = undefined;
@@ -3038,6 +3142,14 @@ export class Runner {
       recordedAtMs: Date.now(),
     };
     this.ownStateShadow.lastEventAtMs = Date.now();
+    // §5 latch 7 (Phase 3 PR2b): a `token-refresh` failure means the SDK could
+    // not re-mint the bearer for a reconnect on an already-connected subscription
+    // — a future reconnect may fail, so the shadow is at risk of going stale.
+    // Latch it into the mirror. (`token-mint` — the initial-connect phase, before
+    // any baseline — is NOT latched here: it leaves `ready` false, which the
+    // mirror already reads as unhealthy.) Cleared on the next frame /
+    // `onStatus('connected')` / rebaseline.
+    if (error.phase === 'token-refresh') this.tokenRefreshFailureInFlight = true;
     // Re-derive composite health: a `fatal` error is a latch input (the recompute
     // reads `lastError.reason === 'fatal'`); a non-fatal error leaves the
     // conjunction unchanged, preserving the Phase-2 "only fatal flips healthy"
@@ -3062,56 +3174,112 @@ export class Runner {
    * ([[feedback_health_predicate_composite_inputs]] + the every-site discipline
    * of [[feedback_enforce_invariant_every_site]]).
    *
-   * `latchesHealthy` is the INSTANTANEOUS conjunction mirrored onto
-   * `shadow.healthy` (what tests inspect AND the divergence comparator gates on).
-   * It captures the TRANSPORT/BASELINE health — the inputs that say "the shadow is
-   * a current, complete view of the maker's own state". Latches wired in PR2a:
+   * `shadow.healthy` is the EDGE-latch mirror — the conjunction of the
+   * event-driven (non-time-dependent) inputs that say "the shadow is a current,
+   * complete view of the maker's own state". It changes only when an SDK event
+   * mutates a latch, so a stored bit recomputed at every mutation site is
+   * accurate (never stale-by-time). Latches:
    *   - `ready` — a durable baseline is swapped in (no baseline ⇒ untrustworthy);
    *   - `lastStatus === 'connected'` (latch 1) — transport settled;
    *   - `!streamOverflowDegraded` (latch 3) — no dropped events;
    *   - `!positionsTruncated` (latch 4) — the baseline's positions are complete;
-   *   - `lastError.reason !== 'fatal'` — the preserved Phase-2 fatal-stream input.
-   * PR2b folds in the remaining TRANSPORT-health latches — 2 (`transportFresh`) and
-   * 7 (`tokenRefreshFailureInFlight`) — which the comparator also needs (a stale /
-   * unauthenticated transport means a stale shadow), so they belong HERE in the
-   * mirror.
+   *   - `lastError.reason !== 'fatal'` — the preserved Phase-2 fatal-stream input;
+   *   - `!tokenRefreshFailureInFlight` (latch 7, PR2b) — the SDK can still
+   *     re-authenticate the transport (a `token-refresh` error means a future
+   *     reconnect may fail; an unauthenticated transport ⇒ a soon-stale shadow).
+   *
+   * Latch 2 (`transportFresh`, PR2b) is DELIBERATELY NOT in this stored
+   * conjunction: it is TIME-DEPENDENT (decays to false with no SDK event), so a
+   * stored bit would go stale between recomputes. It is evaluated at READ time by
+   * {@link transportFresh} and AND-ed onto the edge mirror by
+   * {@link instantOwnStateHealthy} — which is what the divergence comparator AND
+   * the posting gate gate on (a stale transport ⇒ a stale shadow that must not be
+   * audited or traded against). The recovery-hold anchor below is maintained
+   * against that FULL instantaneous composite, NOT the bare edge mirror.
    *
    * The POSTING-only latches do NOT go here: the recovery hold (latch 8) lives in
    * {@link ownStateHealthy} (a posting anti-flap delay — suppressing the audit
    * comparator for it would hide divergences), and §5 latch 5
    * (`auditDivergenceUnresolved`, PR2c) MUST stay out of this mirror because the
-   * comparator gates on the mirror and ALSO produces latch 5 — folding it in would
-   * self-deadlock (a latched divergence would suppress the comparator that clears
-   * it). Latch 6 (`indexerLagDegraded`, PR2c) is likewise a posting-safety latch
+   * comparator gates on the full instant mirror (which reads this edge mirror) and
+   * ALSO produces latch 5 — folding it in would self-deadlock (a latched
+   * divergence would suppress the comparator that clears it). Latch 6
+   * (`indexerLagDegraded`, PR2c) is likewise a posting-safety latch
    * for {@link ownStateHealthy}, not a shadow-freshness signal. See the comparator
    * read site in {@link runShadowComparator}.
    *
-   * The recovery-hold anchor `healthyEligibleSinceSec` is set to `deps.now()` on
-   * the false→true edge and cleared to `null` whenever the conjunction is false,
-   * so a rebaseline / any latch trip restarts the hold.
+   * The recovery-hold anchor `healthyEligibleSinceSec` is set to `nowSec` on the
+   * false→true edge of the FULL instantaneous composite (edge mirror AND
+   * transportFresh) and cleared to `null` whenever it is false, so a rebaseline /
+   * any latch trip / a transport going stale restarts the hold. Because
+   * transportFresh is time-dependent, this maintenance MUST also run at read time
+   * — {@link ownStateHealthy} calls this with the current `nowSec` before reading
+   * the anchor (a transport that simply goes quiet produces no edge event), and
+   * {@link handleOwnerFrame} clears the anchor on a frame that arrives after a
+   * staleness gap. Returns the FULL instantaneous composite so the posting-gate
+   * read site avoids re-evaluating it.
+   *
+   * `nowSec` defaults to `deps.now()` for the edge-mutation callers (each reads
+   * the clock at its own edge); read sites pass an explicit `nowSec` so the whole
+   * §5.1 evaluation within a tick shares one clock sample.
    */
-  private recomputeOwnStateHealth(): void {
-    const latchesHealthy =
+  private recomputeOwnStateHealth(nowSec: number = this.deps.now()): boolean {
+    this.ownStateShadow.healthy =
       this.ownStateShadow.ready &&
       this.ownStateShadow.lastStatus === 'connected' &&
       !this.streamOverflowDegraded &&
       !this.ownStateShadow.positionsTruncated &&
-      this.ownStateShadow.lastError?.reason !== 'fatal';
-    this.ownStateShadow.healthy = latchesHealthy;
-    if (latchesHealthy) {
-      if (this.healthyEligibleSinceSec === null) this.healthyEligibleSinceSec = this.deps.now();
+      this.ownStateShadow.lastError?.reason !== 'fatal' &&
+      !this.tokenRefreshFailureInFlight;
+    const instant = this.instantOwnStateHealthy(nowSec);
+    if (instant) {
+      if (this.healthyEligibleSinceSec === null) this.healthyEligibleSinceSec = nowSec;
     } else {
       this.healthyEligibleSinceSec = null;
     }
+    return instant;
+  }
+
+  /**
+   * §5 latch 2 (`transportFresh`, Phase 3 PR2b) — TIME-DEPENDENT: a frame (any
+   * frame, including a heartbeat — see {@link handleOwnerFrame}) arrived within
+   * `ownState.staleMaxMs`. False before the first frame (`lastFrameAtSec` null).
+   *
+   * Clock note: `nowSec` / `lastFrameAtSec` are unix SECONDS and `staleMaxMs` is
+   * MILLISECONDS, so the elapsed seconds are scaled by 1000 (same idiom as the
+   * recovery-hold comparison). The whole-second clock quantizes the effective
+   * window to whole seconds in production.
+   */
+  private transportFresh(nowSec: number): boolean {
+    return (
+      this.lastFrameAtSec !== null &&
+      (nowSec - this.lastFrameAtSec) * 1000 < this.config.ownState.staleMaxMs
+    );
+  }
+
+  /**
+   * The FULL instantaneous own-state mirror at `nowSec`: the stored edge-latch
+   * mirror ({@link recomputeOwnStateHealth}) AND the time-dependent
+   * {@link transportFresh} (latch 2). This — NOT the bare `shadow.healthy` — is
+   * what the divergence comparator and the posting gate gate on, so a transport
+   * that has gone silent (connected per `lastStatus` but delivering no frames)
+   * is treated as a stale shadow. Pure read (no anchor side-effect); the posting
+   * gate maintains the anchor separately via {@link recomputeOwnStateHealth}.
+   */
+  private instantOwnStateHealthy(nowSec: number): boolean {
+    return this.ownStateShadow.healthy && this.transportFresh(nowSec);
   }
 
   /**
    * The composite own-state health GATE for the §5.1 POSTING decision (own-state
-   * SSE plan §5, Phase 3 PR2): the instantaneous latch mirror
-   * ({@link recomputeOwnStateHealth}) AND the recovery hold (latch 8) — the latches
-   * have been continuously healthy for at least `ownState.recoveryHoldMs`. The
-   * recovery hold is a posting-only anti-flap delay, which is why the divergence
-   * comparator gates on the bare mirror instead (see {@link runShadowComparator}).
+   * SSE plan §5, Phase 3 PR2): the FULL instantaneous mirror
+   * ({@link instantOwnStateHealthy} — the edge mirror AND `transportFresh`,
+   * returned by {@link recomputeOwnStateHealth}) AND the recovery hold (latch 8) —
+   * the composite has been continuously healthy for at least
+   * `ownState.recoveryHoldMs`. The recovery hold is a posting-only anti-flap delay,
+   * which is why the divergence comparator gates on {@link instantOwnStateHealthy}
+   * (the full instant, WITHOUT the recovery hold) instead — see
+   * {@link runShadowComparator}.
    *
    * Clock note: `deps.now()` is unix SECONDS and `recoveryHoldMs` is MILLISECONDS,
    * so the comparison scales the seconds delta by 1000 (mirrors the funding guard's
@@ -3120,11 +3288,19 @@ export class Runner {
    * 1..1000 yields a 1s hold, and the window can open up to ~1s early relative to
    * the nominal ms (the anchor second was already in progress when it was stamped).
    * `recoveryHoldMs: 0` is immediate. PR2c's posting-only latches 5/6 AND in here.
+   *
+   * Calls {@link recomputeOwnStateHealth} with `nowSec` FIRST — re-deriving the
+   * edge mirror (idempotent) and re-maintaining the recovery-hold anchor against
+   * the full composite at this read instant. This is load-bearing: latch 2
+   * (`transportFresh`) decays with no SDK event, so reading a stored mirror would
+   * miss a transport that went silent since the last edge — the gate (and the
+   * anchor) must be re-evaluated with the current clock at the read.
    */
-  private ownStateHealthy(): boolean {
-    if (!this.ownStateShadow.healthy) return false;
-    if (this.healthyEligibleSinceSec === null) return false;
-    return (this.deps.now() - this.healthyEligibleSinceSec) * 1000 >= this.config.ownState.recoveryHoldMs;
+  private ownStateHealthy(nowSec: number = this.deps.now()): boolean {
+    const instant = this.recomputeOwnStateHealth(nowSec);
+    if (!instant) return false;
+    if (this.healthyEligibleSinceSec === null) return false; // defensive — recompute sets it iff instant
+    return (nowSec - this.healthyEligibleSinceSec) * 1000 >= this.config.ownState.recoveryHoldMs;
   }
 
   /**
@@ -3145,7 +3321,7 @@ export class Runner {
    * new posting and surfaces the high-severity signal that documents the posture.
    */
   private updateStreamHealthHold(nowSec: number): boolean {
-    const holding = !this.config.mode.dryRun && this.config.ownState.subscribe && !this.ownStateHealthy();
+    const holding = !this.config.mode.dryRun && this.config.ownState.subscribe && !this.ownStateHealthy(nowSec);
     if (holding === this.streamHealthHolding) return holding; // no transition — stay quiet
     this.streamHealthHolding = holding;
     if (holding) {
@@ -3175,10 +3351,12 @@ export class Runner {
    *
    * Precondition gate (Hermes-required):
    *   - `config.ownState.subscribe: true` — the stream is even opted in;
-   *   - `shadow.healthy` — the INSTANTANEOUS latch mirror (a durable baseline is
-   *     ready, transport is `connected`, no overflow / fatal / positionsTruncated
-   *     latch is tripped). Deliberately NOT the posting gate `ownStateHealthy()`:
-   *     the audit path must not inherit the posting recovery hold (latch 8) nor be
+   *   - `instantOwnStateHealthy(now)` — the FULL instantaneous mirror: the edge
+   *     latches (ready + connected + no overflow / fatal / positionsTruncated +
+   *     no token-refresh failure) AND `transportFresh` (latch 2 — a frame within
+   *     `staleMaxMs`, so a silently-dead transport isn't audited against fresh
+   *     canonical). Deliberately NOT the posting gate `ownStateHealthy()`: the
+   *     audit path must not inherit the posting recovery hold (latch 8) nor be
    *     gated by the audit-divergence latch (latch 5, PR2c) it produces — see the
    *     decoupling note at the read site below (Phase 3 PR2);
    *   - `ownStateQueue.size === 0` — no pending events would alter the shadow;
@@ -3191,6 +3369,7 @@ export class Runner {
    */
   private runShadowComparator(): void {
     const nowMs = Date.now();
+    const nowSec = this.deps.now();
     // Record this tick's poll-side observation timestamp regardless of whether
     // we'll compare — the next compareShadowVsCanonical call needs it.
     this.lastPollObsAtMs = nowMs;
@@ -3207,16 +3386,20 @@ export class Runner {
       return;
     }
     if (!this.config.ownState.subscribe) return;
-    // Gate on the INSTANTANEOUS latch mirror (ready + connected + no overflow /
-    // truncation / fatal), NOT the posting gate `ownStateHealthy()`. The
-    // comparator is the AUDIT path: it must NOT inherit the recovery hold (latch
+    // Gate on the FULL INSTANTANEOUS mirror — the edge latches (ready + connected
+    // + no overflow / truncation / fatal / token-refresh failure) AND the
+    // time-dependent `transportFresh` (latch 2) — NOT the posting gate
+    // `ownStateHealthy()`. transportFresh belongs here: a transport that has gone
+    // silent (still `connected` per lastStatus but delivering no frames) holds a
+    // STALE shadow, and auditing it against fresh canonical would manufacture
+    // divergence. But the comparator must NOT inherit the recovery hold (latch
     // 8 — a posting-only anti-flap delay; suppressing audit for 30s after every
     // blip would hide a real divergence), and it must NOT be gated by the
     // audit-divergence latch (§5 latch 5, PR2c) that it itself produces — doing
     // so would self-deadlock (a latched divergence suppresses the comparator that
     // would clear it). So latch 5 + the recovery hold live ONLY in
-    // `ownStateHealthy()` (posting); the mirror feeds this audit gate.
-    if (!this.ownStateShadow.healthy) return;
+    // `ownStateHealthy()` (posting); this full instant mirror feeds the audit gate.
+    if (!this.instantOwnStateHealthy(nowSec)) return;
     if (this.ownStateQueueSizeForTest() !== 0) return;
     if (!this.firstPollAfterShadowReady) return;
     const payload = compareShadowVsCanonical(
@@ -3244,7 +3427,8 @@ export class Runner {
    * at the current `deps.now()`, so PR2 tests can assert the recovery-hold timing
    * (latch-healthy but gate-false until `recoveryHoldMs` elapses) by advancing the
    * injected clock. Distinct from `ownStateShadowView().healthy`, which is the
-   * instantaneous latch mirror WITHOUT the recovery hold.
+   * EDGE-latch mirror only — WITHOUT the time-dependent `transportFresh` latch
+   * (latch 2) AND WITHOUT the recovery hold, both of which the gate adds.
    */
   ownStateHealthyForTest(): boolean {
     return this.ownStateHealthy();
@@ -3288,9 +3472,40 @@ export class Runner {
     return this.streamOverflowDegraded;
   }
 
+  /**
+   * Test seam — evaluates the time-dependent `transportFresh` latch (latch 2,
+   * PR2b) at an explicit `nowSec`, so tests can assert freshness decay across the
+   * injected clock without reaching into private state.
+   */
+  transportFreshForTest(nowSec: number): boolean {
+    return this.transportFresh(nowSec);
+  }
+
+  /** Test seam — the unix-second timestamp of the last own-state frame (PR2b), or null. */
+  lastFrameAtSecForTest(): number | null {
+    return this.lastFrameAtSec;
+  }
+
+  /** Test seam — reads the `tokenRefreshFailureInFlight` latch (latch 7, PR2b). */
+  tokenRefreshFailureForTest(): boolean {
+    return this.tokenRefreshFailureInFlight;
+  }
+
   /** Test seam — current `ownStateQueue` occupancy (PR4b round 2 / Hermes #69). */
   ownStateQueueSizeForTest(): number {
     return this.ownStateQueue.size;
+  }
+
+  /**
+   * Test seam — current divergence-tracker occupancy (PR5 comparator). Non-zero
+   * iff `runShadowComparator` actually invoked `compareShadowVsCanonical` (the
+   * tracker is populated only inside it, after the precondition gate). PR2b uses
+   * this to prove the comparator gate reads `instantOwnStateHealthy` — a stale
+   * transport with a healthy edge mirror must leave the tracker empty (the audit
+   * was skipped), not populated.
+   */
+  divergenceTrackerSizeForTest(): number {
+    return this.divergenceTracker.size;
   }
 
   /** Test seam — the in-memory `state.ownStateCursor` (own-state SSE plan §4.1, Phase 3 PR1). */

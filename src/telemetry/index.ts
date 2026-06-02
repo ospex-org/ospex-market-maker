@@ -75,6 +75,7 @@ export const TELEMETRY_KINDS = [
   'degraded', //                   a market's odds channel errored
   'stream-health-degraded', //     own-state SSE stream queue overflowed / transport stale (Phase 2 PR3). Carries `{reason: 'queue-overflow', shadowReady, queueCapacity}`. Emitted once per overflow window; Phase 2 shadow-only ⇒ does NOT alter trading behavior.
   'stream-would-hold', //          Phase 2 documentation event — "what Phase 3 cutover would do at this point". Carries `{reason: 'queue-overflow', exposureWei6}`. Emitted iff open exposure > 0 alongside `stream-health-degraded`. Phase 2 does NOT actually set `fundingHold`.
+  'stream-cold-restart', //        own-state SSE stream was cold-restarted (close + reopen cursor-less) because a resume from a persisted cursor delivered no snapshot baseline — a cursor alone is not state (own-state SSE plan §4.2, Phase 3 PR1). Carries `{reason: 'resume-without-baseline'}`. Expected on a Phase-2 boot-after-prior-session (the shadow isn't durable across restart); not an error.
   'divergence', //                 Phase 2 PR5 shadow-vs-canonical comparator (own-state-sse-plan §2.5.4 / §6.3). Per-tick aggregated event when the shadow disagrees with the poll-derived canonical state PAST the tolerance window. Carries `{count, byField, examples, streamObservedAt, pollObservedAt, sinceMs}`.
   'error', //                      { class, detail }
   'kill',

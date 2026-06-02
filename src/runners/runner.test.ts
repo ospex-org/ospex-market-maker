@@ -1732,6 +1732,51 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
       triggerKill();
       await runPromise;
     });
+
+    it('§5.1 race: a same-tick overflow during tick I/O (after a healthy shadow) halts posting before reconcile — no submit (Hermes #73)', async () => {
+      StateStore.at(stateDir).flush(emptyMakerState()); // clean state → no boot/funding hold; isolate the §5.1 gate
+      const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: true, recoveryHoldMs: 0 } });
+      const submit = submitRecorder();
+      const recorder = makeOwnStateRecorder();
+      let injected = false;
+      const adapter = liveSpiedAdapter(
+        config,
+        () => Promise.resolve([contestView({ contestId: '1234' })]), // a quotable market (would post both sides absent the gate)
+        { submitCommitment: submit.fn },
+        undefined,
+        undefined,
+        {
+          // The position poll runs mid-tick — AFTER detectFills, BEFORE reconcileMarkets.
+          // First call: establish a HEALTHY shadow, then overflow the own-state queue.
+          // The enqueue-time overflow latch must degrade health so the SAME tick's
+          // reconcileMarkets refuses to post. Without it, reconcile sees stale-healthy
+          // (the drop wouldn't surface until the post-tick drain) and posts.
+          getPositionStatus: () => {
+            if (!injected) {
+              injected = true;
+              recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: false }, { cursor: 's1' });
+              recorder.fire('onReady', undefined, { cursor: 'r1' });
+              recorder.fire('onStatus', 'connected');
+              expect(runner.ownStateHealthyForTest()).toBe(true); // healthy at this instant...
+              const cap = 10_000;
+              for (let i = 0; i < cap; i++) runner.enqueueOwnStateEvent({ kind: 'commitment', body: MINIMAL_COMMITMENT(`0xc${i}`) });
+              expect(runner.enqueueOwnStateEvent({ kind: 'commitment', body: MINIMAL_COMMITMENT('0xover') })).toBe('overflow');
+              expect(runner.ownStateHealthyForTest()).toBe(false); // ...degraded by the enqueue-time overflow latch
+            }
+            return Promise.resolve(EMPTY_POSITION_STATUS);
+          },
+        },
+      );
+      vi.spyOn(adapter, 'subscribeOwnState').mockImplementation(recorder.subscribe);
+      // `const` declared here but referenced by the getPositionStatus closure above —
+      // the closure only executes during run(), after this initializer, so no TDZ.
+      const runner = makeRunner({ config, adapter, maxTicks: 1, makerAddress: DEFAULT_FAKE_MAKER_ADDRESS as Hex });
+      await runner.run();
+      const events = readEvents();
+      expect(submit.calls).toHaveLength(0); // posting halted — the enqueue-time latch closed the same-tick race
+      expect(events.filter((e) => e.kind === 'stream-health-hold' && e.state === 'entered')).toHaveLength(1);
+      expect(events.some((e) => e.kind === 'stream-health-degraded')).toBe(true); // overflow surfaced immediately
+    });
   });
 
   it('sync throw from openOwnStateSubscription propagates AND runs the finally cleanup — unregister called (Hermes #68 blocker 3)', async () => {

@@ -983,7 +983,7 @@ export class Runner {
    * queue can be exercised by tests without the SSE adapter present.
    */
   enqueueOwnStateEvent(event: { kind: string; body: unknown; arrivedAtMs?: number; cursor?: string }): 'enqueued' | 'overflow' {
-    return this.ownStateQueue.enqueue({
+    return this.enqueueOwnStateAndReact({
       kind: event.kind,
       body: event.body,
       arrivedAtMs: event.arrivedAtMs ?? Date.now(),
@@ -992,6 +992,48 @@ export class Runner {
       // `drainShadow`. The SSE handlers below pass the real `meta.cursor`.
       cursor: event.cursor ?? '',
     });
+  }
+
+  /**
+   * Append an own-state delta to the queue AND react to a queue overflow
+   * IMMEDIATELY (Phase 3 PR2 — Hermes #73). A full queue DROPS the event, so the
+   * lost owner-state mutation is a health-relevant degradation the §5.1 posting
+   * gate must see BEFORE the next `reconcileMarkets`, not only at the post-tick
+   * `drainShadow`: own-state SSE events can arrive (and overflow) during a tick's
+   * I/O, after the pre-tick drain but before the posting decision — latching only
+   * at drain time would let that tick post on stale-healthy state. Shared by the
+   * SSE handlers AND the `enqueueOwnStateEvent` test/external seam so both behave
+   * identically. Does NOT wake — callers decide (the SSE handlers wake the loop;
+   * the test seam stays wake-free, matching prior behavior).
+   */
+  private enqueueOwnStateAndReact(event: { kind: string; body: unknown; arrivedAtMs: number; cursor: string }): 'enqueued' | 'overflow' {
+    const result = this.ownStateQueue.enqueue(event);
+    if (result === 'overflow') this.noteOwnStateOverflow();
+    return result;
+  }
+
+  /**
+   * Latch the queue-overflow degradation, re-derive composite own-state health so
+   * the §5.1 gate halts posting, and emit the once-per-overflow-window telemetry
+   * (`stream-health-degraded` + conditional `stream-would-hold`). Idempotent
+   * within a window via the `streamOverflowDegraded` guard (a fresh `resync`
+   * snapshot rebaselines the dropped events and clears the latch in
+   * `resetShadowForRebaseline`). Called from the enqueue path (the dropped event,
+   * Hermes #73) and the drain path (belt-and-braces).
+   */
+  private noteOwnStateOverflow(): void {
+    if (this.streamOverflowDegraded) return; // once per overflow window
+    this.streamOverflowDegraded = true;
+    this.recomputeOwnStateHealth();
+    this.eventLog.emit('stream-health-degraded', {
+      reason: 'queue-overflow',
+      shadowReady: this.ownStateShadow.ready,
+      queueCapacity: this.ownStateQueue.capacity,
+    });
+    const exposureWei6 = computeOpenExposureWei6(this.state, this.deps.now(), this.config.orders.expiryReleaseGraceSeconds);
+    if (exposureWei6 > 0n) {
+      this.eventLog.emit('stream-would-hold', { reason: 'queue-overflow', exposureWei6: exposureWei6.toString() });
+    }
   }
 
   /**
@@ -1015,22 +1057,13 @@ export class Runner {
    */
   private drainShadow(): void {
     const drained = this.ownStateQueue.drain();
-    if (drained.overflowed && !this.streamOverflowDegraded) {
-      this.streamOverflowDegraded = true;
-      this.recomputeOwnStateHealth(); // overflow latch tripped — re-derive composite health
-      this.eventLog.emit('stream-health-degraded', {
-        reason: 'queue-overflow',
-        shadowReady: this.ownStateShadow.ready,
-        queueCapacity: this.ownStateQueue.capacity,
-      });
-      const exposureWei6 = computeOpenExposureWei6(this.state, this.deps.now(), this.config.orders.expiryReleaseGraceSeconds);
-      if (exposureWei6 > 0n) {
-        this.eventLog.emit('stream-would-hold', {
-          reason: 'queue-overflow',
-          exposureWei6: exposureWei6.toString(),
-        });
-      }
-    }
+    // Belt-and-braces — overflow is normally already latched at ENQUEUE time
+    // (`enqueueOwnStateAndReact` → `noteOwnStateOverflow`), so the §5.1 posting
+    // gate sees a dropped event before the next reconcile rather than only at
+    // this post-tick drain (Hermes #73 — the same-tick overflow/posting race).
+    // `noteOwnStateOverflow` is idempotent within an overflow window, so this
+    // catches any drain-observed overflow without double-emitting.
+    if (drained.overflowed) this.noteOwnStateOverflow();
     // Phase 2 PR4b — dispatch by event.kind and apply owner-side reducers.
     // The reducer module's type system pins the body type per `kind`; the cast
     // here is the runtime narrowing point (the queue carries `body: unknown`
@@ -2825,19 +2858,19 @@ export class Runner {
 
   private handleOwnerCommitment(commitment: OwnerCommitment, cursor: string): void {
     this.ownStateShadow.lastEventAtMs = Date.now();
-    this.ownStateQueue.enqueue({ kind: 'commitment', body: commitment, arrivedAtMs: Date.now(), cursor });
+    this.enqueueOwnStateAndReact({ kind: 'commitment', body: commitment, arrivedAtMs: Date.now(), cursor });
     this.wakeSignal.wake();
   }
 
   private handleOwnerFill(fill: Fill, cursor: string): void {
     this.ownStateShadow.lastEventAtMs = Date.now();
-    this.ownStateQueue.enqueue({ kind: 'fill', body: fill, arrivedAtMs: Date.now(), cursor });
+    this.enqueueOwnStateAndReact({ kind: 'fill', body: fill, arrivedAtMs: Date.now(), cursor });
     this.wakeSignal.wake();
   }
 
   private handleOwnerPositionStatus(event: PositionStatusEvent, cursor: string): void {
     this.ownStateShadow.lastEventAtMs = Date.now();
-    this.ownStateQueue.enqueue({ kind: 'positionStatus', body: event, arrivedAtMs: Date.now(), cursor });
+    this.enqueueOwnStateAndReact({ kind: 'positionStatus', body: event, arrivedAtMs: Date.now(), cursor });
     this.wakeSignal.wake();
   }
 

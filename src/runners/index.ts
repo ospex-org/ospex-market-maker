@@ -116,6 +116,7 @@ import type {
   OwnerStateSnapshot,
   OwnerStateSubscribeHandlers,
   OwnStateFrameMeta,
+  OwnStateHealth,
   PositionStatus,
   PositionStatusEvent,
   SpeculationView,
@@ -561,6 +562,20 @@ export class Runner {
    * must not spam the log), exactly as {@link setFundingHold} gates `funding-hold`.
    */
   private streamHealthHolding = false;
+  /**
+   * §5 latch 6 (`indexerLagDegraded`, Phase 3 PR2c-i) — a POSTING-only latch.
+   * `true` while the last `client.ownState.health()` poll reported the indexer's
+   * lag at/above `ownState.indexerLagMaxSeconds`, OR the poll itself FAILED
+   * (fail-closed: an indexer we can't assess must not let the MM add exposure).
+   * Set/cleared by {@link checkIndexerLag} (throttled to `auditPollIntervalMs`)
+   * and ANDed into the posting gate {@link ownStateHealthy} — NOT the edge mirror
+   * or the comparator's {@link instantOwnStateHealthy} gate (it is a posting-safety
+   * signal, not a shadow-freshness one; the indexer backs both shadow + poll
+   * equally, so it must not suppress the audit nor reset the recovery hold).
+   */
+  private indexerLagDegraded = false;
+  /** Unix-seconds of the last own-state health poll; throttles {@link checkIndexerLag} to `ownState.auditPollIntervalMs`. `null` = never polled. */
+  private lastAuditPollAtSec: number | null = null;
 
   constructor(opts: RunnerOptions) {
     this.config = opts.config;
@@ -1376,6 +1391,7 @@ export class Runner {
             if (!this.config.mode.dryRun) await this.settleAndClaim();
             if (!this.config.mode.dryRun) await this.checkFunding(); // funding guard (C1a) — sets fundingHold before the posting decision below
             if (!this.config.mode.dryRun && this.fundingHold) await this.fundingCancelSweep(); // funding guard (C1b) — actively pull/cancel existing quotes while underfunded, per underfundedCancelMode (reconcileMarkets below is gated by fundingHold anyway)
+            if (this.config.ownState.subscribe) await this.checkIndexerLag(); // §5 latch 6 (PR2c-i) — poll own-state health, set indexerLagDegraded BEFORE reconcileMarkets' §5.1 posting gate reads it (subscribe-gated, not dryRun: runs for observability in dry-run+subscribe, gate dormant there)
             await this.reconcileMarkets();
             await this.maybeOnchainCancelRecoveredSoftCancels(); // cancelMode:onchain only — authoritatively cancel matched soft-cancels (self-guards offchain/dry-run); after reconcileMarkets so the freed side re-quotes next tick
             this.ageOut();
@@ -3287,7 +3303,8 @@ export class Runner {
    * is quantized to whole seconds in production — e.g. any `recoveryHoldMs` in
    * 1..1000 yields a 1s hold, and the window can open up to ~1s early relative to
    * the nominal ms (the anchor second was already in progress when it was stamped).
-   * `recoveryHoldMs: 0` is immediate. PR2c's posting-only latches 5/6 AND in here.
+   * `recoveryHoldMs: 0` is immediate. Posting-only latch 6 (`indexerLagDegraded`,
+   * PR2c-i) ANDs in below; latch 5 (`auditDivergenceUnresolved`) follows in PR2c-ii.
    *
    * Calls {@link recomputeOwnStateHealth} with `nowSec` FIRST — re-deriving the
    * edge mirror (idempotent) and re-maintaining the recovery-hold anchor against
@@ -3299,6 +3316,14 @@ export class Runner {
   private ownStateHealthy(nowSec: number = this.deps.now()): boolean {
     const instant = this.recomputeOwnStateHealth(nowSec);
     if (!instant) return false;
+    // §5 POSTING-only latch 6 (`indexerLagDegraded`, PR2c-i): the indexer must be
+    // keeping up. ANDed in HERE (the posting gate), deliberately NOT in the edge
+    // mirror or `instantOwnStateHealthy` (the comparator gate): it is a
+    // posting-safety signal, not a shadow-freshness one — so it holds posting WITHOUT
+    // suppressing the audit and WITHOUT resetting the recovery-hold anchor (which the
+    // recompute above maintains on the transport composite only). PR2c-ii adds latch 5
+    // (`auditDivergenceUnresolved`) alongside it.
+    if (this.indexerLagDegraded) return false;
     if (this.healthyEligibleSinceSec === null) return false; // defensive — recompute sets it iff instant
     return (nowSec - this.healthyEligibleSinceSec) * 1000 >= this.config.ownState.recoveryHoldMs;
   }
@@ -3339,6 +3364,85 @@ export class Runner {
       this.deps.log('[runner] own-state health hold cleared (posting may resume unless another hold is active)');
     }
     return holding;
+  }
+
+  /**
+   * §5 latch 6 (`indexerLagDegraded`, Phase 3 PR2c-i). Polls the GLOBAL indexer-lag
+   * probe `client.ownState.health()` — throttled to `ownState.auditPollIntervalMs`
+   * — and sets {@link indexerLagDegraded} = `indexerLagSeconds >= indexerLagMaxSeconds`.
+   * A poll FAILURE fails closed (latch degraded): an indexer we can't assess must not
+   * let the MM add exposure, mirroring {@link checkFunding}'s read-failure posture
+   * (always fail-closed here — no opt-out knob, unlike `fundingGuard.failClosedOnReadError`).
+   * The latch holds its value between polls; {@link ownStateHealthy} reads it on each
+   * posting decision. The caller gates this to `ownState.subscribe` (the own-state gate
+   * is subscribe-only); it runs in dry-run+subscribe too (observability — the gate is
+   * dormant there, like the comparator). No signer / token (global probe).
+   */
+  private async checkIndexerLag(): Promise<void> {
+    const nowSec = this.deps.now();
+    // Throttle the poll (it costs an API call; indexer lag moves slowly). Between
+    // polls the latch persists — fail-safe: a degraded latch (from a lagging or
+    // failed poll) stays set until a successful in-bounds poll clears it.
+    if (this.lastAuditPollAtSec !== null && (nowSec - this.lastAuditPollAtSec) * 1000 < this.config.ownState.auditPollIntervalMs) {
+      return;
+    }
+    this.lastAuditPollAtSec = nowSec;
+
+    let health: OwnStateHealth;
+    try {
+      health = await this.adapter.getOwnStateHealth();
+    } catch (err) {
+      this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'own-state-health-poll' });
+      this.setIndexerLagDegraded(true, { reason: 'poll-failed' });
+      return;
+    }
+    const lagSeconds = health.indexerLagSeconds;
+    // A non-finite reading (e.g. a malformed `1e400` → Infinity that the wire
+    // schema's `z.number()` still accepts) is UNUSABLE: the `>=` threshold compare
+    // is meaningless on it and the telemetry emit would reject a non-finite payload.
+    // Treat it like a poll failure — fail closed (UNKNOWN ⇒ degraded), don't pass it
+    // through ([[feedback_defensive_bounds_unknown_not_null]]).
+    if (!Number.isFinite(lagSeconds)) {
+      this.eventLog.emit('error', { class: 'OwnStateHealthMalformed', detail: `non-finite indexerLagSeconds: ${String(lagSeconds)}`, phase: 'own-state-health-poll' });
+      this.setIndexerLagDegraded(true, { reason: 'poll-failed' });
+      return;
+    }
+    const maxSeconds = this.config.ownState.indexerLagMaxSeconds;
+    this.setIndexerLagDegraded(lagSeconds >= maxSeconds, {
+      reason: 'indexer-lag',
+      indexerLagSeconds: lagSeconds,
+      indexerLagMaxSeconds: maxSeconds,
+      lagSource: health.lagSource,
+    });
+  }
+
+  /**
+   * Set {@link indexerLagDegraded} and emit `stream-health-degraded` ONLY on the
+   * false→true (enter-degraded) edge — once per degraded episode, NOT every poll —
+   * matching the `queue-overflow` variant's emit-on-degrade shape (reason-discriminated,
+   * no `state` field). The latch is ALWAYS updated; the clear is silent (recovery is
+   * observable via the composite `stream-health-hold {state:'cleared'}` when the gate
+   * is live). `reason: 'indexer-lag'` carries the lag numbers; `'poll-failed'` is the
+   * fail-closed case (no lag number — the poll threw).
+   */
+  private setIndexerLagDegraded(
+    degraded: boolean,
+    ctx: { reason: 'indexer-lag' | 'poll-failed'; indexerLagSeconds?: number; indexerLagMaxSeconds?: number; lagSource?: string },
+  ): void {
+    const wasDegraded = this.indexerLagDegraded;
+    this.indexerLagDegraded = degraded;
+    if (!degraded || wasDegraded) return; // emit only on enter-degraded; silent on clear / no-change
+    const payload: Record<string, unknown> = { reason: ctx.reason };
+    if (ctx.indexerLagSeconds !== undefined) payload.indexerLagSeconds = ctx.indexerLagSeconds;
+    if (ctx.indexerLagMaxSeconds !== undefined) payload.indexerLagMaxSeconds = ctx.indexerLagMaxSeconds;
+    if (ctx.lagSource !== undefined) payload.lagSource = ctx.lagSource;
+    this.eventLog.emit('stream-health-degraded', payload);
+    this.deps.log(
+      `[runner] indexer-lag posting gate degraded (${ctx.reason})` +
+        (ctx.indexerLagSeconds !== undefined && ctx.indexerLagMaxSeconds !== undefined
+          ? ` — lag ${ctx.indexerLagSeconds}s vs max ${ctx.indexerLagMaxSeconds}s`
+          : ''),
+    );
   }
 
   /**
@@ -3489,6 +3593,21 @@ export class Runner {
   /** Test seam — reads the `tokenRefreshFailureInFlight` latch (latch 7, PR2b). */
   tokenRefreshFailureForTest(): boolean {
     return this.tokenRefreshFailureInFlight;
+  }
+
+  /**
+   * Test seam — sets the `indexerLagDegraded` latch (latch 6, PR2c-i) directly so
+   * tests can exercise the posting gate without driving the throttled poll. Unlike
+   * the overflow seam this needs NO recompute — latch 6 is posting-only (read live by
+   * {@link ownStateHealthy}), not part of the edge mirror / comparator gate.
+   */
+  setIndexerLagDegradedForTest(value: boolean): void {
+    this.indexerLagDegraded = value;
+  }
+
+  /** Test seam — reads the `indexerLagDegraded` latch (latch 6, PR2c-i). */
+  indexerLagDegradedForTest(): boolean {
+    return this.indexerLagDegraded;
   }
 
   /** Test seam — current `ownStateQueue` occupancy (PR4b round 2 / Hermes #69). */

@@ -24,6 +24,7 @@ import {
   type EnsureSpeculationSettledResult,
   type OddsSubscribeHandlers,
   type OspexAdapter,
+  type OwnStateHealth,
   type PositionStatus,
   type Signer,
   type SpeculationView,
@@ -338,6 +339,14 @@ function submitRecorder(): { fn: (args: SubmitCommitmentArgs) => Promise<SubmitC
 }
 
 /**
+ * A healthy own-state indexer-lag probe result (latch 6, PR2c-i). The shared
+ * adapters default `getOwnStateHealth` to this so that subscribe-true tests don't
+ * fail-closed on the real (unmocked) health poll the runner now drives each tick.
+ * Tests exercising the latch override it (high lag / a rejection).
+ */
+const MOCK_OWN_STATE_HEALTH: OwnStateHealth = { indexerLagSeconds: 0, lastIndexedAt: '2026-01-01T00:00:00Z', lagSource: 'test' };
+
+/**
  * A *signed* adapter (`createLiveOspexAdapter`, so `isLive()` is true) with the same
  * reads spied as {@link spiedAdapter}, plus the live writes: `submitCommitment`
  * defaults to rejecting (a test that triggers a submit must stub it via `writes`),
@@ -371,6 +380,7 @@ function liveSpiedAdapter(
     getPositionStatus?: (owner: string) => Promise<PositionStatus>;
     readApprovals?: (owner: Hex) => Promise<ApprovalsSnapshot>;
     readBalances?: (owner: Hex) => Promise<{ owner: Hex; chainId: number; native: bigint; usdc: bigint; link: bigint; usdcAddress: Hex; linkAddress: Hex }>;
+    getOwnStateHealth?: () => Promise<OwnStateHealth>;
   },
 ): OspexAdapter {
   const adapter = createLiveOspexAdapter(config, fakeSigner());
@@ -396,6 +406,9 @@ function liveSpiedAdapter(
   // Default `readBalances` returns saturated USDC so exact-mode auto-approve isn't wallet-bound below the cap ceiling
   // unless a test explicitly underfunds the wallet. Other balances are non-zero placeholders.
   vi.spyOn(adapter, 'readBalances').mockImplementation(reads?.readBalances ?? ((owner: Hex) => Promise.resolve({ owner, chainId: 137, native: 1_000_000_000_000_000_000n, usdc: 2n ** 255n, link: 0n, usdcAddress: '0xusdc' as Hex, linkAddress: '0xlink' as Hex })));
+  // Default the indexer-lag probe (latch 6, PR2c-i) to healthy so a live subscribe-true
+  // test doesn't fail-closed on the per-tick health poll; latch-6 tests override it.
+  vi.spyOn(adapter, 'getOwnStateHealth').mockImplementation(reads?.getOwnStateHealth ?? (() => Promise.resolve(MOCK_OWN_STATE_HEALTH)));
   return adapter;
 }
 
@@ -924,6 +937,9 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
     if (adapter === undefined) {
       adapter = createOspexAdapter(config);
       vi.spyOn(adapter, 'listContests').mockResolvedValue([]);
+      // Default the indexer-lag probe (latch 6, PR2c-i) to healthy so the per-tick
+      // health poll the runner now drives doesn't fail-closed in these tests.
+      vi.spyOn(adapter, 'getOwnStateHealth').mockResolvedValue(MOCK_OWN_STATE_HEALTH);
     }
     vi.spyOn(adapter, 'subscribeOwnState').mockImplementation(recorder.subscribe);
     // Seed state BEFORE the runner boots (the ctor loads it). A clean
@@ -2119,6 +2135,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
         const adapter = createOspexAdapter(cfg({ ownState: { subscribe: true } }));
         vi.spyOn(adapter, 'listContests').mockResolvedValue([]);
         vi.spyOn(adapter, 'listOpenCommitments').mockResolvedValue([]); // canonical stays empty → the shadow's commitment is missing-in-poll
+        vi.spyOn(adapter, 'getOwnStateHealth').mockResolvedValue(MOCK_OWN_STATE_HEALTH);
         const { runner, recorder, runPromise, resolvers, triggerKill } = await makePausedSubscribedRunner({
           config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 0, staleMaxMs: 60000 } }),
           adapter,
@@ -2140,6 +2157,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
         const adapter = createOspexAdapter(cfg({ ownState: { subscribe: true } }));
         vi.spyOn(adapter, 'listContests').mockResolvedValue([]);
         vi.spyOn(adapter, 'listOpenCommitments').mockResolvedValue([]);
+        vi.spyOn(adapter, 'getOwnStateHealth').mockResolvedValue(MOCK_OWN_STATE_HEALTH);
         const { runner, recorder, runPromise, sleepCalls, resolvers, triggerKill } = await makePausedSubscribedRunner({
           config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 0, staleMaxMs: 60000 } }),
           adapter,
@@ -2160,6 +2178,208 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
         expect(runner.divergenceTrackerSizeForTest()).toBe(0);
         triggerKill();
         await runPromise;
+      });
+    });
+
+    // ── §5 latch 6 — indexerLagDegraded (Phase 3 PR2c-i) ────────────────────
+
+    describe('latch 6 — indexerLagDegraded (poll-driven posting-only gate)', () => {
+      const mkHealth = (lag: number): OwnStateHealth => ({ indexerLagSeconds: lag, lastIndexedAt: '2026-01-01T00:00:00Z', lagSource: 'sync_state' });
+
+      it('latch 6 holds the POSTING gate but does NOT reset the recovery-hold anchor — clears immediately on recovery with NO re-earn (recoveryHoldMs > 0, biting)', async () => {
+        // recoveryHoldMs:0 would make this vacuous (any healthy instant passes); a
+        // NON-zero hold + injected clock is what distinguishes "anchor preserved"
+        // (correct — latch 6 isn't in instantOwnStateHealthy) from "anchor reset"
+        // (the regression this test must catch).
+        let t = T0;
+        const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner({
+          config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 30000, staleMaxMs: 300000 } }),
+          deps: { now: () => t },
+        });
+        fireHealthyBaseline(recorder); // transport healthy + recovery-hold anchor stamped at T0
+        t = T0 + 30;
+        expect(runner.ownStateHealthyForTest()).toBe(true); // recovery hold earned (30s)
+        runner.setIndexerLagDegradedForTest(true);
+        expect(runner.ownStateHealthyForTest()).toBe(false); // posting gate held by latch 6
+        expect(runner.ownStateShadowView().healthy).toBe(true); // edge mirror UNAFFECTED — latch 6 is posting-only
+        t = T0 + 40; // 10s into the degrade — a FRESH hold (anchored here) would NOT yet be satisfied
+        runner.setIndexerLagDegradedForTest(false);
+        // Clears IMMEDIATELY: the anchor earned at T0 is intact (latch 6 never touches
+        // it — it's read AFTER recompute and is absent from the transport composite), so
+        // (T0+40 − T0) ≥ recoveryHoldMs already holds. A regression that let latch 6 reset
+        // healthyEligibleSinceSec would force a re-earn to T0+70 → gate FALSE here.
+        expect(runner.ownStateHealthyForTest()).toBe(true);
+        triggerKill();
+        await runPromise;
+      });
+
+      it('latch 6 does NOT suppress the comparator — the audit still runs while indexer-lag holds posting (posting-only)', async () => {
+        const t = T0;
+        const adapter = createOspexAdapter(cfg({ ownState: { subscribe: true } }));
+        vi.spyOn(adapter, 'listContests').mockResolvedValue([]);
+        vi.spyOn(adapter, 'listOpenCommitments').mockResolvedValue([]); // canonical empty → shadow commitment is missing-in-poll
+        vi.spyOn(adapter, 'getOwnStateHealth').mockResolvedValue(mkHealth(9999)); // lag >> threshold → latch degrades via the real poll
+        const { runner, recorder, runPromise, resolvers, triggerKill } = await makePausedSubscribedRunner({
+          config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 0, staleMaxMs: 60000 } }),
+          adapter,
+          deps: { now: () => t },
+        });
+        // A divergent baseline (a commitment in the shadow the poll side never has).
+        recorder.fire('onFrame', { receivedAtMs: 0, kind: 'heartbeat' });
+        recorder.fire('onSnapshot', { commitments: [{ commitmentHash: '0xdiv6', filledRiskAmount: '0', riskAmount: '100', expiry: null, status: 'open', storedStatus: 'open', nonceInvalidated: false }], positions: [], truncated: false, positionsTruncated: false }, { cursor: 's1' });
+        recorder.fire('onReady', undefined, { cursor: 'r1' });
+        recorder.fire('onStatus', 'connected');
+        await waitFor(() => { resolvers.forEach((r) => r?.()); return runner.divergenceTrackerSizeForTest() > 0; });
+        expect(runner.indexerLagDegradedForTest()).toBe(true); // indexer-lag IS holding posting...
+        expect(runner.divergenceTrackerSizeForTest()).toBeGreaterThan(0); // ...yet the comparator audit STILL ran (decoupled)
+        triggerKill();
+        await runPromise;
+      });
+
+      it('checkIndexerLag is throttled to auditPollIntervalMs (one poll per window, regardless of tick count)', async () => {
+        let t = T0;
+        const adapter = createOspexAdapter(cfg({ ownState: { subscribe: true } }));
+        vi.spyOn(adapter, 'listContests').mockResolvedValue([]);
+        vi.spyOn(adapter, 'listOpenCommitments').mockResolvedValue([]);
+        const healthSpy = vi.spyOn(adapter, 'getOwnStateHealth').mockResolvedValue(mkHealth(0));
+        const { recorder, runPromise, sleepCalls, resolvers, triggerKill } = await makePausedSubscribedRunner({
+          config: cfg({ ownState: { subscribe: true, auditPollIntervalMs: 60000 } }),
+          adapter,
+          deps: { now: () => t },
+        });
+        fireHealthyBaseline(recorder);
+        const target1 = sleepCalls.length + 8;
+        await waitFor(() => { resolvers.forEach((r) => r?.()); return sleepCalls.length >= target1; });
+        expect(healthSpy).toHaveBeenCalledTimes(1); // throttled — one poll despite many ticks at the same clock
+        t = T0 + 60; // advance past auditPollIntervalMs
+        const target2 = sleepCalls.length + 4;
+        await waitFor(() => { resolvers.forEach((r) => r?.()); return sleepCalls.length >= target2; });
+        expect(healthSpy).toHaveBeenCalledTimes(2); // the next window polls again
+        triggerKill();
+        await runPromise;
+      });
+
+      it('latch 6: a poll reporting lag >= threshold degrades (telemetry once); a later in-bounds poll clears it', async () => {
+        let t = T0;
+        let lag = 999; // >> indexerLagMaxSeconds (default 30)
+        const adapter = createOspexAdapter(cfg({ ownState: { subscribe: true } }));
+        vi.spyOn(adapter, 'listContests').mockResolvedValue([]);
+        vi.spyOn(adapter, 'listOpenCommitments').mockResolvedValue([]);
+        vi.spyOn(adapter, 'getOwnStateHealth').mockImplementation(() => Promise.resolve(mkHealth(lag)));
+        const { runner, recorder, runPromise, sleepCalls, resolvers, triggerKill } = await makePausedSubscribedRunner({
+          config: cfg({ ownState: { subscribe: true, auditPollIntervalMs: 10000, indexerLagMaxSeconds: 30 } }),
+          adapter,
+          deps: { now: () => t },
+        });
+        fireHealthyBaseline(recorder);
+        await waitFor(() => { resolvers.forEach((r) => r?.()); return runner.indexerLagDegradedForTest(); });
+        expect(runner.indexerLagDegradedForTest()).toBe(true);
+        const degraded = readEvents().filter((e) => e.kind === 'stream-health-degraded' && e.reason === 'indexer-lag');
+        expect(degraded).toHaveLength(1); // emitted ONCE on the degrade edge
+        expect(degraded[0]).toMatchObject({ indexerLagSeconds: 999, indexerLagMaxSeconds: 30, lagSource: 'sync_state' }); // lagSource is a published contract field
+        // Drive more ticks while STILL degraded (advance past the throttle so it re-polls) → no re-emit (no transition).
+        t = T0 + 10;
+        const target = sleepCalls.length + 4;
+        await waitFor(() => { resolvers.forEach((r) => r?.()); return sleepCalls.length >= target; });
+        expect(readEvents().filter((e) => e.kind === 'stream-health-degraded' && e.reason === 'indexer-lag')).toHaveLength(1); // still once
+        // Indexer recovers → next in-bounds poll clears the latch (silent clear).
+        lag = 5; t = T0 + 20;
+        await waitFor(() => { resolvers.forEach((r) => r?.()); return !runner.indexerLagDegradedForTest(); });
+        expect(runner.indexerLagDegradedForTest()).toBe(false);
+        triggerKill();
+        await runPromise;
+      });
+
+      it('latch 6 FAILS CLOSED when the health poll throws (degraded + error telemetry, reason: poll-failed)', async () => {
+        const t = T0;
+        const adapter = createOspexAdapter(cfg({ ownState: { subscribe: true } }));
+        vi.spyOn(adapter, 'listContests').mockResolvedValue([]);
+        vi.spyOn(adapter, 'listOpenCommitments').mockResolvedValue([]);
+        vi.spyOn(adapter, 'getOwnStateHealth').mockRejectedValue(new Error('own-state health endpoint down'));
+        const { runner, recorder, runPromise, resolvers, triggerKill } = await makePausedSubscribedRunner({
+          config: cfg({ ownState: { subscribe: true } }),
+          adapter,
+          deps: { now: () => t },
+        });
+        fireHealthyBaseline(recorder);
+        await waitFor(() => { resolvers.forEach((r) => r?.()); return runner.indexerLagDegradedForTest(); });
+        expect(runner.indexerLagDegradedForTest()).toBe(true); // fail-closed: an indexer we can't assess holds posting
+        expect(readEvents().some((e) => e.kind === 'error' && e.phase === 'own-state-health-poll')).toBe(true);
+        expect(readEvents().filter((e) => e.kind === 'stream-health-degraded' && e.reason === 'poll-failed')).toHaveLength(1);
+        triggerKill();
+        await runPromise;
+      });
+
+      it('latch 6: a NON-FINITE indexerLagSeconds reading fails closed (poll-failed), it does NOT pass through as indexer-lag', async () => {
+        const t = T0;
+        const adapter = createOspexAdapter(cfg({ ownState: { subscribe: true } }));
+        vi.spyOn(adapter, 'listContests').mockResolvedValue([]);
+        vi.spyOn(adapter, 'listOpenCommitments').mockResolvedValue([]);
+        // A malformed wire value (e.g. JSON `1e400` → Infinity) the SDK's z.number() still accepts.
+        vi.spyOn(adapter, 'getOwnStateHealth').mockResolvedValue({ indexerLagSeconds: Infinity, lastIndexedAt: '2026-01-01T00:00:00Z', lagSource: 'sync_state' });
+        const { runner, recorder, runPromise, resolvers, triggerKill } = await makePausedSubscribedRunner({
+          config: cfg({ ownState: { subscribe: true } }),
+          adapter,
+          deps: { now: () => t },
+        });
+        fireHealthyBaseline(recorder);
+        await waitFor(() => { resolvers.forEach((r) => r?.()); return runner.indexerLagDegradedForTest(); });
+        expect(runner.indexerLagDegradedForTest()).toBe(true); // UNKNOWN ⇒ fail-closed
+        expect(readEvents().filter((e) => e.kind === 'stream-health-degraded' && e.reason === 'poll-failed')).toHaveLength(1);
+        // It must NOT have emitted an 'indexer-lag' degrade carrying the non-finite value
+        // (which would have thrown in the wire-safe telemetry guard and lost the edge).
+        expect(readEvents().some((e) => e.kind === 'stream-health-degraded' && e.reason === 'indexer-lag')).toBe(false);
+        triggerKill();
+        await runPromise;
+      });
+
+      it('§5.1 live: an indexer-lag degradation halts posting even with a quotable market + healthy transport (the halt is latch 6, not the transport)', async () => {
+        StateStore.at(stateDir).flush(emptyMakerState()); // clean state → no boot/funding hold; isolate the indexer-lag gate
+        const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: true, recoveryHoldMs: 0 } });
+        const submit = submitRecorder();
+        const recorder = makeOwnStateRecorder();
+        let healthyFired = false;
+        const adapter = liveSpiedAdapter(
+          config,
+          () => Promise.resolve([contestView({ contestId: '1234' })]), // a quotable market (would post both sides absent the gate)
+          { submitCommitment: submit.fn },
+          undefined,
+          undefined,
+          {
+            getOwnStateHealth: () => Promise.resolve(mkHealth(9999)), // indexer is lagging
+            // The position poll runs BEFORE checkIndexerLag/reconcileMarkets: establish a HEALTHY transport
+            // so the ONLY thing that can halt posting is the indexer-lag latch.
+            getPositionStatus: () => {
+              if (!healthyFired) {
+                healthyFired = true;
+                recorder.fire('onFrame', { receivedAtMs: 0, kind: 'heartbeat' });
+                recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: false }, { cursor: 's1' });
+                recorder.fire('onReady', undefined, { cursor: 'r1' });
+                recorder.fire('onStatus', 'connected');
+              }
+              return Promise.resolve(EMPTY_POSITION_STATUS);
+            },
+          },
+        );
+        vi.spyOn(adapter, 'subscribeOwnState').mockImplementation(recorder.subscribe);
+        const runner = makeRunner({ config, adapter, maxTicks: 1, makerAddress: DEFAULT_FAKE_MAKER_ADDRESS as Hex });
+        await runner.run();
+        const events = readEvents();
+        expect(runner.indexerLagDegradedForTest()).toBe(true); // indexer-lag latch tripped
+        expect(runner.ownStateShadowView().healthy).toBe(true); // ...while the TRANSPORT mirror is healthy (so the halt is latch 6, not the transport)
+        expect(submit.calls).toHaveLength(0); // posting halted by the §5.1 gate
+        expect(events.filter((e) => e.kind === 'stream-health-hold' && e.state === 'entered')).toHaveLength(1);
+      });
+
+      it('poll-only mode (subscribe: false) does NOT poll the indexer-lag probe', async () => {
+        const config = cfg({ ownState: { subscribe: false } }); // poll-only — the own-state gate is dormant
+        const adapter = createOspexAdapter(config);
+        vi.spyOn(adapter, 'listContests').mockResolvedValue([]);
+        const healthSpy = vi.spyOn(adapter, 'getOwnStateHealth').mockResolvedValue(mkHealth(0));
+        const runner = makeRunner({ config, adapter, maxTicks: 3 });
+        await runner.run();
+        expect(healthSpy).not.toHaveBeenCalled(); // checkIndexerLag is gated on ownState.subscribe
+        expect(runner.indexerLagDegradedForTest()).toBe(false);
       });
     });
   });

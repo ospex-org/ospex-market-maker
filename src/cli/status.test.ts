@@ -115,7 +115,7 @@ function adapterWithLivePositions(totals: PositionStatus['totals']): OspexAdapte
     approvals: { read: notStubbed('approvals.read') },
     health: { check: notStubbed('health.check') },
     odds: { snapshot: notStubbed('odds.snapshot'), subscribe: notStubbed('odds.subscribe') },
-    ownState: { subscribe: () => ({ unsubscribe: () => Promise.reject(new Error('fake.ownState.subscribe: not stubbed')) }) },
+    ownState: { subscribe: () => ({ unsubscribe: () => Promise.reject(new Error('fake.ownState.subscribe: not stubbed')) }), health: notStubbed('ownState.health') },
   };
   return new OspexAdapter(client, { chainId: 137, apiUrl: 'https://api.test' });
 }
@@ -145,7 +145,7 @@ function adapterWithLivePositionsThrowing(err: Error): OspexAdapter {
     approvals: { read: notStubbed('approvals.read') },
     health: { check: notStubbed('health.check') },
     odds: { snapshot: notStubbed('odds.snapshot'), subscribe: notStubbed('odds.subscribe') },
-    ownState: { subscribe: () => ({ unsubscribe: () => Promise.reject(new Error('fake.ownState.subscribe: not stubbed')) }) },
+    ownState: { subscribe: () => ({ unsubscribe: () => Promise.reject(new Error('fake.ownState.subscribe: not stubbed')) }), health: notStubbed('ownState.health') },
   };
   return new OspexAdapter(client, { chainId: 137, apiUrl: 'https://api.test' });
 }

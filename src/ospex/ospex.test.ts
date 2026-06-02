@@ -230,7 +230,7 @@ function makeFakeClient(overrides: DeepPartial<OspexClientLike> = {}): OspexClie
     approvals: { read: notStubbed('approvals.read'), ...overrides.approvals },
     health: { check: notStubbed('health.check'), ...overrides.health },
     odds: { snapshot: notStubbed('odds.snapshot'), subscribe: notStubbed('odds.subscribe'), ...overrides.odds },
-    ownState: { subscribe: () => ({ unsubscribe: () => Promise.reject(new Error('fake.ownState.subscribe: not stubbed in this test')) }), ...overrides.ownState },
+    ownState: { subscribe: () => ({ unsubscribe: () => Promise.reject(new Error('fake.ownState.subscribe: not stubbed in this test')) }), health: notStubbed('ownState.health'), ...overrides.ownState },
   };
 }
 

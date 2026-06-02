@@ -73,6 +73,7 @@ import {
   type OwnerStateSnapshot,
   type OwnerStateSubscribeHandlers,
   type OwnStateFrameMeta,
+  type OwnStateHealth,
   type OwnStateSubscribeOptions,
   type PositionLifecycle,
   type PositionStatus,
@@ -117,6 +118,7 @@ export type {
   OwnerStateSnapshot,
   OwnerStateSubscribeHandlers,
   OwnStateFrameMeta,
+  OwnStateHealth,
   OwnStateSubscribeOptions,
   PositionLifecycle,
   PositionStatus,
@@ -201,7 +203,7 @@ export type OspexClientLike = {
   approvals: Pick<OspexClient['approvals'], 'read'>;
   health: Pick<OspexClient['health'], 'check'>;
   odds: OspexClient['odds'];
-  ownState: Pick<OspexClient['ownState'], 'subscribe'>;
+  ownState: Pick<OspexClient['ownState'], 'subscribe' | 'health'>;
 };
 
 // ── write-method arg/result shapes (derived from the SDK — no deep imports) ───
@@ -378,6 +380,17 @@ export class OspexAdapter {
     handlers: OwnerStateSubscribeHandlers,
   ): Subscription {
     return this.client.ownState.subscribe(options, handlers);
+  }
+
+  /**
+   * Indexer-lag health probe (`GET /v1/health/own-state`, own-state SSE plan
+   * §5 latch 6). GLOBAL signal — no signer / token (indexer lag is
+   * wallet-independent). The runner polls this on `ownState.auditPollIntervalMs`
+   * and folds `indexerLagSeconds >= ownState.indexerLagMaxSeconds` into its
+   * composite own-state health gate. Pass-through — no field mapping.
+   */
+  getOwnStateHealth(): Promise<OwnStateHealth> {
+    return this.client.ownState.health();
   }
 
   // ── commitments ───────────────────────────────────────────────────────

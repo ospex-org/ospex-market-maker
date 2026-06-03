@@ -36,7 +36,7 @@ What works (Phase 1 read-only core + the Phase-2 dry-run shadow loop + the first
 
 What's **not** implemented yet (see `docs/DESIGN.md §14`):
 
-- **Unrealized P&L** — still ahead. Active positions marked to current fair value; requires `summary` to accept an `OspexAdapter` (a qualitative signature change). Realized P&L is wired. The `raiseMinNonce` bulk-invalidate is a future optimization for both `cancel-stale --authoritative` and the on-chain kill path (currently per-commitment).
+- **Unrealized P&L** — still ahead. Active positions marked to current fair value; requires `summary` to accept an `OspexAdapter` (a qualitative signature change). Realized P&L is wired. The `raiseMinNonce` bulk-invalidate is a future optimization for the on-chain cancel paths (currently all per-commitment).
 
 So: the entire CLI surface (`doctor`, `quote --dry-run`, `run --dry-run`, `run --live`, `cancel-stale`, `status`, `summary`) is wired and full-featured. `run --live` *executes* (submits + off-chain cancels + fill detection + position-status poll + boot-time auto-approve + daily POL gas-budget verdict + auto-settle + auto-claim + on-chain kill on shutdown), and `summary` now populates live-mode metrics including realized P&L. The strict DESIGN §14 Phase-3 code DoD is met; unrealized P&L from API marks is the remaining enhancement. Treat it as alpha until manually exercised end-to-end on a testnet — don't run against real funds yet.
 

@@ -6897,6 +6897,366 @@ describe('Runner — funding guard', () => {
   });
 });
 
+// ── §5.1 own-state-health active cancel-sweep (PR3b-ii, DESIGN §7) ────────────
+// While the §5.1 stream-health gate is holding WITH open exposure (the `high`-
+// severity hold), the runner actively pulls its visible quotes off the relay (and,
+// under `orders.cancelMode: onchain`, authoritatively cancels them) — the active
+// posture the high-severity hold documents, the slice after PR2a's posting halt.
+// The hold is tripped by a subscribe:true stream that opens but never becomes ready
+// (no SSE events → own-state unhealthy), so the seeded local book (still in
+// `this.state`, never replaced by an `onReady` baseline swap) carries the exposure.
+describe('Runner — §5.1 stream-health active cancel-sweep (PR3b-ii)', () => {
+  const MAKER = DEFAULT_FAKE_MAKER_ADDRESS as Hex;
+
+  /** Seed one matchable `visibleOpen` commitment so `computeOpenExposureWei6 > 0`, and return it. */
+  function seedOne(over: Partial<MakerCommitmentRecord> = {}): MakerCommitmentRecord {
+    const record = commitmentRecord({ hash: '0xsh', contestId: 'contest-sh', speculationId: 'spec-sh', makerSide: 'away', riskAmountWei6: '250000', filledRiskWei6: '0', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 10, updatedAtUnixSec: T0 - 10, ...over });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { [record.hash]: record } });
+    return record;
+  }
+
+  /** The `listOpenCommitments` fixture keeping a seeded record "live" through the audit poll. */
+  function openFixture(record: MakerCommitmentRecord): Commitment {
+    return orderbookEntry({
+      commitmentHash: record.hash, maker: MAKER, status: 'open', storedStatus: 'open', isLive: true,
+      riskAmount: record.riskAmountWei6, filledRiskAmount: record.filledRiskWei6,
+      remainingRiskAmount: (BigInt(record.riskAmountWei6) - BigInt(record.filledRiskWei6)).toString(),
+    });
+  }
+
+  function todayUTC(): string {
+    const d = new Date(T0 * 1000);
+    return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+  }
+  function cancelOnchainRecorder(gasUsed = 60_000n, effectiveGasPrice = 30_000_000_000n): { fn: OspexAdapter['cancelCommitmentOnchain']; calls: Hex[] } {
+    const calls: Hex[] = [];
+    return {
+      calls,
+      fn: (arg) => {
+        const hash = ('hash' in arg ? arg.hash : arg.signedCommitment.commitmentHash) as Hex;
+        calls.push(hash);
+        const receipt = { gasUsed, effectiveGasPrice } as unknown as CancelOnchainResult['receipt'];
+        return Promise.resolve({ txHash: '0xkilltx', receipt, commitmentHash: hash });
+      },
+    };
+  }
+
+  /** Spy `subscribeOwnState` so the stream OPENS but never fires `onReady` → own-state stays unhealthy → §5.1 hold. */
+  function holdOwnStateUnhealthy(adapter: OspexAdapter): void {
+    vi.spyOn(adapter, 'subscribeOwnState').mockImplementation((() => ({ unsubscribe: () => Promise.resolve() })) as unknown as OspexAdapter['subscribeOwnState']);
+  }
+
+  it('offchain (default): high-severity hold pulls visible quotes off the relay (soft-cancel reason "stream-health"), no on-chain cancel; exposure still counted (softCancelled rides to expiry)', async () => {
+    const record = seedOne();
+    const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: true } }); // orders.cancelMode defaults to 'offchain'
+    const offchainCancels: Hex[] = [];
+    const cancelOnchain = cancelOnchainRecorder();
+    const submit = submitRecorder();
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([contestView({ contestId: '1234' })]),
+      { submitCommitment: submit.fn, cancelCommitmentOffchain: (h) => { offchainCancels.push(h); return Promise.resolve(); }, cancelCommitmentOnchain: cancelOnchain.fn },
+      undefined, undefined,
+      { listOpenCommitments: () => Promise.resolve([openFixture(record)]) },
+    );
+    holdOwnStateUnhealthy(adapter);
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    const events = readEvents();
+    const entered = events.filter((e) => e.kind === 'stream-health-hold' && e.state === 'entered');
+    expect(entered).toHaveLength(1);
+    expect(entered[0]).toMatchObject({ severity: 'high', exposureWei6: '250000' }); // exposure computed at the enter edge, before the pull
+    expect(offchainCancels).toEqual(['0xsh']); // pulled off the relay
+    expect(cancelOnchain.calls).toEqual([]); // offchain mode → no authoritative cancel
+    const sc = events.filter((e) => e.kind === 'soft-cancel' && e.reason === 'stream-health');
+    expect(sc).toHaveLength(1);
+    expect(sc[0]).toMatchObject({ commitmentHash: '0xsh', reason: 'stream-health' });
+    expect(submit.calls).toHaveLength(0); // §5.1 early-out halted NEW posting too — no re-quote over the pulled side
+    // Pulled, but the signed payload stays matchable on chain → still `softCancelled`, still counted.
+    expect(StateStore.at(stateDir).load().state.commitments['0xsh']?.lifecycle).toBe('softCancelled');
+  });
+
+  it('onchain: soft-cancels then authoritatively cancels on chain → authoritativelyInvalidated (drops from exposure)', async () => {
+    const record = seedOne();
+    const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: true }, orders: { cancelMode: 'onchain' }, gas: { maxDailyGasPOL: 1, emergencyReservePOL: 0.2 } });
+    const offchainCancels: Hex[] = [];
+    const cancelOnchain = cancelOnchainRecorder();
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]),
+      { cancelCommitmentOffchain: (h) => { offchainCancels.push(h); return Promise.resolve(); }, cancelCommitmentOnchain: cancelOnchain.fn },
+      undefined, undefined,
+      { listOpenCommitments: () => Promise.resolve([openFixture(record)]) },
+    );
+    holdOwnStateUnhealthy(adapter);
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    const events = readEvents();
+    expect(offchainCancels).toEqual(['0xsh']); // off-chain pull first
+    expect(cancelOnchain.calls).toEqual(['0xsh']); // then authoritative cancel
+    expect(events.some((e) => e.kind === 'onchain-cancel' && e.commitmentHash === '0xsh')).toBe(true);
+    expect(StateStore.at(stateDir).load().state.commitments['0xsh']?.lifecycle).toBe('authoritativelyInvalidated');
+  });
+
+  it('no open exposure (low-severity hold): the sweep is a no-op — no off-chain pull, no on-chain cancel, severity LOW', async () => {
+    StateStore.at(stateDir).flush(emptyMakerState()); // hold trips (unhealthy) but exposure is 0
+    const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: true }, orders: { cancelMode: 'onchain' } });
+    const offchainCancels: Hex[] = [];
+    const cancelOnchain = cancelOnchainRecorder();
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]),
+      { cancelCommitmentOffchain: (h) => { offchainCancels.push(h); return Promise.resolve(); }, cancelCommitmentOnchain: cancelOnchain.fn },
+    );
+    holdOwnStateUnhealthy(adapter);
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    const events = readEvents();
+    const entered = events.filter((e) => e.kind === 'stream-health-hold' && e.state === 'entered');
+    expect(entered).toHaveLength(1);
+    expect(entered[0]).toMatchObject({ severity: 'low', exposureWei6: '0' });
+    expect(offchainCancels).toEqual([]);
+    expect(cancelOnchain.calls).toEqual([]);
+    expect(events.some((e) => e.kind === 'soft-cancel')).toBe(false);
+  });
+
+  it('dry-run + subscribe: the §5.1 gate is dormant → no hold, no sweep, no cancel even with exposure', async () => {
+    const record = seedOne();
+    const config = cfg({ mode: { dryRun: true }, ownState: { subscribe: true }, orders: { cancelMode: 'onchain' } });
+    const offchainCancels: Hex[] = [];
+    const cancelOnchain = cancelOnchainRecorder();
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]),
+      { cancelCommitmentOffchain: (h) => { offchainCancels.push(h); return Promise.resolve(); }, cancelCommitmentOnchain: cancelOnchain.fn },
+      undefined, undefined,
+      { listOpenCommitments: () => Promise.resolve([openFixture(record)]) },
+    );
+    holdOwnStateUnhealthy(adapter);
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    const events = readEvents();
+    expect(events.some((e) => e.kind === 'stream-health-hold')).toBe(false); // dormant in dry-run
+    expect(offchainCancels).toEqual([]);
+    expect(cancelOnchain.calls).toEqual([]);
+    expect(events.some((e) => e.kind === 'soft-cancel' || e.kind === 'would-soft-cancel')).toBe(false);
+  });
+
+  it('onchain + gas budget exhausted: the gas-denial candidate surfaces ONCE per hold episode (not per tick), the record is never authoritatively cancelled', async () => {
+    const record = seedOne();
+    const POL = 10n ** 18n;
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { [record.hash]: record }, dailyCounters: { [todayUTC()]: { gasPolWei: POL.toString(), feeUsdcWei6: '0' } } }); // today's spend already at the full cap
+    const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: true }, orders: { cancelMode: 'onchain' }, gas: { maxDailyGasPOL: 1, emergencyReservePOL: 0 } });
+    const cancelOnchain = cancelOnchainRecorder();
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]),
+      { cancelCommitmentOffchain: () => Promise.resolve(), cancelCommitmentOnchain: cancelOnchain.fn },
+      undefined, undefined,
+      {
+        listOpenCommitments: () => Promise.resolve([openFixture(record)]),
+        getCommitment: (h) => (h === '0xsh' ? Promise.resolve(openFixture(record)) : Promise.reject(new Error('unknown hash'))), // tick-2 soft-cancelled-fill probe (audit)
+      },
+    );
+    holdOwnStateUnhealthy(adapter);
+    await makeRunner({ config, adapter, maxTicks: 2 }).run(); // two held ticks — the warning must fire once, not per tick
+    const events = readEvents();
+    const denied = events.filter((e) => e.kind === 'candidate' && e.skipReason === 'gas-budget-blocks-onchain-cancel');
+    expect(denied).toHaveLength(1); // warn-once per episode (break + streamHealthOnchainGasDeniedWarned)
+    expect(cancelOnchain.calls).toEqual([]); // gas gate fired before any write
+    expect(StateStore.at(stateDir).load().state.commitments['0xsh']?.lifecycle).not.toBe('authoritativelyInvalidated');
+  });
+
+  it('onchain + missing-legacy + visibleOpen: the M6/A PRE-PASS on-chain { hash } cancel runs BEFORE the off-chain pull, the off-chain DELETE is never called on the record, no BLOCKED telemetry', async () => {
+    const record: MakerCommitmentRecord = commitmentRecord({ hash: '0xsh', contestId: 'contest-sh', speculationId: 'spec-sh', makerSide: 'away', riskAmountWei6: '250000', filledRiskWei6: '0', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 10, updatedAtUnixSec: T0 - 10, signedPayloadStatus: 'missing-legacy' });
+    delete record.signedPayload; // missing-legacy MUST have no signedPayload (the validator rejects the inconsistency)
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { [record.hash]: record } });
+    const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: true }, orders: { cancelMode: 'onchain' }, gas: { maxDailyGasPOL: 1, emergencyReservePOL: 0.2 } });
+    const offchainCancels: Hex[] = [];
+    const cancelOnchain = cancelOnchainRecorder();
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]),
+      { cancelCommitmentOffchain: (h) => { offchainCancels.push(h); return Promise.resolve(); }, cancelCommitmentOnchain: cancelOnchain.fn },
+      undefined, undefined,
+      { listOpenCommitments: () => Promise.resolve([openFixture(record)]) },
+    );
+    holdOwnStateUnhealthy(adapter);
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    expect(offchainCancels).toEqual([]); // off-chain pull SKIPPED (touched-by-pre-pass set prevents the brick-into-BLOCKED)
+    expect(cancelOnchain.calls).toEqual(['0xsh']); // pre-pass authoritatively invalidated it
+    expect(StateStore.at(stateDir).load().state.commitments['0xsh']?.lifecycle).toBe('authoritativelyInvalidated');
+    expect(readEvents().some((e) => e.kind === 'cancel-blocked-missing-payload')).toBe(false);
+  });
+
+  it('offchain: a transient off-chain pull failure (cancelCommitmentOffchain throws) leaves the record visibleOpen for the next held tick; the second tick lands the pull', async () => {
+    const record = seedOne();
+    const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: true } });
+    let attempts = 0;
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]),
+      { cancelCommitmentOffchain: () => { attempts += 1; return attempts === 1 ? Promise.reject(new Error('relay 503')) : Promise.resolve(); } },
+      undefined, undefined,
+      {
+        listOpenCommitments: () => Promise.resolve([openFixture(record)]),
+        getCommitment: (h) => (h === '0xsh' ? Promise.resolve(openFixture(record)) : Promise.reject(new Error('unknown hash'))), // (only reached if 0xsh ever softCancels mid-run)
+      },
+    );
+    holdOwnStateUnhealthy(adapter);
+    await makeRunner({ config, adapter, maxTicks: 2 }).run();
+    expect(attempts).toBe(2); // retried on the second held tick
+    expect(StateStore.at(stateDir).load().state.commitments['0xsh']?.lifecycle).toBe('softCancelled'); // the second pull landed
+    expect(readEvents().some((e) => e.kind === 'error' && e.phase === 'cancel')).toBe(true); // the first throw was logged
+  });
+
+  it('coexists with the funding sweep (both onchain): a record cancelled by the funding sweep is NOT double-cancelled by the stream-health sweep', async () => {
+    const record = seedOne();
+    const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: true }, orders: { cancelMode: 'onchain' }, fundingGuard: { underfundedCancelMode: 'onchain' }, gas: { maxDailyGasPOL: 1, emergencyReservePOL: 0.2 } });
+    const cancelOnchain = cancelOnchainRecorder();
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]),
+      { cancelCommitmentOffchain: () => Promise.resolve(), cancelCommitmentOnchain: cancelOnchain.fn },
+      undefined, undefined,
+      { listOpenCommitments: () => Promise.resolve([openFixture(record)]), readBalances: (owner: Hex) => Promise.resolve({ owner, chainId: 137, native: 10n ** 18n, usdc: 0n, link: 0n, usdcAddress: '0xusdc' as Hex, linkAddress: '0xlink' as Hex }) }, // 0 USDC → fundingHold too
+    );
+    holdOwnStateUnhealthy(adapter);
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    const events = readEvents();
+    expect(events.some((e) => e.kind === 'funding-hold' && e.state === 'entered')).toBe(true);
+    expect(events.filter((e) => e.kind === 'stream-health-hold' && e.state === 'entered')).toHaveLength(1);
+    // The funding sweep (runs first this tick) cancels the only exposure → authoritativelyInvalidated.
+    // The stream-health sweep then sees exposure 0 and early-returns; either way the record is cancelled
+    // exactly ONCE. (The per-record `authoritativelyInvalidated` skip in the on-chain leg is exercised
+    // directly by the 'already-invalidated record is skipped' test below, where exposure stays > 0.)
+    expect(cancelOnchain.calls).toEqual(['0xsh']);
+    expect(StateStore.at(stateDir).load().state.commitments['0xsh']?.lifecycle).toBe('authoritativelyInvalidated');
+  });
+
+  it('onchain + TWO missing-legacy + visibleOpen + pre-pass gas-denied → BOTH stay visibleOpen (UPFRONT touched-set covers the later candidate), off-chain pull hides neither', async () => {
+    // The skip-set-pre-population regression ([[feedback_skip_set_pre_population]] / Hermes #63 r2):
+    // touchedByPrePass MUST be populated with ALL candidates before the cancel loop, so a gas-denied
+    // break on the FIRST candidate still protects the SECOND from the off-chain pull (which would
+    // flip book_visible:false → brick it into BLOCKED). Mirror of the funding-sweep test.
+    const a: MakerCommitmentRecord = commitmentRecord({ hash: '0xsh-a', contestId: 'contest-a', speculationId: 'spec-a', makerSide: 'away', riskAmountWei6: '250000', filledRiskWei6: '0', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 10, updatedAtUnixSec: T0 - 10, signedPayloadStatus: 'missing-legacy' });
+    delete a.signedPayload;
+    const b: MakerCommitmentRecord = commitmentRecord({ hash: '0xsh-b', contestId: 'contest-b', speculationId: 'spec-b', makerSide: 'home', riskAmountWei6: '250000', filledRiskWei6: '0', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 10, updatedAtUnixSec: T0 - 10, signedPayloadStatus: 'missing-legacy' });
+    delete b.signedPayload;
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { [a.hash]: a, [b.hash]: b }, dailyCounters: { [todayUTC()]: { gasPolWei: (10n ** 18n).toString(), feeUsdcWei6: '0' } } }); // cap exhausted → canSpendGas denies on the FIRST pre-pass candidate
+    const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: true }, orders: { cancelMode: 'onchain' }, gas: { maxDailyGasPOL: 1, emergencyReservePOL: 0 } });
+    const offchainCancels: Hex[] = [];
+    const cancelOnchain = cancelOnchainRecorder();
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]),
+      { cancelCommitmentOffchain: (h) => { offchainCancels.push(h); return Promise.resolve(); }, cancelCommitmentOnchain: cancelOnchain.fn },
+      undefined, undefined,
+      { listOpenCommitments: () => Promise.resolve([openFixture(a), openFixture(b)]) },
+    );
+    holdOwnStateUnhealthy(adapter);
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    expect(cancelOnchain.calls).toEqual([]); // pre-pass denied on the first → break; no on-chain cancel landed
+    expect(offchainCancels).toEqual([]); // ← THE KEY ASSERTION: neither record was off-chain-hidden (touched-set covered the later candidate)
+    const reloaded = StateStore.at(stateDir).load().state;
+    expect(reloaded.commitments[a.hash]?.lifecycle).toBe('visibleOpen');
+    expect(reloaded.commitments[b.hash]?.lifecycle).toBe('visibleOpen'); // not bricked into BLOCKED
+  });
+
+  it('onchain: an already-`authoritativelyInvalidated` record is NOT re-cancelled while a live record IS (the on-chain leg lifecycle skip, exposure kept > 0)', async () => {
+    const inv: MakerCommitmentRecord = commitmentRecord({ hash: '0xinv', contestId: 'contest-inv', speculationId: 'spec-inv', makerSide: 'away', riskAmountWei6: '250000', filledRiskWei6: '0', lifecycle: 'authoritativelyInvalidated', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 10, updatedAtUnixSec: T0 - 10 });
+    const live: MakerCommitmentRecord = commitmentRecord({ hash: '0xlive', contestId: 'contest-live', speculationId: 'spec-live', makerSide: 'home', riskAmountWei6: '250000', filledRiskWei6: '0', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 10, updatedAtUnixSec: T0 - 10 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { [inv.hash]: inv, [live.hash]: live } });
+    const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: true }, orders: { cancelMode: 'onchain' }, gas: { maxDailyGasPOL: 1, emergencyReservePOL: 0.2 } });
+    const cancelOnchain = cancelOnchainRecorder();
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]),
+      { cancelCommitmentOffchain: () => Promise.resolve(), cancelCommitmentOnchain: cancelOnchain.fn },
+      undefined, undefined,
+      { listOpenCommitments: () => Promise.resolve([openFixture(live)]) }, // only the live one is on the API book
+    );
+    holdOwnStateUnhealthy(adapter);
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    expect(cancelOnchain.calls).toEqual(['0xlive']); // 0xinv skipped by the lifecycle filter; exposure stayed > 0 (0xlive) so the sweep did NOT early-return
+  });
+
+  it('subscribe:false (poll-only backout): the sweep is DORMANT — no hold, no cancel, even live with open exposure', async () => {
+    const record = seedOne();
+    const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: false }, orders: { cancelMode: 'onchain' } }); // poll-canonical (the default merge posture)
+    const offchainCancels: Hex[] = [];
+    const cancelOnchain = cancelOnchainRecorder();
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]),
+      { cancelCommitmentOffchain: (h) => { offchainCancels.push(h); return Promise.resolve(); }, cancelCommitmentOnchain: cancelOnchain.fn },
+      undefined, undefined,
+      { listOpenCommitments: () => Promise.resolve([openFixture(record)]) },
+    ); // no SSE subscription at all in poll-only mode
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    const events = readEvents();
+    expect(events.some((e) => e.kind === 'stream-health-hold')).toBe(false); // §5.1 gate dormant when subscribe:false
+    expect(offchainCancels).toEqual([]);
+    expect(cancelOnchain.calls).toEqual([]);
+    expect(events.some((e) => e.kind === 'soft-cancel' && e.reason === 'stream-health')).toBe(false);
+    expect(StateStore.at(stateDir).load().state.commitments['0xsh']?.lifecycle).toBe('visibleOpen'); // untouched — byte-identical backout
+  });
+
+  it('offchain: a partiallyFilled remainder is NOT pulled (rides to expiry) and emits no partial-remainder-retained', async () => {
+    const record = seedOne({ hash: '0xpf', lifecycle: 'partiallyFilled', riskAmountWei6: '250000', filledRiskWei6: '100000' });
+    const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: true } }); // offchain default
+    const offchainCancels: Hex[] = [];
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]),
+      { cancelCommitmentOffchain: (h) => { offchainCancels.push(h); return Promise.resolve(); } },
+      undefined, undefined,
+      { listOpenCommitments: () => Promise.resolve([openFixture(record)]) },
+    );
+    holdOwnStateUnhealthy(adapter);
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    const events = readEvents();
+    expect(offchainCancels).toEqual([]); // the API rejects an off-chain DELETE once matched — never pulled
+    expect(events.some((e) => e.kind === 'candidate' && e.skipReason === 'partial-remainder-retained')).toBe(false); // the sweep emits no retained-partial (unlike the reconcile path)
+    expect(events.some((e) => e.kind === 'error' && e.phase === 'cancel')).toBe(false); // not even attempted (no NonVisibleOpenSoftCancel)
+    expect(StateStore.at(stateDir).load().state.commitments['0xpf']?.lifecycle).toBe('partiallyFilled'); // rides to expiry
+  });
+
+  it('onchain: a partiallyFilled remainder IS authoritatively cancelled on chain → authoritativelyInvalidated (never the off-chain DELETE)', async () => {
+    const record = seedOne({ hash: '0xpf', lifecycle: 'partiallyFilled', riskAmountWei6: '250000', filledRiskWei6: '100000' });
+    const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: true }, orders: { cancelMode: 'onchain' }, gas: { maxDailyGasPOL: 1, emergencyReservePOL: 0.2 } });
+    const offchainCancels: Hex[] = [];
+    const cancelOnchain = cancelOnchainRecorder();
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]),
+      { cancelCommitmentOffchain: (h) => { offchainCancels.push(h); return Promise.resolve(); }, cancelCommitmentOnchain: cancelOnchain.fn },
+      undefined, undefined,
+      { listOpenCommitments: () => Promise.resolve([openFixture(record)]) },
+    );
+    holdOwnStateUnhealthy(adapter);
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    expect(offchainCancels).toEqual([]); // partiallyFilled is never off-chain-pulled (409 COMMITMENT_MATCHED)
+    expect(cancelOnchain.calls).toEqual(['0xpf']); // authoritative on-chain cancel
+    expect(StateStore.at(stateDir).load().state.commitments['0xpf']?.lifecycle).toBe('authoritativelyInvalidated');
+  });
+
+  it('onchain: a transient on-chain cancel failure (adapter throw) does NOT break the sweep — a later record still cancels; the throw is logged, no gas-denied candidate', async () => {
+    const a = commitmentRecord({ hash: '0xa', contestId: 'contest-a', speculationId: 'spec-a', makerSide: 'away', riskAmountWei6: '250000', filledRiskWei6: '0', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 10, updatedAtUnixSec: T0 - 10 });
+    const b = commitmentRecord({ hash: '0xb', contestId: 'contest-b', speculationId: 'spec-b', makerSide: 'home', riskAmountWei6: '250000', filledRiskWei6: '0', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 10, updatedAtUnixSec: T0 - 10 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { [a.hash]: a, [b.hash]: b } });
+    const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: true }, orders: { cancelMode: 'onchain' }, gas: { maxDailyGasPOL: 1, emergencyReservePOL: 0.2 } });
+    const attempted: Hex[] = [];
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]),
+      {
+        cancelCommitmentOffchain: () => Promise.resolve(),
+        cancelCommitmentOnchain: (arg) => {
+          const h = ('hash' in arg ? arg.hash : arg.signedCommitment.commitmentHash) as Hex;
+          attempted.push(h);
+          if (h === '0xa') return Promise.reject(new Error('RPC down')); // first record's on-chain cancel throws
+          const receipt = { gasUsed: 60_000n, effectiveGasPrice: 30_000_000_000n } as unknown as CancelOnchainResult['receipt'];
+          return Promise.resolve({ txHash: '0xtx', receipt, commitmentHash: h });
+        },
+      },
+      undefined, undefined,
+      { listOpenCommitments: () => Promise.resolve([openFixture(a), openFixture(b)]) },
+    );
+    holdOwnStateUnhealthy(adapter);
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    expect(attempted).toEqual(expect.arrayContaining(['0xa', '0xb'])); // a transient throw on 0xa did NOT break the loop — 0xb was still attempted
+    const reloaded = StateStore.at(stateDir).load().state;
+    expect(reloaded.commitments['0xb']?.lifecycle).toBe('authoritativelyInvalidated'); // 0xb landed
+    expect(reloaded.commitments['0xa']?.lifecycle).toBe('softCancelled'); // 0xa's on-chain throw left it at the off-chain-pulled lifecycle, retried next held tick
+    const events = readEvents();
+    expect(events.some((e) => e.kind === 'error' && e.phase === 'onchain-cancel')).toBe(true); // the throw was logged
+    expect(events.some((e) => e.kind === 'candidate' && e.skipReason === 'gas-budget-blocks-onchain-cancel')).toBe(false); // a throw is NOT a gas denial
+  });
+});
+
 describe('computeOpenExposureWei6 — terminal positions carry no live exposure', () => {
   const NOW = 1_900_000_000;
   function posRecord(status: MakerState['positions'][string]['status'], riskAmountWei6: string, speculationId: string): MakerState['positions'][string] {

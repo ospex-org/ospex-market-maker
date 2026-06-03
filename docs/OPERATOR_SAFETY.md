@@ -29,6 +29,18 @@ A commitment's stake is pulled from your wallet **when it's matched**, not when 
 - It **fails closed**: if the balance/allowance read itself fails, the MM enters the hold rather than risk posting commitments it can't back (`failClosedOnReadError: true`, the default).
 - This is an *advisory, time-sensitive* guard, not an escrow — funding can still move between the check and a fill. The real protection against unbacked exposure is keeping your wallet funded and using short expiries (see below).
 
+## Own-state-health guard — auto-cancel on a degraded stream
+
+This applies **only when `ownState.subscribe: true`** (the own-state SSE stream is opted in). With the default `subscribe: false` it is entirely dormant.
+
+When the MM subscribes to its own-state stream, that stream becomes the source of truth for its commitments, fills, and positions. If the stream degrades — it goes silent, overflows, lags the indexer, fails to authenticate, or diverges from the polled view — the MM can no longer trust its own book, so it **stops posting new quotes** (a `stream-health-hold` telemetry event records it). If there is open exposure when that happens (a `high`-severity hold), the MM also **actively cancels its existing quotes** so no new fills land against a book it can't see:
+
+- It pulls every still-matchable `visibleOpen` quote off the relay (gasless — but, like the funding guard, the signed payloads stay matchable on chain until expiry, so the exposure persists until then).
+- Under **`orders.cancelMode: onchain`** it *also* authoritatively cancels them on chain — this **spends POL gas** (gas-gated, and it will **not** touch your emergency reserve), and is the only mode that actually clears the exposure.
+- There is **no `none` opt-out** (unlike the funding guard): a degraded own-state view is treated as a safety event, and pulling your relay quotes is the minimum response. To avoid the on-chain gas spend, leave `orders.cancelMode` at its default `offchain`.
+
+So before you enable `ownState.subscribe: true` with `orders.cancelMode: onchain`, know that a flaky stream can trigger automatic, gas-spending on-chain cancels. Keep POL funded, and watch for `stream-health-hold` / `onchain-cancel` telemetry.
+
 ## Dry-run first
 
 `mode.dryRun: true` is the default. Run `ospex-mm run --dry-run` for a meaningful window before going live. The MM does everything except post — it logs what it *would* submit/cancel/replace, runs the risk engine, and measures quote competitiveness against the visible order book. Read the output:

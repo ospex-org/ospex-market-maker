@@ -119,6 +119,9 @@ orders:
                                     #   "onchain" — authoritatively cancelCommitment the remainder on chain (costs POL gas,
                                     #     gas-gated WITHOUT the emergency reserve), then re-quote the freed side. Use this for
                                     #     long-lived / match-time quotes where a remainder would otherwise block the side for hours.
+                                    # ALSO governs the §5.1 own-state-health active cancel-sweep (when ownState.subscribe:true):
+                                    #   on a high-severity stream-health hold the MM pulls its quotes off the relay ("offchain")
+                                    #   and, under "onchain", authoritatively cancels them too. No "none" opt-out there.
 
 fundingGuard:                       # solvency guard (DESIGN §6): halt NEW posting when the wallet can no longer back its
                                     #   outstanding fill obligations. funding = min(wallet USDC, PositionModule allowance);

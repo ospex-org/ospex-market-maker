@@ -407,6 +407,18 @@ export class Runner {
   private fundingOnchainGasDeniedWarned = false;
 
   /**
+   * Stream-health guard (§5.1, PR3b-ii): under `orders.cancelMode: onchain`, whether the
+   * active cancel-sweep ({@link streamHealthCancelSweep}) has already emitted a
+   * `gas-budget-blocks-onchain-cancel` candidate for the *current* own-state-health hold
+   * episode — so a sustained gas shortfall doesn't spam the log every tick (same warn-once
+   * discipline + BREAK-on-first-denial rationale as {@link fundingOnchainGasDeniedWarned}).
+   * Reset to `false` on the hold-CLEAR edge (in {@link updateStreamHealthHold}) and on the
+   * first cancel that lands within an episode. Tracked SEPARATELY from the funding flag: the
+   * two holds can co-occur (underfunded AND degraded own-state) but warn independently.
+   */
+  private streamHealthOnchainGasDeniedWarned = false;
+
+  /**
    * Wakeable-sleep primitive (Phase 2 PR3 — own-state-sse-plan §2.5.1). PR4's
    * SSE handlers will call `wake()` when an own-state event arrives; the runner
    * loop replaces its straight `deps.sleep` with a `Promise.race` against this
@@ -958,6 +970,130 @@ export class Runner {
     }
   }
 
+  /**
+   * Own-state-health active-cancel response (§5.1, PR3b-ii, DESIGN §7). Runs each live
+   * tick while the §5.1 {@link streamHealthHolding} gate is active (degraded own-state
+   * SSE view — see {@link updateStreamHealthHold}) AND there is open exposure to protect
+   * ({@link computeOpenExposureWei6} > 0, i.e. the `high`-severity hold). While our own
+   * commitment/fill/position view is untrustworthy the MM must not let NEW fills land
+   * against a book it can't observe: it pulls its still-matchable quotes off the relay
+   * (and, under `orders.cancelMode: onchain`, authoritatively cancels them on chain).
+   * This is the active-cancel posture the high-severity `stream-health-hold` documents;
+   * PR2a only halted NEW posting (§5.1 early-out), letting existing quotes ride.
+   *
+   * Two-leg shape mirrors {@link fundingCancelSweep} exactly, keyed off
+   * `orders.cancelMode` instead of `fundingGuard.underfundedCancelMode`:
+   *
+   *   - `offchain` (default) — pull every still-matchable `visibleOpen` quote off the
+   *                 relay (gasless `cancelCommitmentOffchain` → `softCancelled`, reason
+   *                 `'stream-health'`). Visibility-only: the signed payload stays
+   *                 matchable on chain until expiry, so the exposure — and the hold —
+   *                 persist until then. There is no `none` opt-out (unlike the funding
+   *                 guard): a degraded own-state view is a safety event, and pulling the
+   *                 relay quotes is the minimum response — it can't make things worse.
+   *   - `onchain`  — the off-chain pull above, THEN an authoritative on-chain
+   *                 `cancelCommitment` for every still-matchable non-terminal record →
+   *                 `authoritativelyInvalidated`, which DROPS it from the exposure. The
+   *                 only mode that actively shrinks the at-risk USDC. Gas-gated via
+   *                 {@link onchainCancelCommitment} (`mayUseReserve: false` — an
+   *                 automatic guard must not burn the emergency reserve); a gas denial
+   *                 emits ONE `gas-budget-blocks-onchain-cancel` candidate per hold
+   *                 episode (see {@link streamHealthOnchainGasDeniedWarned}) and stops
+   *                 the sweep for the tick.
+   *
+   * Eligibility mirrors {@link computeOpenExposureWei6} / {@link fundingCancelSweep}:
+   * non-terminal lifecycle, not past `expiry + expiryReleaseGraceSeconds`. Global scan of
+   * `state.commitments` (a matchable commitment's contest may no longer be tracked, yet its
+   * latent risk still counts). Live-only — the §5.1 gate is dry-run / poll-only-DORMANT, the
+   * caller gates on the live-only {@link streamHealthHolding}, and the per-record primitives
+   * never write to chain in dry-run. Per-record failures self-heal (a thrown off-chain pull
+   * leaves the record `visibleOpen`, a thrown on-chain cancel leaves it as-is), retried on the
+   * next held tick. Includes the same M6/A pre-pass as {@link fundingCancelSweep} (Hermes #63):
+   * for `onchain`, `missing-legacy` + `visibleOpen` records are on-chain-cancelled BEFORE the
+   * off-chain pull (which would otherwise flip `book_visible: false` and brick them into
+   * BLOCKED), with `touchedByPrePass` pre-populated UPFRONT so a gas-denied break can't strand
+   * later candidates ([[skip-set pre-population]]).
+   *
+   * `now` is the clock sample {@link tick} feeds to BOTH {@link updateStreamHealthHold} and this
+   * sweep in the same tick block, so the hold's severity and the sweep act on one exposure snapshot.
+   * (It is NOT a tick-wide clock — `reconcileMarkets` samples its own `now` afterward, and that
+   * sample can legitimately differ across the sweep's awaited cancels.)
+   *
+   * Audit interaction (source flip): this mutates `this.state` (the SSE-canonical book under
+   * `subscribe:true`) mid-tick, AFTER `detectFills` reseeded `auditState` from the pre-sweep book.
+   * So on a tick where the hold is driven by a POSTING-only latch (indexer-lag / audit-divergence /
+   * recovery hold) while transport is instant-healthy — the one case {@link runAuditComparator}
+   * also runs — the comparator can momentarily see canonical `softCancelled` vs audit `visibleOpen`.
+   * That is a single-tick transient: the next cycle's `reseedAuditState` clones the post-sweep book
+   * (so audit converges), the API stops listing the off-chain-pulled record (book-hidden), and the
+   * divergence-tolerance window never elapses — so no `divergence` is emitted and `auditDivergenceUnresolved`
+   * is not set. Same property as the pre-existing {@link fundingCancelSweep}; relied on, not enforced.
+   */
+  private async streamHealthCancelSweep(now: number): Promise<void> {
+    if (this.config.mode.dryRun || this.makerAddress === null) return; // live-only invariant (caller gates on streamHealthHolding, only ever set live)
+    const mode = this.config.orders.cancelMode;
+    const grace = this.config.orders.expiryReleaseGraceSeconds;
+    if (computeOpenExposureWei6(this.state, now, grace) <= 0n) return; // nothing matchable to protect — a low-severity hold needs no sweep
+
+    // ── M6/A PRE-PASS (mirrors fundingCancelSweep / Hermes #63 round 2) ────────
+    // For `cancelMode: onchain` only: pre-populate `touchedByPrePass` with ALL
+    // missing-legacy + visibleOpen candidates UPFRONT so a gas-denied break can't
+    // strand later candidates without their off-chain-skip protection (which would
+    // brick them into BLOCKED via the off-chain DELETE → book_visible:false path).
+    const eligibleCandidates = Object.values(this.state.commitments).filter(
+      (r) => r.signedPayloadStatus === 'missing-legacy' && r.lifecycle === 'visibleOpen' && !isExpiredForRelease(r.expiryUnixSec, now, grace),
+    );
+    const touchedByPrePass = new Set<string>(eligibleCandidates.map((r) => r.hash));
+    if (mode === 'onchain') {
+      for (const r of eligibleCandidates) {
+        const result = await this.onchainCancelCommitment(r, now, {
+          emitGasDenied: !this.streamHealthOnchainGasDeniedWarned,
+          overrideDispatch: { kind: 'use-hash', hash: r.hash as Hex },
+        });
+        if (result === 'gas-denied') {
+          this.streamHealthOnchainGasDeniedWarned = true;
+          break; // today's spend only grows — every later attempt would deny too; the touched-set above already protects them
+        }
+        if (result === 'cancelled') this.streamHealthOnchainGasDeniedWarned = false;
+        // 'transient-failure': adapter threw — record left visibleOpen + in `touchedByPrePass`,
+        // so the off-chain loop skips and the regular on-chain leg below retries via dispatch.
+      }
+    } else {
+      touchedByPrePass.clear(); // offchain mode never authoritatively cancels — let the pull hide missing-legacy records normally
+    }
+
+    // ── off-chain pull (both `offchain` and `onchain` modes) ───────────────────
+    let softCancelled = 0;
+    for (const r of Object.values(this.state.commitments)) {
+      if (touchedByPrePass.has(r.hash)) continue; // M6/A pre-pass already tried — never off-chain-hide these
+      if (r.lifecycle !== 'visibleOpen') continue;
+      if (isExpiredForRelease(r.expiryUnixSec, now, grace)) continue; // dead on chain — not matchable; ageOut handles it
+      if (await this.softCancelRecord(r, 'stream-health', now)) softCancelled += 1;
+    }
+
+    // ── on-chain authoritative cancel (`onchain` mode only) ────────────────────
+    let onchainCancelled = 0;
+    if (mode === 'onchain') {
+      for (const r of Object.values(this.state.commitments)) {
+        if (r.lifecycle !== 'visibleOpen' && r.lifecycle !== 'softCancelled' && r.lifecycle !== 'partiallyFilled') continue;
+        if (isExpiredForRelease(r.expiryUnixSec, now, grace)) continue;
+        const result = await this.onchainCancelCommitment(r, now, { emitGasDenied: !this.streamHealthOnchainGasDeniedWarned });
+        if (result === 'gas-denied') {
+          this.streamHealthOnchainGasDeniedWarned = true; // warned once for this hold episode
+          break; // today's spend only grows — the rest would deny identically; retry next tick (budget frees at the UTC daily reset)
+        }
+        if (result === 'cancelled') {
+          this.streamHealthOnchainGasDeniedWarned = false; // a cancel landed — re-warn if a later denial occurs this episode
+          onchainCancelled += 1;
+        }
+      }
+    }
+
+    if (softCancelled > 0 || onchainCancelled > 0) {
+      this.deps.log(`[runner] stream-health cancel sweep (mode=${mode}): soft-cancelled ${softCancelled} visible quote(s), on-chain-cancelled ${onchainCancelled}`);
+    }
+  }
+
   /** True once a shutdown has been requested (kill-switch file or an OS signal). */
   private get stopRequested(): boolean {
     return this.shutdownReason !== null;
@@ -1455,6 +1591,16 @@ export class Runner {
             if (!this.config.mode.dryRun) await this.checkFunding(); // funding guard (C1a) — sets fundingHold before the posting decision below
             if (!this.config.mode.dryRun && this.fundingHold) await this.fundingCancelSweep(); // funding guard (C1b) — actively pull/cancel existing quotes while underfunded, per underfundedCancelMode (reconcileMarkets below is gated by fundingHold anyway)
             if (this.config.ownState.subscribe) await this.checkIndexerLag(); // §5 latch 6 (PR2c-i) — poll own-state health, set indexerLagDegraded BEFORE reconcileMarkets' §5.1 posting gate reads it (subscribe-gated, not dryRun: runs for observability in dry-run+subscribe, gate dormant there)
+            // §5.1 active cancel-sweep (PR3b-ii) — derive the own-state-health hold ONCE per tick
+            // (AFTER checkIndexerLag so latch 6 is fresh; this is the call that fires the enter/clear
+            // edge). While the high-severity hold is active (degraded own-state + open exposure) we
+            // actively pull/cancel our quotes; reconcileMarkets below re-reads the now-settled hold
+            // (idempotent — no transition) and early-outs on it. Dormant until subscribe flips: in
+            // dry-run / poll-only, updateStreamHealthHold returns false, so the sweep never runs.
+            {
+              const streamHealthNow = this.deps.now();
+              if (this.updateStreamHealthHold(streamHealthNow)) await this.streamHealthCancelSweep(streamHealthNow);
+            }
             await this.reconcileMarkets();
             await this.maybeOnchainCancelRecoveredSoftCancels(); // cancelMode:onchain only — authoritatively cancel matched soft-cancels (self-guards offchain/dry-run); after reconcileMarkets so the freed side re-quotes next tick
             this.ageOut();
@@ -1843,7 +1989,7 @@ export class Runner {
     const streamHealthHold = this.updateStreamHealthHold(now);
     if (this.isHoldingQuoting()) return; // DESIGN §12 — must not resume quoting on a blank slate
     if (this.fundingHold) return; // DESIGN §6 funding guard (C1a) — wallet can't back its matchable-commitment exposure; halt NEW posting until a successful funding re-read clears it
-    if (streamHealthHold) return; // own-state SSE §5.1 early-out — degraded at pass start; submitQuote re-checks for mid-pass degradation (active cancel-sweep posture lands in PR3b)
+    if (streamHealthHold) return; // own-state SSE §5.1 early-out — degraded at pass start; submitQuote re-checks for mid-pass degradation. The active cancel-sweep of existing exposure (PR3b-ii) already ran THIS tick, before reconcileMarkets — see streamHealthCancelSweep.
     for (const m of this.trackedMarkets.values()) {
       if (!this.needsReconcile(m, now)) continue;
       m.dirty = false; // read-and-clear BEFORE reconciling, so a dirty re-armed DURING the reconcile (a success re-quote, a concurrent onChange) survives to the next tick instead of being clobbered
@@ -3536,9 +3682,13 @@ export class Runner {
    * Emits `stream-health-hold` ONLY on an enter/clear transition (a sustained
    * hold must not spam the log — same discipline as {@link setFundingHold}),
    * with `severity: 'high'` iff there is open exposure to protect, `'low'`
-   * otherwise. The active cancel-sweep posture for `exposure > 0` (§5.1) lands in
-   * PR3b alongside the source cutover, when the gate first goes live; PR2a halts
-   * new posting and surfaces the high-severity signal that documents the posture.
+   * otherwise. The high-severity posture (`exposure > 0`) is acted on by the active
+   * cancel-sweep {@link streamHealthCancelSweep}, which {@link tick} runs each held
+   * tick once `subscribe` is enabled; this gate only HALTS new posting + emits the
+   * signal. NOTE: `severity` is computed on the enter edge and not re-emitted, while
+   * the sweep follows LIVE exposure each tick — so a hold that entered at `'low'` can
+   * still sweep on a later tick if exposure crosses 0 (e.g. a stale signed payload
+   * matches mid-hold). The telemetry label is the enter-edge snapshot, not a guarantee.
    */
   private updateStreamHealthHold(nowSec: number): boolean {
     const holding = !this.config.mode.dryRun && this.config.ownState.subscribe && !this.ownStateHealthy(nowSec);
@@ -3553,6 +3703,7 @@ export class Runner {
       });
       this.deps.log(`[runner] own-state health hold ENTERED — halting new posting (open exposure ${exposureWei6} wei6)`);
     } else {
+      this.streamHealthOnchainGasDeniedWarned = false; // hold cleared — the next episode's onchain cancel-sweep re-warns on a fresh gas denial (PR3b-ii)
       this.eventLog.emit('stream-health-hold', { state: 'cleared' });
       // Matches the setFundingHold log style — no unconditional "posting resumes"
       // claim, since a boot / funding hold may still gate this same reconcile pass.

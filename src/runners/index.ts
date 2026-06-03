@@ -2794,7 +2794,12 @@ export class Runner {
           if (!audit) this.eventLog.emit('fill', d.payload as unknown as Record<string, unknown>);
           break;
         case 'emit-expire':
-          this.eventLog.emit('expire', d.payload as unknown as Record<string, unknown>);
+          // The audit poll is NOT authoritative for expiry — `ageOut()` emits the
+          // canonical `expire` off `this.state`. Suppressing it on the audit path
+          // avoids a double-emit (audit clone classifies expired, then ageOut does
+          // too in the same tick) and a phantom-expire when the audit clone reads
+          // a commitment expired that the SSE canonical shows filled.
+          if (!audit) this.eventLog.emit('expire', d.payload as unknown as Record<string, unknown>);
           break;
         case 'emit-position-transition':
           if (!audit) this.eventLog.emit('position-transition', d.payload as unknown as Record<string, unknown>);
@@ -3510,8 +3515,10 @@ export class Runner {
    * (always fail-closed here — no opt-out knob, unlike `fundingGuard.failClosedOnReadError`).
    * The latch holds its value between polls; {@link ownStateHealthy} reads it on each
    * posting decision. The caller gates this to `ownState.subscribe` (the own-state gate
-   * is subscribe-only); it runs in dry-run+subscribe too (observability — the gate is
-   * dormant there, like the comparator). No signer / token (global probe).
+   * is subscribe-only); it runs in dry-run+subscribe too (observability — the §5.1
+   * posting gate is dormant there). (The audit comparator, by contrast, does NOT run in
+   * dry-run: its `auditState` is poll-fed and the poll is `!dryRun`-gated — see
+   * {@link runAuditComparator}.) No signer / token (global probe).
    */
   private async checkIndexerLag(): Promise<void> {
     const nowSec = this.deps.now();
@@ -3629,6 +3636,15 @@ export class Runner {
       return;
     }
     if (!this.config.ownState.subscribe) return;
+    // The audit comparator is a LIVE-mode cross-check: `this.auditState` is fed
+    // ONLY by the poll path (detectFills/pollPositionStatus/reconcileSoftCancelledFills),
+    // which is gated behind `!dryRun` in `tick()`. In dry-run + subscribe the SSE
+    // still populates canonical `this.state` (for observability) but `auditState`
+    // stays empty, so comparing them would emit a CONSTANT false `divergence`
+    // (every canonical row reads as `missing-in-audit`) and latch
+    // `auditDivergenceUnresolved` — corrupting the very signal a dry-run+subscribe
+    // operator watches. Skip the comparison when the audit poll didn't run.
+    if (this.config.mode.dryRun) return;
     // Gate on the FULL INSTANTANEOUS mirror — the edge latches (ready + connected
     // + no overflow / truncation / fatal / token-refresh failure) AND the
     // time-dependent `transportFresh` (latch 2) — NOT the posting gate

@@ -35,6 +35,7 @@ import type { Fill, OwnerCommitment, PositionStatusEvent } from '../ospex/index.
 import { oppositeSide } from '../pricing/index.js';
 import {
   fillDedupKey,
+  isTerminalPositionStatus,
   type MakerCommitmentRecord,
   type MakerPositionRecord,
   type MakerPositionStatus,
@@ -318,7 +319,16 @@ export function reduceOwnerPositionStatus(
     }];
   }
   const updated = mapPositionStatusEventToMaker(existing, body);
-  if (positionStatusRank(updated.status) < positionStatusRank(existing.status)) {
+  // Forward-only, and TERMINAL IS IMMUTABLE. The rank refuses a strict backwards
+  // move; the terminal clause additionally refuses any change OUT of a terminal
+  // state (claimed/settledLost/void). The terminal triple share the top rank, so
+  // the rank check alone (`<`) would NOT catch a claimed→settledLost rewrite (a
+  // stale / out-of-order / corrupt event overwriting a settled outcome). A
+  // terminal position has no further legitimate transition.
+  if (
+    positionStatusRank(updated.status) < positionStatusRank(existing.status) ||
+    (isTerminalPositionStatus(existing.status) && updated.status !== existing.status)
+  ) {
     return [{
       kind: 'emit-error',
       payload: {

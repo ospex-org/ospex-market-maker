@@ -114,6 +114,14 @@ describe('compareAuditVsCanonical — commitment field divergences', () => {
     const audit = stateWithCommitment(makerCommitment({ filledRiskWei6: '50000' }));
     const payload = compareAuditVsCanonical(canonical, audit, new Map(), NOW, TOLERANCE, SETTLED, SETTLED);
     expect(payload?.byField['commitment-filled']).toBe(1);
+    // Value-level assertion — a regression swapping canonical/audit in the payload
+    // would still satisfy the byField count, so pin the exact example values.
+    expect(payload?.examples[0]).toMatchObject({
+      field: 'commitment-filled',
+      key: '0xabc',
+      canonical: '100000',
+      audit: '50000',
+    });
   });
 
   it('lifecycle AND filledRiskWei6 differ → both reported (count=2)', () => {
@@ -132,6 +140,13 @@ describe('compareAuditVsCanonical — position field divergences', () => {
     const audit = stateWithPosition('spec-1:away', makerPosition({ status: 'active' }));
     const payload = compareAuditVsCanonical(canonical, audit, new Map(), NOW, TOLERANCE, SETTLED, SETTLED);
     expect(payload?.byField['position-status']).toBe(1);
+    // Value-level assertion — guards against a canonical/audit swap in the payload.
+    expect(payload?.examples[0]).toMatchObject({
+      field: 'position-status',
+      key: 'spec-1:away',
+      canonical: 'pendingSettle',
+      audit: 'active',
+    });
   });
 
   it('riskAmountWei6 differs → position-risk', () => {
@@ -139,6 +154,13 @@ describe('compareAuditVsCanonical — position field divergences', () => {
     const audit = stateWithPosition('spec-1:away', makerPosition({ riskAmountWei6: '100000' }));
     const payload = compareAuditVsCanonical(canonical, audit, new Map(), NOW, TOLERANCE, SETTLED, SETTLED);
     expect(payload?.byField['position-risk']).toBe(1);
+    // Value-level assertion — guards against a canonical/audit swap in the payload.
+    expect(payload?.examples[0]).toMatchObject({
+      field: 'position-risk',
+      key: 'spec-1:away',
+      canonical: '200000',
+      audit: '100000',
+    });
   });
 
   // Post-flip, the audit (poll) path never produces the terminal triple

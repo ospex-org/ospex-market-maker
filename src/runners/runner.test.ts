@@ -1284,27 +1284,28 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
     status: 'open', storedStatus: 'open', nonceInvalidated: false,
   });
 
-  it('promotes the untruncated-page cursor on a successful onReady baseline swap (§4.3)', async () => {
+  it('promotes the onReady cursor on a successful baseline swap (§4.3 / SDK Last-Event-ID contract)', async () => {
     const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
     expect(runner.ownStateCursorForTest()).toBeUndefined();
     recorder.fire('onSnapshot', { commitments: [MINIMAL_COMMITMENT('0xa')], positions: [], truncated: false, positionsTruncated: false }, { cursor: 'snap-1' });
-    // Before ready, the cursor is NOT yet promoted (only staged internally).
+    // Before ready, no cursor is promoted (a snapshot page's frame id is not a
+    // resumable position; only the onReady cursor is).
     expect(runner.ownStateCursorForTest()).toBeUndefined();
     recorder.fire('onReady', undefined, { cursor: 'ready-1' });
-    // The staged baseline cursor wins over the onReady cursor.
-    expect(runner.ownStateCursorForTest()).toBe('snap-1');
+    // The onReady cursor — not the snapshot-page cursor — is the persisted resume point.
+    expect(runner.ownStateCursorForTest()).toBe('ready-1');
     triggerKill();
     await runPromise;
   });
 
-  it('a truncated page does NOT stage a cursor; the final untruncated page does (§4.3)', async () => {
+  it('promotes the onReady cursor, never a snapshot-page cursor (truncated or final) (§4.3)', async () => {
     const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
-    // Page 1 truncated — its cursor must NOT become the resume point.
+    // Page 1 truncated, page 2 final — NEITHER page's frame id is the resume
+    // point; only the cursor delivered to onReady is a valid Last-Event-ID.
     recorder.fire('onSnapshot', { commitments: [MINIMAL_COMMITMENT('0xa')], positions: [], truncated: true, positionsTruncated: false }, { cursor: 'page-1-truncated' });
-    // Page 2 untruncated — this cursor pairs with the complete baseline.
     recorder.fire('onSnapshot', { commitments: [MINIMAL_COMMITMENT('0xb')], positions: [], truncated: false, positionsTruncated: false }, { cursor: 'page-2-final' });
     recorder.fire('onReady', undefined, { cursor: 'ready-x' });
-    expect(runner.ownStateCursorForTest()).toBe('page-2-final');
+    expect(runner.ownStateCursorForTest()).toBe('ready-x');
     triggerKill();
     await runPromise;
   });
@@ -1320,11 +1321,11 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
     await runPromise;
   });
 
-  it('resync clears the staged + persisted cursor (a stale resume point must not survive a re-baseline)', async () => {
+  it('resync clears the persisted cursor (a stale resume point must not survive a re-baseline)', async () => {
     const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
     recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: false }, { cursor: 'snap-1' });
     recorder.fire('onReady', undefined, { cursor: 'ready-1' });
-    expect(runner.ownStateCursorForTest()).toBe('snap-1');
+    expect(runner.ownStateCursorForTest()).toBe('ready-1');
     recorder.fire('onStatus', 'resync');
     expect(runner.ownStateCursorForTest()).toBeUndefined();
     triggerKill();
@@ -1386,7 +1387,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
     recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: false }, { cursor: 'snap-new' });
     recorder.fire('onReady', undefined, { cursor: 'ready-new' });
     expect(runner.ownStateShadowView().ready).toBe(true); // guard did NOT trip
-    expect(runner.ownStateCursorForTest()).toBe('snap-new'); // fresh cursor promoted, boot cursor replaced
+    expect(runner.ownStateCursorForTest()).toBe('ready-new'); // fresh onReady cursor promoted, boot cursor replaced
     triggerKill();
     await runPromise;
     expect(readEvents().filter((e) => e.kind === 'stream-cold-restart')).toHaveLength(0); // no cold restart
@@ -1429,12 +1430,12 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
     recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: false }, { cursor: 'snap-1' });
     recorder.fire('onReady', undefined, { cursor: 'ready-1' });
     expect(runner.ownStateShadowView().ready).toBe(true);
-    expect(runner.ownStateCursorForTest()).toBe('snap-1');
+    expect(runner.ownStateCursorForTest()).toBe('ready-1');
     // A reconnect delivers catchup + ready with NO new snapshot. resumedFromPersistedCursor
     // is false (cold connect), so the guard must NOT trip — the in-memory baseline backs it.
     recorder.fire('onReady', undefined, { cursor: 'ready-2' });
     expect(runner.ownStateShadowView().ready).toBe(true); // still ready
-    expect(runner.ownStateCursorForTest()).toBe('snap-1'); // unchanged — no new baseline → no promote
+    expect(runner.ownStateCursorForTest()).toBe('ready-1'); // unchanged — no new baseline → no promote
     triggerKill();
     await runPromise;
     expect(readEvents().filter((e) => e.kind === 'stream-cold-restart')).toHaveLength(0);
@@ -1444,14 +1445,14 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
     const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
     recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: false }, { cursor: 'snap-1' });
     recorder.fire('onReady', undefined, { cursor: 'ready-1' });
-    expect(runner.ownStateCursorForTest()).toBe('snap-1');
+    expect(runner.ownStateCursorForTest()).toBe('ready-1');
     recorder.fire('onStatus', 'resync');
     expect(runner.ownStateCursorForTest()).toBeUndefined();
     expect(runner.ownStateShadowView().ready).toBe(false);
     // Fresh snapshot after resync re-establishes the cursor.
     recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: false }, { cursor: 'snap-2' });
     recorder.fire('onReady', undefined, { cursor: 'ready-2' });
-    expect(runner.ownStateCursorForTest()).toBe('snap-2');
+    expect(runner.ownStateCursorForTest()).toBe('ready-2');
     expect(runner.ownStateShadowView().ready).toBe(true);
     triggerKill();
     await runPromise;

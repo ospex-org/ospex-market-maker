@@ -2728,6 +2728,35 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
         await runPromise;
       });
 
+      it('a per-hash audit getCommitment failure (disappeared-lookup-failed) does NOT clear a prior divergence latch', async () => {
+        // The top-level audit-read failures are covered above; this is the Pass-2
+        // per-hash path: listOpenCommitments SUCCEEDS, but a disappeared
+        // commitment's getCommitment(hash) THROWS. The audit didn't observe that
+        // row's true state, so the (unconverged) clone must NOT be read as "clean"
+        // to clear a prior auditDivergenceUnresolved.
+        const t = T0;
+        const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: true, recoveryHoldMs: 0, staleMaxMs: 300000 } });
+        const adapter = liveSpiedAdapter(config, () => Promise.resolve([]), undefined, undefined, undefined, {
+          listOpenCommitments: () => Promise.resolve([]), // 0xdis "disappeared" from the open book (Pass 1 finds nothing)
+          getCommitment: (h) => Promise.reject(new Error(`per-hash audit lookup down (${h})`)), // Pass 2 per-hash lookup throws
+        });
+        const { runner, recorder, runPromise, resolvers, triggerKill } = await makePausedSubscribedRunner({ config, adapter, deps: { now: () => t } });
+        // Healthy baseline carrying a visibleOpen commitment 0xdis, so the audit's
+        // detectFills has a localOpen row to probe (→ the disappeared Pass-2 lookup).
+        recorder.fire('onFrame', { receivedAtMs: 0, kind: 'heartbeat' });
+        recorder.fire('onSnapshot', { commitments: [mappableOwnerCommitment('0xdis')], positions: [], truncated: false, positionsTruncated: false }, { cursor: 's1' });
+        recorder.fire('onReady', undefined, { cursor: 'r1' });
+        recorder.fire('onStatus', 'connected');
+        await waitFor(() => { resolvers.forEach((r) => r?.()); return readEvents().filter((e) => e.kind === 'tick-start').length >= 2; });
+        runner.setAuditDivergenceUnresolvedForTest(true); // a prior REAL divergence latched the posting hold
+        // Each detectFills audit cycle hits the per-hash getCommitment throw →
+        // auditPollFailedThisCycle → the comparator is skipped → latch preserved.
+        await waitFor(() => { resolvers.forEach((r) => r?.()); return readEvents().filter((e) => e.kind === 'tick-start').length >= 5; });
+        expect(runner.auditDivergenceUnresolvedForTest()).toBe(true);
+        triggerKill();
+        await runPromise;
+      });
+
       it('a canonical mapping failure during the baseline latches own-state UNHEALTHY (incomplete book holds the §5.1 gate); a clean rebaseline clears it', async () => {
         const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner({
           config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 0, staleMaxMs: 300000 } }),

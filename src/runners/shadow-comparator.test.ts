@@ -170,6 +170,29 @@ describe('compareShadowVsCanonical — position field divergences', () => {
     const payload = compareShadowVsCanonical(state, shadow, new Map(), NOW, TOLERANCE, SETTLED);
     expect(payload?.byField['position-risk']).toBe(1);
   });
+
+  // The canonical mapper (PR3a) preserves terminal settledLost / void; the shadow
+  // collapses them to claimed. The comparator must treat canonical settledLost /
+  // void as shadow-equivalent to claimed — else a real terminal position reads as
+  // a permanent false position-status divergence once PR3b wires the mapper.
+  it('canonical settledLost + shadow claimed → NO divergence (shadow collapses settledLost→claimed)', () => {
+    const state = stateWithPosition('spec-1:away', canonicalPosition({ status: 'settledLost' }));
+    const shadow = shadowWithPosition('spec-1:away', shadowPosition({ status: 'claimed' }));
+    expect(compareShadowVsCanonical(state, shadow, new Map(), NOW, TOLERANCE, SETTLED)).toBeNull();
+  });
+
+  it('canonical void + shadow claimed → NO divergence (shadow collapses void→claimed)', () => {
+    const state = stateWithPosition('spec-1:away', canonicalPosition({ status: 'void' }));
+    const shadow = shadowWithPosition('spec-1:away', shadowPosition({ status: 'claimed' }));
+    expect(compareShadowVsCanonical(state, shadow, new Map(), NOW, TOLERANCE, SETTLED)).toBeNull();
+  });
+
+  it('canonical settledLost + shadow active → STILL reports position-status (normalization does not mask a real divergence)', () => {
+    const state = stateWithPosition('spec-1:away', canonicalPosition({ status: 'settledLost' }));
+    const shadow = shadowWithPosition('spec-1:away', shadowPosition({ status: 'active' }));
+    const payload = compareShadowVsCanonical(state, shadow, new Map(), NOW, TOLERANCE, SETTLED);
+    expect(payload?.byField['position-status']).toBe(1);
+  });
 });
 
 // ── missing-side divergences ────────────────────────────────────────────────
@@ -210,6 +233,13 @@ describe('compareShadowVsCanonical — missing-side', () => {
   it('canonical-only CLAIMED position → NOT reported (terminal drift)', () => {
     const state = stateWithPosition('spec-1:away', canonicalPosition({ status: 'claimed' }));
     expect(compareShadowVsCanonical(state, emptyOwnStateShadow(), new Map(), NOW, TOLERANCE, SETTLED)).toBeNull();
+  });
+
+  it('canonical-only SETTLEDLOST / VOID position → NOT reported (terminal drift, same as claimed)', () => {
+    for (const status of ['settledLost', 'void'] as const) {
+      const state = stateWithPosition('spec-1:away', canonicalPosition({ status }));
+      expect(compareShadowVsCanonical(state, emptyOwnStateShadow(), new Map(), NOW, TOLERANCE, SETTLED), `expected no divergence for canonical-only ${status}`).toBeNull();
+    }
   });
 
   it('canonical-only ACTIVE position → missing-in-stream', () => {

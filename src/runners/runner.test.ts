@@ -549,6 +549,43 @@ function mappableOwnerFill(overrides: Record<string, unknown> = {}): Record<stri
   };
 }
 
+/**
+ * A live (signed) adapter wired for a GENUINE own-state AUDIT divergence (Phase 3
+ * PR3b). The SSE canonical book carries commitment `hash` at `visibleOpen` /
+ * `filledRiskWei6='0'` (via a `mappableOwnerCommitment` snapshot the caller fires);
+ * the audit POLL converges that same hash UP to `filled` / `filledRiskWei6='250000'`
+ * because:
+ *   - `listOpenCommitments` → `[]` (the hash "disappeared" from the open book), and
+ *   - `getCommitment(hash)` → a fully-FILLED `Commitment` (filledRiskAmount===riskAmount,
+ *     status 'filled').
+ * `detectFills` reseeds `auditState` from canonical each cycle, then converges the
+ * clone to `filled` — so the comparator sees a `commitment-lifecycle`
+ * (visibleOpen vs filled) + `commitment-filled` ('0' vs '250000') divergence in the
+ * dangerous "SSE under-counted / lagged" direction. This is a REAL field divergence,
+ * NOT the empty-audit `missing-in-audit` artifact of dry-run (where the audit poll
+ * never runs and `auditState` stays empty). `getOwnStateHealth` defaults to healthy
+ * (lag 0) so latch 6 doesn't hold; pass `health` to override (e.g. the latch-6 test).
+ */
+function liveDivergentAdapter(
+  config: Config,
+  hash: string,
+  health: OwnStateHealth = MOCK_OWN_STATE_HEALTH,
+): OspexAdapter {
+  const apiFilled: Commitment = orderbookEntry({
+    commitmentHash: hash, maker: DEFAULT_FAKE_MAKER_ADDRESS, contestId: '1',
+    positionType: 0, oddsTick: 250, riskAmount: '250000',
+    filledRiskAmount: '250000', remainingRiskAmount: '0', status: 'filled', isLive: false,
+  });
+  return liveSpiedAdapter(
+    config, () => Promise.resolve([]), undefined, undefined, undefined,
+    {
+      listOpenCommitments: () => Promise.resolve([]), // the canonical hash "disappeared" from the open book
+      getCommitment: (h) => (h === hash ? Promise.resolve(apiFilled) : Promise.reject(new Error(`unexpected getCommitment(${h})`))),
+      getOwnStateHealth: () => Promise.resolve(health),
+    },
+  );
+}
+
 // ── boot path — the state-loss fail-safe (DESIGN §12) ────────────────────────
 
 describe('Runner — boot', () => {
@@ -671,7 +708,11 @@ describe('Runner — tick loop', () => {
 
   it('subscribe:true paces the tick at auditPollIntervalMs (the SSE stream drives own-state real-time; the poll is the slower AUDIT cross-check)', async () => {
     const sleepMsCalls: number[] = [];
-    const config = cfg({ ownState: { subscribe: true, auditPollIntervalMs: 45000 } });
+    // auditPollIntervalMs:10000 is the config-min — legal AND BELOW the 30000 trading
+    // floor. This is the bite-gap case: a regression that clamped the subscribe
+    // cadence to POLL_INTERVAL_FLOOR_MS (as the backout path does) would yield 30000,
+    // NOT 10000. (A value above the floor, e.g. 45000, would pass either way.)
+    const config = cfg({ ownState: { subscribe: true, auditPollIntervalMs: 10000 } });
     const adapter = createOspexAdapter(config);
     vi.spyOn(adapter, 'listContests').mockResolvedValue([]);
     vi.spyOn(adapter, 'getOwnStateHealth').mockResolvedValue(MOCK_OWN_STATE_HEALTH);
@@ -681,8 +722,8 @@ describe('Runner — tick loop', () => {
       config, adapter, maxTicks: 3, makerAddress: DEFAULT_FAKE_MAKER_ADDRESS as Hex,
       deps: { sleep: (ms) => { sleepMsCalls.push(ms); return Promise.resolve(); } },
     }).run();
-    // 3 ticks → 2 poll-deadline sleeps, each at auditPollIntervalMs (NOT the 30000 trading floor).
-    expect(sleepMsCalls).toEqual([45000, 45000]);
+    // 3 ticks → 2 poll-deadline sleeps, each at auditPollIntervalMs (NOT clamped to the 30000 trading floor).
+    expect(sleepMsCalls).toEqual([10000, 10000]);
   });
 
   it('subscribe:false (backout) paces the tick at the trading pollIntervalMs/floor, NOT auditPollIntervalMs', async () => {
@@ -2258,14 +2299,18 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
         recorder.fire('onStatus', 'connected');
       }
 
-      it('comparator RUNS the audit when transport is fresh (tracker populated for a real divergence)', async () => {
+      it('comparator RUNS the audit when transport is fresh (tracker populated for a real LIVE-mode divergence)', async () => {
+        // LIVE mode (mode.dryRun:false) — the audit poll (detectFills) ONLY runs in
+        // live, so a GENUINE divergence is only possible here. The SSE canonical book
+        // gets commitment 0xdiv at visibleOpen/'0'; the audit poll converges it UP to
+        // filled/'250000' (listOpenCommitments→[] + getCommitment→filled). The
+        // comparator detects a real commitment-lifecycle + commitment-filled field
+        // divergence — NOT the dry-run empty-audit `missing-in-audit` artifact.
         const t = T0; // fixed injected clock → the baseline frame stays fresh regardless of real wall-clock
-        const adapter = createOspexAdapter(cfg({ ownState: { subscribe: true } }));
-        vi.spyOn(adapter, 'listContests').mockResolvedValue([]);
-        vi.spyOn(adapter, 'listOpenCommitments').mockResolvedValue([]); // audit/poll stays empty → the canonical SSE commitment is missing-in-audit
-        vi.spyOn(adapter, 'getOwnStateHealth').mockResolvedValue(MOCK_OWN_STATE_HEALTH);
+        const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: true, recoveryHoldMs: 0, staleMaxMs: 60000 } });
+        const adapter = liveDivergentAdapter(config, '0xdiv');
         const { runner, recorder, runPromise, resolvers, triggerKill } = await makePausedSubscribedRunner({
-          config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 0, staleMaxMs: 60000 } }),
+          config,
           adapter,
           deps: { now: () => t },
         });
@@ -2276,6 +2321,10 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
         // audit. Transport is fresh, so the comparator populates the tracker.
         await waitFor(() => { resolvers.forEach((r) => r?.()); return runner.divergenceTrackerSizeForTest() > 0; });
         expect(runner.divergenceTrackerSizeForTest()).toBeGreaterThan(0); // comparator ran — transport fresh
+        // The canonical (SSE) book stays at visibleOpen/'0' while the audit converged
+        // up — a genuine field divergence, not the empty-audit artifact.
+        expect(runner.stateForTest().commitments['0xdiv']?.lifecycle).toBe('visibleOpen');
+        expect(runner.auditStateForTest().commitments['0xdiv']?.lifecycle).toBe('filled');
         triggerKill();
         await runPromise;
       });
@@ -2342,17 +2391,18 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
       });
 
       it('latch 6 does NOT suppress the comparator — the audit still runs while indexer-lag holds posting (posting-only)', async () => {
+        // LIVE mode — the audit poll only runs in live. The canonical SSE book gets
+        // 0xdiv6 at visibleOpen/'0'; the audit poll converges it UP to filled →
+        // a genuine field divergence. Health lag 9999 trips latch 6 (posting-only).
         const t = T0;
-        const adapter = createOspexAdapter(cfg({ ownState: { subscribe: true } }));
-        vi.spyOn(adapter, 'listContests').mockResolvedValue([]);
-        vi.spyOn(adapter, 'listOpenCommitments').mockResolvedValue([]); // audit/poll empty → the canonical SSE commitment is missing-in-audit
-        vi.spyOn(adapter, 'getOwnStateHealth').mockResolvedValue(mkHealth(9999)); // lag >> threshold → latch degrades via the real poll
+        const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: true, recoveryHoldMs: 0, staleMaxMs: 60000 } });
+        const adapter = liveDivergentAdapter(config, '0xdiv6', mkHealth(9999)); // lag >> threshold → latch degrades via the real poll
         const { runner, recorder, runPromise, resolvers, triggerKill } = await makePausedSubscribedRunner({
-          config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 0, staleMaxMs: 60000 } }),
+          config,
           adapter,
           deps: { now: () => t },
         });
-        // A divergent baseline (a commitment in canonical SSE state the poll/audit side never has).
+        // A divergent baseline (a commitment in canonical SSE state whose audit clone converges up).
         recorder.fire('onFrame', { receivedAtMs: 0, kind: 'heartbeat' });
         recorder.fire('onSnapshot', { commitments: [mappableOwnerCommitment('0xdiv6')], positions: [], truncated: false, positionsTruncated: false }, { cursor: 's1' });
         recorder.fire('onReady', undefined, { cursor: 'r1' });
@@ -2548,13 +2598,18 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
       });
 
       it('latch 5 does NOT self-deadlock the comparator — a latched divergence is cleared by the next clean comparison (the comparator gates on instantOwnStateHealthy, NOT ownStateHealthy)', async () => {
+        // LIVE mode — the audit poll (hence the comparator) only runs in live. A healthy
+        // EMPTY baseline: nothing tracked, so the audit converges nothing and the
+        // comparison is CLEAN. Latch 5 is manually pre-set (a previously-latched
+        // persistent divergence); the next clean comparison must clear it.
         const t = T0;
-        const adapter = createOspexAdapter(cfg({ ownState: { subscribe: true } }));
-        vi.spyOn(adapter, 'listContests').mockResolvedValue([]);
-        vi.spyOn(adapter, 'listOpenCommitments').mockResolvedValue([]);
-        vi.spyOn(adapter, 'getOwnStateHealth').mockResolvedValue(MOCK_OWN_STATE_HEALTH);
+        const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: true, recoveryHoldMs: 0, staleMaxMs: 60000 } });
+        const adapter = liveSpiedAdapter(
+          config, () => Promise.resolve([]), undefined, undefined, undefined,
+          { listOpenCommitments: () => Promise.resolve([]), getOwnStateHealth: () => Promise.resolve(MOCK_OWN_STATE_HEALTH) },
+        );
         const { runner, recorder, runPromise, resolvers, triggerKill } = await makePausedSubscribedRunner({
-          config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 0, staleMaxMs: 60000 } }),
+          config,
           adapter,
           deps: { now: () => t },
         });
@@ -2577,12 +2632,13 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
           const baseMs = 1_700_000_000_000;
           vi.setSystemTime(baseMs);
           const t = T0; // the §5 health clock (deps.now, seconds) is independent of the faked Date
-          const adapter = createOspexAdapter(cfg({ ownState: { subscribe: true } }));
-          vi.spyOn(adapter, 'listContests').mockResolvedValue([]);
-          vi.spyOn(adapter, 'listOpenCommitments').mockResolvedValue([]); // audit/poll empty → the canonical SSE commitment is missing-in-audit
-          vi.spyOn(adapter, 'getOwnStateHealth').mockResolvedValue(MOCK_OWN_STATE_HEALTH);
+          // LIVE mode — the audit poll (hence the comparator) only runs in live. The
+          // canonical SSE book gets 0xdiv5 at visibleOpen/'0'; the audit poll converges
+          // it UP to filled → a GENUINE field divergence (not the empty-audit artifact).
+          const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: true, recoveryHoldMs: 0, staleMaxMs: 60000, divergenceToleranceMs: 5000 } });
+          const adapter = liveDivergentAdapter(config, '0xdiv5');
           const { runner, recorder, runPromise, resolvers, triggerKill } = await makePausedSubscribedRunner({
-            config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 0, staleMaxMs: 60000, divergenceToleranceMs: 5000 } }),
+            config,
             adapter,
             deps: { now: () => t },
           });
@@ -2602,6 +2658,34 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
         } finally {
           vi.useRealTimers();
         }
+      });
+
+      it('dry-run + subscribe: the comparator does NOT run, so an empty audit state cannot manufacture a spurious divergence', async () => {
+        // DRY-RUN + subscribe is a supported observability mode: the SSE stream
+        // populates canonical this.state (0xdiv5 via fireDivergentBaseline5), but
+        // detectFills/reseedAuditState are dryRun-gated so this.auditState stays
+        // EMPTY. runAuditComparator MUST early-return on dryRun — otherwise it would
+        // compare the populated canonical book against the empty audit and flag every
+        // non-terminal canonical row as `missing-in-audit`, emitting a CONSTANT false
+        // `divergence` + latching auditDivergenceUnresolved (corrupting the very signal
+        // an operator watches before going live). Regression guard for that gate.
+        const t = T0; // fixed clock → the baseline frame stays transport-fresh
+        const config = cfg({ mode: { dryRun: true }, ownState: { subscribe: true, recoveryHoldMs: 0, staleMaxMs: 60000 } });
+        const { runner, recorder, runPromise, resolvers, triggerKill } = await makePausedSubscribedRunner({
+          config,
+          deps: { now: () => t },
+        });
+        fireDivergentBaseline5(recorder); // canonical gets 0xdiv5; auditState stays empty (no audit poll in dry-run)
+        expect(runner.ownStateSessionView().ready).toBe(true);
+        // Drive >=4 ticks — well past the ~2 the live comparator needs to populate its
+        // tracker on detection (tracker fills on DETECTION, before the tolerance window,
+        // so no clock advance is needed to prove the comparator never ran).
+        await waitFor(() => { resolvers.forEach((r) => r?.()); return readEvents().filter((e) => e.kind === 'tick-start').length >= 4; });
+        expect(runner.divergenceTrackerSizeForTest()).toBe(0); // comparator never ran in dry-run
+        expect(readEvents().some((e) => e.kind === 'divergence')).toBe(false);
+        expect(runner.auditDivergenceUnresolvedForTest()).toBe(false);
+        triggerKill();
+        await runPromise;
       });
 
       it('latch 5: a resync rebaseline clears the latch (the prior divergence verdict is moot on a fresh baseline)', async () => {
@@ -2658,6 +2742,138 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
         // The cold restart reopened the subscription CURSOR-LESS (fresh re-snapshot).
         await waitFor(() => { resolvers.forEach((r) => r?.()); return (recorder.options as { initialCursor?: string }).initialCursor === undefined; });
         expect(recorder.options).toEqual({ address: DEFAULT_FAKE_MAKER_ADDRESS });
+
+        triggerKill();
+        await runPromise;
+      });
+    });
+
+    // ── audit path end-to-end (PR3b-i — the highest-risk source-flip behavior) ──
+    //
+    // These two tests exercise the AUDIT poll converging against the SSE canonical
+    // book in LIVE mode. The audit clone is reseeded from canonical each cycle and
+    // converged against the API; the SSE-canonical book MUST stay untouched, and the
+    // audit pass MUST NOT re-emit fills / re-dirty markets (the SSE path already did).
+    describe('audit path (live + subscribe)', () => {
+      // An SSE-canonical commitment 0xiso at partiallyFilled / filledRiskWei6='100000'
+      // (riskAmount 500000) whose audit clone converges UP to '300000' via a
+      // still-listed partial bump (listOpenCommitments returns it at filledRiskAmount
+      // 300000). A clean SSE baseline (frame + snapshot + onReady + connected).
+      const ISO_HASH = '0xiso';
+      function fireIsoBaseline(recorder: ReturnType<typeof makeOwnStateRecorder>): void {
+        recorder.fire('onFrame', { receivedAtMs: 0, kind: 'heartbeat' });
+        recorder.fire('onSnapshot', {
+          commitments: [mappableOwnerCommitment(ISO_HASH, { riskAmount: '500000', filledRiskAmount: '100000' })],
+          positions: [], truncated: false, positionsTruncated: false,
+        }, { cursor: 's1' });
+        recorder.fire('onReady', undefined, { cursor: 'r1' });
+        recorder.fire('onStatus', 'connected');
+      }
+      // The audit poll sees 0xiso still listed with filledRiskAmount advanced to
+      // 300000 (delta 200000) → the audit clone converges to filledRiskWei6='300000',
+      // staying partiallyFilled. (riskAmount 500000 so it does NOT flip to filled.)
+      function isoAuditAdapter(config: Config): OspexAdapter {
+        const apiBump: Commitment = orderbookEntry({
+          commitmentHash: ISO_HASH, maker: DEFAULT_FAKE_MAKER_ADDRESS, contestId: '1',
+          positionType: 0, oddsTick: 250, riskAmount: '500000',
+          filledRiskAmount: '300000', remainingRiskAmount: '200000', status: 'partially_filled', isLive: true,
+        });
+        return liveSpiedAdapter(
+          config, () => Promise.resolve([]), undefined, undefined, undefined,
+          {
+            listOpenCommitments: () => Promise.resolve([apiBump]),
+            getOwnStateHealth: () => Promise.resolve(MOCK_OWN_STATE_HEALTH),
+          },
+        );
+      }
+
+      it('AUDIT→CANONICAL ISOLATION: the audit converges its clone UP without mutating the SSE-canonical book (shallow-clone proof)', async () => {
+        const t = T0;
+        const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: true, recoveryHoldMs: 0, staleMaxMs: 60000 } });
+        const adapter = isoAuditAdapter(config);
+        const { runner, recorder, runPromise, resolvers, triggerKill } = await makePausedSubscribedRunner({
+          config, adapter, deps: { now: () => t },
+        });
+        fireIsoBaseline(recorder);
+        // An SSE fill appends one entry to the commitment's canonical fills[] (and
+        // creates the canonical position) — without touching filledRiskWei6.
+        recorder.fire('onFill', mappableOwnerFill({ commitmentHash: ISO_HASH, txHash: '0xisofill', logIndex: 0 }));
+        // Drive ticks until detectFills (audit) has converged the clone UP to 300000.
+        await waitFor(() => { resolvers.forEach((r) => r?.()); return runner.auditStateForTest().commitments[ISO_HASH]?.filledRiskWei6 === '300000'; });
+
+        // Audit clone converged.
+        expect(runner.auditStateForTest().commitments[ISO_HASH]?.filledRiskWei6).toBe('300000');
+        expect(runner.auditStateForTest().commitments[ISO_HASH]?.lifecycle).toBe('partiallyFilled');
+        // Canonical (SSE) book UNTOUCHED — the shallow `{ ...r }` clone isolates it.
+        // (A regression making reseedAuditState alias `r` instead of `{ ...r }` would
+        // corrupt this to '300000'.)
+        expect(runner.stateForTest().commitments[ISO_HASH]?.filledRiskWei6).toBe('100000');
+        expect(runner.stateForTest().commitments[ISO_HASH]?.lifecycle).toBe('partiallyFilled');
+        // The SSE-appended fills[] entry survives untouched (the poll never mutates fills[]).
+        expect(runner.stateForTest().commitments[ISO_HASH]?.fills).toHaveLength(1);
+
+        triggerKill();
+        await runPromise;
+      });
+
+      it('AUDIT DESCRIPTOR SUPPRESSION: the converging audit emits NO audit-source `fill` event and does NOT re-dirty the tracked market each cycle', async () => {
+        // A tracked market on contest 1 with NO usable reference odds → it reconciles
+        // once (no-reference-odds gate → 'applied', NO getSpeculation, NO submit), goes
+        // dirty:false, and at the FIXED clock is never re-reconciled — UNLESS the audit
+        // dirties it. The divergent SSE commitment 0xiso is on contest 1, so the audit
+        // converge produces a (suppressed) mark-dirty {contestId:'1'} + a (suppressed)
+        // emit-fill each cycle. Each reconcile of the no-odds market emits exactly one
+        // `candidate {skipReason:'no-reference-odds'}`, so the COUNT of those is the
+        // discriminator: it stays at 1 forever when the audit is suppressed (the market
+        // never re-dirties), but grows every audit cycle if `if (audit) break` is dropped.
+        const t = T0;
+        const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: true, recoveryHoldMs: 0, staleMaxMs: 60000 } });
+        const apiBump: Commitment = orderbookEntry({
+          commitmentHash: ISO_HASH, maker: DEFAULT_FAKE_MAKER_ADDRESS, contestId: '1',
+          positionType: 0, oddsTick: 250, riskAmount: '500000',
+          filledRiskAmount: '300000', remainingRiskAmount: '200000', status: 'partially_filled', isLive: true,
+        });
+        const adapter = liveSpiedAdapter(
+          config,
+          () => Promise.resolve([contestView({ contestId: '1' })]), // a tracked market on contest 1
+          undefined, undefined,
+          { snapshot: (id) => Promise.resolve(oddsSnapshotView(id, null)) }, // NO moneyline → unquoteable → reconcile clears dirty WITHOUT submitting / getSpeculation
+          {
+            listOpenCommitments: () => Promise.resolve([apiBump]),
+            getOwnStateHealth: () => Promise.resolve(MOCK_OWN_STATE_HEALTH),
+          },
+        );
+        const { runner, recorder, runPromise, sleepCalls, resolvers, triggerKill } = await makePausedSubscribedRunner({
+          config, adapter, deps: { now: () => t },
+        });
+        fireIsoBaseline(recorder);
+        // An SSE fill on 0xiso — the canonical (own-state-stream) fill the audit must NOT re-emit.
+        recorder.fire('onFill', mappableOwnerFill({ commitmentHash: ISO_HASH, txHash: '0xisofill', logIndex: 0 }));
+        // Drive ticks until the audit has converged the clone (proves detectFills-audit ran).
+        await waitFor(() => { resolvers.forEach((r) => r?.()); return runner.auditStateForTest().commitments[ISO_HASH]?.filledRiskWei6 === '300000'; });
+        // Drive SEVERAL more full ticks so a mark-dirty regression (re-dirty every audit
+        // cycle) would have re-reconciled the no-odds market repeatedly by now.
+        const targetSleeps = sleepCalls.length + 8;
+        await waitFor(() => { resolvers.forEach((r) => r?.()); return sleepCalls.length >= targetSleeps; });
+
+        const events = readEvents();
+        // (1) NO audit-source fill — the SSE path already emitted the canonical fill
+        // (source 'own-state-stream'); the audit MUST NOT re-emit one. A regression
+        // making emit-fill unconditional in applyDescriptors would add a
+        // 'commitment-diff' fill here.
+        const auditSourceFills = events.filter(
+          (e) => e.kind === 'fill' && (e.source === 'commitment-diff' || e.source === 'position-poll' || e.source === 'softcancel-recovery'),
+        );
+        expect(auditSourceFills).toHaveLength(0);
+        // (1b) The canonical SSE fill DID fire (positive control — the fill path ran).
+        expect(events.some((e) => e.kind === 'fill' && e.source === 'own-state-stream')).toBe(true);
+        // (2) The tracked market was NOT re-dirtied by the audit: the no-odds market
+        // reconciled EXACTLY ONCE (its initial discovery-dirty pass) and stayed clean
+        // at the fixed clock. A regression dropping `if (audit) break` on mark-dirty
+        // would re-dirty contest 1 every audit cycle → one extra `candidate` per cycle.
+        const noRefCandidates = events.filter((e) => e.kind === 'candidate' && e.contestId === '1' && e.skipReason === 'no-reference-odds');
+        expect(noRefCandidates).toHaveLength(1);
+        expect(runner.trackedMarketView('1')?.dirty).toBe(false);
 
         triggerKill();
         await runPromise;

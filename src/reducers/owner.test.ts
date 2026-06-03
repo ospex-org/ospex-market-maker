@@ -233,6 +233,33 @@ describe('reduceOwnerFill — maker side (ourAddress matches fill.maker)', () =>
     expect(state.commitments['0xabc']?.fills).toHaveLength(2);
     expect(state.commitments['0xabc']?.filledRiskWei6).toBe(before);
   });
+
+  // The EXTEND path (existing position) accumulates BOTH our risk AND the
+  // counterparty risk, and the emit-fill descriptor's `cumulativeRiskWei6` is the
+  // post-bump POSITION total — not the per-fill amount. Two fills on the same
+  // (speculationId, side) with NON-ZERO taker risk pin both.
+  it('extend path accumulates counterparty risk; the second emit-fill cumulativeRiskWei6 is the post-bump position total', () => {
+    const state = emptyMakerState();
+    state.commitments['0xabc'] = mapOwnerCommitmentToMaker(ownerCommitment());
+    const dedup = new Set<string>();
+    // Fill 1 creates the position (30000 ours / 45000 counterparty).
+    reduceOwnerFill(state, fill({ txHash: '0xa', logIndex: 0, makerRiskAmount: '30000', takerRiskAmount: '45000' }), dedup, OUR_ADDR, 1);
+    // Fill 2 EXTENDS it (+20000 ours / +30000 counterparty).
+    const descriptors = reduceOwnerFill(state, fill({ txHash: '0xa', logIndex: 1, makerRiskAmount: '20000', takerRiskAmount: '30000' }), dedup, OUR_ADDR, 2);
+
+    // Both legs accumulated: 30000+20000 ours, 45000+30000 counterparty.
+    expect(state.positions['spec-1:away']?.riskAmountWei6).toBe('50000');
+    expect(state.positions['spec-1:away']?.counterpartyRiskWei6).toBe('75000');
+
+    // The SECOND emit-fill carries the post-bump POSITION total (50000), NOT the
+    // per-fill amount (20000).
+    const fillDesc = descriptors[1];
+    expect(fillDesc?.kind).toBe('emit-fill');
+    if (fillDesc?.kind === 'emit-fill') {
+      expect(fillDesc.payload.newFillWei6).toBe('20000'); // this fill's own risk
+      expect(fillDesc.payload.cumulativeRiskWei6).toBe('50000'); // the position total after the bump
+    }
+  });
 });
 
 describe('reduceOwnerFill — taker side (ourAddress matches fill.taker)', () => {
@@ -339,6 +366,25 @@ describe('reduceOwnerPositionStatus — mapping + transitions', () => {
     expect(state.positions['spec-1:away']?.status).toBe('claimable'); // unchanged
   });
 
+  // TERMINAL IS IMMUTABLE: the terminal triple (claimed/settledLost/void) share
+  // the TOP rank, so the rank check alone (`<`) would NOT catch a terminal→terminal
+  // rewrite. The source's extra terminal clause refuses ANY change OUT of a terminal
+  // status — a stale / out-of-order / corrupt event must not overwrite a settled
+  // outcome. claimed → settledLost is the dangerous same-rank case.
+  it('a terminal position (claimed) refuses ANY transition out — even another terminal (settledLost), same top rank', () => {
+    const state = stateWith('claimed');
+    const descriptors = reduceOwnerPositionStatus(state, positionEvent({ status: 'settledLost', result: 'lost' }));
+    // The position STAYS claimed — not overwritten by the same-rank terminal.
+    expect(state.positions['spec-1:away']?.status).toBe('claimed');
+    // Refused via the backwards-transition error, NOT an emit-position-transition.
+    expect(descriptors).toHaveLength(1);
+    expect(descriptors[0]?.kind).toBe('emit-error');
+    if (descriptors[0]?.kind === 'emit-error') {
+      expect(descriptors[0].payload.class).toBe('OwnerBackwardsPositionTransition');
+    }
+    expect(descriptors.some((d) => d.kind === 'emit-position-transition')).toBe(false);
+  });
+
   it('unknown position → emits OwnerPositionStatusForUnknownPosition; does NOT insert', () => {
     const state = emptyMakerState();
     const descriptors = reduceOwnerPositionStatus(state, positionEvent({ status: 'active' }));
@@ -350,10 +396,18 @@ describe('reduceOwnerPositionStatus — mapping + transitions', () => {
     expect(state.positions).toEqual({});
   });
 
-  it('idempotent on no-status-change (no descriptor, state byte-identical apart from updatedAt)', () => {
+  it('idempotent on no-status-change (no descriptor, state byte-identical apart from an ADVANCED updatedAtUnixSec)', () => {
     const state = stateWith('pendingSettle');
-    const descriptors = reduceOwnerPositionStatus(state, positionEvent({ status: 'pendingSettle' }));
-    expect(descriptors).toEqual([]);
-    expect(state.positions['spec-1:away']?.status).toBe('pendingSettle');
+    const before = structuredClone(state.positions['spec-1:away']);
+    // A DIFFERENT sourceUpdatedAt than the fixture (1735689600 = 2025-01-01) so the
+    // updatedAtUnixSec actually moves — the old fixture collapsed it to a no-op,
+    // proving nothing. 2025-06-01T00:00:00Z = 1748736000.
+    const descriptors = reduceOwnerPositionStatus(state, positionEvent({ status: 'pendingSettle', sourceUpdatedAt: '2025-06-01T00:00:00.000Z' }));
+    expect(descriptors).toEqual([]); // no status change → no descriptor
+    const after = state.positions['spec-1:away'];
+    // The record is identical to the original EXCEPT updatedAtUnixSec ADVANCED.
+    expect(after?.updatedAtUnixSec).toBe(1748736000);
+    expect(before?.updatedAtUnixSec).toBe(1735689600);
+    expect(after).toEqual({ ...before, updatedAtUnixSec: 1748736000 });
   });
 });

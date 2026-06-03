@@ -2700,6 +2700,61 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
         triggerKill();
         await runPromise;
       });
+
+      it('a FAILED audit poll does NOT clear a prior divergence latch (no successful observation must not validate "clean")', async () => {
+        // The audit reseeds auditState from canonical BEFORE polling, so a FAILED
+        // poll leaves auditState === canonical (no API observation applied).
+        // runAuditComparator must SKIP such a cycle — otherwise the empty-vs-clone
+        // "clean" comparison would clear a real prior auditDivergenceUnresolved
+        // without any successful observation. Live mode (the audit only runs live);
+        // getPositionStatus throws every tick so each audit cycle fails.
+        const t = T0;
+        const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: true, recoveryHoldMs: 0, staleMaxMs: 300000 } });
+        const adapter = liveSpiedAdapter(config, () => Promise.resolve([]), undefined, undefined, undefined, {
+          listOpenCommitments: () => Promise.resolve([]),
+          getPositionStatus: () => Promise.reject(new Error('audit poll API down')),
+        });
+        const { runner, recorder, runPromise, resolvers, triggerKill } = await makePausedSubscribedRunner({ config, adapter, deps: { now: () => t } });
+        fireHealthyBaseline(recorder); // ready + connected + fresh → instantOwnStateHealthy true
+        // Drive >=2 ticks so firstAuditPollAfterReady latches (the comparator's first-poll gate).
+        await waitFor(() => { resolvers.forEach((r) => r?.()); return readEvents().filter((e) => e.kind === 'tick-start').length >= 2; });
+        runner.setAuditDivergenceUnresolvedForTest(true); // a prior REAL divergence latched the posting hold
+        // Drive more ticks: each audit cycle FAILS (getPositionStatus throws), so the
+        // comparator is skipped and the latch must persist — a failed poll cannot
+        // VALIDATE "clean" even though it must not GATE trading.
+        await waitFor(() => { resolvers.forEach((r) => r?.()); return readEvents().filter((e) => e.kind === 'tick-start').length >= 5; });
+        expect(runner.auditDivergenceUnresolvedForTest()).toBe(true);
+        triggerKill();
+        await runPromise;
+      });
+
+      it('a canonical mapping failure during the baseline latches own-state UNHEALTHY (incomplete book holds the §5.1 gate); a clean rebaseline clears it', async () => {
+        const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner({
+          config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 0, staleMaxMs: 300000 } }),
+        });
+        // Healthy transport, but the snapshot carries a MALFORMED owner commitment
+        // (empty sport → mapOwnerCommitmentToMaker fails closed + skips the row).
+        // With the SSE as the canonical writer, a skipped row = an INCOMPLETE
+        // canonical book, so own-state must NOT read healthy (it would undercount
+        // exposure and allow posting) even though ready + connected + fresh.
+        recorder.fire('onFrame', { receivedAtMs: 0, kind: 'heartbeat' });
+        recorder.fire('onSnapshot', { commitments: [mappableOwnerCommitment('0xok'), mappableOwnerCommitment('0xbad', { sport: '' })], positions: [], truncated: false, positionsTruncated: false }, { cursor: 's1' });
+        recorder.fire('onReady', undefined, { cursor: 'r1' });
+        recorder.fire('onStatus', 'connected');
+        expect(Object.keys(runner.stateForTest().commitments)).toEqual(['0xok']); // good row landed; malformed row skipped
+        expect(readEvents().some((e) => e.kind === 'owner-mapping-failed' && e.field === 'sport')).toBe(true);
+        expect(runner.ownStateSessionView().ready).toBe(true);
+        expect(runner.ownStateHealthyForTest()).toBe(false); // mapping-degraded latch holds the gate
+        // A clean rebaseline (resync → well-formed snapshot) clears the latch → healthy.
+        recorder.fire('onStatus', 'resync');
+        recorder.fire('onFrame', { receivedAtMs: 0, kind: 'heartbeat' });
+        recorder.fire('onSnapshot', { commitments: [mappableOwnerCommitment('0xok')], positions: [], truncated: false, positionsTruncated: false }, { cursor: 's2' });
+        recorder.fire('onReady', undefined, { cursor: 'r2' });
+        recorder.fire('onStatus', 'connected');
+        expect(runner.ownStateHealthyForTest()).toBe(true);
+        triggerKill();
+        await runPromise;
+      });
     });
 
     // ── §7.2 unknown-own-fill (an SSE fill for a commitment not in canonical state) ──

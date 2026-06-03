@@ -1,18 +1,13 @@
 /**
- * Source-aware reducers — Phase 2 PR2 architectural boundary (`phase2-plan.md` § PR2).
- *
- * Each reducer mutates an explicit target — either canonical `MakerState` (poll-source,
- * the source of truth for trading writes) OR `OwnStateShadow` (owner/SSE-source, a
- * projection consumed by the PR5 comparator for divergence telemetry). The split is
- * typed: passing the wrong target is a compile-time error. See
- * `phase2-pr2-transition-table.md` for the exhaustive poll-side transition table this
- * module preserves.
- *
- * Owner-side reducers ship as signatures + stub bodies in PR2; their real
- * implementations land in PR4 alongside the SSE adapter wrapper. Stub bodies
- * intentionally return `[]` and do not mutate their target — PR3 wires them through
- * `applyDescriptors(_, 'owner')` so the type contract is exercised end-to-end before
- * any real owner-side behaviour exists.
+ * Source-aware reducers. Both the poll-source (`reducePolled*`) and the
+ * owner/SSE-source (`reduceOwner*`) reducers mutate a `MakerState` target +
+ * return IO descriptors. Post Phase-3 PR3b source flip: when `ownState.subscribe`
+ * is true the SSE stream is the CANONICAL writer (the owner reducers write
+ * `this.state` via the PR3a `mapOwner*ToMaker` mappers) and the poll path is a
+ * best-effort AUDIT over `this.auditState` (compared by `compareAuditVsCanonical`);
+ * in backout (`subscribe:false`) the poll path is the canonical writer and the
+ * SSE is dormant. See `phase2-pr2-transition-table.md` for the poll-side
+ * transition table this module preserves.
  */
 
 export type {

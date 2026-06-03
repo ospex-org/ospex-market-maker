@@ -95,11 +95,10 @@ export function deriveCommitmentLifecycle(c: OwnerCommitment): CommitmentLifecyc
 /**
  * Map the SDK's `PositionLifecycle` to the canonical {@link MakerPositionStatus}.
  *
- * Unlike the shadow's `mapPositionLifecycle` (src/reducers/owner.ts), which
- * COLLAPSES the terminal `'settledLost'` / `'void'` states into `'claimed'`,
- * the canonical mapper PRESERVES them (own-state plan A7): they are distinct
- * zero-payout terminals, not the same as a claimed win. This is possible now
- * that {@link MAKER_POSITION_STATUSES} carries both states.
+ * PRESERVES the terminal `'settledLost'` / `'void'` states (own-state plan A7):
+ * they are distinct zero-payout terminals, not the same as a claimed win. (The
+ * poll/audit path never produces them — the API has no settledLost/void bucket.)
+ * This is possible now that {@link MAKER_POSITION_STATUSES} carries both states.
  *
  * Exhaustive over `PositionLifecycle` — if the SDK enum gains a state this stops
  * compiling, which is the intended forcing function.
@@ -271,9 +270,9 @@ export function mapOwnerPositionToMaker(p: OwnerPosition): MakerPositionRecord {
  * (created by the snapshot / fill path) are preserved from `prev`.
  *
  * **Pure transform — does NOT enforce forward-only ordering.** Rejecting a
- * backwards transition is the caller's responsibility (mirrors the shadow's
- * projector/reducer split, where `projectOwnerPosition` is pure and
- * `reduceOwnerPositionStatus` guards direction). The caller is also responsible
+ * backwards transition (and refusing any change out of a terminal status) is
+ * the caller's responsibility — `reduceOwnerPositionStatus` (src/reducers/owner.ts)
+ * guards direction + terminal-immutability around this pure map. The caller is also responsible
  * for resolving `prev` for `(speculationId, side)` before calling.
  *
  * `result`: `PositionStatusEvent.result` includes `'lost'`, which has no

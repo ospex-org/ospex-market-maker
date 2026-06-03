@@ -430,10 +430,11 @@ export class Runner {
    * `reduceOwnerFill`. Keys are `(txHash, logIndex)` per the SDK's spec
    * §2.1.2 dedup contract.
    *
-   * Phase 2 is shadow-only: `MakerCommitmentRecord.fills[]` is empty (poll
-   * never appends; owner reducer never writes canonical state). So the seed
-   * is empty at boot in Phase 2 — forward-compat infrastructure for Phase 3
-   * cutover when `reduceOwnerFill` starts appending to canonical `fills[]`.
+   * PR3b source flip: `reduceOwnerFill` now appends observed fills to
+   * `MakerCommitmentRecord.fills[]` (canonical), so the boot seed reconstructs
+   * the dedup set from disk-loaded `fills[]` on resume. The poll path still
+   * never appends (no `txHash`), and a baseline swap re-seeds the set empty
+   * (the snapshot's `filledRiskWei6` is already post-fill).
    */
   private readonly ownStateDedupSet = new Set<string>();
   /**
@@ -472,6 +473,31 @@ export class Runner {
    * (never clear) since the SSE handlers PR4 will own the recovery path.
    */
   private streamOverflowDegraded = false;
+  /**
+   * Latch (Phase 3 PR3b source flip) — `true` while a canonical own-state MAPPER
+   * failed during baseline accumulation or a delta (`OwnerMappingError`, or any
+   * other throw the drain catch funnels through {@link emitOwnStateMappingFailure}).
+   * When the SSE is the CANONICAL writer (`subscribe:true`), a skipped row means
+   * `MakerState` is MISSING an owned commitment/position — so own-state cannot be
+   * considered healthy (it would undercount exposure and allow posting on an
+   * incomplete book). ANDed into the edge mirror ({@link recomputeOwnStateHealth})
+   * so the §5.1 posting gate holds AND the audit comparator skips a known-incomplete
+   * canonical book. Cleared on a clean rebaseline ({@link resetOwnStateForRebaseline}) —
+   * a fresh snapshot re-sets it if the offending row is still malformed.
+   */
+  private ownStateMappingDegraded = false;
+  /**
+   * Per-audit-cycle flag (Phase 3 PR3b source flip) — `true` if THIS cycle's audit
+   * poll (detectFills/pollPositionStatus/reconcileSoftCancelledFills) hit an API
+   * read failure. The audit reseeds `auditState` from canonical BEFORE polling, so
+   * a FAILED poll leaves `auditState === canonical` (no API observation applied) →
+   * the comparator would see a null payload and spuriously CLEAR a real prior
+   * `auditDivergenceUnresolved` without any successful observation. Reset at cycle
+   * start ({@link reseedAuditState}); {@link runAuditComparator} skips the
+   * comparison (preserving the prior latch) when set. Audit failures still never
+   * GATE trading — they just don't VALIDATE the divergence verdict.
+   */
+  private auditPollFailedThisCycle = false;
   /**
    * The currently-active own-state SSE subscription (Phase 2 PR4a). `null`
    * when `config.ownState.subscribe` is false OR while the runner is
@@ -1124,7 +1150,8 @@ export class Runner {
   }
 
   /**
-   * Drain the ownState queue and apply owner-source reducers to the shadow.
+   * Drain the ownState queue and apply owner-source reducers to CANONICAL
+   * `MakerState` (PR3b source flip — gated on `ownStateSession.ready`).
    * Overflow is normally already latched + telemetered at ENQUEUE time
    * (`noteOwnStateOverflow`, Hermes #73); this drain only belt-and-braces it.
    *
@@ -2685,6 +2712,7 @@ export class Runner {
       apiList = await this.adapter.listOpenCommitments(this.makerAddress, listLimit);
     } catch (err) {
       this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'fill-detection' });
+      if (subscribe) this.auditPollFailedThisCycle = true; // audit didn't observe the API → must not validate/clear divergence
       return subscribe ? true : false; // backout: fail closed (skip live writes + ageOut); audit: never gates trading
     }
     const apiByHash = new Map<string, Commitment>();
@@ -2736,6 +2764,11 @@ export class Runner {
    * comparator never reads them — only `filledRiskWei6` matters).
    */
   private reseedAuditState(): void {
+    // New audit cycle — clear the per-cycle "poll failed to observe the API" flag.
+    // A failed audit read this cycle leaves auditState === canonical (the clone,
+    // unconverged), which the comparator would mistake for a clean comparison and
+    // use to CLEAR a real prior divergence; runAuditComparator skips on this flag.
+    this.auditPollFailedThisCycle = false;
     this.auditState.commitments = Object.fromEntries(
       Object.entries(this.state.commitments).map(([hash, r]) => [hash, { ...r }]),
     );
@@ -2745,11 +2778,18 @@ export class Runner {
   }
 
   /**
-   * Emit the right telemetry for a canonical own-state mapping failure: the
+   * Emit the right telemetry for a canonical own-state mapping failure (the
    * dedicated `owner-mapping-failed` kind when a PR3a mapper threw
-   * `OwnerMappingError` (a payload missing metadata a `Maker*Record` requires),
-   * or a generic `error` otherwise. Shared by the drain dispatch and the
-   * snapshot-baseline accumulation — both skip the offending row (fail-closed).
+   * `OwnerMappingError`, else a generic `error`) AND latch own-state unhealthy.
+   * Shared by the drain dispatch and the snapshot-baseline accumulation — both
+   * skip the offending row, which means canonical `MakerState` is now MISSING an
+   * owned commitment/position. With the SSE as the canonical writer that cannot
+   * be treated as telemetry-only: {@link ownStateMappingDegraded} holds the §5.1
+   * posting gate (and skips the audit comparator) until a clean rebaseline, so
+   * the runner never posts on an incomplete canonical book. The recompute keeps
+   * the edge mirror in sync for the delta path (the snapshot path recomputes at
+   * `onReady` after the swap); during baseline accumulation `ready` is still
+   * false, so the per-row recompute is a cheap no-op on the result.
    */
   private emitOwnStateMappingFailure(err: unknown, where: string): void {
     if (err instanceof OwnerMappingError) {
@@ -2768,6 +2808,8 @@ export class Runner {
         phase: 'own-state-stream',
       });
     }
+    this.ownStateMappingDegraded = true;
+    this.recomputeOwnStateHealth();
   }
 
   /**
@@ -2843,11 +2885,13 @@ export class Runner {
    * identity-guard inside the handlers can compare against
    * `this.currentOwnStateSubscription` correctly on the very first event.
    *
-   * Phase 2 invariant — shadow-only: the handlers project SSE bodies into
-   * `this.ownStateSession` ONLY. Canonical `MakerState` writes still come
-   * from the poll path. Owner-reducer event-application is stubbed in
-   * PR4a (queue events drain to no-op reducers); PR4b lands the real
-   * reducer bodies.
+   * PR3b source flip: the handlers feed the SSE-derived deltas into the
+   * `ownStateQueue`; `drainOwnState` then applies them to the CANONICAL
+   * `MakerState` via the PR3a mappers (this is now the canonical own-state
+   * writer when `subscribe:true`). The snapshot/`onReady` handlers write the
+   * `ownStateSession` baseline + swap it into `MakerState`. (In backout —
+   * `subscribe:false` — this subscription is never opened and the poll path
+   * remains the canonical writer.)
    */
   private openOwnStateSubscription(): void {
     if (this.makerAddress === null) return; // guarded by caller; defensive
@@ -3245,6 +3289,10 @@ export class Runner {
     // (the fresh snapshot replaces the shadow the comparator measured), so clear the
     // posting-only latch with its tracker — a post-rebaseline comparison re-derives it.
     this.auditDivergenceUnresolved = false;
+    // PR3b: clear the mapping-degraded latch — a fresh baseline supersedes the
+    // incomplete one. If the offending row is still malformed, the new snapshot's
+    // accumulation re-sets it (and holds again); a clean snapshot heals it.
+    this.ownStateMappingDegraded = false;
     // The rebaseline cleared `ready` + the overflow latch, so re-derive composite
     // health (it goes unhealthy on `ready=false`, which also clears the recovery
     // hold so the fresh baseline must re-earn `recoveryHoldMs` of stability before
@@ -3380,6 +3428,7 @@ export class Runner {
       this.ownStateSession.lastStatus === 'connected' &&
       !this.streamOverflowDegraded &&
       !this.ownStateSession.positionsTruncated &&
+      !this.ownStateMappingDegraded &&
       this.ownStateSession.lastError?.reason !== 'fatal' &&
       !this.tokenRefreshFailureInFlight;
     const instant = this.instantOwnStateHealthy(nowSec);
@@ -3645,6 +3694,14 @@ export class Runner {
     // `auditDivergenceUnresolved` — corrupting the very signal a dry-run+subscribe
     // operator watches. Skip the comparison when the audit poll didn't run.
     if (this.config.mode.dryRun) return;
+    // The audit reseeds `auditState` from canonical BEFORE polling, so a FAILED
+    // audit read this cycle leaves `auditState === canonical` (no API observation
+    // applied) — which the comparator would read as "no divergence" and use to
+    // CLEAR a real prior `auditDivergenceUnresolved`. An audit failure must not
+    // GATE trading (the poll methods returned success), but it must not VALIDATE
+    // the divergence verdict either: skip the comparison entirely so the prior
+    // latch + tracker persist until a cycle that actually observed the API.
+    if (this.auditPollFailedThisCycle) return;
     // Gate on the FULL INSTANTANEOUS mirror — the edge latches (ready + connected
     // + no overflow / truncation / fatal / token-refresh failure) AND the
     // time-dependent `transportFresh` (latch 2) — NOT the posting gate
@@ -3894,6 +3951,7 @@ export class Runner {
       const result = this.applyDescriptors(descriptors, source);
       if (result.softCancelledProbeFailed) allProbesOk = false;
     }
+    if (subscribe && !allProbesOk) this.auditPollFailedThisCycle = true; // a probe failed → audit observation incomplete; don't validate/clear divergence
     return subscribe ? true : allProbesOk; // audit never gates trading
   }
 
@@ -3963,6 +4021,7 @@ export class Runner {
       status = await this.adapter.getPositionStatus(this.makerAddress);
     } catch (err) {
       this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'position-poll' });
+      if (subscribe) this.auditPollFailedThisCycle = true; // audit didn't observe the API → must not validate/clear divergence
       return subscribe ? true : false; // backout: caller fails closed iff non-terminal softCancelled commitments exist; audit: never gates
     }
     for (const p of status.active) {

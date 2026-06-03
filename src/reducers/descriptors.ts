@@ -12,7 +12,7 @@
 import type { MakerSide } from '../state/index.js';
 
 export interface FillEventPayload {
-  source: 'commitment-diff' | 'softcancel-recovery' | 'position-poll';
+  source: 'commitment-diff' | 'softcancel-recovery' | 'position-poll' | 'own-state-stream';
   commitmentHash?: string;
   positionId?: string;
   speculationId: string;
@@ -61,6 +61,24 @@ export interface ErrorEventPayload {
   speculationId?: string;
 }
 
+/**
+ * An own-state SSE `fill` event arrived for a `commitmentHash` the canonical
+ * `MakerState` has no record of (own-state SSE plan §7.2). The canonical fill
+ * reducer refuses to materialize an orphan position (a fill alone carries no
+ * sport/team identity — that lives on the originating commitment), so it emits
+ * this signal instead. The runner translates it into `unknown-own-fill`
+ * telemetry + sets the audit-divergence posting hold + requests a cursor-less
+ * cold restart (re-snapshot) so a fresh baseline either includes the commitment
+ * — and the fill is re-delivered and matches — or it never lands (the correct
+ * terminal state for that data inconsistency).
+ */
+export interface UnknownOwnFillPayload {
+  commitmentHash: string;
+  speculationId: string;
+  txHash: string;
+  logIndex: number;
+}
+
 export type ReducerDescriptor =
   | { kind: 'emit-fill'; payload: FillEventPayload }
   | { kind: 'emit-expire'; payload: ExpireEventPayload }
@@ -68,9 +86,12 @@ export type ReducerDescriptor =
   | { kind: 'emit-error'; payload: ErrorEventPayload }
   | { kind: 'mark-dirty'; contestId: string }
   | { kind: 'signal-past-expiry-lookup-failed' }
-  | { kind: 'signal-softcancel-probe-failed' };
+  | { kind: 'signal-softcancel-probe-failed' }
+  | { kind: 'signal-unknown-own-fill'; payload: UnknownOwnFillPayload };
 
 export interface ApplyDescriptorsResult {
   pastExpiryLookupFailed: boolean;
   softCancelledProbeFailed: boolean;
+  /** An own-state `fill` referenced a commitment not in canonical state (§7.2) — the orphan was NOT applied; the runner froze cursor promotion + requested recovery. */
+  unknownOwnFill: boolean;
 }

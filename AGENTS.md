@@ -393,6 +393,7 @@ CommitmentLifecycle: 'visibleOpen' | 'softCancelled' | 'partiallyFilled'
                    | 'filled' | 'expired' | 'authoritativelyInvalidated'
 
 MakerPositionStatus: 'active' | 'pendingSettle' | 'claimable' | 'claimed'
+                   | 'settledLost' | 'void'   // settledLost/void are terminal zero-payout; produced by the canonical own-state mapper (the poll path + shadow collapse them to 'claimed')
 
 SignedPayloadStatus: 'present' | 'missing-legacy'
 ```
@@ -465,7 +466,7 @@ Unrealized P&L over `unsettledCount` positions is a future slice (requires `summ
 | Term | Where it lives |
 |---|---|
 | `CommitmentLifecycle` (6 values) | [`src/state/index.ts`](./src/state/index.ts) — `COMMITMENT_LIFECYCLE_STATES` |
-| `MakerPositionStatus` (4 values) | [`src/state/index.ts`](./src/state/index.ts) — `MAKER_POSITION_STATUSES` |
+| `MakerPositionStatus` (6 values) | [`src/state/index.ts`](./src/state/index.ts) — `MAKER_POSITION_STATUSES` |
 | `TelemetryKind` (24 values) | [`src/telemetry/index.ts`](./src/telemetry/index.ts) — `TELEMETRY_KINDS` |
 | `CandidateSkipReason` (14 values) | [`src/telemetry/index.ts`](./src/telemetry/index.ts) — `CANDIDATE_SKIP_REASONS` |
 | `SoftCancelReason` / `ReplaceReason` | [`src/orders/index.ts`](./src/orders/index.ts) |

@@ -62,7 +62,12 @@ function positionStatusRank(s: MakerPositionStatus): number {
     case 'active': return 0;
     case 'pendingSettle': return 1;
     case 'claimable': return 2;
+    // Terminal triple at the top rank. The poll path only ever produces the
+    // first four (the API has no settledLost/void bucket); the last two arms
+    // exist for exhaustiveness over the extended MakerPositionStatus.
     case 'claimed': return 3;
+    case 'settledLost': return 3;
+    case 'void': return 3;
   }
 }
 

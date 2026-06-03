@@ -331,12 +331,15 @@ describe('inventoryFromState', () => {
     expect(() => inventoryFromState(stateWith({ commitments: { o: overFilled } }), NOW, 0)).toThrow(/corrupt inventory/);
   });
 
-  it('keeps active / pendingSettle / claimable positions; drops claimed (positions never add to the commitment count)', () => {
+  it('keeps active / pendingSettle / claimable positions; drops ALL terminal statuses claimed / settledLost / void (positions never add to the commitment count)', () => {
     const positions: Record<string, MakerPositionRecord> = {
       'spec-1:away': positionRecord({ status: 'active', side: 'away', riskAmountWei6: '250000' }),
       'spec-2:home': positionRecord({ speculationId: 'spec-2', contestId: 'contest-2', status: 'pendingSettle', side: 'home', riskAmountWei6: '100000' }),
       'spec-3:away': positionRecord({ speculationId: 'spec-3', contestId: 'contest-3', status: 'claimable', side: 'away', riskAmountWei6: '50000' }),
       'spec-4:home': positionRecord({ speculationId: 'spec-4', contestId: 'contest-4', status: 'claimed', side: 'home', riskAmountWei6: '999999' }),
+      // the two NEW terminals carry no live exposure either — they must NOT be counted
+      'spec-5:away': positionRecord({ speculationId: 'spec-5', contestId: 'contest-5', status: 'settledLost', side: 'away', riskAmountWei6: '888888' }),
+      'spec-6:home': positionRecord({ speculationId: 'spec-6', contestId: 'contest-6', status: 'void', side: 'home', riskAmountWei6: '777777' }),
     };
     const inv = inventoryFromState(stateWith({ positions }), NOW, 0);
     expect(inv.openCommitmentCount).toBe(0);

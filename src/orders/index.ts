@@ -40,7 +40,7 @@ import {
   type QuoteSide,
 } from '../pricing/index.js';
 import { headroomForSide, verdictForMarket, type ExposureItem, type Inventory, type MakerSide, type Market, type RiskCaps } from '../risk/index.js';
-import type { CommitmentLifecycle, MakerCommitmentRecord, MakerState } from '../state/index.js';
+import { isTerminalPositionStatus, type CommitmentLifecycle, type MakerCommitmentRecord, type MakerState } from '../state/index.js';
 
 // ── types ────────────────────────────────────────────────────────────────────
 
@@ -234,11 +234,15 @@ export function isExpiredForRelease(expiryUnixSec: number, nowUnixSec: number, g
  * `openCommitmentCount` is the count of those kept
  * commitments — what the `maxOpenCommitments` cap binds.
  *
- * Positions: keep everything except `claimed`. `pendingSettle` / `claimable` are
- * short-lived (the runner settles / claims promptly in live mode) and counting
- * them is the conservative direction — a `claimable` position has actually *won*,
- * so it can't lose; counting it slightly over-states worst-case exposure, but
- * over-counting errs toward quoting *less*, which is the safe side.
+ * Positions: keep everything except the TERMINAL statuses
+ * ({@link isTerminalPositionStatus} — `claimed` / `settledLost` / `void`), which
+ * carry no remaining live exposure (collected win / realized loss / returned
+ * stake). The kept non-terminal states (`active` / `pendingSettle` /
+ * `claimable`) are counted in full: `pendingSettle` / `claimable` are
+ * short-lived (the runner settles / claims promptly in live mode), and a
+ * `claimable` position has actually *won* so it can't lose — counting it
+ * slightly over-states worst-case exposure, but over-counting errs toward
+ * quoting *less*, which is the safe side.
  *
  * Amounts are wei6 decimal strings; the `risk - filled` subtraction is done in
  * `BigInt` (exact), then the result → `Number` for `wei6ToUSDC` (the USDC caps
@@ -274,7 +278,7 @@ export function inventoryFromState(state: MakerState, nowUnixSec: number, graceS
   }
 
   for (const record of Object.values(state.positions)) {
-    if (record.status === 'claimed') continue;
+    if (isTerminalPositionStatus(record.status)) continue; // claimed / settledLost / void — no live exposure
     const riskWei6 = BigInt(record.riskAmountWei6);
     if (riskWei6 === 0n) continue; // a zero-stake position carries no exposure
     items.push({

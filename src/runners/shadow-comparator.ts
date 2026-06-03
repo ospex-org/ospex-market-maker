@@ -29,7 +29,7 @@
  * neither side tracks; not part of this comparator pass.
  */
 
-import type { CommitmentLifecycle, MakerCommitmentRecord, MakerPositionRecord, MakerState } from '../state/index.js';
+import { isTerminalPositionStatus, type CommitmentLifecycle, type MakerCommitmentRecord, type MakerPositionRecord, type MakerState } from '../state/index.js';
 import type { OwnStateShadow, ShadowCommitment, ShadowPosition } from '../reducers/index.js';
 
 /** The divergence field vocabulary (own-state-sse-plan §6.3). */
@@ -165,10 +165,13 @@ export function compareShadowVsCanonical(
     const canonical: MakerPositionRecord | undefined = state.positions[posKey];
     const shadowRow: ShadowPosition | undefined = shadow.positions[posKey];
     if (canonical !== undefined && shadowRow === undefined) {
-      // Terminal positions ('claimed') may have been pruned shadow-side; the
-      // SSE position-status reducer is forward-only and a terminal-then-cleared
-      // shadow is plausible. Skip terminal-only-canonical.
-      if (canonical.status === 'claimed') continue;
+      // Terminal positions (claimed / settledLost / void) may have been pruned
+      // shadow-side; the SSE position-status reducer is forward-only and a
+      // terminal-then-cleared shadow is plausible. Skip terminal-only-canonical.
+      // (In Phase 2 canonical is poll-written, so only `claimed` occurs; the
+      // shared predicate keeps this correct when PR3b's canonical mapper starts
+      // producing settledLost / void.)
+      if (isTerminalPositionStatus(canonical.status)) continue;
       const key = divergenceKey('missing-in-stream', posKey);
       detected.set(key, { observation: { field: 'missing-in-stream', key: posKey, canonical: canonical.status, shadow: null } });
     } else if (canonical === undefined && shadowRow !== undefined) {

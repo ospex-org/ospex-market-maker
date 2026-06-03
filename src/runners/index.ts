@@ -144,7 +144,7 @@ import { OwnStateQueue } from './own-state-queue.js';
 import { compareShadowVsCanonical, type TrackedDivergence } from './shadow-comparator.js';
 import { WakeSignal } from './wake-signal.js';
 import { canSpendGas, requiredPositionModuleAllowanceUSDC, type Market } from '../risk/index.js';
-import { assessStateLoss, dispatchCancel, fillDedupKey, toMakerSignedPayload, type CancelDispatch, type MakerCommitmentRecord, type MakerSide, type MakerSignedPayload, type MakerState, type StateLossAssessment, type StateStore } from '../state/index.js';
+import { assessStateLoss, dispatchCancel, fillDedupKey, isTerminalPositionStatus, toMakerSignedPayload, type CancelDispatch, type MakerCommitmentRecord, type MakerSide, type MakerSignedPayload, type MakerState, type StateLossAssessment, type StateStore } from '../state/index.js';
 import { EventLog, eventLogsExist } from '../telemetry/index.js';
 
 // ── injectable seams (the defaults are the real impls; tests override) ───────
@@ -4439,14 +4439,15 @@ export class Runner {
 
 /**
  * Sum the maker's currently-at-risk USDC across non-released commitments +
- * non-claimed positions, in wei6. Used by the own-state overflow telemetry
+ * non-terminal positions ({@link isTerminalPositionStatus} excludes claimed /
+ * settledLost / void — none carry live exposure), in wei6. Used by the own-state overflow telemetry
  * (`stream-would-hold {exposureWei6}`) and the §5.1 `stream-health-hold` severity
  * (`high` iff > 0) — the exposure the Phase 3 PR2a posting gate protects when it
  * halts new posting on degraded own-state. Identical accounting to `inventoryFromState` minus the
  * per-item shape; keep the predicates in lockstep with `RELEASED_LIFECYCLES`
  * and `isExpiredForRelease` over there if either changes.
  */
-function computeOpenExposureWei6(state: MakerState, nowUnixSec: number, graceSeconds: number): bigint {
+export function computeOpenExposureWei6(state: MakerState, nowUnixSec: number, graceSeconds: number): bigint {
   let total = 0n;
   for (const c of Object.values(state.commitments)) {
     if (c.lifecycle !== 'visibleOpen' && c.lifecycle !== 'softCancelled' && c.lifecycle !== 'partiallyFilled') continue;
@@ -4455,7 +4456,7 @@ function computeOpenExposureWei6(state: MakerState, nowUnixSec: number, graceSec
     if (remaining > 0n) total += remaining;
   }
   for (const p of Object.values(state.positions)) {
-    if (p.status === 'claimed') continue;
+    if (isTerminalPositionStatus(p.status)) continue; // claimed / settledLost / void — no live exposure
     total += BigInt(p.riskAmountWei6);
   }
   return total;

@@ -487,6 +487,68 @@ function commitmentRecord(overrides: Partial<MakerCommitmentRecord>): MakerCommi
   };
 }
 
+/**
+ * A fully-populated, mappable own-state `OwnerCommitment` (enriched per PR0b) —
+ * mirrors `src/reducers/owner-mapping.test.ts`'s `commitment()`. Post the PR3b
+ * source flip the SSE snapshot + delta reducers project this via
+ * `mapOwnerCommitmentToMaker`, which FAILS CLOSED on missing metadata; an
+ * incomplete fixture would be skipped (no book row), so any test that asserts a
+ * commitment landed in the canonical book must use this. Loosely typed as
+ * `Record<string, unknown>` to keep the recorder/`enqueueOwnStateEvent` seams
+ * ergonomic (the runner-side casts narrow it).
+ */
+function mappableOwnerCommitment(hash: string, overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    ownerAuthorized: true, visibility: 'visible', redacted: false,
+    commitmentHash: hash, maker: DEFAULT_FAKE_MAKER_ADDRESS,
+    contestId: '1', scorer: '0xscorer', lineTicks: 0, positionType: 0, oddsTick: 250,
+    marketType: 'moneyline', riskAmount: '250000', filledRiskAmount: '0',
+    remainingRiskAmount: '250000', nonce: '1',
+    expiry: '2099-01-01T00:00:00.000Z', speculationKey: null, signature: null,
+    status: 'open', storedStatus: 'open', source: 'sse', network: 'polygon',
+    nonceInvalidated: false, isLive: true, createdAt: '2025-01-01T00:00:00.000Z',
+    speculationId: 'spec-1', sport: 'baseball_mlb', awayTeam: 'NYM', homeTeam: 'LAD',
+    updatedAtUnixSec: 1735689600, signedPayload: null,
+    ...overrides,
+  };
+}
+
+/**
+ * A fully-populated own-state snapshot `OwnerPosition` row — mirrors
+ * owner-mapping.test.ts's `BASE_POSITION`. Mapped via `mapOwnerPositionToMaker`
+ * on the snapshot baseline path (PR3b source flip).
+ */
+function mappableOwnerPosition(speculationId: string, overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    positionId: `p-${speculationId}`, speculationId, positionType: 0,
+    team: 'NYM', opponent: 'LAD', market: 'moneyline', oddsDecimal: 2.5,
+    riskAmountUSDC: 0.1, profitAmountUSDC: 0.15,
+    contestId: '1', sport: 'baseball_mlb', awayTeam: 'NYM', homeTeam: 'LAD',
+    riskAmountWei6: '100000', counterpartyRiskWei6: '150000',
+    updatedAtUnixSec: 1735689600, status: 'active',
+    ...overrides,
+  };
+}
+
+/**
+ * A fully-populated own-state `Fill` (enriched per PR0b) — the maker fills its
+ * own `mappableOwnerCommitment`. The canonical fill reducer resolves position
+ * identity from the sibling commitment, so the commitment must already be in the
+ * book (snapshot/delta) before this fill is delivered.
+ */
+function mappableOwnerFill(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    speculationId: 'spec-1', contestId: '1', commitmentHash: '0xabc',
+    maker: DEFAULT_FAKE_MAKER_ADDRESS, taker: '0xother',
+    makerPositionType: 0, takerPositionType: 1,
+    makerRiskAmount: '100000', takerRiskAmount: '150000',
+    makerRiskUSDC: 0.1, takerRiskUSDC: 0.15, oddsTick: 250,
+    filledAt: '2025-01-01T00:00:00.000Z', contestStarted: false,
+    txHash: '0xtx1', logIndex: 0,
+    ...overrides,
+  };
+}
+
 // ── boot path — the state-loss fail-safe (DESIGN §12) ────────────────────────
 
 describe('Runner — boot', () => {
@@ -603,6 +665,38 @@ describe('Runner — tick loop', () => {
     }).run();
     expect(sleepMsCalls).toEqual([30000, 30000]); // 3 ticks → 2 sleeps (the loop exits after tick 3 before sleeping)
     expect(lines.filter((l) => /clamping to 30000ms/.test(l))).toHaveLength(1);
+  });
+
+  // ── PR3b source flip — tick cadence selection (sleepMs) ──────────────────
+
+  it('subscribe:true paces the tick at auditPollIntervalMs (the SSE stream drives own-state real-time; the poll is the slower AUDIT cross-check)', async () => {
+    const sleepMsCalls: number[] = [];
+    const config = cfg({ ownState: { subscribe: true, auditPollIntervalMs: 45000 } });
+    const adapter = createOspexAdapter(config);
+    vi.spyOn(adapter, 'listContests').mockResolvedValue([]);
+    vi.spyOn(adapter, 'getOwnStateHealth').mockResolvedValue(MOCK_OWN_STATE_HEALTH);
+    // The SSE stream opens but never fires events; the loop still ticks + sleeps.
+    vi.spyOn(adapter, 'subscribeOwnState').mockImplementation((() => ({ unsubscribe: () => Promise.resolve() })) as unknown as OspexAdapter['subscribeOwnState']);
+    await makeRunner({
+      config, adapter, maxTicks: 3, makerAddress: DEFAULT_FAKE_MAKER_ADDRESS as Hex,
+      deps: { sleep: (ms) => { sleepMsCalls.push(ms); return Promise.resolve(); } },
+    }).run();
+    // 3 ticks → 2 poll-deadline sleeps, each at auditPollIntervalMs (NOT the 30000 trading floor).
+    expect(sleepMsCalls).toEqual([45000, 45000]);
+  });
+
+  it('subscribe:false (backout) paces the tick at the trading pollIntervalMs/floor, NOT auditPollIntervalMs', async () => {
+    const sleepMsCalls: number[] = [];
+    // pollIntervalMs above the floor + a distinct auditPollIntervalMs that MUST be ignored in backout.
+    const config = cfg({ pollIntervalMs: 40000, ownState: { subscribe: false, auditPollIntervalMs: 45000 } });
+    const adapter = createOspexAdapter(config);
+    vi.spyOn(adapter, 'listContests').mockResolvedValue([]);
+    await makeRunner({
+      config, maxTicks: 3, adapter,
+      deps: { sleep: (ms) => { sleepMsCalls.push(ms); return Promise.resolve(); } },
+    }).run();
+    // Trading cadence = max(pollIntervalMs, POLL_INTERVAL_FLOOR_MS) = 40000; the audit interval is unused in backout.
+    expect(sleepMsCalls).toEqual([40000, 40000]);
   });
 
   it('warns at boot when odds.maxRealtimeChannels + reserved own-state streams would exceed the core-api per-IP cap', () => {
@@ -902,7 +996,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
     const sentinelSub: Subscription = { unsubscribe: () => Promise.resolve() };
     runner.setCurrentOwnStateSubscriptionForTest(sentinelSub);
 
-    const shadowBefore = JSON.parse(JSON.stringify(runner.ownStateShadowView()));
+    const shadowBefore = JSON.parse(JSON.stringify(runner.ownStateSessionView()));
 
     // Fire every kind of handler with realistic-shaped payloads.
     recorder.fire('onSnapshot', { cursor: 'c1', commitments: [], positions: [], truncated: false, positionsTruncated: false });
@@ -913,7 +1007,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
     recorder.fire('onError', { reason: 'fatal', message: 'simulated', constructor: { name: 'OspexStreamError' } });
 
     // Shadow must be byte-identical (no stale handler mutation).
-    expect(JSON.parse(JSON.stringify(runner.ownStateShadowView()))).toEqual(shadowBefore);
+    expect(JSON.parse(JSON.stringify(runner.ownStateSessionView()))).toEqual(shadowBefore);
 
     // Restore so shutdown unsubscribes cleanly.
     runner.setCurrentOwnStateSubscriptionForTest(recorder.sub);
@@ -964,45 +1058,47 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
     return { runner, recorder, runPromise, sleepCalls, resolvers, triggerKill: () => triggerKill() };
   }
 
-  it('multi-page snapshot accumulates into pendingBaseline; onReady atomically swaps into shadow.commitments + shadow.positions', async () => {
+  it('multi-page snapshot accumulates into pendingBaseline; onReady atomically swaps into canonical state.commitments + state.positions', async () => {
     const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
 
     // Page 1 (truncated=true) — accumulate commitment A + position P1
     recorder.fire('onSnapshot', {
       cursor: 'c1',
-      commitments: [{ commitmentHash: '0xa', filledRiskAmount: '0', riskAmount: '100', expiry: null, status: 'open', storedStatus: 'open', nonceInvalidated: false }],
-      positions: [{ speculationId: 'spec-1', positionType: 0, riskAmountUSDC: 0.1, profitAmountUSDC: 0, status: 'active' }],
+      commitments: [mappableOwnerCommitment('0xa')],
+      positions: [mappableOwnerPosition('spec-1')],
       truncated: true,
       positionsTruncated: false,
     });
 
-    let shadow = runner.ownStateShadowView();
-    expect(shadow.ready).toBe(false);
-    expect(shadow.pendingBaseline).not.toBeNull();
-    expect(Object.keys(shadow.pendingBaseline!.commitments)).toEqual(['0xa']);
-    expect(Object.keys(shadow.pendingBaseline!.positions)).toEqual(['spec-1:away']);
-    expect(shadow.commitments).toEqual({}); // not yet swapped
-    expect(shadow.positions).toEqual({});
+    // pendingBaseline stays on the session view; the canonical book stays empty until onReady.
+    let session = runner.ownStateSessionView();
+    expect(session.ready).toBe(false);
+    expect(session.pendingBaseline).not.toBeNull();
+    expect(Object.keys(session.pendingBaseline!.commitments)).toEqual(['0xa']);
+    expect(Object.keys(session.pendingBaseline!.positions)).toEqual(['spec-1:away']);
+    expect(runner.stateForTest().commitments).toEqual({}); // not yet swapped
+    expect(runner.stateForTest().positions).toEqual({});
 
     // Page 2 (truncated=false) — accumulate commitment B
     recorder.fire('onSnapshot', {
       cursor: 'c2',
-      commitments: [{ commitmentHash: '0xb', filledRiskAmount: '0', riskAmount: '200', expiry: null, status: 'open', storedStatus: 'open', nonceInvalidated: false }],
+      commitments: [mappableOwnerCommitment('0xb', { riskAmount: '200000' })],
       positions: [],
       truncated: false,
       positionsTruncated: false,
     });
 
-    shadow = runner.ownStateShadowView();
-    expect(Object.keys(shadow.pendingBaseline!.commitments).sort()).toEqual(['0xa', '0xb']);
+    session = runner.ownStateSessionView();
+    expect(Object.keys(session.pendingBaseline!.commitments).sort()).toEqual(['0xa', '0xb']);
 
-    // onReady: atomic swap.
+    // onReady: atomic swap into the CANONICAL book (PR3b source flip).
     recorder.fire('onReady');
-    shadow = runner.ownStateShadowView();
-    expect(shadow.ready).toBe(true);
-    expect(shadow.pendingBaseline).toBeNull();
-    expect(Object.keys(shadow.commitments).sort()).toEqual(['0xa', '0xb']);
-    expect(Object.keys(shadow.positions)).toEqual(['spec-1:away']);
+    session = runner.ownStateSessionView();
+    expect(session.ready).toBe(true);
+    expect(session.pendingBaseline).toBeNull();
+    const state = runner.stateForTest();
+    expect(Object.keys(state.commitments).sort()).toEqual(['0xa', '0xb']);
+    expect(Object.keys(state.positions)).toEqual(['spec-1:away']);
 
     triggerKill();
     await runPromise;
@@ -1013,34 +1109,34 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
 
     recorder.fire('onSnapshot', {
       cursor: 'c1',
-      commitments: [{ commitmentHash: '0xpre', filledRiskAmount: '0', riskAmount: '100', expiry: null, status: 'open', storedStatus: 'open', nonceInvalidated: false }],
+      commitments: [mappableOwnerCommitment('0xpre')],
       positions: [],
       truncated: false,
       positionsTruncated: false,
     });
     recorder.fire('onReady');
-    expect(runner.ownStateShadowView().ready).toBe(true);
-    expect(Object.keys(runner.ownStateShadowView().commitments)).toEqual(['0xpre']);
+    expect(runner.ownStateSessionView().ready).toBe(true);
+    expect(Object.keys(runner.stateForTest().commitments)).toEqual(['0xpre']);
 
     // resync mid-stream — drops the in-flight baseline + flags not-ready
     recorder.fire('onStatus', 'resync');
-    const shadow = runner.ownStateShadowView();
-    expect(shadow.ready).toBe(false);
-    expect(shadow.pendingBaseline).toBeNull();
-    expect(shadow.lastStatus).toBe('resync');
-    // Pre-resync shadow.commitments PRESERVED — comparator suppresses via `ready` precondition.
-    expect(Object.keys(shadow.commitments)).toEqual(['0xpre']);
+    const session = runner.ownStateSessionView();
+    expect(session.ready).toBe(false);
+    expect(session.pendingBaseline).toBeNull();
+    expect(session.lastStatus).toBe('resync');
+    // Pre-resync canonical state.commitments PRESERVED — comparator suppresses via `ready` precondition.
+    expect(Object.keys(runner.stateForTest().commitments)).toEqual(['0xpre']);
 
     triggerKill();
     await runPromise;
   });
 
-  it('onError(fatal) sets healthy=false; pre-existing shadow state PRESERVED (comparator suppression is PR5\'s job)', async () => {
+  it('onError(fatal) sets healthy=false; pre-existing canonical state PRESERVED (comparator suppression is PR5\'s job)', async () => {
     const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
 
     recorder.fire('onSnapshot', {
       cursor: 'c1',
-      commitments: [{ commitmentHash: '0xpre', filledRiskAmount: '0', riskAmount: '100', expiry: null, status: 'open', storedStatus: 'open', nonceInvalidated: false }],
+      commitments: [mappableOwnerCommitment('0xpre')],
       positions: [],
       truncated: false,
       positionsTruncated: false,
@@ -1049,11 +1145,11 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
 
     // Simulate a fatal error.
     recorder.fire('onError', Object.assign(new Error('boom'), { reason: 'fatal' }));
-    const shadow = runner.ownStateShadowView();
-    expect(shadow.healthy).toBe(false);
-    expect(shadow.lastError?.reason).toBe('fatal');
-    // Shadow state preserved as STALE — PR5 comparator's `healthy && ready` precondition is the suppression.
-    expect(Object.keys(shadow.commitments)).toEqual(['0xpre']);
+    const session = runner.ownStateSessionView();
+    expect(session.healthy).toBe(false);
+    expect(session.lastError?.reason).toBe('fatal');
+    // Canonical state preserved as STALE — PR5 comparator's `healthy && ready` precondition is the suppression.
+    expect(Object.keys(runner.stateForTest().commitments)).toEqual(['0xpre']);
 
     triggerKill();
     await runPromise;
@@ -1068,7 +1164,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
     recorder.fire('onPositionStatus', { address: '0xabc', speculationId: 'spec-1', positionType: 0, status: 'active', sourceUpdatedAt: '2025-01-01T00:00:00Z' });
 
     // No direct assertion on queue contents (private); but lastEventAtMs advanced.
-    expect(runner.ownStateShadowView().lastEventAtMs).toBeGreaterThan(0);
+    expect(runner.ownStateSessionView().lastEventAtMs).toBeGreaterThan(0);
 
     triggerKill();
     await runPromise;
@@ -1085,10 +1181,10 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
     // (the explicit seam exercises the gating logic; the integration test
     // path is in "Runner — own-state queue overflow telemetry" above.)
     recorder.fire('onStatus', 'degraded');
-    expect(runner.ownStateShadowView().healthy).toBe(false);
+    expect(runner.ownStateSessionView().healthy).toBe(false);
     recorder.fire('onStatus', 'connected');
     // Transport reconnected, but the overflow latch survives — healthy stays false.
-    expect(runner.ownStateShadowView().healthy).toBe(false);
+    expect(runner.ownStateSessionView().healthy).toBe(false);
     expect(runner.streamOverflowDegradedForTest()).toBe(true);
     triggerKill();
     await runPromise;
@@ -1100,7 +1196,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
     recorder.fire('onStatus', 'resync');
     expect(runner.streamOverflowDegradedForTest()).toBe(false);
     // Ready also flips off — the next onReady restores healthy after a fresh baseline.
-    expect(runner.ownStateShadowView().ready).toBe(false);
+    expect(runner.ownStateSessionView().ready).toBe(false);
     triggerKill();
     await runPromise;
   });
@@ -1115,7 +1211,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
       positionsTruncated: true, // server signaled the 200-row position cap
     });
     recorder.fire('onReady');
-    const shadow = runner.ownStateShadowView();
+    const shadow = runner.ownStateSessionView();
     expect(shadow.ready).toBe(true);
     expect(shadow.positionsTruncated).toBe(true);
     // The truncated baseline must NOT be marked healthy — PR5 comparator's
@@ -1124,7 +1220,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
     // A subsequent `connected` status doesn't restore healthy until a
     // non-truncated baseline lands.
     recorder.fire('onStatus', 'connected');
-    expect(runner.ownStateShadowView().healthy).toBe(false);
+    expect(runner.ownStateSessionView().healthy).toBe(false);
     triggerKill();
     await runPromise;
   });
@@ -1150,79 +1246,57 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
       positionsTruncated: false,
     });
     recorder.fire('onReady');
-    expect(runner.ownStateShadowView().positionsTruncated).toBe(true);
-    expect(runner.ownStateShadowView().healthy).toBe(false);
+    expect(runner.ownStateSessionView().positionsTruncated).toBe(true);
+    expect(runner.ownStateSessionView().healthy).toBe(false);
     triggerKill();
     await runPromise;
   });
 
-  // ── PR4b — drainShadow dispatch + dedup-set boot construction ───────────
+  // ── PR4b — drain dispatch + dedup-set boot construction ─────────────────
 
-  it('drainShadow dispatches commitment/fill/positionStatus events to owner reducers (Phase 2 PR4b)', async () => {
+  it('the drain dispatches commitment/fill/positionStatus deltas to owner reducers → CANONICAL state (Phase 3 PR3b source flip)', async () => {
     const { runner, recorder, runPromise, sleepCalls, resolvers, triggerKill } = await makePausedSubscribedRunner();
 
-    // Fire a snapshot so the shadow is ready (otherwise the reducer mutations
-    // would happen but be harder to observe without ready=true). Bring up
-    // ready first so the dispatch path is meaningful.
+    // Establish the baseline (snapshot + onReady) FIRST so ready=true — the
+    // drain gates on `ownStateSessionView().ready`, so a delta enqueued before
+    // onReady stays queued and is never applied (PR3b drain ready-gate). The
+    // snapshot seeds the sibling commitment the fill below resolves identity from.
     recorder.fire('onSnapshot', {
       cursor: 'c1',
-      commitments: [{
-        ownerAuthorized: true, visibility: 'visible', redacted: false,
-        commitmentHash: '0xabc', maker: DEFAULT_FAKE_MAKER_ADDRESS,
-        contestId: '1', scorer: '0xscorer', lineTicks: 0, positionType: 0, oddsTick: 250,
-        marketType: 'moneyline', riskAmount: '250000', filledRiskAmount: '0',
-        remainingRiskAmount: '250000', nonce: '1',
-        expiry: '2099-01-01T00:00:00.000Z', speculationKey: null, signature: null,
-        status: 'open', storedStatus: 'open', source: 'sse', network: 'polygon',
-        nonceInvalidated: false, isLive: true, createdAt: '2025-01-01T00:00:00.000Z',
-      }],
+      commitments: [mappableOwnerCommitment('0xabc')],
       positions: [],
       truncated: false,
       positionsTruncated: false,
     });
     recorder.fire('onReady');
 
-    // Fire a commitment delta — onCommitment enqueues; we wake to trigger
-    // the loop's drain. The drain dispatches via reduceOwnerCommitmentObservation.
-    recorder.fire('onCommitment', {
-      ownerAuthorized: true, visibility: 'visible', redacted: false,
-      commitmentHash: '0xabc', maker: DEFAULT_FAKE_MAKER_ADDRESS,
-      contestId: '1', scorer: '0xscorer', lineTicks: 0, positionType: 0, oddsTick: 250,
-      marketType: 'moneyline', riskAmount: '250000', filledRiskAmount: '100000',
-      remainingRiskAmount: '150000', nonce: '1',
-      expiry: '2099-01-01T00:00:00.000Z', speculationKey: null, signature: null,
-      status: 'partially_filled', storedStatus: 'partially_filled', source: 'sse',
-      network: 'polygon', nonceInvalidated: false, isLive: true,
-      createdAt: '2025-01-01T00:00:00.000Z',
-    });
+    // Fire a commitment delta — onCommitment enqueues; the handler wakes the
+    // loop to trigger the drain → reduceOwnerCommitmentObservation writes canonical state.
+    recorder.fire('onCommitment', mappableOwnerCommitment('0xabc', {
+      filledRiskAmount: '100000', remainingRiskAmount: '150000',
+      status: 'partially_filled', storedStatus: 'partially_filled',
+    }));
 
-    // Fire a fill delta.
-    recorder.fire('onFill', {
-      speculationId: 'spec-1', contestId: 'contest-1', commitmentHash: '0xabc',
-      maker: DEFAULT_FAKE_MAKER_ADDRESS, taker: '0xother',
-      makerPositionType: 0, takerPositionType: 1,
-      makerRiskAmount: '100000', takerRiskAmount: '150000',
-      makerRiskUSDC: 0.1, takerRiskUSDC: 0.15, oddsTick: 250,
-      filledAt: '2025-01-01T00:00:00.000Z', contestStarted: false,
-      txHash: '0xtx1', logIndex: 0,
-    });
+    // Fire a fill delta (maker side) — the canonical fill reducer resolves
+    // identity from the sibling commitment and creates the maker-side position.
+    recorder.fire('onFill', mappableOwnerFill());
 
     // The handlers fired wake() — the loop's main sleep aborted, debounce
     // started. Resolve the debounce so the wake-handler completes its
-    // drainShadow → reducer dispatch path.
+    // drain → reducer dispatch path.
     await waitFor(() => sleepCalls.filter((ms) => ms === 500).length >= 1);
     const idx = sleepCalls.findIndex((ms) => ms === 500);
     const debounceResolve = resolvers[idx];
     if (debounceResolve === undefined) throw new Error('expected debounce resolver');
     debounceResolve();
-    await waitFor(() => runner.ownStateShadowView().commitments['0xabc']?.lifecycle === 'partiallyFilled');
+    await waitFor(() => runner.stateForTest().commitments['0xabc']?.lifecycle === 'partiallyFilled');
 
-    const shadow = runner.ownStateShadowView();
+    const state = runner.stateForTest();
     // Commitment delta → projection → lifecycle 'partiallyFilled', filledRiskWei6 = '100000'.
-    expect(shadow.commitments['0xabc']?.lifecycle).toBe('partiallyFilled');
-    expect(shadow.commitments['0xabc']?.filledRiskWei6).toBe('100000');
+    expect(state.commitments['0xabc']?.lifecycle).toBe('partiallyFilled');
+    expect(state.commitments['0xabc']?.filledRiskWei6).toBe('100000');
     // Fill delta → position created with maker-side risk.
-    expect(shadow.positions['spec-1:away']?.riskAmountWei6).toBe('100000');
+    expect(state.positions['spec-1:away']?.riskAmountWei6).toBe('100000');
 
     triggerKill();
     await runPromise;
@@ -1264,8 +1338,8 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
     // Resync — must clear the queued event.
     recorder.fire('onStatus', 'resync');
     expect(runner.ownStateQueueSizeForTest()).toBe(0);
-    expect(runner.ownStateShadowView().ready).toBe(false);
-    expect(runner.ownStateShadowView().pendingBaseline).toBeNull();
+    expect(runner.ownStateSessionView().ready).toBe(false);
+    expect(runner.ownStateSessionView().pendingBaseline).toBeNull();
 
     triggerKill();
     await runPromise;
@@ -1275,14 +1349,45 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
   //
   // The resume cursor (`state.ownStateCursor`) advances ONLY when paired with a
   // real applied effect: a snapshot baseline whose `onReady` swap succeeded
-  // (promoting the untruncated-page cursor), or a delta whose reducer applied
-  // cleanly (contiguous-success prefix only). A truncated page, a baseline-less
-  // onReady, a reducer throw, and a resync all leave (or clear) the cursor.
+  // (promoting the ONReady cursor — the SDK's Last-Event-ID contract; the
+  // PR1 page-cursor staging was dropped at the PR3b reconfirm), or a delta whose
+  // reducer applied cleanly (contiguous-success prefix only). A truncated page,
+  // a baseline-less onReady, a reducer throw, and a resync all leave (or clear)
+  // the cursor.
 
+  // A SHAPE-MINIMAL own-state commitment — enough to enqueue + to establish a
+  // (cursor-only) baseline page, but NOT enough metadata for the canonical PR3b
+  // mapper, which fails closed and SKIPS the row. Tests that assert a row landed
+  // in the canonical book — or that a DELTA reducer applied cleanly (and so
+  // promoted its cursor) — use `mappableOwnerCommitment` instead.
   const MINIMAL_COMMITMENT = (hash: string) => ({
     commitmentHash: hash, filledRiskAmount: '0', riskAmount: '100', expiry: null,
     status: 'open', storedStatus: 'open', nonceInvalidated: false,
   });
+
+  /**
+   * Establish a ready baseline (empty snapshot + onReady with NO cursor so the
+   * cursor stays undefined), enqueue the given deltas, then drive ONE drain pass
+   * through the paused loop (wake → resolve debounce). Post PR3b the drain gates
+   * on `ownStateSessionView().ready`, so delta-application tests must establish
+   * ready first — a delta enqueued before onReady stays queued forever.
+   */
+  async function drainDeltasWithReadyBaseline(
+    deltas: Array<{ kind: string; body: unknown; cursor?: string }>,
+  ): Promise<{ runner: Runner; cleanup: () => Promise<void> }> {
+    const { runner, recorder, runPromise, sleepCalls, resolvers, triggerKill } = await makePausedSubscribedRunner();
+    recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: false }); // empty meta cursor → no promote
+    recorder.fire('onReady'); // empty meta cursor → ready, cursor stays undefined
+    for (const d of deltas) runner.enqueueOwnStateEvent(d);
+    runner.wake();
+    await waitFor(() => sleepCalls.filter((ms) => ms === 500).length >= 1);
+    const idx = sleepCalls.findIndex((ms) => ms === 500);
+    resolvers[idx]?.();
+    return {
+      runner,
+      cleanup: async () => { triggerKill(); await runPromise; },
+    };
+  }
 
   it('promotes the onReady cursor on a successful baseline swap (§4.3 / SDK Last-Event-ID contract)', async () => {
     const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
@@ -1310,6 +1415,19 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
     await runPromise;
   });
 
+  it('does NOT promote an EMPTY-STRING onReady cursor on a successful baseline swap (`cursor || undefined` → no resume point)', async () => {
+    // The SDK may deliver onReady with an empty-string cursor; the source does
+    // `const promoted = cursor || undefined`, so a real baseline swap still
+    // leaves ownStateCursor undefined (no spurious '' resume point persisted).
+    const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
+    recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: false }, { cursor: 'snap-1' });
+    recorder.fire('onReady', undefined, { cursor: '' }); // explicit empty cursor
+    expect(runner.ownStateSessionView().ready).toBe(true); // baseline DID swap (ready flipped)
+    expect(runner.ownStateCursorForTest()).toBeUndefined(); // ...but no cursor promoted
+    triggerKill();
+    await runPromise;
+  });
+
   it('does NOT promote a cursor on a baseline-less onReady (resume delivered no snapshot — cursor alone is not state)', async () => {
     const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
     // onReady with NO prior snapshot → pendingBaseline is null → no durable
@@ -1333,32 +1451,40 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
   });
 
   it('promotes a delta cursor after its reducer applies (§4.3 delta track)', async () => {
-    const runner = makeRunner({ maxTicks: 1 });
-    runner.enqueueOwnStateEvent({ kind: 'commitment', body: MINIMAL_COMMITMENT('0xc'), cursor: 'delta-1' });
-    await runner.run();
+    // The delta must MAP cleanly for the reducer to apply + promote — post PR3b
+    // a shape-minimal body would throw OwnerMappingError and freeze the cursor.
+    const { runner, cleanup } = await drainDeltasWithReadyBaseline([
+      { kind: 'commitment', body: mappableOwnerCommitment('0xc'), cursor: 'delta-1' },
+    ]);
+    await waitFor(() => runner.ownStateCursorForTest() === 'delta-1');
     expect(runner.ownStateCursorForTest()).toBe('delta-1');
+    await cleanup();
   });
 
   it('freezes cursor promotion at the first reducer throw — a later success cannot leapfrog the failed event (contiguous-success, FM3)', async () => {
-    const runner = makeRunner({ maxTicks: 1 });
-    // Good → promote 'g1'.
-    runner.enqueueOwnStateEvent({ kind: 'commitment', body: MINIMAL_COMMITMENT('0xg1'), cursor: 'g1' });
-    // Bad fill (no maker/taker) → reducer throws → freeze promotion.
-    runner.enqueueOwnStateEvent({ kind: 'fill', body: { txHash: '0x1', logIndex: 0 }, cursor: 'g2' });
-    // Good → reduces cleanly, BUT promotion is frozen → its cursor is NOT taken.
-    runner.enqueueOwnStateEvent({ kind: 'commitment', body: MINIMAL_COMMITMENT('0xg3'), cursor: 'g3' });
-    await runner.run();
+    const { runner, cleanup } = await drainDeltasWithReadyBaseline([
+      // Good → promote 'g1'.
+      { kind: 'commitment', body: mappableOwnerCommitment('0xg1'), cursor: 'g1' },
+      // Bad fill (no maker/taker) → reducer throws → freeze promotion.
+      { kind: 'fill', body: { txHash: '0x1', logIndex: 0 }, cursor: 'g2' },
+      // Good → reduces cleanly, BUT promotion is frozen → its cursor is NOT taken.
+      { kind: 'commitment', body: mappableOwnerCommitment('0xg3'), cursor: 'g3' },
+    ]);
     // Cursor stays at the last CONTIGUOUS success before the throw, never 'g3'.
+    await waitFor(() => runner.ownStateCursorForTest() === 'g1');
     expect(runner.ownStateCursorForTest()).toBe('g1');
+    await cleanup();
   });
 
   it('an unknown event kind also freezes promotion (never advance past a skipped effect)', async () => {
-    const runner = makeRunner({ maxTicks: 1 });
-    runner.enqueueOwnStateEvent({ kind: 'commitment', body: MINIMAL_COMMITMENT('0xk1'), cursor: 'k1' });
-    runner.enqueueOwnStateEvent({ kind: 'made-up-kind', body: {}, cursor: 'k2' });
-    runner.enqueueOwnStateEvent({ kind: 'commitment', body: MINIMAL_COMMITMENT('0xk3'), cursor: 'k3' });
-    await runner.run();
+    const { runner, cleanup } = await drainDeltasWithReadyBaseline([
+      { kind: 'commitment', body: mappableOwnerCommitment('0xk1'), cursor: 'k1' },
+      { kind: 'made-up-kind', body: {}, cursor: 'k2' },
+      { kind: 'commitment', body: mappableOwnerCommitment('0xk3'), cursor: 'k3' },
+    ]);
+    await waitFor(() => runner.ownStateCursorForTest() === 'k1');
     expect(runner.ownStateCursorForTest()).toBe('k1');
+    await cleanup();
   });
 
   // ── PR1 — boot resume wiring + empty-baseline guard (§4.2) ───────────────
@@ -1386,7 +1512,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
     // (resumedFromPersistedCursor=false), so onReady swaps a real baseline.
     recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: false }, { cursor: 'snap-new' });
     recorder.fire('onReady', undefined, { cursor: 'ready-new' });
-    expect(runner.ownStateShadowView().ready).toBe(true); // guard did NOT trip
+    expect(runner.ownStateSessionView().ready).toBe(true); // guard did NOT trip
     expect(runner.ownStateCursorForTest()).toBe('ready-new'); // fresh onReady cursor promoted, boot cursor replaced
     triggerKill();
     await runPromise;
@@ -1400,7 +1526,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
     // Resume delivers onReady with NO snapshot → baseline-less resume → guard.
     recorder.fire('onReady', undefined, { cursor: 'ready-x' });
     // Synchronous guard effects: NOT ready, cursor dropped.
-    expect(runner.ownStateShadowView().ready).toBe(false);
+    expect(runner.ownStateSessionView().ready).toBe(false);
     expect(runner.ownStateCursorForTest()).toBeUndefined();
     triggerKill();
     await runPromise;
@@ -1429,12 +1555,12 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
     // Cold connect (no boot cursor): snapshot + ready establishes the baseline.
     recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: false }, { cursor: 'snap-1' });
     recorder.fire('onReady', undefined, { cursor: 'ready-1' });
-    expect(runner.ownStateShadowView().ready).toBe(true);
+    expect(runner.ownStateSessionView().ready).toBe(true);
     expect(runner.ownStateCursorForTest()).toBe('ready-1');
     // A reconnect delivers catchup + ready with NO new snapshot. resumedFromPersistedCursor
     // is false (cold connect), so the guard must NOT trip — the in-memory baseline backs it.
     recorder.fire('onReady', undefined, { cursor: 'ready-2' });
-    expect(runner.ownStateShadowView().ready).toBe(true); // still ready
+    expect(runner.ownStateSessionView().ready).toBe(true); // still ready
     expect(runner.ownStateCursorForTest()).toBe('ready-1'); // unchanged — no new baseline → no promote
     triggerKill();
     await runPromise;
@@ -1448,33 +1574,31 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
     expect(runner.ownStateCursorForTest()).toBe('ready-1');
     recorder.fire('onStatus', 'resync');
     expect(runner.ownStateCursorForTest()).toBeUndefined();
-    expect(runner.ownStateShadowView().ready).toBe(false);
+    expect(runner.ownStateSessionView().ready).toBe(false);
     // Fresh snapshot after resync re-establishes the cursor.
     recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: false }, { cursor: 'snap-2' });
     recorder.fire('onReady', undefined, { cursor: 'ready-2' });
     expect(runner.ownStateCursorForTest()).toBe('ready-2');
-    expect(runner.ownStateShadowView().ready).toBe(true);
+    expect(runner.ownStateSessionView().ready).toBe(true);
     triggerKill();
     await runPromise;
   });
 
-  it('drainShadow logs error + skips on unknown event kind (Phase 2 PR4b)', async () => {
-    const runner = makeRunner({ maxTicks: 1 });
-    runner.enqueueOwnStateEvent({ kind: 'made-up-kind', body: {} });
-    await runner.run();
-    const events = readEvents();
-    const errs = events.filter((e) => e.kind === 'error' && e.class === 'UnknownOwnStateEventKind');
+  it('the drain logs error + skips on unknown event kind (Phase 2 PR4b)', async () => {
+    const { cleanup } = await drainDeltasWithReadyBaseline([{ kind: 'made-up-kind', body: {} }]);
+    await waitFor(() => readEvents().some((e) => e.kind === 'error' && e.class === 'UnknownOwnStateEventKind'));
+    const errs = readEvents().filter((e) => e.kind === 'error' && e.class === 'UnknownOwnStateEventKind');
     expect(errs).toHaveLength(1);
+    await cleanup();
   });
 
   it('reducer throw logs error + skips (Phase 2 PR4b — malformed body defensive path)', async () => {
-    const runner = makeRunner({ maxTicks: 1 });
     // Synthetic fill body missing maker/taker — the reducer throws on toLowerCase().
-    runner.enqueueOwnStateEvent({ kind: 'fill', body: { txHash: '0x1', logIndex: 0 } });
-    await runner.run();
-    const events = readEvents();
-    const errs = events.filter((e) => e.kind === 'error' && typeof e.detail === 'string' && e.detail.includes('event.kind=fill'));
+    const { cleanup } = await drainDeltasWithReadyBaseline([{ kind: 'fill', body: { txHash: '0x1', logIndex: 0 } }]);
+    await waitFor(() => readEvents().some((e) => e.kind === 'error' && typeof e.detail === 'string' && e.detail.includes('event.kind=fill')));
+    const errs = readEvents().filter((e) => e.kind === 'error' && typeof e.detail === 'string' && e.detail.includes('event.kind=fill'));
     expect(errs.length).toBeGreaterThanOrEqual(1);
+    await cleanup();
   });
 
   // ── PR5 — shadow comparator preconditions ────────────────────────────────
@@ -1511,9 +1635,9 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
     recorder.fire('onSnapshot', { cursor: 'c1', commitments: [], positions: [], truncated: false, positionsTruncated: false });
     recorder.fire('onReady');
     recorder.fire('onStatus', 'connected');
-    expect(runner.ownStateShadowView().ready).toBe(true);
-    expect(runner.ownStateShadowView().lastStatus).toBe('connected');
-    expect(runner.ownStateShadowView().healthy).toBe(true);
+    expect(runner.ownStateSessionView().ready).toBe(true);
+    expect(runner.ownStateSessionView().lastStatus).toBe('connected');
+    expect(runner.ownStateSessionView().healthy).toBe(true);
 
     triggerKill();
     await runPromise;
@@ -1544,10 +1668,10 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
       // A clean baseline swaps in, but transport status has not settled yet.
       recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: false }, { cursor: 's1' });
       recorder.fire('onReady', undefined, { cursor: 'r1' });
-      expect(runner.ownStateShadowView().ready).toBe(true);
-      expect(runner.ownStateShadowView().healthy).toBe(false); // ready, but not 'connected'
+      expect(runner.ownStateSessionView().ready).toBe(true);
+      expect(runner.ownStateSessionView().healthy).toBe(false); // ready, but not 'connected'
       recorder.fire('onStatus', 'connected');
-      expect(runner.ownStateShadowView().healthy).toBe(true);
+      expect(runner.ownStateSessionView().healthy).toBe(true);
       triggerKill();
       await runPromise;
     });
@@ -1559,7 +1683,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
         deps: { now: () => t },
       });
       fireHealthyBaseline(recorder); // eligibility anchored at t === T0
-      expect(runner.ownStateShadowView().healthy).toBe(true); // latch mirror healthy immediately
+      expect(runner.ownStateSessionView().healthy).toBe(true); // latch mirror healthy immediately
       expect(runner.ownStateHealthyForTest()).toBe(false); // ...but the recovery hold is not satisfied
       t = T0 + 29; // 29s < 30s
       expect(runner.ownStateHealthyForTest()).toBe(false);
@@ -1593,7 +1717,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
       expect(runner.ownStateHealthyForTest()).toBe(true); // hold earned
       // Transport degrades — the latch trips: gate + mirror false, anchor cleared.
       recorder.fire('onStatus', 'degraded');
-      expect(runner.ownStateShadowView().healthy).toBe(false);
+      expect(runner.ownStateSessionView().healthy).toBe(false);
       expect(runner.ownStateHealthyForTest()).toBe(false);
       // Recover — the hold RESTARTS from here (T0+30), not from the original anchor.
       recorder.fire('onStatus', 'connected');
@@ -1611,11 +1735,11 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
         config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 0 } }),
       });
       fireHealthyBaseline(recorder);
-      expect(runner.ownStateShadowView().healthy).toBe(true);
+      expect(runner.ownStateSessionView().healthy).toBe(true);
       recorder.fire('onError', Object.assign(new Error('boom'), { reason: 'fatal' }));
-      expect(runner.ownStateShadowView().healthy).toBe(false);
+      expect(runner.ownStateSessionView().healthy).toBe(false);
       recorder.fire('onStatus', 'connected'); // clears lastError → the fatal input is gone
-      expect(runner.ownStateShadowView().healthy).toBe(true);
+      expect(runner.ownStateSessionView().healthy).toBe(true);
       triggerKill();
       await runPromise;
     });
@@ -1696,12 +1820,12 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
         config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 0 } }),
       });
       fireHealthyBaseline(recorder);
-      expect(runner.ownStateShadowView().healthy).toBe(true);
+      expect(runner.ownStateSessionView().healthy).toBe(true);
       expect(runner.ownStateHealthyForTest()).toBe(true);
       // Trip the overflow latch via the seam with NO follow-up event: the seam
       // itself must recompute (it did NOT before this fix — the every-site lesson).
       runner.setStreamOverflowDegradedForTest(true);
-      expect(runner.ownStateShadowView().healthy).toBe(false);
+      expect(runner.ownStateSessionView().healthy).toBe(false);
       expect(runner.ownStateHealthyForTest()).toBe(false);
       triggerKill();
       await runPromise;
@@ -1712,14 +1836,14 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
         config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 0 } }),
       });
       fireHealthyBaseline(recorder);
-      expect(runner.ownStateShadowView().healthy).toBe(true);
+      expect(runner.ownStateSessionView().healthy).toBe(true);
       // Force a genuine overflow into the delta queue, then let the loop drain it.
       const cap = 10_000;
       for (let i = 0; i < cap; i++) runner.enqueueOwnStateEvent({ kind: 'commitment', body: MINIMAL_COMMITMENT(`0xc${i}`) });
       expect(runner.enqueueOwnStateEvent({ kind: 'commitment', body: MINIMAL_COMMITMENT('0xover') })).toBe('overflow');
       // Advance the loop until drainShadow runs the overflow branch (latch + recompute).
       await waitFor(() => { resolvers.forEach((r) => r?.()); return runner.streamOverflowDegradedForTest(); });
-      expect(runner.ownStateShadowView().healthy).toBe(false); // the production drainShadow recompute flipped it
+      expect(runner.ownStateSessionView().healthy).toBe(false); // the production drainShadow recompute flipped it
       expect(runner.ownStateHealthyForTest()).toBe(false);
       triggerKill();
       await runPromise;
@@ -1945,7 +2069,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
         recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: false }, { cursor: 's1' });
         recorder.fire('onReady', undefined, { cursor: 'r1' });
         recorder.fire('onStatus', 'connected');
-        expect(runner.ownStateShadowView().healthy).toBe(true); // edge mirror healthy
+        expect(runner.ownStateSessionView().healthy).toBe(true); // edge mirror healthy
         expect(runner.lastFrameAtSecForTest()).toBeNull(); // no frame yet
         expect(runner.ownStateHealthyForTest()).toBe(false); // gate false — transportFresh requires a frame
         // A frame flips the gate healthy (recoveryHoldMs:0 → immediate).
@@ -1966,7 +2090,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
         t = T0 + 60; // (60s)*1000 = 60000 NOT < 60000 → stale
         expect(runner.transportFreshForTest(t)).toBe(false);
         expect(runner.ownStateHealthyForTest()).toBe(false); // gate halts on a silent transport
-        expect(runner.ownStateShadowView().healthy).toBe(true); // edge mirror unchanged — transportFresh isn't folded in
+        expect(runner.ownStateSessionView().healthy).toBe(true); // edge mirror unchanged — transportFresh isn't folded in
         // Just under the boundary stays fresh.
         t = T0 + 59;
         expect(runner.transportFreshForTest(t)).toBe(true);
@@ -2062,19 +2186,19 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
           config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 0 } }),
         });
         fireHealthyBaseline(recorder);
-        expect(runner.ownStateShadowView().healthy).toBe(true);
+        expect(runner.ownStateSessionView().healthy).toBe(true);
         expect(runner.tokenRefreshFailureForTest()).toBe(false);
         // Non-fatal connection_failed in the token-refresh phase: re-mint for a
         // reconnect on an active subscription failed.
         recorder.fire('onError', new OspexStreamError('refresh failed', { reason: 'connection_failed', phase: 'token-refresh' }));
         expect(runner.tokenRefreshFailureForTest()).toBe(true);
-        expect(runner.ownStateShadowView().healthy).toBe(false); // folded into the edge mirror
+        expect(runner.ownStateSessionView().healthy).toBe(false); // folded into the edge mirror
         expect(runner.ownStateHealthyForTest()).toBe(false);
         // A frame proves the transport re-authenticated (frames only flow on an
         // open, authed connection) → latch clears.
         recorder.fire('onFrame', { receivedAtMs: 0, kind: 'heartbeat' });
         expect(runner.tokenRefreshFailureForTest()).toBe(false);
-        expect(runner.ownStateShadowView().healthy).toBe(true);
+        expect(runner.ownStateSessionView().healthy).toBe(true);
         triggerKill();
         await runPromise;
       });
@@ -2086,7 +2210,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
         fireHealthyBaseline(recorder);
         recorder.fire('onError', new OspexStreamError('mint failed', { reason: 'connection_failed', phase: 'token-mint' }));
         expect(runner.tokenRefreshFailureForTest()).toBe(false); // token-mint is covered by the `ready` latch, not latch 7
-        expect(runner.ownStateShadowView().healthy).toBe(true); // unaffected
+        expect(runner.ownStateSessionView().healthy).toBe(true); // unaffected
         triggerKill();
         await runPromise;
       });
@@ -2117,16 +2241,19 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
         await runPromise;
       });
 
-      // The comparator (runShadowComparator) gates the audit on
+      // The comparator (runAuditComparator) gates the audit on
       // `instantOwnStateHealthy(now)` (the edge mirror AND transportFresh), NOT the
       // bare `shadow.healthy`. These two tests pin that decouple at the comparator's
       // CALL SITE — the headline PR2b behavioral change — via the divergence-tracker
-      // seam (populated only when `compareShadowVsCanonical` actually ran). The
-      // baseline carries a commitment the poll side never has → a `missing-in-poll`
+      // seam (populated only when `compareAuditVsCanonical` actually ran). Post the
+      // PR3b source flip the SSE baseline IS canonical, so the commitment must MAP
+      // cleanly (a shape-minimal body would be skipped, leaving the canonical book
+      // empty → no divergence): it lands in canonical `this.state`, the poll/audit
+      // side (`listOpenCommitments` → []) never has it → a `missing-in-audit`
       // divergence the comparator detects + tracks once it runs.
       function fireDivergentBaseline(recorder: ReturnType<typeof makeOwnStateRecorder>): void {
         recorder.fire('onFrame', { receivedAtMs: 0, kind: 'heartbeat' });
-        recorder.fire('onSnapshot', { commitments: [{ commitmentHash: '0xdiv', filledRiskAmount: '0', riskAmount: '100', expiry: null, status: 'open', storedStatus: 'open', nonceInvalidated: false }], positions: [], truncated: false, positionsTruncated: false }, { cursor: 's1' });
+        recorder.fire('onSnapshot', { commitments: [mappableOwnerCommitment('0xdiv')], positions: [], truncated: false, positionsTruncated: false }, { cursor: 's1' });
         recorder.fire('onReady', undefined, { cursor: 'r1' });
         recorder.fire('onStatus', 'connected');
       }
@@ -2135,7 +2262,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
         const t = T0; // fixed injected clock → the baseline frame stays fresh regardless of real wall-clock
         const adapter = createOspexAdapter(cfg({ ownState: { subscribe: true } }));
         vi.spyOn(adapter, 'listContests').mockResolvedValue([]);
-        vi.spyOn(adapter, 'listOpenCommitments').mockResolvedValue([]); // canonical stays empty → the shadow's commitment is missing-in-poll
+        vi.spyOn(adapter, 'listOpenCommitments').mockResolvedValue([]); // audit/poll stays empty → the canonical SSE commitment is missing-in-audit
         vi.spyOn(adapter, 'getOwnStateHealth').mockResolvedValue(MOCK_OWN_STATE_HEALTH);
         const { runner, recorder, runPromise, resolvers, triggerKill } = await makePausedSubscribedRunner({
           config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 0, staleMaxMs: 60000 } }),
@@ -2143,7 +2270,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
           deps: { now: () => t },
         });
         fireDivergentBaseline(recorder);
-        expect(runner.ownStateShadowView().healthy).toBe(true);
+        expect(runner.ownStateSessionView().healthy).toBe(true);
         // Drive ticks (the loop sleeps >1×/tick, so resolve-until-condition, not a
         // fixed count): tick N latches firstPollAfterShadowReady, tick N+1 runs the
         // audit. Transport is fresh, so the comparator populates the tracker.
@@ -2171,9 +2298,9 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
         // control proving this same setup DOES populate the tracker when fresh.
         const target = sleepCalls.length + 8;
         await waitFor(() => { resolvers.forEach((r) => r?.()); return sleepCalls.length >= target; });
-        expect(runner.ownStateShadowView().healthy).toBe(true); // edge mirror STILL healthy...
+        expect(runner.ownStateSessionView().healthy).toBe(true); // edge mirror STILL healthy...
         expect(runner.transportFreshForTest(t)).toBe(false); // ...but transport is stale
-        // Tracker empty ⇒ compareShadowVsCanonical never ran ⇒ the gate read
+        // Tracker empty ⇒ compareAuditVsCanonical never ran ⇒ the gate read
         // instantOwnStateHealthy (false), NOT shadow.healthy (true). A regression
         // reverting the gate to shadow.healthy would populate this → the test fails.
         expect(runner.divergenceTrackerSizeForTest()).toBe(0);
@@ -2202,7 +2329,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
         expect(runner.ownStateHealthyForTest()).toBe(true); // recovery hold earned (30s)
         runner.setIndexerLagDegradedForTest(true);
         expect(runner.ownStateHealthyForTest()).toBe(false); // posting gate held by latch 6
-        expect(runner.ownStateShadowView().healthy).toBe(true); // edge mirror UNAFFECTED — latch 6 is posting-only
+        expect(runner.ownStateSessionView().healthy).toBe(true); // edge mirror UNAFFECTED — latch 6 is posting-only
         t = T0 + 40; // 10s into the degrade — a FRESH hold (anchored here) would NOT yet be satisfied
         runner.setIndexerLagDegradedForTest(false);
         // Clears IMMEDIATELY: the anchor earned at T0 is intact (latch 6 never touches
@@ -2218,16 +2345,16 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
         const t = T0;
         const adapter = createOspexAdapter(cfg({ ownState: { subscribe: true } }));
         vi.spyOn(adapter, 'listContests').mockResolvedValue([]);
-        vi.spyOn(adapter, 'listOpenCommitments').mockResolvedValue([]); // canonical empty → shadow commitment is missing-in-poll
+        vi.spyOn(adapter, 'listOpenCommitments').mockResolvedValue([]); // audit/poll empty → the canonical SSE commitment is missing-in-audit
         vi.spyOn(adapter, 'getOwnStateHealth').mockResolvedValue(mkHealth(9999)); // lag >> threshold → latch degrades via the real poll
         const { runner, recorder, runPromise, resolvers, triggerKill } = await makePausedSubscribedRunner({
           config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 0, staleMaxMs: 60000 } }),
           adapter,
           deps: { now: () => t },
         });
-        // A divergent baseline (a commitment in the shadow the poll side never has).
+        // A divergent baseline (a commitment in canonical SSE state the poll/audit side never has).
         recorder.fire('onFrame', { receivedAtMs: 0, kind: 'heartbeat' });
-        recorder.fire('onSnapshot', { commitments: [{ commitmentHash: '0xdiv6', filledRiskAmount: '0', riskAmount: '100', expiry: null, status: 'open', storedStatus: 'open', nonceInvalidated: false }], positions: [], truncated: false, positionsTruncated: false }, { cursor: 's1' });
+        recorder.fire('onSnapshot', { commitments: [mappableOwnerCommitment('0xdiv6')], positions: [], truncated: false, positionsTruncated: false }, { cursor: 's1' });
         recorder.fire('onReady', undefined, { cursor: 'r1' });
         recorder.fire('onStatus', 'connected');
         await waitFor(() => { resolvers.forEach((r) => r?.()); return runner.divergenceTrackerSizeForTest() > 0; });
@@ -2367,7 +2494,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
         await runner.run();
         const events = readEvents();
         expect(runner.indexerLagDegradedForTest()).toBe(true); // indexer-lag latch tripped
-        expect(runner.ownStateShadowView().healthy).toBe(true); // ...while the TRANSPORT mirror is healthy (so the halt is latch 6, not the transport)
+        expect(runner.ownStateSessionView().healthy).toBe(true); // ...while the TRANSPORT mirror is healthy (so the halt is latch 6, not the transport)
         expect(submit.calls).toHaveLength(0); // posting halted by the §5.1 gate
         expect(events.filter((e) => e.kind === 'stream-health-hold' && e.state === 'entered')).toHaveLength(1);
       });
@@ -2387,11 +2514,13 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
     // ── §5 latch 5 — auditDivergenceUnresolved (Phase 3 PR2c-ii) ─────────────
 
     describe('latch 5 — auditDivergenceUnresolved (comparator-driven posting-only gate)', () => {
-      // A divergent baseline: a commitment in the shadow the poll side never has
-      // (missing-in-poll) — the comparator flags it once it persists past the tolerance.
+      // A divergent baseline: a commitment in canonical SSE state the poll/audit
+      // side never has (missing-in-audit) — the comparator flags it once it
+      // persists past the tolerance. Must MAP cleanly post PR3b (else the row is
+      // skipped → canonical empty → no divergence).
       function fireDivergentBaseline5(recorder: ReturnType<typeof makeOwnStateRecorder>): void {
         recorder.fire('onFrame', { receivedAtMs: 0, kind: 'heartbeat' });
-        recorder.fire('onSnapshot', { commitments: [{ commitmentHash: '0xdiv5', filledRiskAmount: '0', riskAmount: '100', expiry: null, status: 'open', storedStatus: 'open', nonceInvalidated: false }], positions: [], truncated: false, positionsTruncated: false }, { cursor: 's1' });
+        recorder.fire('onSnapshot', { commitments: [mappableOwnerCommitment('0xdiv5')], positions: [], truncated: false, positionsTruncated: false }, { cursor: 's1' });
         recorder.fire('onReady', undefined, { cursor: 'r1' });
         recorder.fire('onStatus', 'connected');
       }
@@ -2407,7 +2536,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
         expect(runner.ownStateHealthyForTest()).toBe(true); // recovery hold earned
         runner.setAuditDivergenceUnresolvedForTest(true);
         expect(runner.ownStateHealthyForTest()).toBe(false); // posting gate held by latch 5
-        expect(runner.ownStateShadowView().healthy).toBe(true); // edge mirror UNAFFECTED — posting-only
+        expect(runner.ownStateSessionView().healthy).toBe(true); // edge mirror UNAFFECTED — posting-only
         t = T0 + 40;
         runner.setAuditDivergenceUnresolvedForTest(false);
         // Clears immediately: latch 5 (read AFTER recompute, absent from instantOwnStateHealthy)
@@ -2450,7 +2579,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
           const t = T0; // the §5 health clock (deps.now, seconds) is independent of the faked Date
           const adapter = createOspexAdapter(cfg({ ownState: { subscribe: true } }));
           vi.spyOn(adapter, 'listContests').mockResolvedValue([]);
-          vi.spyOn(adapter, 'listOpenCommitments').mockResolvedValue([]); // canonical empty → shadow's commitment is missing-in-poll
+          vi.spyOn(adapter, 'listOpenCommitments').mockResolvedValue([]); // audit/poll empty → the canonical SSE commitment is missing-in-audit
           vi.spyOn(adapter, 'getOwnStateHealth').mockResolvedValue(MOCK_OWN_STATE_HEALTH);
           const { runner, recorder, runPromise, resolvers, triggerKill } = await makePausedSubscribedRunner({
             config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 0, staleMaxMs: 60000, divergenceToleranceMs: 5000 } }),
@@ -2484,6 +2613,52 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
         expect(runner.auditDivergenceUnresolvedForTest()).toBe(true);
         recorder.fire('onStatus', 'resync'); // rebaseline clears dependent latches + the divergence verdict
         expect(runner.auditDivergenceUnresolvedForTest()).toBe(false);
+        triggerKill();
+        await runPromise;
+      });
+    });
+
+    // ── §7.2 unknown-own-fill (an SSE fill for a commitment not in canonical state) ──
+
+    describe('§7.2 unknown-own-fill', () => {
+      it('an SSE fill for a commitmentHash NOT in canonical state emits `unknown-own-fill`, holds posting, cold-restarts, and does NOT materialize an orphan position', async () => {
+        const { runner, recorder, runPromise, resolvers, triggerKill } = await makePausedSubscribedRunner({
+          config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 0, staleMaxMs: 300000 } }),
+        });
+        // Establish a HEALTHY, EMPTY baseline — the posting gate is healthy and
+        // the canonical book has NO commitments, so the fill below is an orphan.
+        fireHealthyBaseline(recorder);
+        expect(runner.ownStateHealthyForTest()).toBe(true); // healthy before the unknown fill
+
+        // An owner fill whose commitmentHash is not in canonical state. maker is
+        // ours (so it passes the foreign-address guard) but the §7.2 gate fires
+        // because the sibling commitment carrying contest identity is absent.
+        recorder.fire('onFill', mappableOwnerFill({
+          commitmentHash: '0xnotinbook', speculationId: 'spec-unknown',
+          txHash: '0xorphan', logIndex: 7,
+        }));
+
+        // Drive the wake-path drain (debounce → drainOwnState → §7.2 signal).
+        await waitFor(() => { resolvers.forEach((r) => r?.()); return readEvents().some((e) => e.kind === 'unknown-own-fill'); });
+
+        const unknown = readEvents().filter((e) => e.kind === 'unknown-own-fill');
+        expect(unknown).toHaveLength(1);
+        expect(unknown[0]).toMatchObject({ commitmentHash: '0xnotinbook', speculationId: 'spec-unknown', txHash: '0xorphan', logIndex: 7 });
+
+        // NO orphan position materialized (a fill carries no contest identity).
+        const state = runner.stateForTest();
+        expect(state.positions['spec-unknown:away']).toBeUndefined();
+        expect(state.positions['spec-unknown:home']).toBeUndefined();
+        expect(state.commitments['0xnotinbook']).toBeUndefined();
+
+        // Posting is HELD (the §7.2 path set the audit-divergence hold + requested a
+        // cursor-less cold restart, which rebaselines → ready=false). Either way the
+        // posting gate is false until a fresh clean baseline lands.
+        expect(runner.ownStateHealthyForTest()).toBe(false);
+        // The cold restart reopened the subscription CURSOR-LESS (fresh re-snapshot).
+        await waitFor(() => { resolvers.forEach((r) => r?.()); return (recorder.options as { initialCursor?: string }).initialCursor === undefined; });
+        expect(recorder.options).toEqual({ address: DEFAULT_FAKE_MAKER_ADDRESS });
+
         triggerKill();
         await runPromise;
       });
@@ -3606,6 +3781,30 @@ describe('Runner — fill detection', () => {
     const listOpenSpy = vi.spyOn(adapter, 'listOpenCommitments').mockResolvedValue([]);
     await makeRunner({ config, adapter, maxTicks: 1 }).run();
     expect(listOpenSpy).not.toHaveBeenCalled();
+  });
+
+  it('backout (subscribe:false): the POLL writes the CANONICAL book (stateForTest), the audit book stays empty (PR3b inversion)', async () => {
+    // In backout there is no SSE stream — the poll path remains the canonical
+    // writer of `this.state` and `this.auditState` is unused (never reseeded).
+    const record = commitmentRecord({ hash: '0xrealAway', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '250000', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 1 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xrealAway': record } });
+    const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: false } });
+    const apiFilled: Commitment = orderbookEntry({ commitmentHash: '0xrealAway', maker: DEFAULT_FAKE_MAKER_ADDRESS, contestId: '1234', positionType: 1, oddsTick: 200, riskAmount: '250000', filledRiskAmount: '250000', remainingRiskAmount: '0', status: 'filled', isLive: false });
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]), undefined, undefined, undefined,
+      { listOpenCommitments: () => Promise.resolve([]), getCommitment: (h) => h === '0xrealAway' ? Promise.resolve(apiFilled) : Promise.reject(new Error('unknown hash')) },
+    );
+    // No SSE handlers are installed in backout — the subscription is never opened.
+    const subscribeSpy = vi.spyOn(adapter, 'subscribeOwnState');
+    const runner = makeRunner({ config, adapter, maxTicks: 1 });
+    await runner.run();
+    expect(subscribeSpy).not.toHaveBeenCalled(); // no SSE stream opened in backout
+
+    // The poll-derived fill landed in the CANONICAL book; the audit book is empty.
+    expect(runner.stateForTest().commitments['0xrealAway']?.lifecycle).toBe('filled');
+    expect(runner.stateForTest().positions['spec-1234:home']?.riskAmountWei6).toBe('250000');
+    expect(runner.auditStateForTest().commitments).toEqual({});
+    expect(runner.auditStateForTest().positions).toEqual({});
   });
 
   it('a fully-filled commitment is reclassified `filled`, a position is created, the market is dirtied, and a `fill` event fires (partial:false)', async () => {

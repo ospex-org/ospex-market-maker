@@ -39,16 +39,21 @@ export {
   reduceOwnerCommitmentObservation,
   reduceOwnerFill,
   reduceOwnerPositionStatus,
-  emptyOwnStateShadow,
-  projectOwnerCommitment,
-  projectOwnerPosition,
+  emptyOwnStateSession,
 } from './owner.js';
 export type {
-  OwnStateShadow,
-  ShadowCommitment,
-  ShadowPosition,
-  ShadowTransportStatus,
+  OwnStateSession,
+  OwnStateTransportStatus,
   OwnerCommitmentBody,
   OwnerFillBody,
   OwnerPositionStatusBody,
 } from './owner.js';
+
+export {
+  mapOwnerCommitmentToMaker,
+  mapOwnerPositionToMaker,
+  mapPositionStatusEventToMaker,
+  deriveCommitmentLifecycle,
+  mapPositionLifecycleToMaker,
+  OwnerMappingError,
+} from './owner-mapping.js';

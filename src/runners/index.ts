@@ -124,9 +124,10 @@ import type {
 } from '../ospex/index.js';
 import { decimalToTick, inverseOddsTick, isTickInRange, oppositeSide, positionTypeForSide, toProtocolQuote, type ProtocolQuote, type QuoteSide } from '../pricing/index.js';
 import {
-  emptyOwnStateShadow,
-  projectOwnerCommitment,
-  projectOwnerPosition,
+  emptyOwnStateSession,
+  mapOwnerCommitmentToMaker,
+  mapOwnerPositionToMaker,
+  OwnerMappingError,
   reduceOwnerCommitmentObservation,
   reduceOwnerFill,
   reduceOwnerPositionStatus,
@@ -134,17 +135,17 @@ import {
   reducePolledPositionObservation,
   reducePolledSoftCancelledObservation,
   type ApplyDescriptorsResult,
-  type OwnStateShadow,
+  type OwnStateSession,
+  type OwnStateTransportStatus,
   type PolledCommitmentObservation,
   type PolledPositionInput,
   type ReducerDescriptor,
-  type ShadowTransportStatus,
 } from '../reducers/index.js';
 import { OwnStateQueue } from './own-state-queue.js';
-import { compareShadowVsCanonical, type TrackedDivergence } from './shadow-comparator.js';
+import { compareAuditVsCanonical, type TrackedDivergence } from './audit-comparator.js';
 import { WakeSignal } from './wake-signal.js';
 import { canSpendGas, requiredPositionModuleAllowanceUSDC, type Market } from '../risk/index.js';
-import { assessStateLoss, dispatchCancel, fillDedupKey, isTerminalPositionStatus, toMakerSignedPayload, type CancelDispatch, type MakerCommitmentRecord, type MakerSide, type MakerSignedPayload, type MakerState, type StateLossAssessment, type StateStore } from '../state/index.js';
+import { assessStateLoss, dispatchCancel, emptyMakerState, fillDedupKey, isTerminalPositionStatus, toMakerSignedPayload, type CancelDispatch, type MakerCommitmentRecord, type MakerSide, type MakerSignedPayload, type MakerState, type StateLossAssessment, type StateStore } from '../state/index.js';
 import { EventLog, eventLogsExist } from '../telemetry/index.js';
 
 // ── injectable seams (the defaults are the real impls; tests override) ───────
@@ -354,6 +355,16 @@ export class Runner {
 
   private state: MakerState;
   /**
+   * The AUDIT projection of own-state (Phase 3 PR3b source flip). When
+   * `ownState.subscribe` is true the SSE stream writes canonical `this.state`
+   * and the POLL path writes THIS second `MakerState` instead — a slower
+   * cross-check fed to {@link compareAuditVsCanonical}. Process-lifetime, NEVER
+   * flushed (an audit divergence is telemetry, not exposure; the one durable
+   * canonical file stays `this.state`). Unused in backout (`subscribe:false`),
+   * where the poll path remains the canonical writer of `this.state`.
+   */
+  private readonly auditState: MakerState = emptyMakerState();
+  /**
    * Unix-seconds deadline before which the boot fail-safe holds (DESIGN §12) — the
    * (TODO) per-market reconcile step must not post, AND state is not flushed (the
    * loaded state is empty / loss-derived, so persisting a clean `maker-state.json`
@@ -432,7 +443,7 @@ export class Runner {
    */
   private readonly divergenceTracker = new Map<string, TrackedDivergence>();
   /**
-   * Wall-clock ms (`Date.now()`) of the last completed post-tick `drainShadow`
+   * Wall-clock ms (`Date.now()`) of the last completed post-tick `drainOwnState`
    * — the comparator uses this as "the poll side last observed at..." for the
    * tolerance window. `0` until the first tick completes.
    */
@@ -444,7 +455,7 @@ export class Runner {
    * spuriously report divergence for every row before the next poll refreshes).
    * Cleared on resync (`shadow.ready = false`).
    */
-  private firstPollAfterShadowReady = false;
+  private firstAuditPollAfterReady = false;
   /**
    * Projection of canonical state built from the SSE stream (Phase 2 PR2 type;
    * PR4 wires the SSE feed). Distinct object identity from `this.state` so the
@@ -452,7 +463,7 @@ export class Runner {
    * shadow boundary. PR5 wires the comparator that reads this against
    * `this.state` and emits divergence telemetry.
    */
-  private readonly ownStateShadow: OwnStateShadow = emptyOwnStateShadow();
+  private readonly ownStateSession: OwnStateSession = emptyOwnStateSession();
   /**
    * Latch — `true` while the last drain reported `overflowed: true` and a
    * subsequent recovery (healthy stream + empty queue) hasn't cleared it. Used
@@ -492,7 +503,7 @@ export class Runner {
    * cold restart of the own-state subscription — close + reopen CURSOR-LESS so
    * the SDK cold-connects with a fresh snapshot. Acted on (and cleared) by
    * `performOwnStateColdRestart`, which the run loop invokes right after the
-   * wake-path / post-tick `drainShadow`. The guard cannot do the async
+   * wake-path / post-tick `drainOwnState`. The guard cannot do the async
    * close/reopen itself (it runs inside a synchronous SDK handler).
    */
   private ownStateColdRestartRequested = false;
@@ -567,9 +578,9 @@ export class Runner {
   private lastAuditPollAtSec: number | null = null;
   /**
    * §5 latch 5 (`auditDivergenceUnresolved`, Phase 3 PR2c-ii) — a POSTING-only latch.
-   * `true` while {@link runShadowComparator}'s last comparison found an EMIT-WORTHY
+   * `true` while {@link runAuditComparator}'s last comparison found an EMIT-WORTHY
    * (persistent — aged past `divergenceToleranceMs`) shadow-vs-canonical divergence;
-   * cleared when a comparison finds none, and on rebaseline ({@link resetShadowForRebaseline},
+   * cleared when a comparison finds none, and on rebaseline ({@link resetOwnStateForRebaseline},
    * with the divergence tracker). Set/cleared from the comparator's `payload !== null`
    * result and ANDed into {@link ownStateHealthy} — NOT the edge mirror or the comparator's
    * own {@link instantOwnStateHealthy} gate. The decouple is LOAD-BEARING: the comparator
@@ -932,6 +943,16 @@ export class Runner {
   }
 
   private sleepMs(): number {
+    // Cadence selection (PR3b source flip): when subscribe is true the SSE
+    // stream drives own-state in real time and the per-tick poll is only the
+    // slower AUDIT cross-check + the reconcile/settle/funding/ageOut sweep, so
+    // pace the tick at `ownState.auditPollIntervalMs` (default 60s, range
+    // 10–300s — its own floor, NOT the trading `POLL_INTERVAL_FLOOR_MS`, which
+    // exists to bound the poll-CANONICAL trading cadence in backout). In backout
+    // (subscribe:false) the poll IS the trading cadence → the trading floor applies.
+    if (this.config.ownState.subscribe) {
+      return this.config.ownState.auditPollIntervalMs;
+    }
     return Math.max(this.config.pollIntervalMs, POLL_INTERVAL_FLOOR_MS);
   }
 
@@ -976,7 +997,7 @@ export class Runner {
           // cycle (debounce + drain). Phase 2 cadence preservation: do NOT
           // chain another debounce; exit so the outer loop runs the next
           // tick. Pending wakes that arrived during the wait will be picked
-          // up by the outer loop's pre-tick `drainShadow`.
+          // up by the outer loop's pre-tick `drainOwnState`.
           this.wakeSignal.clearPending();
           return;
         }
@@ -1005,7 +1026,7 @@ export class Runner {
         // Cadence preservation: `pollDeadlineMs` is unchanged across wake iterations.
         await this.deps.sleep(this.config.ownState.debounceMs, this.abortController.signal);
         if (this.abortController.signal.aborted) return;
-        this.drainShadow();
+        this.drainOwnState();
         // §4.2 (Phase 3 PR1) — the empty-baseline guard wakes the loop after
         // requesting a cold restart; perform it here, off the wake, now that
         // we're in an async context. No-op unless requested.
@@ -1055,7 +1076,7 @@ export class Runner {
       arrivedAtMs: event.arrivedAtMs ?? Date.now(),
       // PR1 (own-state SSE plan §4.1): default to '' (no resumable cursor) for
       // the test/external entry point — an empty cursor is never promoted by
-      // `drainShadow`. The SSE handlers below pass the real `meta.cursor`.
+      // `drainOwnState`. The SSE handlers below pass the real `meta.cursor`.
       cursor: event.cursor ?? '',
     });
   }
@@ -1065,7 +1086,7 @@ export class Runner {
    * IMMEDIATELY (Phase 3 PR2 — Hermes #73). A full queue DROPS the event, so the
    * lost owner-state mutation is a health-relevant degradation the §5.1 posting
    * gate must see BEFORE the next `reconcileMarkets`, not only at the post-tick
-   * `drainShadow`: own-state SSE events can arrive (and overflow) during a tick's
+   * `drainOwnState`: own-state SSE events can arrive (and overflow) during a tick's
    * I/O, after the pre-tick drain but before the posting decision — latching only
    * at drain time would let that tick post on stale-healthy state. Shared by the
    * SSE handlers AND the `enqueueOwnStateEvent` test/external seam so both behave
@@ -1084,7 +1105,7 @@ export class Runner {
    * (`stream-health-degraded` + conditional `stream-would-hold`). Idempotent
    * within a window via the `streamOverflowDegraded` guard (a fresh `resync`
    * snapshot rebaselines the dropped events and clears the latch in
-   * `resetShadowForRebaseline`). Called from the enqueue path (the dropped event,
+   * `resetOwnStateForRebaseline`). Called from the enqueue path (the dropped event,
    * Hermes #73) and the drain path (belt-and-braces).
    */
   private noteOwnStateOverflow(): void {
@@ -1093,7 +1114,7 @@ export class Runner {
     this.recomputeOwnStateHealth();
     this.eventLog.emit('stream-health-degraded', {
       reason: 'queue-overflow',
-      shadowReady: this.ownStateShadow.ready,
+      shadowReady: this.ownStateSession.ready,
       queueCapacity: this.ownStateQueue.capacity,
     });
     const exposureWei6 = computeOpenExposureWei6(this.state, this.deps.now(), this.config.orders.expiryReleaseGraceSeconds);
@@ -1118,13 +1139,22 @@ export class Runner {
    *   is inert, so this stays telemetry-only and never alters canonical trading
    *   state (never sets `fundingHold` / runs `fundingCancelSweep`).
    *
-   * Event dispatch (Phase 2 PR4b): each queued event is routed by `kind` to
-   * the appropriate owner reducer; the returned descriptors flow through
-   * `applyDescriptors(_, 'owner')`. Unknown kinds emit an error and skip.
-   * Reducers mutate `this.ownStateShadow` (not canonical state) — the type
-   * system enforces this (see `src/reducers/owner.test.ts`).
+   * Event dispatch (Phase 3 PR3b — the source flip): each queued event is routed
+   * by `kind` to the appropriate owner reducer, which now writes **canonical
+   * `MakerState`** via the PR3a mappers; the returned descriptors flow through
+   * `applyDescriptors(_, 'owner')`. A mapper throw (`OwnerMappingError`) emits
+   * `owner-mapping-failed` + skips the row; an unknown event kind emits an error
+   * and skips; either freezes cursor promotion past the skipped event.
+   *
+   * **Gated on `ownStateSession.ready`**: deltas apply to canonical state ONLY
+   * after `onReady` has established the baseline — a delta applied to an
+   * unestablished book would corrupt it. Pre-ready deltas stay queued (the SDK
+   * buffers too; `resetOwnStateForRebaseline` clears the queue on resync; the
+   * enqueue-time overflow latch bounds growth). In backout (`subscribe:false`)
+   * `ready` never flips, so this is a no-op.
    */
-  private drainShadow(): void {
+  private drainOwnState(): void {
+    if (!this.ownStateSession.ready) return;
     const drained = this.ownStateQueue.drain();
     // Belt-and-braces — overflow is normally already latched at ENQUEUE time
     // (`enqueueOwnStateAndReact` → `noteOwnStateOverflow`), so the §5.1 posting
@@ -1167,22 +1197,22 @@ export class Runner {
         let descriptors: ReducerDescriptor[];
         switch (event.kind) {
           case 'commitment':
-            descriptors = reduceOwnerCommitmentObservation(this.ownStateShadow, event.body as OwnerCommitment, now);
+            descriptors = reduceOwnerCommitmentObservation(this.state, event.body as OwnerCommitment);
             break;
           case 'fill':
             // The reducer needs our address for the maker/taker disambiguation.
             // When subscribe is true, makerAddress is non-null (boot refuses
             // otherwise); the empty-string fallback is defensive against a
             // misconfigured drain path with no subscription.
-            descriptors = reduceOwnerFill(this.ownStateShadow, event.body as Fill, this.ownStateDedupSet, this.makerAddress ?? '', now);
+            descriptors = reduceOwnerFill(this.state, event.body as Fill, this.ownStateDedupSet, this.makerAddress ?? '', now);
             break;
           case 'positionStatus':
-            descriptors = reduceOwnerPositionStatus(this.ownStateShadow, event.body as PositionStatusEvent, now);
+            descriptors = reduceOwnerPositionStatus(this.state, event.body as PositionStatusEvent);
             break;
           default:
             this.eventLog.emit('error', {
               class: 'UnknownOwnStateEventKind',
-              detail: `drainShadow received unrecognized event.kind=${JSON.stringify(event.kind)} — skipping`,
+              detail: `drainOwnState received unrecognized event.kind=${JSON.stringify(event.kind)} — skipping`,
               phase: 'own-state-stream',
             });
             // An unrecognized event is NOT applied — freeze cursor promotion so
@@ -1190,13 +1220,16 @@ export class Runner {
             promotionStopped = true;
             continue;
         }
-        this.applyDescriptors(descriptors, 'owner');
+        const applied = this.applyDescriptors(descriptors, 'owner');
+        // §7.2: an unknown-own-fill skipped the orphan (no state mutation) and
+        // requested a cursor-less cold restart — freeze promotion so the cursor
+        // never advances past a fill we didn't apply ([[feedback_dont_promote_partial_resume_cursor]]).
+        if (applied.unknownOwnFill) promotionStopped = true;
       } catch (err) {
-        this.eventLog.emit('error', {
-          class: errClass(err),
-          detail: `${errMessage(err)} (event.kind=${event.kind})`,
-          phase: 'own-state-stream',
-        });
+        // The PR3a mappers fail closed (`OwnerMappingError`) on a payload missing
+        // metadata a Maker*Record requires — emit the dedicated kind + skip the
+        // row (never a partial record); other throws are defensive.
+        this.emitOwnStateMappingFailure(err, `event.kind=${event.kind}`);
         promotionStopped = true;
         continue;
       }
@@ -1266,18 +1299,18 @@ export class Runner {
           // else: live + holding — leave the latch false, retry next tick.
         }
         ticks += 1;
-        this.drainShadow(); // own-state-sse-plan §"Drain placement" — pre-tick drain
+        this.drainOwnState(); // own-state-sse-plan §"Drain placement" — pre-tick drain
         await this.tick(ticks);
-        this.drainShadow(); // §"Drain placement" — post-tick drain catches events that arrived during tick IO
+        this.drainOwnState(); // §"Drain placement" — post-tick drain catches events that arrived during tick IO
         // §4.2 (Phase 3 PR1) — belt-and-braces cold-restart hook for a guard
         // that tripped during tick IO (before the loop returned to the wait).
         await this.performOwnStateColdRestart();
         // PR5 — comparator pass. Records that this tick completed (lastPollObsAtMs),
-        // latches firstPollAfterShadowReady when applicable, and runs the comparator
+        // latches firstAuditPollAfterReady when applicable, and runs the comparator
         // when preconditions hold. Read-only on canonical state (never writes
         // `MakerState`); besides emitting `divergence` it sets the posting-only latch 5
         // (`auditDivergenceUnresolved`, PR2c-ii) that gates NEW posting in live+subscribe.
-        this.runShadowComparator();
+        this.runAuditComparator();
         if (this.stopRequested) break;
         if (this.maxTicks !== undefined && ticks >= this.maxTicks) break;
         // Phase 2 PR3 — wakeable wait. A wake interrupts the sleep but does NOT
@@ -2623,10 +2656,22 @@ export class Runner {
    */
   private async detectFills(): Promise<boolean> {
     if (this.makerAddress === null) return true; // dry-run path — defensive (the caller skips); treat as ok so the rest of the tick proceeds
+    // PR3b source flip: when subscribe is true the SSE stream is the canonical
+    // own-state writer, so the poll path runs as a best-effort AUDIT over a fresh
+    // clone of canonical (`this.auditState`) — cross-checking SSE-derived fills
+    // against the API. detectFills is the first poll method in the tick, so it
+    // (re)seeds the audit state from canonical for the whole audit cycle. An
+    // audit failure NEVER gates trading (returns true): the §5 health gate owns
+    // SSE fail-closed. In backout (subscribe:false) the poll IS canonical
+    // (writes this.state) and a failure gates the tick fail-closed as before.
+    const subscribe = this.config.ownState.subscribe;
+    if (subscribe) this.reseedAuditState();
+    const target = subscribe ? this.auditState : this.state;
+    const source: 'poll' | 'audit' = subscribe ? 'audit' : 'poll';
     const now = this.deps.now();
     const reducerConfig = { expiryReleaseGraceSeconds: this.config.orders.expiryReleaseGraceSeconds };
     const localOpen = new Map<string, MakerCommitmentRecord>();
-    for (const r of Object.values(this.state.commitments)) {
+    for (const r of Object.values(target.commitments)) {
       if (r.lifecycle !== 'visibleOpen' && r.lifecycle !== 'partiallyFilled') continue;
       // Past-local-expiry records ARE included — see the doc above (a fill that landed
       // just before expiry must be classified before `ageOut` terminalizes the record).
@@ -2640,7 +2685,7 @@ export class Runner {
       apiList = await this.adapter.listOpenCommitments(this.makerAddress, listLimit);
     } catch (err) {
       this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'fill-detection' });
-      return false; // fail closed — the caller skips live writes + ageOut this tick
+      return subscribe ? true : false; // backout: fail closed (skip live writes + ageOut); audit: never gates trading
     }
     const apiByHash = new Map<string, Commitment>();
     for (const c of apiList) apiByHash.set(c.commitmentHash, c);
@@ -2652,8 +2697,8 @@ export class Runner {
       const apiCommitment = apiByHash.get(record.hash);
       if (apiCommitment === undefined) continue; // disappeared — handled below
       const observation: PolledCommitmentObservation = { kind: 'still-listed', record, apiCommitment };
-      const descriptors = reducePolledCommitmentObservation(this.state, observation, now, reducerConfig);
-      const result = this.applyDescriptors(descriptors, 'poll');
+      const descriptors = reducePolledCommitmentObservation(target, observation, now, reducerConfig);
+      const result = this.applyDescriptors(descriptors, source);
       if (result.pastExpiryLookupFailed) pastExpiryLookupFailed = true;
     }
 
@@ -2670,38 +2715,95 @@ export class Runner {
       } catch (err) {
         observation = { kind: 'disappeared-lookup-failed', record, err };
       }
-      const descriptors = reducePolledCommitmentObservation(this.state, observation, now, reducerConfig);
-      const result = this.applyDescriptors(descriptors, 'poll');
+      const descriptors = reducePolledCommitmentObservation(target, observation, now, reducerConfig);
+      const result = this.applyDescriptors(descriptors, source);
       if (result.pastExpiryLookupFailed) pastExpiryLookupFailed = true;
     }
-    return !pastExpiryLookupFailed;
+    return subscribe ? true : !pastExpiryLookupFailed;
+  }
+
+  /**
+   * Reseed `this.auditState` from a shallow per-record clone of canonical
+   * `this.state` (PR3b source flip, subscribe mode). The audit poll then
+   * converges these COPIES against the API; because the poll reducers mutate
+   * only primitive fields (`filledRiskWei6` / `lifecycle` / status / risk) of the
+   * passed records, a shallow `{ ...record }` clone fully isolates the canonical
+   * book from audit mutation. Reseeding each cycle makes the audit stateless and
+   * lets it catch the dangerous SSE-BEHIND direction: the API convergence only
+   * ever bumps `filledRiskWei6` UP, so an SSE that under-counted a fill diverges
+   * from the API-converged audit (→ `auditDivergenceUnresolved` → posting hold).
+   * `fills[]` arrays are shared by reference (the poll never mutates them and the
+   * comparator never reads them — only `filledRiskWei6` matters).
+   */
+  private reseedAuditState(): void {
+    this.auditState.commitments = Object.fromEntries(
+      Object.entries(this.state.commitments).map(([hash, r]) => [hash, { ...r }]),
+    );
+    this.auditState.positions = Object.fromEntries(
+      Object.entries(this.state.positions).map(([key, p]) => [key, { ...p }]),
+    );
+  }
+
+  /**
+   * Emit the right telemetry for a canonical own-state mapping failure: the
+   * dedicated `owner-mapping-failed` kind when a PR3a mapper threw
+   * `OwnerMappingError` (a payload missing metadata a `Maker*Record` requires),
+   * or a generic `error` otherwise. Shared by the drain dispatch and the
+   * snapshot-baseline accumulation — both skip the offending row (fail-closed).
+   */
+  private emitOwnStateMappingFailure(err: unknown, where: string): void {
+    if (err instanceof OwnerMappingError) {
+      this.eventLog.emit('owner-mapping-failed', {
+        class: 'OwnerMappingError',
+        field: err.field,
+        ...(err.commitmentHash !== undefined ? { commitmentHash: err.commitmentHash } : {}),
+        ...(err.speculationId !== undefined ? { speculationId: err.speculationId } : {}),
+        detail: err.message,
+        phase: 'own-state-stream',
+      });
+    } else {
+      this.eventLog.emit('error', {
+        class: errClass(err),
+        detail: `${errMessage(err)} (${where})`,
+        phase: 'own-state-stream',
+      });
+    }
   }
 
   /**
    * Translate a reducer's `ReducerDescriptor[]` into the runner's side-effects:
    * telemetry emits, market-dirtying (gated on `trackedMarkets`), and orchestrator-
-   * level signals (`pastExpiryLookupFailed`, `softCancelledProbeFailed`). State
-   * mutations have already happened inside the reducer; this method is purely
-   * IO + signal aggregation. The `source` tag is preserved for PR3+ (divergence
-   * telemetry will read it); in Phase 2 it's a label.
+   * level signals (`pastExpiryLookupFailed`, `softCancelledProbeFailed`,
+   * `unknownOwnFill`). State mutations have already happened inside the reducer;
+   * this method is purely IO + signal aggregation.
+   *
+   * The `source` tag distinguishes the canonical SSE writer (`'owner'`) from the
+   * AUDIT poll (`'audit'`, post PR3b): an audit-source pass runs the poll
+   * reducers against `this.auditState` purely to feed the divergence comparator,
+   * so it MUST NOT re-emit `fill` / `position-transition` telemetry (the SSE
+   * canonical path already emitted those) nor re-dirty markets (the audit must
+   * never drive posting). Audit suppresses those; it keeps `emit-error` +
+   * `emit-expire` (audit-internal anomalies) and the fail-closed signals.
    */
-  private applyDescriptors(descriptors: ReducerDescriptor[], _source: 'poll' | 'owner'): ApplyDescriptorsResult {
-    const result: ApplyDescriptorsResult = { pastExpiryLookupFailed: false, softCancelledProbeFailed: false };
+  private applyDescriptors(descriptors: ReducerDescriptor[], source: 'poll' | 'owner' | 'audit'): ApplyDescriptorsResult {
+    const result: ApplyDescriptorsResult = { pastExpiryLookupFailed: false, softCancelledProbeFailed: false, unknownOwnFill: false };
+    const audit = source === 'audit';
     for (const d of descriptors) {
       switch (d.kind) {
         case 'emit-fill':
-          this.eventLog.emit('fill', d.payload as unknown as Record<string, unknown>);
+          if (!audit) this.eventLog.emit('fill', d.payload as unknown as Record<string, unknown>);
           break;
         case 'emit-expire':
           this.eventLog.emit('expire', d.payload as unknown as Record<string, unknown>);
           break;
         case 'emit-position-transition':
-          this.eventLog.emit('position-transition', d.payload as unknown as Record<string, unknown>);
+          if (!audit) this.eventLog.emit('position-transition', d.payload as unknown as Record<string, unknown>);
           break;
         case 'emit-error':
           this.eventLog.emit('error', d.payload as unknown as Record<string, unknown>);
           break;
         case 'mark-dirty': {
+          if (audit) break; // the audit poll must never dirty markets / drive posting
           const m = this.trackedMarkets.get(d.contestId);
           if (m !== undefined) m.dirty = true;
           break;
@@ -2711,6 +2813,17 @@ export class Runner {
           break;
         case 'signal-softcancel-probe-failed':
           result.softCancelledProbeFailed = true;
+          break;
+        case 'signal-unknown-own-fill':
+          // §7.2: an own-state fill referenced a commitment not in canonical
+          // state. Emit telemetry, latch the audit-divergence posting hold, and
+          // request a cursor-less cold restart whose fresh snapshot reconciles
+          // (the orphan fill was NOT applied — a fill carries no contest identity).
+          this.eventLog.emit('unknown-own-fill', d.payload as unknown as Record<string, unknown>);
+          this.auditDivergenceUnresolved = true;
+          this.ownStateColdRestartRequested = true;
+          this.wakeSignal.wake();
+          result.unknownOwnFill = true;
           break;
       }
     }
@@ -2726,7 +2839,7 @@ export class Runner {
    * `this.currentOwnStateSubscription` correctly on the very first event.
    *
    * Phase 2 invariant — shadow-only: the handlers project SSE bodies into
-   * `this.ownStateShadow` ONLY. Canonical `MakerState` writes still come
+   * `this.ownStateSession` ONLY. Canonical `MakerState` writes still come
    * from the poll path. Owner-reducer event-application is stubbed in
    * PR4a (queue events drain to no-op reducers); PR4b lands the real
    * reducer bodies.
@@ -2814,51 +2927,60 @@ export class Runner {
   /**
    * Handle one snapshot page from the SSE cold-connect (inline) or REST
    * paging (when the first inline page was `truncated: true`). Each call
-   * accumulates the page's commitments + positions into
-   * `shadow.pendingBaseline`. The final page (`truncated: false`) is
-   * followed by `onReady`, which atomically swaps `pendingBaseline` into
-   * `shadow.commitments` / `shadow.positions`.
+   * accumulates the page's commitments + positions — projected to CANONICAL
+   * `MakerCommitmentRecord` / `MakerPositionRecord` via the PR3a mappers — into
+   * `session.pendingBaseline`. The final page (`truncated: false`) is followed
+   * by `onReady`, which atomically swaps `pendingBaseline` into
+   * `this.state.commitments` / `.positions` (the source flip, PR3b).
    *
-   * Phase 2 invariant — shadow-only: writes are to `pendingBaseline` (a
-   * shadow projection), NOT to canonical `MakerState`.
+   * Fail-closed per row: a mapper throw (`OwnerMappingError` — missing required
+   * metadata) emits `owner-mapping-failed` and SKIPS that row rather than
+   * materializing a partial record or crashing the whole baseline.
    *
    * The snapshot page's own SSE-frame cursor is NOT consumed here: the SDK's
    * `OwnStateEventMeta` contract is that ONLY the cursor delivered to `onReady`
    * (final baseline complete) is a valid `Last-Event-ID` resume point — a
    * snapshot page's frame id (truncated pages especially) is not resumable. So
    * `handleOwnerReady` promotes the `onReady` cursor and this handler ignores
-   * the per-page cursor entirely (own-state SSE plan §4.3 reconfirmed for the
-   * PR3b cursor flip).
+   * the per-page cursor entirely (own-state SSE plan §4.3).
    */
   private handleOwnerSnapshot(snapshot: OwnerStateSnapshot): void {
     // A snapshot page means the SDK IS delivering a baseline on this connect
     // (even a resume that re-snapshots) — so this is no longer a baseline-less
     // resume; disarm the empty-baseline guard (own-state SSE plan §4.2).
     this.resumedFromPersistedCursor = false;
-    if (this.ownStateShadow.pendingBaseline === null) {
-      this.ownStateShadow.pendingBaseline = {
+    if (this.ownStateSession.pendingBaseline === null) {
+      this.ownStateSession.pendingBaseline = {
         commitments: {},
         positions: {},
         truncated: snapshot.truncated,
         positionsTruncated: snapshot.positionsTruncated,
       };
     } else {
-      this.ownStateShadow.pendingBaseline.truncated = snapshot.truncated;
+      this.ownStateSession.pendingBaseline.truncated = snapshot.truncated;
       // OR-latch positionsTruncated across pages — once any page reports the
       // actionable-positions cap was hit, the baseline is incomplete and the
-      // shadow MUST surface that signal to the comparator regardless of
+      // session MUST surface that signal to the comparator regardless of
       // subsequent page outcomes (Hermes #68 review blocker 2 — don't rely
       // on `onStatus('degraded')` event ordering).
-      if (snapshot.positionsTruncated) this.ownStateShadow.pendingBaseline.positionsTruncated = true;
+      if (snapshot.positionsTruncated) this.ownStateSession.pendingBaseline.positionsTruncated = true;
     }
     for (const c of snapshot.commitments) {
-      this.ownStateShadow.pendingBaseline.commitments[c.commitmentHash] = projectOwnerCommitment(c);
+      try {
+        this.ownStateSession.pendingBaseline.commitments[c.commitmentHash] = mapOwnerCommitmentToMaker(c);
+      } catch (err) {
+        this.emitOwnStateMappingFailure(err, 'snapshot-commitment');
+      }
     }
     for (const p of snapshot.positions) {
-      const projected = projectOwnerPosition(p);
-      this.ownStateShadow.pendingBaseline.positions[`${p.speculationId}:${projected.side}`] = projected;
+      try {
+        const mapped = mapOwnerPositionToMaker(p);
+        this.ownStateSession.pendingBaseline.positions[`${p.speculationId}:${mapped.side}`] = mapped;
+      } catch (err) {
+        this.emitOwnStateMappingFailure(err, 'snapshot-position');
+      }
     }
-    this.ownStateShadow.lastEventAtMs = Date.now();
+    this.ownStateSession.lastEventAtMs = Date.now();
     // Don't wake on snapshot pages — wake when `ready` fires (the comparator
     // shouldn't run against a partial baseline; the SDK still buffers deltas
     // internally until `ready`, but we belt-and-braces by deferring drain).
@@ -2878,12 +3000,12 @@ export class Runner {
    * is being delivered, so at swap time the delta queue holds no pre-baseline
    * events; and the `baseline !== null` gate means a reconnect's `onReady`
    * (baseline already swapped) promotes nothing while catchup deltas stay queued
-   * and promote in-order in `drainShadow`. The synchronous swap is a plain
+   * and promote in-order in `drainOwnState`. The synchronous swap is a plain
    * object assignment and cannot throw, so §4.4's "swap throws → cursor not
    * advanced" case is N/A. No leapfrog path exists.
    */
   private handleOwnerReady(cursor: string): void {
-    const baseline = this.ownStateShadow.pendingBaseline;
+    const baseline = this.ownStateSession.pendingBaseline;
     // EMPTY-BASELINE GUARD (own-state SSE plan §4.2, "a cursor alone is not
     // state", Phase 3 PR1): a resume seeded from a persisted cursor that
     // reaches `onReady` with NO snapshot (`baseline === null`) has no durable
@@ -2904,16 +3026,22 @@ export class Runner {
       return; // do NOT set ready — an empty shadow must not look ready
     }
     if (baseline !== null) {
-      // Atomic swap — replace shadow's commitments/positions wholesale rather
-      // than merging. The pendingBaseline accumulated EVERY commitment/position
-      // visible at snapshot time; anything in shadow.commitments from a prior
-      // resync MUST NOT survive (a resync explicitly clears pendingBaseline +
-      // ready=false beforehand — see `handleOwnerStatus`).
-      this.ownStateShadow.commitments = baseline.commitments;
-      this.ownStateShadow.positions = baseline.positions;
-      this.ownStateShadow.truncated = baseline.truncated;
-      this.ownStateShadow.positionsTruncated = baseline.positionsTruncated;
-      this.ownStateShadow.pendingBaseline = null;
+      // Atomic swap — the SSE baseline becomes the CANONICAL book (PR3b source
+      // flip). REPLACE `this.state.commitments`/`.positions` wholesale: the
+      // pendingBaseline accumulated EVERY commitment/position the owner snapshot
+      // reported, which is the authoritative re-grounding. A commitment the MM
+      // posted but the indexer hasn't surfaced yet would be dropped here, but
+      // §7.2 (unknown-own-fill) re-snapshots if such a commitment later fills,
+      // and the §5.1 health gate halts posting across a resync — so the drop is
+      // self-healing. The fill-dedup set is reseeded from the fresh baseline's
+      // (empty) `fills[]` so a re-delivered fill isn't mis-deduped against a
+      // pre-swap key (the snapshot's `filledRiskWei6` already reflects all fills).
+      this.state.commitments = baseline.commitments;
+      this.state.positions = baseline.positions;
+      this.ownStateDedupSet.clear();
+      this.ownStateSession.truncated = baseline.truncated;
+      this.ownStateSession.positionsTruncated = baseline.positionsTruncated;
+      this.ownStateSession.pendingBaseline = null;
       // §4.3 cursor promotion: the baseline is now live in the shadow, so the
       // cursor that pairs with it is safe to persist. The tick's existing atomic
       // flush writes it alongside the rest of MakerState. A cursor is promoted
@@ -2938,9 +3066,9 @@ export class Runner {
     // in-memory baseline is still live — either way a baseline now backs the
     // shadow, so the resume guard is satisfied.
     this.resumedFromPersistedCursor = false;
-    this.ownStateShadow.ready = true;
-    this.ownStateShadow.lastReadyAtMs = Date.now();
-    this.ownStateShadow.lastEventAtMs = Date.now();
+    this.ownStateSession.ready = true;
+    this.ownStateSession.lastReadyAtMs = Date.now();
+    this.ownStateSession.lastEventAtMs = Date.now();
     // Re-derive the composite latch health (Phase 3 PR2): `ready` just flipped
     // true and a fresh baseline (possibly `positionsTruncated`) swapped in, both
     // composite inputs. A queue overflow OR positionsTruncated baseline means the
@@ -2953,19 +3081,19 @@ export class Runner {
   }
 
   private handleOwnerCommitment(commitment: OwnerCommitment, cursor: string): void {
-    this.ownStateShadow.lastEventAtMs = Date.now();
+    this.ownStateSession.lastEventAtMs = Date.now();
     this.enqueueOwnStateAndReact({ kind: 'commitment', body: commitment, arrivedAtMs: Date.now(), cursor });
     this.wakeSignal.wake();
   }
 
   private handleOwnerFill(fill: Fill, cursor: string): void {
-    this.ownStateShadow.lastEventAtMs = Date.now();
+    this.ownStateSession.lastEventAtMs = Date.now();
     this.enqueueOwnStateAndReact({ kind: 'fill', body: fill, arrivedAtMs: Date.now(), cursor });
     this.wakeSignal.wake();
   }
 
   private handleOwnerPositionStatus(event: PositionStatusEvent, cursor: string): void {
-    this.ownStateShadow.lastEventAtMs = Date.now();
+    this.ownStateSession.lastEventAtMs = Date.now();
     this.enqueueOwnStateAndReact({ kind: 'positionStatus', body: event, arrivedAtMs: Date.now(), cursor });
     this.wakeSignal.wake();
   }
@@ -3024,15 +3152,15 @@ export class Runner {
    * `healthy && ready` suppresses divergence telemetry until the transport
    * recovers (`connected` clears it).
    */
-  private handleOwnerStatus(status: ShadowTransportStatus): void {
-    this.ownStateShadow.lastStatus = status;
-    this.ownStateShadow.lastEventAtMs = Date.now();
+  private handleOwnerStatus(status: OwnStateTransportStatus): void {
+    this.ownStateSession.lastStatus = status;
+    this.ownStateSession.lastEventAtMs = Date.now();
     if (status === 'resync') {
       // The upcoming fresh snapshot is authoritative — drop every buffer the
-      // prior baseline seeded. Centralized in `resetShadowForRebaseline` so the
+      // prior baseline seeded. Centralized in `resetOwnStateForRebaseline` so the
       // resync path and the empty-baseline cold-restart path clear the SAME set
       // ([[feedback_enforce_invariant_every_site]] + [[feedback_reset_event_clears_dependent_buffers]]).
-      this.resetShadowForRebaseline();
+      this.resetOwnStateForRebaseline();
     } else if (status === 'connected') {
       // Transport recovered — clear any prior transport-level error mark
       // (including the fatal-error input the recompute below reads). A queue
@@ -3042,7 +3170,7 @@ export class Runner {
       // events the runner dropped), so they need a `resync` → fresh snapshot
       // to clear (Hermes #68 review blocker 1). The recompute below keeps
       // `healthy` false while either latch is still set.
-      this.ownStateShadow.lastError = null;
+      this.ownStateSession.lastError = null;
       // Latch 7 backstop (Phase 3 PR2b): `connected` proves the transport
       // re-authenticated. `onFrame` is the primary clear (it precedes
       // `connected`), but `onFrame` is optional in the SDK contract — clearing
@@ -3092,13 +3220,13 @@ export class Runner {
    *   a server-driven resync already re-baselines on the LIVE socket, so it
    *   supersedes a not-yet-performed MM-driven cold restart (which would
    *   pointlessly close + reopen the connection the resync is already healing).
-   * - `firstPollAfterShadowReady` + `divergenceTracker` + `auditDivergenceUnresolved`
+   * - `firstAuditPollAfterReady` + `divergenceTracker` + `auditDivergenceUnresolved`
    *   (latch 5, PR2c-ii) — the comparator must wait for the post-rebaseline `onReady`
    *   AND one poll-tick before comparing; the prior divergence verdict is moot.
    */
-  private resetShadowForRebaseline(): void {
-    this.ownStateShadow.ready = false;
-    this.ownStateShadow.pendingBaseline = null;
+  private resetOwnStateForRebaseline(): void {
+    this.ownStateSession.ready = false;
+    this.ownStateSession.pendingBaseline = null;
     this.streamOverflowDegraded = false;
     this.tokenRefreshFailureInFlight = false;
     this.lastFrameAtSec = null;
@@ -3106,7 +3234,7 @@ export class Runner {
     this.state.ownStateCursor = undefined;
     this.resumedFromPersistedCursor = false;
     this.ownStateColdRestartRequested = false;
-    this.firstPollAfterShadowReady = false;
+    this.firstAuditPollAfterReady = false;
     this.divergenceTracker.clear();
     // §5 latch 5 (PR2c-ii): a rebaseline invalidates any prior divergence verdict
     // (the fresh snapshot replaces the shadow the comparator measured), so clear the
@@ -3124,7 +3252,7 @@ export class Runner {
    * Act on a cold-restart request raised by the empty-baseline guard (own-state
    * SSE plan §4.2, Phase 3 PR1). The guard runs inside a synchronous SDK
    * handler, so it can only set `ownStateColdRestartRequested` + wake; this
-   * async method (invoked off the wake-path / post-tick `drainShadow`) does the
+   * async method (invoked off the wake-path / post-tick `drainOwnState`) does the
    * close + reopen. Order matters: close FIRST (the SDK contract + the runner's
    * identity guard mean no handler fires after `await unsubscribe()`), THEN
    * reset the rebaseline buffers (so no event delivered between the guard and
@@ -3140,7 +3268,7 @@ export class Runner {
     this.ownStateColdRestartRequested = false;
     if (this.stopRequested || this.abortController.signal.aborted) return;
     await this.closeOwnStateSubscription();
-    this.resetShadowForRebaseline();
+    this.resetOwnStateForRebaseline();
     if (this.makerAddress !== null) this.openOwnStateSubscription();
   }
 
@@ -3153,13 +3281,13 @@ export class Runner {
    */
   private handleOwnerError(error: OspexStreamError): void {
     const reason = error.reason;
-    this.ownStateShadow.lastError = {
+    this.ownStateSession.lastError = {
       class: error.constructor.name,
       detail: error.message,
       reason: reason ?? 'unknown',
       recordedAtMs: Date.now(),
     };
-    this.ownStateShadow.lastEventAtMs = Date.now();
+    this.ownStateSession.lastEventAtMs = Date.now();
     // §5 latch 7 (Phase 3 PR2b): a `token-refresh` failure means the SDK could
     // not re-mint the bearer for a reconnect on an already-connected subscription
     // — a future reconnect may fail, so the shadow is at risk of going stale.
@@ -3186,7 +3314,7 @@ export class Runner {
    * Phase 3 PR2) and maintain the recovery-hold anchor. MUST be called at EVERY
    * latch-mutation site — `handleOwnerReady` (ready / positionsTruncated),
    * `handleOwnerStatus` (lastStatus / lastError-clear), `handleOwnerError`
-   * (fatal), `drainShadow` (overflow set), `resetShadowForRebaseline` (overflow
+   * (fatal), `drainOwnState` (overflow set), `resetOwnStateForRebaseline` (overflow
    * clear + ready clear) — so the conjunction is re-derived from ALL inputs and
    * a recovery on one signal can never mask a different still-tripped latch
    * ([[feedback_health_predicate_composite_inputs]] + the every-site discipline
@@ -3224,7 +3352,7 @@ export class Runner {
    * divergence would suppress the comparator that clears it). Latch 6
    * (`indexerLagDegraded`, PR2c) is likewise a posting-safety latch
    * for {@link ownStateHealthy}, not a shadow-freshness signal. See the comparator
-   * read site in {@link runShadowComparator}.
+   * read site in {@link runAuditComparator}.
    *
    * The recovery-hold anchor `healthyEligibleSinceSec` is set to `nowSec` on the
    * false→true edge of the FULL instantaneous composite (edge mirror AND
@@ -3242,12 +3370,12 @@ export class Runner {
    * §5.1 evaluation within a tick shares one clock sample.
    */
   private recomputeOwnStateHealth(nowSec: number = this.deps.now()): boolean {
-    this.ownStateShadow.healthy =
-      this.ownStateShadow.ready &&
-      this.ownStateShadow.lastStatus === 'connected' &&
+    this.ownStateSession.healthy =
+      this.ownStateSession.ready &&
+      this.ownStateSession.lastStatus === 'connected' &&
       !this.streamOverflowDegraded &&
-      !this.ownStateShadow.positionsTruncated &&
-      this.ownStateShadow.lastError?.reason !== 'fatal' &&
+      !this.ownStateSession.positionsTruncated &&
+      this.ownStateSession.lastError?.reason !== 'fatal' &&
       !this.tokenRefreshFailureInFlight;
     const instant = this.instantOwnStateHealthy(nowSec);
     if (instant) {
@@ -3285,7 +3413,7 @@ export class Runner {
    * gate maintains the anchor separately via {@link recomputeOwnStateHealth}.
    */
   private instantOwnStateHealthy(nowSec: number): boolean {
-    return this.ownStateShadow.healthy && this.transportFresh(nowSec);
+    return this.ownStateSession.healthy && this.transportFresh(nowSec);
   }
 
   /**
@@ -3297,7 +3425,7 @@ export class Runner {
    * `ownState.recoveryHoldMs`. The recovery hold is a posting-only anti-flap delay,
    * which is why the divergence comparator gates on {@link instantOwnStateHealthy}
    * (the full instant, WITHOUT the recovery hold) instead — see
-   * {@link runShadowComparator}.
+   * {@link runAuditComparator}.
    *
    * Clock note: `deps.now()` is unix SECONDS and `recoveryHoldMs` is MILLISECONDS,
    * so the comparison scales the seconds delta by 1000 (mirrors the funding guard's
@@ -3454,8 +3582,8 @@ export class Runner {
 
   /**
    * Run the Phase 2 PR5 shadow-vs-canonical comparator (own-state-sse-plan §6.3).
-   * Called once per tick AFTER the post-tick `drainShadow`. Records the
-   * poll-side observation timestamp, latches `firstPollAfterShadowReady`
+   * Called once per tick AFTER the post-tick `drainOwnState`. Records the
+   * poll-side observation timestamp, latches `firstAuditPollAfterReady`
    * when appropriate, and runs the comparator when the precondition gate
    * holds. Comparator output (an aggregated `divergence` payload OR `null`)
    * drives a single `divergence` telemetry emit per tick.
@@ -3471,7 +3599,7 @@ export class Runner {
    *     gated by the audit-divergence latch (latch 5, PR2c) it produces — see the
    *     decoupling note at the read site below (Phase 3 PR2);
    *   - `ownStateQueue.size === 0` — no pending events would alter the shadow;
-   *   - `firstPollAfterShadowReady` — at least one tick has completed since
+   *   - `firstAuditPollAfterReady` — at least one tick has completed since
    *     `shadow.ready` flipped true (otherwise canonical is stale relative
    *     to a fresh shadow and every row reads as divergent).
    *
@@ -3482,19 +3610,19 @@ export class Runner {
    * {@link ownStateHealthy} (NOT the `instantOwnStateHealthy` gate this method itself
    * uses), so producing it can never suppress the next comparison that clears it.
    */
-  private runShadowComparator(): void {
+  private runAuditComparator(): void {
     const nowMs = Date.now();
     const nowSec = this.deps.now();
-    // Record this tick's poll-side observation timestamp regardless of whether
-    // we'll compare — the next compareShadowVsCanonical call needs it.
+    // Record this tick's audit-poll observation timestamp regardless of whether
+    // we'll compare — the next compareAuditVsCanonical call needs it.
     this.lastPollObsAtMs = nowMs;
-    // Latch firstPollAfterShadowReady: this tick just completed a pre+tick+post
-    // drainShadow cycle with `shadow.ready === true`; the canonical side is
+    // Latch firstAuditPollAfterReady: this tick just completed a pre+tick+post
+    // drainOwnState cycle with `shadow.ready === true`; the canonical side is
     // now post-ready, so the comparator can fire on the NEXT iteration.
-    if (this.ownStateShadow.ready && !this.firstPollAfterShadowReady) {
-      this.firstPollAfterShadowReady = true;
+    if (this.ownStateSession.ready && !this.firstAuditPollAfterReady) {
+      this.firstAuditPollAfterReady = true;
       // Don't compare on the same tick the latch first flips — give the next
-      // tick's pre-drainShadow + tick a chance to refresh canonical first.
+      // tick's pre-drainOwnState + tick a chance to refresh canonical first.
       // (The plan's wording: "firstPollAfterReadyDone — need ≥1 poll completed
       // since shadow became ready". Setting the latch this tick means the
       // poll completed this tick; the comparator runs FROM the next tick.)
@@ -3516,14 +3644,15 @@ export class Runner {
     // `ownStateHealthy()` (posting); this full instant mirror feeds the audit gate.
     if (!this.instantOwnStateHealthy(nowSec)) return;
     if (this.ownStateQueueSizeForTest() !== 0) return;
-    if (!this.firstPollAfterShadowReady) return;
-    const payload = compareShadowVsCanonical(
-      this.state,
-      this.ownStateShadow,
+    if (!this.firstAuditPollAfterReady) return;
+    const payload = compareAuditVsCanonical(
+      this.state, // canonical — SSE-derived (post PR3b source flip)
+      this.auditState, // audit — poll-derived
       this.divergenceTracker,
       nowMs,
       this.config.ownState.divergenceToleranceMs,
-      this.lastPollObsAtMs,
+      this.ownStateSession.lastEventAtMs, // canonical (SSE) last-event observation
+      this.lastPollObsAtMs, // audit (poll) last observation
     );
     // §5 latch 5 (PR2c-ii): a non-null payload IS an emit-worthy (persistent) divergence
     // — set the posting-only latch; a null payload means the audit is clean → clear it.
@@ -3538,18 +3667,39 @@ export class Runner {
   }
 
   /**
-   * Test seam — exposes the shadow projection for assertions in
-   * `runner.test.ts`. Returns the live reference; tests must not mutate it.
+   * Test seam — exposes the own-state SSE session (transport/health/baseline
+   * bits) for assertions in `runner.test.ts`. Returns the live reference; tests
+   * must not mutate it. The canonical book (commitments/positions) lives on
+   * {@link stateForTest} now (PR3b source flip), NOT here.
    */
-  ownStateShadowView(): Readonly<OwnStateShadow> {
-    return this.ownStateShadow;
+  ownStateSessionView(): Readonly<OwnStateSession> {
+    return this.ownStateSession;
+  }
+
+  /**
+   * Test seam — exposes the canonical `MakerState` (commitments / positions /
+   * cursor / pnl). Post PR3b source flip this is the SSE-written book in
+   * subscribe mode (the poll-written book in backout). Returns the live
+   * reference; tests must not mutate it.
+   */
+  stateForTest(): Readonly<MakerState> {
+    return this.state;
+  }
+
+  /**
+   * Test seam — exposes the AUDIT `MakerState` (poll-derived, subscribe mode)
+   * that {@link compareAuditVsCanonical} cross-checks against canonical. Returns
+   * the live reference; tests must not mutate it.
+   */
+  auditStateForTest(): Readonly<MakerState> {
+    return this.auditState;
   }
 
   /**
    * Test seam — evaluates the composite §5 health GATE ({@link ownStateHealthy})
    * at the current `deps.now()`, so PR2 tests can assert the recovery-hold timing
    * (latch-healthy but gate-false until `recoveryHoldMs` elapses) by advancing the
-   * injected clock. Distinct from `ownStateShadowView().healthy`, which is the
+   * injected clock. Distinct from `ownStateSessionView().healthy`, which is the
    * EDGE-latch mirror only — WITHOUT the time-dependent `transportFresh` latch
    * (latch 2) AND WITHOUT the recovery hold, both of which the gate adds.
    */
@@ -3579,7 +3729,7 @@ export class Runner {
   /**
    * Test seam — sets the `streamOverflowDegraded` latch directly so tests can
    * exercise the connected/resync gating without driving the full overflow
-   * detection path through `drainShadow` (PR4a round 2 / Hermes #68 review).
+   * detection path through `drainOwnState` (PR4a round 2 / Hermes #68 review).
    * Re-derives composite health (Phase 3 PR2) so the seam mirrors the production
    * latch-mutation sites — directly setting the latch without recomputing would
    * leave `shadow.healthy` / the recovery-hold anchor stale and the seam would
@@ -3651,7 +3801,7 @@ export class Runner {
 
   /**
    * Test seam — current divergence-tracker occupancy (PR5 comparator). Non-zero
-   * iff `runShadowComparator` actually invoked `compareShadowVsCanonical` (the
+   * iff `runAuditComparator` actually invoked `compareShadowVsCanonical` (the
    * tracker is populated only inside it, after the precondition gate). PR2b uses
    * this to prove the comparator gate reads `instantOwnStateHealthy` — a stale
    * transport with a healthy edge mirror must leave the tracker empty (the audit
@@ -3705,8 +3855,13 @@ export class Runner {
    */
   private async reconcileSoftCancelledFills(): Promise<boolean> {
     if (this.makerAddress === null) return true; // dry-run path — defensive (the caller skips); treat as ok
+    // PR3b: AUDIT over this.auditState when subscribe (cross-check; never gates
+    // trading); canonical this.state in backout (poll-canonical, fail-closed).
+    const subscribe = this.config.ownState.subscribe;
+    const target = subscribe ? this.auditState : this.state;
+    const source: 'poll' | 'audit' = subscribe ? 'audit' : 'poll';
     const now = this.deps.now();
-    const softCancelled = Object.values(this.state.commitments).filter((r) => r.lifecycle === 'softCancelled');
+    const softCancelled = Object.values(target.commitments).filter((r) => r.lifecycle === 'softCancelled');
     if (softCancelled.length === 0) return true; // nothing soft-cancelled → nothing to converge
     let allProbesOk = true;
     for (const record of softCancelled) {
@@ -3719,11 +3874,11 @@ export class Runner {
       } catch (err) {
         observation = { kind: 'probe-failed', record, err };
       }
-      const descriptors = reducePolledSoftCancelledObservation(this.state, observation, now);
-      const result = this.applyDescriptors(descriptors, 'poll');
+      const descriptors = reducePolledSoftCancelledObservation(target, observation, now);
+      const result = this.applyDescriptors(descriptors, source);
       if (result.softCancelledProbeFailed) allProbesOk = false;
     }
-    return allProbesOk;
+    return subscribe ? true : allProbesOk; // audit never gates trading
   }
 
   /**
@@ -3779,25 +3934,32 @@ export class Runner {
    */
   private async pollPositionStatus(): Promise<boolean> {
     if (this.makerAddress === null) return true; // dry-run path — defensive (the caller skips); treat as ok
+    // PR3b: AUDIT over this.auditState when subscribe (cross-check; never gates
+    // trading); canonical this.state in backout. detectFills already reseeded
+    // this.auditState from canonical this tick, so the position convergence
+    // resolves identity against the audit clone's commitments.
+    const subscribe = this.config.ownState.subscribe;
+    const target = subscribe ? this.auditState : this.state;
+    const source: 'poll' | 'audit' = subscribe ? 'audit' : 'poll';
     const now = this.deps.now();
     let status: PositionStatus;
     try {
       status = await this.adapter.getPositionStatus(this.makerAddress);
     } catch (err) {
       this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'position-poll' });
-      return false; // caller fails closed iff any non-terminal softCancelled commitments exist
+      return subscribe ? true : false; // backout: caller fails closed iff non-terminal softCancelled commitments exist; audit: never gates
     }
     for (const p of status.active) {
-      const descriptors = reducePolledPositionObservation(this.state, 'active', p as PolledPositionInput, undefined, undefined, now);
-      this.applyDescriptors(descriptors, 'poll');
+      const descriptors = reducePolledPositionObservation(target, 'active', p as PolledPositionInput, undefined, undefined, now);
+      this.applyDescriptors(descriptors, source);
     }
     for (const p of status.pendingSettle) {
-      const descriptors = reducePolledPositionObservation(this.state, 'pendingSettle', p as PolledPositionInput, p.result, p.predictedWinSide, now);
-      this.applyDescriptors(descriptors, 'poll');
+      const descriptors = reducePolledPositionObservation(target, 'pendingSettle', p as PolledPositionInput, p.result, p.predictedWinSide, now);
+      this.applyDescriptors(descriptors, source);
     }
     for (const p of status.claimable) {
-      const descriptors = reducePolledPositionObservation(this.state, 'claimable', p as PolledPositionInput, p.result, undefined, now);
-      this.applyDescriptors(descriptors, 'poll');
+      const descriptors = reducePolledPositionObservation(target, 'claimable', p as PolledPositionInput, p.result, undefined, now);
+      this.applyDescriptors(descriptors, source);
     }
     return true;
   }

@@ -475,17 +475,6 @@ export class Runner {
    */
   private currentOwnStateSubscription: Subscription | null = null;
   /**
-   * The opaque resume cursor of the FINAL untruncated snapshot page accumulated
-   * into `shadow.pendingBaseline` (own-state SSE plan §4.3, Phase 3 PR1). Staged
-   * by `handleOwnerSnapshot` ONLY from an untruncated page — a truncated page's
-   * cursor is a non-resumable page marker the SDK 400s on as Last-Event-ID, so
-   * it must NEVER become the persisted resume point (a cursor alone is not
-   * state, and a truncated page is not a complete baseline). Promoted into
-   * `state.ownStateCursor` by `handleOwnerReady` ONLY after the baseline swap
-   * succeeds; cleared on resync (the fresh snapshot re-stages it).
-   */
-  private pendingBaselineCursor: string | undefined = undefined;
-  /**
    * Whether the CURRENT own-state subscription was opened with a persisted
    * `initialCursor` (a resume), and no snapshot page has arrived on it yet
    * (own-state SSE plan §4.2, Phase 3 PR1). Set when `openOwnStateSubscription`
@@ -2753,9 +2742,9 @@ export class Runner {
     let mySub: Subscription | null = null;
     const sameSub = (): boolean => mySub !== null && mySub === this.currentOwnStateSubscription;
     const handlers: OwnerStateSubscribeHandlers = {
-      onSnapshot: (snapshot, meta) => {
+      onSnapshot: (snapshot) => {
         if (!sameSub()) return;
-        this.handleOwnerSnapshot(snapshot, meta.cursor);
+        this.handleOwnerSnapshot(snapshot);
       },
       onReady: (meta) => {
         if (!sameSub()) return;
@@ -2832,22 +2821,20 @@ export class Runner {
    *
    * Phase 2 invariant — shadow-only: writes are to `pendingBaseline` (a
    * shadow projection), NOT to canonical `MakerState`.
+   *
+   * The snapshot page's own SSE-frame cursor is NOT consumed here: the SDK's
+   * `OwnStateEventMeta` contract is that ONLY the cursor delivered to `onReady`
+   * (final baseline complete) is a valid `Last-Event-ID` resume point — a
+   * snapshot page's frame id (truncated pages especially) is not resumable. So
+   * `handleOwnerReady` promotes the `onReady` cursor and this handler ignores
+   * the per-page cursor entirely (own-state SSE plan §4.3 reconfirmed for the
+   * PR3b cursor flip).
    */
-  private handleOwnerSnapshot(snapshot: OwnerStateSnapshot, cursor: string): void {
+  private handleOwnerSnapshot(snapshot: OwnerStateSnapshot): void {
     // A snapshot page means the SDK IS delivering a baseline on this connect
     // (even a resume that re-snapshots) — so this is no longer a baseline-less
     // resume; disarm the empty-baseline guard (own-state SSE plan §4.2).
     this.resumedFromPersistedCursor = false;
-    // §4.3 cursor track (Phase 3 PR1): stage the baseline cursor ONLY from an
-    // untruncated page. A truncated page's cursor is a non-resumable page marker
-    // (the SDK 400s on it as Last-Event-ID), and a truncated page is not a
-    // complete baseline — promoting it would persist a cursor that no durable
-    // baseline pairs with. The final (untruncated) page carries the cursor that
-    // pairs with the complete baseline; `handleOwnerReady` promotes it after the
-    // swap. (positionsTruncated is handled separately via the `healthy` gate.)
-    if (!snapshot.truncated && cursor) {
-      this.pendingBaselineCursor = cursor;
-    }
     if (this.ownStateShadow.pendingBaseline === null) {
       this.ownStateShadow.pendingBaseline = {
         commitments: {},
@@ -2911,7 +2898,6 @@ export class Runner {
     if (baseline === null && this.resumedFromPersistedCursor) {
       this.eventLog.emit('stream-cold-restart', { reason: 'resume-without-baseline' });
       this.state.ownStateCursor = undefined;
-      this.pendingBaselineCursor = undefined;
       this.resumedFromPersistedCursor = false;
       this.ownStateColdRestartRequested = true;
       this.wakeSignal.wake(); // so the loop's wake path performs the restart promptly
@@ -2935,20 +2921,18 @@ export class Runner {
       // empty-baseline guard above intercepts, where a resume delivered no
       // snapshot and a cursor alone is not state.
       //
-      // PREFERENCE: follows plan §4.3 (`pendingBaselineCursor || event.cursor`)
-      // — prefer the staged final-untruncated-page cursor, fall back to the
-      // onReady cursor. ⚠️ The SDK's OwnStateEventMeta doc says the opposite:
-      // "persist only the cursor that lands on onReady". The two AGREE in
-      // practice for a cold start (onReady fires right after the final page, no
-      // deltas between, so the two cursors coincide), and PR1 is fail-SAFE
-      // either way (shadow-only; the empty-baseline guard cold-restarts every
-      // boot-resume so the persisted cursor is never actually resumed from).
-      // RECONFIRM before PR3b makes the cursor load-bearing: if the snapshot-page
-      // SSE-frame id is NOT a valid Last-Event-ID, flip to prefer the onReady
-      // cursor (likely dropping pendingBaselineCursor staging entirely).
-      const promoted = this.pendingBaselineCursor ?? (cursor || undefined);
+      // Persist the `onReady` cursor — the SDK's `OwnStateEventMeta` contract is
+      // that the cursor delivered to `onReady` (final baseline complete) is the
+      // FIRST cursor safe to persist as a restart `Last-Event-ID`; a snapshot
+      // page's frame id (truncated pages especially) is NOT a resumable
+      // position. The PR1 `pendingBaselineCursor` staging that preferred the
+      // final-page cursor was fail-safe only while the cursor was shadow-only
+      // (every boot-resume cold-restarted via the empty-baseline guard). PR3b
+      // makes resume load-bearing, so this honours the documented contract and
+      // drops the page-cursor staging entirely (own-state SSE plan §4.3, the
+      // mandated pre-flip cursor reconfirm).
+      const promoted = cursor || undefined;
       if (promoted) this.state.ownStateCursor = promoted;
-      this.pendingBaselineCursor = undefined;
     }
     // A real baseline was swapped, OR this is a mid-session reconnect whose
     // in-memory baseline is still live — either way a baseline now backs the
@@ -3097,10 +3081,10 @@ export class Runner {
    *   dependence on the SDK's onFrame-before-onReady ordering.
    * - `ownStateQueue.clear()` — pre-rebaseline deltas would double-count on the
    *   fresh baseline (Hermes #69).
-   * - `pendingBaselineCursor` + `state.ownStateCursor` — the resume cursor that
-   *   indexed the dropped baseline is stale; a stale cursor surviving could
-   *   resume a future boot onto a baseline the snapshot replaced (a cursor alone
-   *   is not state). Cleared persisted cursor is written on the next flush.
+   * - `state.ownStateCursor` — the resume cursor that indexed the dropped
+   *   baseline is stale; a stale cursor surviving could resume a future boot
+   *   onto a baseline the snapshot replaced (a cursor alone is not state).
+   *   Cleared persisted cursor is written on the next flush.
    * - `resumedFromPersistedCursor=false` — the next connect's snapshot (or a
    *   reopen) re-arms it as appropriate.
    * - `ownStateColdRestartRequested=false` — consume any pending cold-restart
@@ -3119,7 +3103,6 @@ export class Runner {
     this.tokenRefreshFailureInFlight = false;
     this.lastFrameAtSec = null;
     this.ownStateQueue.clear();
-    this.pendingBaselineCursor = undefined;
     this.state.ownStateCursor = undefined;
     this.resumedFromPersistedCursor = false;
     this.ownStateColdRestartRequested = false;

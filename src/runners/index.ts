@@ -2742,6 +2742,12 @@ export class Runner {
         observation = { kind: 'disappeared', record, apiCommitment };
       } catch (err) {
         observation = { kind: 'disappeared-lookup-failed', record, err };
+        // The audit could NOT observe this disappeared row's true state (the
+        // per-hash getCommitment threw). The clone still carries the canonical
+        // value for it, so the comparator must NOT read that as a validated
+        // "clean" and clear a prior divergence — mark the audit cycle incomplete.
+        // (Backout still fails closed only via pastExpiryLookupFailed below.)
+        if (subscribe) this.auditPollFailedThisCycle = true;
       }
       const descriptors = reducePolledCommitmentObservation(target, observation, now, reducerConfig);
       const result = this.applyDescriptors(descriptors, source);

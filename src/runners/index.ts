@@ -576,6 +576,19 @@ export class Runner {
   private indexerLagDegraded = false;
   /** Unix-seconds of the last own-state health poll; throttles {@link checkIndexerLag} to `ownState.auditPollIntervalMs`. `null` = never polled. */
   private lastAuditPollAtSec: number | null = null;
+  /**
+   * §5 latch 5 (`auditDivergenceUnresolved`, Phase 3 PR2c-ii) — a POSTING-only latch.
+   * `true` while {@link runShadowComparator}'s last comparison found an EMIT-WORTHY
+   * (persistent — aged past `divergenceToleranceMs`) shadow-vs-canonical divergence;
+   * cleared when a comparison finds none, and on rebaseline ({@link resetShadowForRebaseline},
+   * with the divergence tracker). Set/cleared from the comparator's `payload !== null`
+   * result and ANDed into {@link ownStateHealthy} — NOT the edge mirror or the comparator's
+   * own {@link instantOwnStateHealthy} gate. The decouple is LOAD-BEARING: the comparator
+   * (which PRODUCES this latch) gates on `instantOwnStateHealthy`, so a latched divergence
+   * holds posting WITHOUT suppressing the very comparator that can clear it — folding latch
+   * 5 into the comparator gate would self-deadlock.
+   */
+  private auditDivergenceUnresolved = false;
 
   constructor(opts: RunnerOptions) {
     this.config = opts.config;
@@ -1270,10 +1283,11 @@ export class Runner {
         // §4.2 (Phase 3 PR1) — belt-and-braces cold-restart hook for a guard
         // that tripped during tick IO (before the loop returned to the wait).
         await this.performOwnStateColdRestart();
-        // Phase 2 PR5 — comparator pass. Records that this tick completed (lastPollObsAtMs),
+        // PR5 — comparator pass. Records that this tick completed (lastPollObsAtMs),
         // latches firstPollAfterShadowReady when applicable, and runs the comparator
-        // when preconditions hold. Phase 2 invariant: comparator is read-only on both
-        // sides — only emits `divergence` telemetry, never alters canonical state.
+        // when preconditions hold. Read-only on canonical state (never writes
+        // `MakerState`); besides emitting `divergence` it sets the posting-only latch 5
+        // (`auditDivergenceUnresolved`, PR2c-ii) that gates NEW posting in live+subscribe.
         this.runShadowComparator();
         if (this.stopRequested) break;
         if (this.maxTicks !== undefined && ticks >= this.maxTicks) break;
@@ -3094,8 +3108,9 @@ export class Runner {
    *   a server-driven resync already re-baselines on the LIVE socket, so it
    *   supersedes a not-yet-performed MM-driven cold restart (which would
    *   pointlessly close + reopen the connection the resync is already healing).
-   * - `firstPollAfterShadowReady` + `divergenceTracker` — the comparator must
-   *   wait for the post-rebaseline `onReady` AND one poll-tick before comparing.
+   * - `firstPollAfterShadowReady` + `divergenceTracker` + `auditDivergenceUnresolved`
+   *   (latch 5, PR2c-ii) — the comparator must wait for the post-rebaseline `onReady`
+   *   AND one poll-tick before comparing; the prior divergence verdict is moot.
    */
   private resetShadowForRebaseline(): void {
     this.ownStateShadow.ready = false;
@@ -3110,6 +3125,10 @@ export class Runner {
     this.ownStateColdRestartRequested = false;
     this.firstPollAfterShadowReady = false;
     this.divergenceTracker.clear();
+    // §5 latch 5 (PR2c-ii): a rebaseline invalidates any prior divergence verdict
+    // (the fresh snapshot replaces the shadow the comparator measured), so clear the
+    // posting-only latch with its tracker — a post-rebaseline comparison re-derives it.
+    this.auditDivergenceUnresolved = false;
     // The rebaseline cleared `ready` + the overflow latch, so re-derive composite
     // health (it goes unhealthy on `ready=false`, which also clears the recovery
     // hold so the fresh baseline must re-earn `recoveryHoldMs` of stability before
@@ -3303,8 +3322,8 @@ export class Runner {
    * is quantized to whole seconds in production — e.g. any `recoveryHoldMs` in
    * 1..1000 yields a 1s hold, and the window can open up to ~1s early relative to
    * the nominal ms (the anchor second was already in progress when it was stamped).
-   * `recoveryHoldMs: 0` is immediate. Posting-only latch 6 (`indexerLagDegraded`,
-   * PR2c-i) ANDs in below; latch 5 (`auditDivergenceUnresolved`) follows in PR2c-ii.
+   * `recoveryHoldMs: 0` is immediate. The posting-only latches AND in below: latch 6
+   * (`indexerLagDegraded`, PR2c-i) and latch 5 (`auditDivergenceUnresolved`, PR2c-ii).
    *
    * Calls {@link recomputeOwnStateHealth} with `nowSec` FIRST — re-deriving the
    * edge mirror (idempotent) and re-maintaining the recovery-hold anchor against
@@ -3321,9 +3340,14 @@ export class Runner {
     // mirror or `instantOwnStateHealthy` (the comparator gate): it is a
     // posting-safety signal, not a shadow-freshness one — so it holds posting WITHOUT
     // suppressing the audit and WITHOUT resetting the recovery-hold anchor (which the
-    // recompute above maintains on the transport composite only). PR2c-ii adds latch 5
-    // (`auditDivergenceUnresolved`) alongside it.
+    // recompute above maintains on the transport composite only).
     if (this.indexerLagDegraded) return false;
+    // §5 POSTING-only latch 5 (`auditDivergenceUnresolved`, PR2c-ii): a persistent
+    // shadow-vs-canonical divergence means the own-state view is suspect — hold posting.
+    // Same placement rationale as latch 6, PLUS the load-bearing decouple: the comparator
+    // that PRODUCES this latch gates on `instantOwnStateHealthy` (which excludes latch 5),
+    // so a latched divergence never suppresses the comparison that can clear it.
+    if (this.auditDivergenceUnresolved) return false;
     if (this.healthyEligibleSinceSec === null) return false; // defensive — recompute sets it iff instant
     return (nowSec - this.healthyEligibleSinceSec) * 1000 >= this.config.ownState.recoveryHoldMs;
   }
@@ -3468,8 +3492,12 @@ export class Runner {
    *     `shadow.ready` flipped true (otherwise canonical is stale relative
    *     to a fresh shadow and every row reads as divergent).
    *
-   * Phase 2 invariant: comparator is read-only on both states. Only `divergence`
-   * telemetry is emitted; no `MakerState` writes; no quote-timing changes.
+   * Read-only on canonical state: no `MakerState` writes (the audit never touches
+   * `this.state`). Besides emitting `divergence`, it sets the POSTING-only latch 5
+   * (`auditDivergenceUnresolved`, PR2c-ii) from `payload !== null` — which, in live +
+   * subscribe, holds NEW posting via the §5.1 gate. The latch is read ONLY by
+   * {@link ownStateHealthy} (NOT the `instantOwnStateHealthy` gate this method itself
+   * uses), so producing it can never suppress the next comparison that clears it.
    */
   private runShadowComparator(): void {
     const nowMs = Date.now();
@@ -3514,6 +3542,14 @@ export class Runner {
       this.config.ownState.divergenceToleranceMs,
       this.lastPollObsAtMs,
     );
+    // §5 latch 5 (PR2c-ii): a non-null payload IS an emit-worthy (persistent) divergence
+    // — set the posting-only latch; a null payload means the audit is clean → clear it.
+    // This runs only when the comparator's preconditions hold (subscribe + instant-healthy
+    // + empty queue + first-poll-done); across early-returns the latch persists, and a
+    // rebaseline clears it with the tracker. Because the latch is read ONLY by
+    // `ownStateHealthy` (NOT the `instantOwnStateHealthy` gate above), setting it here can
+    // never suppress the next comparison that would clear it — no self-deadlock.
+    this.auditDivergenceUnresolved = payload !== null;
     if (payload === null) return;
     this.eventLog.emit('divergence', payload as unknown as Record<string, unknown>);
   }
@@ -3608,6 +3644,21 @@ export class Runner {
   /** Test seam — reads the `indexerLagDegraded` latch (latch 6, PR2c-i). */
   indexerLagDegradedForTest(): boolean {
     return this.indexerLagDegraded;
+  }
+
+  /**
+   * Test seam — sets the `auditDivergenceUnresolved` latch (latch 5, PR2c-ii) directly
+   * so tests can exercise the posting gate + the comparator decouple without driving a
+   * persistent divergence through the tolerance window. Posting-only (read live by
+   * {@link ownStateHealthy}); no recompute needed.
+   */
+  setAuditDivergenceUnresolvedForTest(value: boolean): void {
+    this.auditDivergenceUnresolved = value;
+  }
+
+  /** Test seam — reads the `auditDivergenceUnresolved` latch (latch 5, PR2c-ii). */
+  auditDivergenceUnresolvedForTest(): boolean {
+    return this.auditDivergenceUnresolved;
   }
 
   /** Test seam — current `ownStateQueue` occupancy (PR4b round 2 / Hermes #69). */

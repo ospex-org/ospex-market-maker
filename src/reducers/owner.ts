@@ -69,9 +69,7 @@ export interface OwnStateShadow {
    * the conjunction of the EVENT-DRIVEN (non-time-dependent) §5 latches — `ready`
    * (a durable baseline is swapped in), `lastStatus === 'connected'`,
    * `!streamOverflowDegraded`, `!positionsTruncated`, `lastError.reason !==
-   * 'fatal'`, and `!tokenRefreshFailureInFlight` (latch 7, PR2b) — with the
-   * still-deferred §5 latches (indexerLag / auditDivergence) defaulting healthy
-   * until PR2c.
+   * 'fatal'`, and `!tokenRefreshFailureInFlight` (latch 7, PR2b).
    *
    * It deliberately does NOT include the TIME-dependent latches, which decay with
    * no SDK event and so cannot live as a stored bit: latch 2 `transportFresh`
@@ -79,6 +77,13 @@ export interface OwnStateShadow {
    * evaluated at READ time in the runner: the divergence comparator gates on
    * `instantOwnStateHealthy()` (this mirror AND `transportFresh`), while only the
    * posting gate `ownStateHealthy()` additionally applies the recovery hold.
+   *
+   * Nor does it include the POSTING-only latches now wired into `ownStateHealthy()`
+   * — latch 6 `indexerLagDegraded` (PR2c-i) and latch 5 `auditDivergenceUnresolved`
+   * (PR2c-ii). Those are posting-safety signals, not shadow-freshness ones; latch 5
+   * in particular MUST stay out of this mirror because the comparator reads the
+   * mirror (via `instantOwnStateHealthy`) AND produces latch 5 — folding it in would
+   * self-deadlock the very comparison that clears it.
    *
    * The factory default is `false` — a fresh, never-baselined shadow (`ready:
    * false`, `lastStatus: null`) is not healthy, matching what the conjunction

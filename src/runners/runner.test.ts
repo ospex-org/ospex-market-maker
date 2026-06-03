@@ -2382,6 +2382,111 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
         expect(runner.indexerLagDegradedForTest()).toBe(false);
       });
     });
+
+    // ── §5 latch 5 — auditDivergenceUnresolved (Phase 3 PR2c-ii) ─────────────
+
+    describe('latch 5 — auditDivergenceUnresolved (comparator-driven posting-only gate)', () => {
+      // A divergent baseline: a commitment in the shadow the poll side never has
+      // (missing-in-poll) — the comparator flags it once it persists past the tolerance.
+      function fireDivergentBaseline5(recorder: ReturnType<typeof makeOwnStateRecorder>): void {
+        recorder.fire('onFrame', { receivedAtMs: 0, kind: 'heartbeat' });
+        recorder.fire('onSnapshot', { commitments: [{ commitmentHash: '0xdiv5', filledRiskAmount: '0', riskAmount: '100', expiry: null, status: 'open', storedStatus: 'open', nonceInvalidated: false }], positions: [], truncated: false, positionsTruncated: false }, { cursor: 's1' });
+        recorder.fire('onReady', undefined, { cursor: 'r1' });
+        recorder.fire('onStatus', 'connected');
+      }
+
+      it('latch 5 holds the POSTING gate but does NOT reset the recovery-hold anchor — clears immediately, no re-earn (recoveryHoldMs > 0, biting)', async () => {
+        let t = T0;
+        const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner({
+          config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 30000, staleMaxMs: 300000 } }),
+          deps: { now: () => t },
+        });
+        fireHealthyBaseline(recorder); // anchor stamped at T0
+        t = T0 + 30;
+        expect(runner.ownStateHealthyForTest()).toBe(true); // recovery hold earned
+        runner.setAuditDivergenceUnresolvedForTest(true);
+        expect(runner.ownStateHealthyForTest()).toBe(false); // posting gate held by latch 5
+        expect(runner.ownStateShadowView().healthy).toBe(true); // edge mirror UNAFFECTED — posting-only
+        t = T0 + 40;
+        runner.setAuditDivergenceUnresolvedForTest(false);
+        // Clears immediately: latch 5 (read AFTER recompute, absent from instantOwnStateHealthy)
+        // never touched the anchor, so the hold earned at T0 still holds. A regression that let
+        // latch 5 reset healthyEligibleSinceSec would force a re-earn → gate FALSE here.
+        expect(runner.ownStateHealthyForTest()).toBe(true);
+        triggerKill();
+        await runPromise;
+      });
+
+      it('latch 5 does NOT self-deadlock the comparator — a latched divergence is cleared by the next clean comparison (the comparator gates on instantOwnStateHealthy, NOT ownStateHealthy)', async () => {
+        const t = T0;
+        const adapter = createOspexAdapter(cfg({ ownState: { subscribe: true } }));
+        vi.spyOn(adapter, 'listContests').mockResolvedValue([]);
+        vi.spyOn(adapter, 'listOpenCommitments').mockResolvedValue([]);
+        vi.spyOn(adapter, 'getOwnStateHealth').mockResolvedValue(MOCK_OWN_STATE_HEALTH);
+        const { runner, recorder, runPromise, resolvers, triggerKill } = await makePausedSubscribedRunner({
+          config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 0, staleMaxMs: 60000 } }),
+          adapter,
+          deps: { now: () => t },
+        });
+        fireHealthyBaseline(recorder); // healthy transport, EMPTY baseline (no divergence)
+        runner.setAuditDivergenceUnresolvedForTest(true); // simulate a previously-latched persistent divergence
+        expect(runner.ownStateHealthyForTest()).toBe(false); // latch 5 holds posting
+        // The comparator gates on instantOwnStateHealthy (transport-only), NOT ownStateHealthy,
+        // so it RUNS despite latch 5 being set, finds no divergence, and clears the latch. A
+        // regression that gated the comparator on ownStateHealthy would deadlock here (latch 5
+        // set → comparator suppressed → can never clear it).
+        await waitFor(() => { resolvers.forEach((r) => r?.()); return !runner.auditDivergenceUnresolvedForTest(); });
+        expect(runner.auditDivergenceUnresolvedForTest()).toBe(false); // comparator ran + cleared it — no self-deadlock
+        triggerKill();
+        await runPromise;
+      });
+
+      it('a PERSISTENT divergence sets latch 5 via the real comparator → emits `divergence` AND holds the posting gate', async () => {
+        vi.useFakeTimers({ toFake: ['Date'] }); // control the wall-clock tolerance window; leaves the loop's injected sleep + waitFor real
+        try {
+          const baseMs = 1_700_000_000_000;
+          vi.setSystemTime(baseMs);
+          const t = T0; // the §5 health clock (deps.now, seconds) is independent of the faked Date
+          const adapter = createOspexAdapter(cfg({ ownState: { subscribe: true } }));
+          vi.spyOn(adapter, 'listContests').mockResolvedValue([]);
+          vi.spyOn(adapter, 'listOpenCommitments').mockResolvedValue([]); // canonical empty → shadow's commitment is missing-in-poll
+          vi.spyOn(adapter, 'getOwnStateHealth').mockResolvedValue(MOCK_OWN_STATE_HEALTH);
+          const { runner, recorder, runPromise, resolvers, triggerKill } = await makePausedSubscribedRunner({
+            config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 0, staleMaxMs: 60000, divergenceToleranceMs: 5000 } }),
+            adapter,
+            deps: { now: () => t },
+          });
+          fireDivergentBaseline5(recorder);
+          // Pass 1: the comparator DETECTS the divergence (tracker populated) but it is not yet
+          // emit-worthy (age 0 < toleranceMs) → latch 5 stays false.
+          await waitFor(() => { resolvers.forEach((r) => r?.()); return runner.divergenceTrackerSizeForTest() > 0; });
+          expect(runner.auditDivergenceUnresolvedForTest()).toBe(false);
+          // Advance wall-clock past the tolerance → the SAME divergence is now persistent.
+          vi.setSystemTime(baseMs + 6000);
+          await waitFor(() => { resolvers.forEach((r) => r?.()); return runner.auditDivergenceUnresolvedForTest(); });
+          expect(runner.auditDivergenceUnresolvedForTest()).toBe(true); // persistent → latch 5 set by the REAL comparator
+          expect(readEvents().some((e) => e.kind === 'divergence')).toBe(true); // ...and the divergence telemetry fired
+          expect(runner.ownStateHealthyForTest()).toBe(false); // posting gate held by latch 5
+          triggerKill();
+          await runPromise;
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
+      it('latch 5: a resync rebaseline clears the latch (the prior divergence verdict is moot on a fresh baseline)', async () => {
+        const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner({
+          config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 0 } }),
+        });
+        fireHealthyBaseline(recorder);
+        runner.setAuditDivergenceUnresolvedForTest(true);
+        expect(runner.auditDivergenceUnresolvedForTest()).toBe(true);
+        recorder.fire('onStatus', 'resync'); // rebaseline clears dependent latches + the divergence verdict
+        expect(runner.auditDivergenceUnresolvedForTest()).toBe(false);
+        triggerKill();
+        await runPromise;
+      });
+    });
   });
 
   it('sync throw from openOwnStateSubscription propagates AND runs the finally cleanup — unregister called (Hermes #68 blocker 3)', async () => {

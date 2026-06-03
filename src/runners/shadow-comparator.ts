@@ -29,7 +29,7 @@
  * neither side tracks; not part of this comparator pass.
  */
 
-import { isTerminalPositionStatus, type CommitmentLifecycle, type MakerCommitmentRecord, type MakerPositionRecord, type MakerState } from '../state/index.js';
+import { isTerminalPositionStatus, type CommitmentLifecycle, type MakerCommitmentRecord, type MakerPositionRecord, type MakerPositionStatus, type MakerState } from '../state/index.js';
 import type { OwnStateShadow, ShadowCommitment, ShadowPosition } from '../reducers/index.js';
 
 /** The divergence field vocabulary (own-state-sse-plan §6.3). */
@@ -94,6 +94,21 @@ function divergenceKey(field: DivergenceField, identifyingKey: string): string {
  */
 function isTerminalCommitmentLifecycle(lifecycle: string): boolean {
   return lifecycle === 'filled' || lifecycle === 'expired' || lifecycle === 'authoritativelyInvalidated';
+}
+
+/**
+ * Collapse a canonical position status to the value the SHADOW would carry, for
+ * comparison only. The shadow reducer (`mapPositionLifecycle` in
+ * `src/reducers/owner.ts`) collapses the terminal `settledLost` / `void` to
+ * `claimed`, but the canonical own-state mapper (PR3a) PRESERVES them — so a
+ * real terminal-lost / voided position present on both sides would otherwise
+ * read as a permanent false `position-status` divergence (canonical
+ * `settledLost` vs shadow `claimed`). Normalize the canonical side here; the
+ * canonical `MakerPositionRecord.status` keeps the distinction everywhere else.
+ * (Whole comparator is inverted + the shadow deleted at PR3b's source flip.)
+ */
+function shadowEquivalentStatus(status: MakerPositionStatus): MakerPositionStatus {
+  return status === 'settledLost' || status === 'void' ? 'claimed' : status;
 }
 
 /**
@@ -178,7 +193,10 @@ export function compareShadowVsCanonical(
       const key = divergenceKey('missing-in-poll', posKey);
       detected.set(key, { observation: { field: 'missing-in-poll', key: posKey, canonical: null, shadow: shadowRow.status } });
     } else if (canonical !== undefined && shadowRow !== undefined) {
-      if (canonical.status !== shadowRow.status) {
+      // Compare against the shadow-equivalent of the canonical status — the
+      // shadow collapses terminal settledLost / void to claimed, so a canonical
+      // settledLost / void matched by a shadow claimed is NOT a divergence.
+      if (shadowEquivalentStatus(canonical.status) !== shadowRow.status) {
         const key = divergenceKey('position-status', posKey);
         detected.set(key, { observation: { field: 'position-status', key: posKey, canonical: canonical.status, shadow: shadowRow.status } });
       }

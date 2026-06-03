@@ -10,7 +10,10 @@ import {
   dispatchCancel,
   emptyMakerState,
   fillDedupKey,
+  isTerminalPositionStatus,
+  MAKER_POSITION_STATUSES,
   StateStore,
+  TERMINAL_POSITION_STATUSES,
   toMakerSignedPayload,
   toSdkSignedPayload,
   type MakerCommitmentFill,
@@ -668,5 +671,27 @@ describe('fillDedupKey (Phase 2 PR1)', () => {
     // documentation pin.
     expect(fillDedupKey('0xabc', 5)).toBe('0xabc:5');
     expect(fillDedupKey('0xabc', 5)).not.toBe('5:0xabc');
+  });
+});
+
+describe('isTerminalPositionStatus / TERMINAL_POSITION_STATUSES', () => {
+  it('treats claimed / settledLost / void as terminal (zero live exposure)', () => {
+    expect(isTerminalPositionStatus('claimed')).toBe(true);
+    expect(isTerminalPositionStatus('settledLost')).toBe(true);
+    expect(isTerminalPositionStatus('void')).toBe(true);
+  });
+
+  it('treats active / pendingSettle / claimable as non-terminal (still carry exposure)', () => {
+    expect(isTerminalPositionStatus('active')).toBe(false);
+    expect(isTerminalPositionStatus('pendingSettle')).toBe(false);
+    expect(isTerminalPositionStatus('claimable')).toBe(false);
+  });
+
+  it('the terminal set partitions MAKER_POSITION_STATUSES exactly (no status is unclassified)', () => {
+    const terminal = MAKER_POSITION_STATUSES.filter((s) => TERMINAL_POSITION_STATUSES.has(s));
+    const nonTerminal = MAKER_POSITION_STATUSES.filter((s) => !TERMINAL_POSITION_STATUSES.has(s));
+    expect(new Set([...terminal, ...nonTerminal])).toEqual(new Set(MAKER_POSITION_STATUSES));
+    expect(terminal).toEqual(['claimed', 'settledLost', 'void']);
+    expect(nonTerminal).toEqual(['active', 'pendingSettle', 'claimable']);
   });
 });

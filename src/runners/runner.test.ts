@@ -33,7 +33,7 @@ import {
   type Subscription,
 } from '../ospex/index.js';
 import { StateStore, emptyMakerState, type MakerCommitmentRecord, type MakerSide, type MakerState } from '../state/index.js';
-import { Runner, interruptibleSleep, type RunnerDeps, type RunnerOptions } from './index.js';
+import { Runner, computeOpenExposureWei6, interruptibleSleep, type RunnerDeps, type RunnerOptions } from './index.js';
 
 // ── harness ──────────────────────────────────────────────────────────────────
 
@@ -6394,5 +6394,40 @@ describe('Runner — funding guard', () => {
     await makeRunner({ config, adapter, maxTicks: 1 }).run();
     expect(reads).toBe(0);
     expect(readEvents().some((e) => e.kind === 'funding-hold')).toBe(false);
+  });
+});
+
+describe('computeOpenExposureWei6 — terminal positions carry no live exposure', () => {
+  const NOW = 1_900_000_000;
+  function posRecord(status: MakerState['positions'][string]['status'], riskAmountWei6: string, speculationId: string): MakerState['positions'][string] {
+    return { speculationId, contestId: 'c', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', side: 'home', riskAmountWei6, counterpartyRiskWei6: '0', status, updatedAtUnixSec: NOW - 60 };
+  }
+
+  it('sums active / pendingSettle / claimable; EXCLUDES every terminal (claimed / settledLost / void)', () => {
+    const state: MakerState = {
+      ...emptyMakerState(),
+      positions: {
+        a: posRecord('active', '100000', 'a'),
+        b: posRecord('pendingSettle', '200000', 'b'),
+        c: posRecord('claimable', '50000', 'c'),
+        d: posRecord('claimed', '999999', 'd'),
+        e: posRecord('settledLost', '888888', 'e'), // realized loss — stake gone, NOT live exposure
+        f: posRecord('void', '777777', 'f'), //        stake returned — NOT live exposure
+      },
+    };
+    // 100000 + 200000 + 50000; the three terminals contribute nothing
+    expect(computeOpenExposureWei6(state, NOW, 0)).toBe(350000n);
+  });
+
+  it('a state of only terminal positions has zero exposure', () => {
+    const state: MakerState = {
+      ...emptyMakerState(),
+      positions: {
+        d: posRecord('claimed', '999999', 'd'),
+        e: posRecord('settledLost', '888888', 'e'),
+        f: posRecord('void', '777777', 'f'),
+      },
+    };
+    expect(computeOpenExposureWei6(state, NOW, 0)).toBe(0n);
   });
 });

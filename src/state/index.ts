@@ -49,14 +49,42 @@ export const COMMITMENT_LIFECYCLE_STATES = [
 ] as const;
 export type CommitmentLifecycle = (typeof COMMITMENT_LIFECYCLE_STATES)[number];
 
-/** A position's status — a (cached) view of the SDK's three-bucket status plus the claimed terminal. The runner reconciles this from `positions.status` (chain is truth). */
+/**
+ * A position's status — a (cached) view of the SDK's lifecycle. The runner
+ * reconciles this from `positions.status` (chain is truth). The terminal triple
+ * `claimed` / `settledLost` / `void` stays DISTINCT (own-state SSE plan A7): a
+ * claimed win, a settled loss, and a voided contest are different zero/positive
+ * payout terminals, not interchangeable. `settledLost` / `void` enter only via
+ * the canonical `positionStatus` mapper (`src/reducers/owner-mapping.ts`) — the
+ * poll path and the audit-only shadow never produce them (the shadow collapses
+ * them to `claimed`).
+ */
 export const MAKER_POSITION_STATUSES = [
   'active', //                       the speculation is still open
   'pendingSettle', //                scored but not yet settled
   'claimable', //                    settled, this side won, not yet claimed
-  'claimed', //                      claimed (or: a losing side that settled with nothing to claim)
+  'claimed', //                      claimed a winning payout
+  'settledLost', //                  settled, this side lost — terminal, zero payout, nothing to claim
+  'void', //                         contest voided — terminal, stake returned, distinct from a loss
 ] as const;
 export type MakerPositionStatus = (typeof MAKER_POSITION_STATUSES)[number];
+
+/**
+ * The terminal position statuses — no further on-chain transition is possible
+ * and the maker has NO remaining live exposure: `claimed` (won + collected),
+ * `settledLost` (loss realized, stake gone), `void` (stake returned). Every
+ * exposure / inventory accounting site that excludes settled positions must
+ * exclude this whole set, not just `claimed` — keep them deriving the
+ * "is this position done?" signal from {@link isTerminalPositionStatus} so a
+ * future status addition forces a single re-audit here rather than silently
+ * over-counting at each call site.
+ */
+export const TERMINAL_POSITION_STATUSES: ReadonlySet<MakerPositionStatus> = new Set(['claimed', 'settledLost', 'void']);
+
+/** Whether a position is in a terminal, zero-live-exposure state — see {@link TERMINAL_POSITION_STATUSES}. */
+export function isTerminalPositionStatus(status: MakerPositionStatus): boolean {
+  return TERMINAL_POSITION_STATUSES.has(status);
+}
 
 /** Which side of a contest a maker item is on (mirrors `src/risk/`'s `MakerSide`). */
 export type MakerSide = 'away' | 'home';

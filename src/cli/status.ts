@@ -264,7 +264,7 @@ const COMMITMENT_LIFECYCLES: readonly CommitmentLifecycle[] = [
 ];
 
 const POSITION_STATUSES: readonly MakerPositionStatus[] = [
-  'active', 'pendingSettle', 'claimable', 'claimed',
+  'active', 'pendingSettle', 'claimable', 'claimed', 'settledLost', 'void',
 ];
 
 const NON_TERMINAL_LIFECYCLES: ReadonlySet<CommitmentLifecycle> = new Set(['visibleOpen', 'softCancelled', 'partiallyFilled']);
@@ -291,8 +291,12 @@ function summarizePositions(state: MakerState): PositionsSummary {
     pendingSettle: { count: 0, ownRiskWei6: '0' },
     claimable: { count: 0, ownRiskWei6: '0' },
     claimed: { count: 0, ownRiskWei6: '0' },
+    settledLost: { count: 0, ownRiskWei6: '0' },
+    void: { count: 0, ownRiskWei6: '0' },
   };
-  const sums: Record<MakerPositionStatus, bigint> = { active: 0n, pendingSettle: 0n, claimable: 0n, claimed: 0n };
+  const sums: Record<MakerPositionStatus, bigint> = {
+    active: 0n, pendingSettle: 0n, claimable: 0n, claimed: 0n, settledLost: 0n, void: 0n,
+  };
   for (const p of Object.values(state.positions)) {
     byStatus[p.status].count += 1;
     sums[p.status] += BigInt(p.riskAmountWei6);

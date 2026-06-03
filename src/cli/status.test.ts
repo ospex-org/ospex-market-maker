@@ -448,6 +448,8 @@ describe('runStatus — renderers', () => {
           pendingSettle: { count: 0, ownRiskWei6: '0' },
           claimable: { count: 0, ownRiskWei6: '0' },
           claimed: { count: 0, ownRiskWei6: '0' },
+          settledLost: { count: 0, ownRiskWei6: '0' },
+          void: { count: 0, ownRiskWei6: '0' },
         },
       },
       dailyCounters: {

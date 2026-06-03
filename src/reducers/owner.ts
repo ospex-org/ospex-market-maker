@@ -227,7 +227,13 @@ function positionStatusRank(s: MakerPositionStatus): number {
     case 'active': return 0;
     case 'pendingSettle': return 1;
     case 'claimable': return 2;
+    // The terminal triple share the top rank — no forward transition leaves any
+    // of them. The shadow collapses settledLost/void → claimed, so those two
+    // arms are unreachable here; they exist for exhaustiveness over the extended
+    // MakerPositionStatus.
     case 'claimed': return 3;
+    case 'settledLost': return 3;
+    case 'void': return 3;
   }
 }
 

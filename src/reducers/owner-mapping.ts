@@ -4,11 +4,13 @@
  * Pure functions that project the SDK's enriched own-state payloads
  * (`OwnerCommitment`, `OwnerPosition`, `PositionStatusEvent` — populated
  * server-side by PR0b) into the MM's canonical {@link MakerCommitmentRecord} /
- * {@link MakerPositionRecord} shapes. These are the building blocks the PR3b
- * **source flip** wires in: when `ownState.subscribe` is true the SSE stream
- * becomes the canonical writer and these mappers replace the poll-path
- * reducers, writing `MakerState` directly (today they're unwired — the SSE
- * stream still feeds the audit-only shadow via `src/reducers/owner.ts`).
+ * {@link MakerPositionRecord} shapes. The PR3b **source flip** wires these in:
+ * when `ownState.subscribe` is true the SSE stream is the canonical own-state
+ * writer, and `src/reducers/owner.ts` uses these mappers to write `MakerState`
+ * directly while the poll path demotes to the 60s audit floor. (In backout —
+ * `ownState.subscribe:false`, the shipped default — the SSE subscription is not
+ * opened, so these mappers are unexercised at runtime and the poll path stays
+ * canonical.)
  *
  * Design contract:
  * - **Pure + no IO.** No network, no clock, no telemetry emit (own-state plan

@@ -38,13 +38,15 @@ odds:
                                    #   the server cap. The runner warns at boot if the budget would be exceeded.
 
 ownState:
-  subscribe: false                 # Phase 2 PR4a — opt-in to the owner-authenticated own-state SSE stream. Default false until
-                                   #   the PR5 comparator is wired + soak-validated. `true` requires `mode.dryRun: false` AND a
-                                   #   `wallet.keystorePath` (the SDK mints a bearer token signed by the maker's key).
-                                   #   Phase 2 invariant: shadow-only — never alters canonical trading state or quote timing.
+  subscribe: false                 # Phase 3 cutover — opt-in to the owner-authenticated own-state SSE stream. Default false
+                                   #   until the cutover is soak-validated (§9 coverage matrix). `true` requires `mode.dryRun:
+                                   #   false` AND a `wallet.keystorePath` (the SDK mints a bearer token signed by the maker's key).
+                                   #   When true the SSE stream is the CANONICAL own-state writer and drives quote timing; the
+                                   #   poll path demotes to the 60s audit floor.
   debounceMs: 500                  # Phase 2 PR3 — coalescing window (250-1000ms) after a wake fires before the runner drains the
-                                   #   shadow queue. SSE bursts of N events within this window collapse to a single drain pass.
-                                   #   Phase 2 ships shadow-only — no canonical-state writes, no trading-timing changes.
+                                   #   own-state queue. SSE bursts of N events within this window collapse to a single drain pass.
+                                   #   When subscribe:true these drains apply canonical own-state writes; in backout (subscribe:false)
+                                   #   the SSE is not opened and the poll path stays canonical.
   divergenceToleranceMs: 5000      # Phase 2 PR5 — comparator suppresses divergences while EITHER the shadow-side last observation
                                    #   OR the poll-side last observation is within this window (1000-60000ms; default 5000).
                                    #   Persistent mismatch past this window is emitted regardless. Tune up if your poll interval is

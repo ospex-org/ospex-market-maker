@@ -2784,6 +2784,90 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
         triggerKill();
         await runPromise;
       });
+
+      it('F1: a LIVE-delta mapping failure SELF-HEALS via a cursor-less cold restart — recovers WITHOUT a manual resync', async () => {
+        const { runner, recorder, runPromise, resolvers, triggerKill } = await makePausedSubscribedRunner({
+          config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 0, staleMaxMs: 300000 } }),
+        });
+        fireHealthyBaseline(recorder);
+        expect(runner.ownStateHealthyForTest()).toBe(true);
+
+        // A LIVE commitment delta arrives with empty team identity — a transient
+        // enrichment gap, which the core-api enricher emits as '' on a missing /
+        // lagging contest join. mapOwnerCommitmentToMaker fails closed → the row is
+        // skipped → ownStateMappingDegraded latches → the §5.1 gate holds. PRE-FIX
+        // this stuck until an unrelated server resync (the F1 outage); the fix
+        // self-heals by requesting a cursor-less cold restart.
+        recorder.fire('onCommitment', mappableOwnerCommitment('0xbad', { sport: '' }), { cursor: 'c1' });
+
+        // Drive the wake-path drain. The mapper throws → owner-mapping-failed + the
+        // self-heal cold restart, which rebaselines (ready → false). NOTE: this test
+        // NEVER fires onStatus('resync') — recovery is entirely self-driven.
+        await waitFor(() => { resolvers.forEach((r) => r?.()); return runner.ownStateSessionView().ready === false; });
+        expect(readEvents().some((e) => e.kind === 'owner-mapping-failed' && e.field === 'sport')).toBe(true);
+        expect(readEvents().some((e) => e.kind === 'stream-cold-restart' && e.reason === 'mapping-degraded')).toBe(true);
+        expect(runner.ownStateHealthyForTest()).toBe(false); // incomplete book holds the gate
+        // The reopen is CURSOR-LESS (a fresh re-snapshot, not a cursor resume).
+        expect((recorder.options as { initialCursor?: string }).initialCursor).toBeUndefined();
+
+        // Enrichment has caught up: the fresh re-snapshot now maps cleanly. The latch
+        // (cleared by the cold restart's rebaseline) stays clear → health recovers
+        // with NO operator action and NO resync.
+        recorder.fire('onFrame', { receivedAtMs: 0, kind: 'heartbeat' });
+        recorder.fire('onSnapshot', { commitments: [mappableOwnerCommitment('0xbad')], positions: [], truncated: false, positionsTruncated: false }, { cursor: 's2' });
+        recorder.fire('onReady', undefined, { cursor: 'r2' });
+        recorder.fire('onStatus', 'connected');
+        expect(runner.ownStateHealthyForTest()).toBe(true);
+        expect(Object.keys(runner.stateForTest().commitments)).toEqual(['0xbad']); // the row now landed
+
+        triggerKill();
+        await runPromise;
+      });
+
+      it('F1: a PERSISTENT mapping gap re-trips a cold restart on each fresh baseline (rate-limited by the wake-path, not a busy loop), then recovers when it clears', async () => {
+        const { runner, recorder, runPromise, resolvers, triggerKill } = await makePausedSubscribedRunner({
+          config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 0, staleMaxMs: 300000 } }),
+        });
+        const restarts = () => readEvents().filter((e) => e.kind === 'stream-cold-restart' && e.reason === 'mapping-degraded').length;
+        fireHealthyBaseline(recorder);
+
+        // 1) A live delta fails → the first self-heal cold restart.
+        recorder.fire('onCommitment', mappableOwnerCommitment('0xbad', { sport: '' }), { cursor: 'c1' });
+        await waitFor(() => { resolvers.forEach((r) => r?.()); return runner.ownStateSessionView().ready === false; });
+        expect(restarts()).toBe(1);
+
+        // 2) The fresh re-snapshot STILL carries the malformed row (the gap is
+        // PERSISTENT) → the onReady incomplete-baseline check re-trips. Each re-trip
+        // requires (a) a fresh snapshot delivered — the test controls the cadence —
+        // and (b) the wake-path driven to actually perform the restart, so it is
+        // rate-limited, never a synchronous busy loop. The good row keeps the
+        // baseline non-empty while 0xbad re-trips the latch.
+        for (const n of [2, 3]) {
+          recorder.fire('onFrame', { receivedAtMs: 0, kind: 'heartbeat' });
+          recorder.fire('onSnapshot', { commitments: [mappableOwnerCommitment('0xok'), mappableOwnerCommitment('0xbad', { sport: '' })], positions: [], truncated: false, positionsTruncated: false }, { cursor: `s${n}` });
+          recorder.fire('onReady', undefined, { cursor: `r${n}` });
+          recorder.fire('onStatus', 'connected');
+          expect(runner.ownStateHealthyForTest()).toBe(false); // still incomplete → held
+          expect(restarts()).toBe(n); // re-tripped exactly once for THIS baseline
+          await waitFor(() => { resolvers.forEach((r) => r?.()); return runner.ownStateSessionView().ready === false; });
+        }
+        // Exactly one restart per triggering baseline (1 delta + 2 re-snapshots) —
+        // a bounded slow retry, NOT an unbounded spin.
+        expect(restarts()).toBe(3);
+
+        // 3) The gap clears: a clean fresh snapshot maps fully → the latch clears →
+        // health recovers, and NO further cold restart is requested.
+        recorder.fire('onFrame', { receivedAtMs: 0, kind: 'heartbeat' });
+        recorder.fire('onSnapshot', { commitments: [mappableOwnerCommitment('0xok'), mappableOwnerCommitment('0xbad')], positions: [], truncated: false, positionsTruncated: false }, { cursor: 's-ok' });
+        recorder.fire('onReady', undefined, { cursor: 'r-ok' });
+        recorder.fire('onStatus', 'connected');
+        expect(runner.ownStateHealthyForTest()).toBe(true);
+        expect(restarts()).toBe(3); // recovered — no new restart
+        expect(Object.keys(runner.stateForTest().commitments).sort()).toEqual(['0xbad', '0xok']);
+
+        triggerKill();
+        await runPromise;
+      });
     });
 
     // ── §7.2 unknown-own-fill (an SSE fill for a commitment not in canonical state) ──

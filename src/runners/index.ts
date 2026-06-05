@@ -1347,6 +1347,9 @@ export class Runner {
     // drain ([[feedback_dont_promote_partial_resume_cursor]] + the FM3 two-layer
     // model). We promote the event's carried cursor, never the SDK's.
     let promotionStopped = false;
+    // F1: track whether ANY row failed to map this drain, so the self-heal cold
+    // restart is requested ONCE after the batch rather than per failed row.
+    let mappingFailedThisDrain = false;
     for (const event of drained.events) {
       // Reducer dispatch AND descriptor application share ONE try/catch so the
       // cursor-promotion gate has a SINGLE freeze site: promotion happens iff
@@ -1394,6 +1397,7 @@ export class Runner {
         // row (never a partial record); other throws are defensive.
         this.emitOwnStateMappingFailure(err, `event.kind=${event.kind}`);
         promotionStopped = true;
+        mappingFailedThisDrain = true;
         continue;
       }
       // Success — promote the event's carried cursor (a no-op for the empty-
@@ -1402,6 +1406,15 @@ export class Runner {
         this.state.ownStateCursor = event.cursor;
       }
     }
+    // F1 self-heal: a LIVE-delta mapper failure (e.g. a transient enrichment gap
+    // that delivered an owner body with empty team identity) skipped the row, so
+    // `emitOwnStateMappingFailure` latched `ownStateMappingDegraded` and the §5.1
+    // gate now holds posting on an INCOMPLETE canonical book. Mirror the §7.2
+    // unknown-own-fill self-heal: request a cursor-less cold restart so a fresh
+    // snapshot re-grounds (enrichment has usually caught up by then; the
+    // rebaseline clears the latch). Without this the latch would stick until an
+    // unrelated server resync, holding posting indefinitely (the F1 outage).
+    if (mappingFailedThisDrain) this.requestOwnStateColdRestart('mapping-degraded');
   }
 
   /**
@@ -2938,10 +2951,14 @@ export class Runner {
    * owned commitment/position. With the SSE as the canonical writer that cannot
    * be treated as telemetry-only: {@link ownStateMappingDegraded} holds the §5.1
    * posting gate (and skips the audit comparator) until a clean rebaseline, so
-   * the runner never posts on an incomplete canonical book. The recompute keeps
-   * the edge mirror in sync for the delta path (the snapshot path recomputes at
-   * `onReady` after the swap); during baseline accumulation `ready` is still
-   * false, so the per-row recompute is a cheap no-op on the result.
+   * the runner never posts on an incomplete canonical book. The latch SELF-HEALS
+   * (F1): the live-delta drain and the `onReady` incomplete-baseline check each
+   * request a cursor-less cold restart ({@link requestOwnStateColdRestart}) whose
+   * fresh snapshot re-grounds the book and clears the latch — so it no longer
+   * sticks until an unrelated server resync. The recompute keeps the edge mirror
+   * in sync for the delta path (the snapshot path recomputes at `onReady` after
+   * the swap); during baseline accumulation `ready` is still false, so the per-row
+   * recompute is a cheap no-op on the result.
    */
   private emitOwnStateMappingFailure(err: unknown, where: string): void {
     if (err instanceof OwnerMappingError) {
@@ -3276,6 +3293,23 @@ export class Runner {
     // shadow is incomplete in ways a transport-recovery alone cannot fix, so the
     // recompute keeps `healthy` false until a clean rebaseline clears them.
     this.recomputeOwnStateHealth();
+    // F1 self-heal (persistent case): if THIS fresh baseline is INCOMPLETE — a row
+    // failed to map during the snapshot's accumulation, so `ownStateMappingDegraded`
+    // is set — the new canonical book is still missing an owned commitment. The
+    // pre-snapshot rebaseline (`resetOwnStateForRebaseline`) / initial state
+    // guarantees the latch was false before accumulation, so a `true` here means
+    // THIS snapshot, not a stale prior delta. Keep the §5.1 hold (fail-closed) AND
+    // re-trip a cursor-less cold restart so a persistent enrichment gap keeps
+    // retrying — rate-limited to one restart per `ownState.debounceMs` by the wake
+    // loop (a slow retry, not a tight loop) and visible as repeated
+    // `stream-cold-restart` telemetry instead of a silent permanent hold. Only on a
+    // fresh baseline (`baseline !== null`); a mid-session reconnect re-fetches
+    // nothing, so its latch already reflects the live book (and any delta-path
+    // restart it had pending still stands). A clean baseline leaves the latch false
+    // → health recovers normally.
+    if (baseline !== null && this.ownStateMappingDegraded) {
+      this.requestOwnStateColdRestart('mapping-degraded');
+    }
     // No telemetry emit in PR4a — PR5 wires the proper `stream-ready` /
     // comparator-pass shape. Wake the loop so the next iteration drains.
     this.wakeSignal.wake();
@@ -3451,6 +3485,27 @@ export class Runner {
     // the posting gate trusts it again). Covers both callers — the resync path
     // and `performOwnStateColdRestart`.
     this.recomputeOwnStateHealth();
+  }
+
+  /**
+   * Request a cursor-less own-state cold restart with an OBSERVABLE `reason`.
+   * Safe from a synchronous SSE handler or the drain: it only emits
+   * `stream-cold-restart`, sets the flag, and wakes the loop — the actual
+   * close+reopen runs off the wake loop in {@link performOwnStateColdRestart},
+   * whose consume site is preceded by the `ownState.debounceMs` debounce
+   * ({@link waitForNextPollDeadline}). So a condition that keeps re-requesting —
+   * a PERSISTENT enrichment gap that re-trips {@link ownStateMappingDegraded} on
+   * every fresh snapshot — is rate-limited to one restart per debounce window (a
+   * slow retry, never a tight loop) and surfaces as repeated telemetry rather
+   * than silence. The empty-baseline guard ({@link handleOwnerReady}) and §7.2
+   * keep their own inline request because they reset extra state (cursor /
+   * audit-divergence); this is the shared path for the F1 mapping-degraded
+   * self-heal.
+   */
+  private requestOwnStateColdRestart(reason: string): void {
+    this.eventLog.emit('stream-cold-restart', { reason });
+    this.ownStateColdRestartRequested = true;
+    this.wakeSignal.wake();
   }
 
   /**

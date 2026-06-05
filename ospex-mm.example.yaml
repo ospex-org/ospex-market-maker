@@ -47,8 +47,9 @@ ownState:
                                    #   own-state queue. SSE bursts of N events within this window collapse to a single drain pass.
                                    #   When subscribe:true these drains apply canonical own-state writes; in backout (subscribe:false)
                                    #   the SSE is not opened and the poll path stays canonical.
-  divergenceToleranceMs: 5000      # Phase 2 PR5 — comparator suppresses divergences while EITHER the shadow-side last observation
-                                   #   OR the poll-side last observation is within this window (1000-60000ms; default 5000).
+  divergenceToleranceMs: 5000      # Phase 2 PR5 — comparator suppresses divergences while EITHER the canonical/SSE-side last
+                                   #   observation OR the audit/poll-side last observation is within this window (1000-60000ms;
+                                   #   default 5000).
                                    #   Persistent mismatch past this window is emitted regardless. Tune up if your poll interval is
                                    #   large + SSE-vs-poll skew is expected; tune down for tighter divergence detection.
   auditPollIntervalMs: 60000       # Phase 3 PR2 — cadence (10000-300000ms) of the own-state health poll that drives the

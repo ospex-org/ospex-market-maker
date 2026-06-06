@@ -534,14 +534,16 @@ describe('StateStore — signedPayload validator (own-state SSE plan §M6)', () 
   });
 });
 
-// ── fills history (own-state SSE plan §2.5.3, Phase 2 PR1) ──────────────────
+// ── fills history (append-only audit/history) ──────────────────────────────
 //
 // The `fills` field on a `MakerCommitmentRecord` is the append-only history of
-// on-chain Match log events observed for that commitment. It exists to enable
-// SSE restart-safety (the dedup-set is reconstructed from these entries on
-// cold start). The poll path NEVER appends to it — only the SSE `fill` reducer
-// (Phase 2 PR4) will populate it.
-describe('fills history validator (Phase 2 PR1 — own-state SSE plan §2.5.3)', () => {
+// on-chain Match log events observed for that commitment — an audit/history
+// record. The runtime owner-fill dedup set is keyed on `(txHash, logIndex)` and
+// is NOT reconstructed from these entries (own-state-sse-plan §2.5.3's proposed
+// cold-start boot-seed was removed as dead-in-practice; restart-safety is the
+// snapshot-subsumes path). The poll path NEVER appends to it — only the SSE
+// `fill` reducer (Phase 2 PR4) populates it.
+describe('fills history validator (append-only audit/history)', () => {
   let dir: string;
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), 'ospex-mm-fills-'));

@@ -246,16 +246,17 @@ export function dispatchCancel(record: MakerCommitmentRecord): CancelDispatch {
 /**
  * One observed on-chain fill for the maker — appended to
  * {@link MakerCommitmentRecord.fills} when the SSE `fill` reducer applies it.
- * The `(txHash, logIndex)` pair is the canonical dedup key (see
- * {@link fillDedupKey}); on cold start the runner reconstructs the dedup set by
- * walking every commitment's `fills[]`, so a replay across restart can't re-emit
- * fill telemetry or double-count exposure (spec §2.5.3 restart-safety).
+ * This is an append-only audit/history record of observed fills; the runtime
+ * dedup of overlap re-deliveries is keyed on `(txHash, logIndex)` (see
+ * {@link fillDedupKey}) in the in-memory dedup set, NOT reconstructed from this
+ * array. (own-state-sse-plan §2.5.3 proposed a cold-start reconstruction from
+ * `fills[]`; it was removed as dead-in-practice — the first `onReady` re-grounds
+ * from a fresh snapshot that already subsumes prior fills.)
  *
  * Per Phase 2 plan PR1 (Hermes-endorsed Q1): the **poll path does NOT append**
- * to this array. Commitment-diff observations don't carry `(txHash, logIndex)`,
- * and synthetic poll entries would create a false sense of restart-safety
- * (they don't actually match against SSE replays). Fills accumulate here only
- * when Phase 2 PR4's owner-fill reducer applies an SSE `fill` event.
+ * to this array. Commitment-diff observations don't carry `(txHash, logIndex)`.
+ * Fills accumulate here only when Phase 2 PR4's owner-fill reducer applies an
+ * SSE `fill` event.
  */
 export interface MakerCommitmentFill {
   /** The matching transaction hash that produced this fill (`0x`-prefixed hex). */
@@ -270,10 +271,9 @@ export interface MakerCommitmentFill {
 
 /**
  * The canonical dedup key for a fill event — the pair `(txHash, logIndex)`
- * uniquely identifies an on-chain `Match` log event in the protocol. Shared
- * between the SSE `fill` reducer (Phase 2 PR4) and the cold-start dedup-set
- * reconstruction. Stable, no escaping concerns (both fields are constrained
- * shape).
+ * uniquely identifies an on-chain `Match` log event in the protocol. Used by the
+ * SSE `fill` reducer (Phase 2 PR4) to dedup overlap re-deliveries. Stable, no
+ * escaping concerns (both fields are constrained shape).
  */
 export function fillDedupKey(txHash: string, logIndex: number): string {
   return `${txHash}:${logIndex}`;

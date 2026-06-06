@@ -340,10 +340,14 @@ interface MakerCommitmentRecord {
   fills: MakerCommitmentFill[];
 }
 
-// One observed on-chain Match log event for the maker. The (txHash, logIndex)
-// pair is the canonical dedup key — see `fillDedupKey`. Used at cold start to
-// reconstruct the SSE fill dedup-set so a replay across restart cannot re-emit
-// fill telemetry or double-count exposure (spec §2.5.3 restart-safety).
+// One observed on-chain Match log event for the maker — an append-only audit /
+// history record. The (txHash, logIndex) pair is the canonical dedup key (see
+// `fillDedupKey`), used at RUNTIME by the SSE fill reducer to drop overlap
+// re-deliveries; it is NOT reconstructed from `fills[]` at cold start. Restart
+// dedup is the snapshot-subsumes path — the fresh snapshot's position risk
+// already reflects prior fills and the server flows only post-snapshot fills live
+// (own-state-sse-plan §2.5.3's proposed cold-start reconstruction was removed as
+// dead-in-practice).
 interface MakerCommitmentFill {
   txHash: string;                   // 0x-prefixed; the matching tx hash
   logIndex: number;                 // non-negative integer; log index within the tx

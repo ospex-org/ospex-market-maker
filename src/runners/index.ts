@@ -436,17 +436,17 @@ export class Runner {
    */
   private readonly ownStateQueue = new OwnStateQueue();
   /**
-   * Process-lifetime dedup set for owner-side `fill` events (Phase 2 PR4b —
-   * own-state-sse-plan §2.5.3 restart-safety model). Seeded at the end of
-   * the constructor from `state.commitments[].fills[]`; mutated by
-   * `reduceOwnerFill`. Keys are `(txHash, logIndex)` per the SDK's spec
-   * §2.1.2 dedup contract.
+   * Process-lifetime dedup set for owner-side `fill` events. Keys are
+   * `(txHash, logIndex)` per the SDK's spec §2.1.2 dedup contract. Populated at
+   * RUNTIME by `reduceOwnerFill` (no construction-time boot-seed); cleared on
+   * every baseline swap and PRESERVED across a mid-session reconnect, where it
+   * dedups the server's overlap re-deliveries.
    *
-   * PR3b source flip: `reduceOwnerFill` now appends observed fills to
-   * `MakerCommitmentRecord.fills[]` (canonical), so the boot seed reconstructs
-   * the dedup set from disk-loaded `fills[]` on resume. The poll path still
-   * never appends (no `txHash`), and a baseline swap re-seeds the set empty
-   * (the snapshot's `filledRiskWei6` is already post-fill).
+   * Restart-safety against duplicate fills across a PROCESS restart is NOT this
+   * set's job — the first `onReady` re-grounds from a fresh snapshot whose
+   * position risk already subsumes prior fills, and the server flows only
+   * post-snapshot fills live (own-state-sse-plan §2.5.3's proposed disk boot-seed
+   * was removed as dead-in-practice; see the constructor NB).
    */
   private readonly ownStateDedupSet = new Set<string>();
   /**

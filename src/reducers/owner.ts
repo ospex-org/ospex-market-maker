@@ -59,9 +59,9 @@ export type OwnStateTransportStatus = 'connected' | 'reconnecting' | 'degraded' 
  * ONLY the connection-health bits the §5 health gate reads + the in-flight
  * snapshot baseline that `onReady` atomically swaps into `MakerState`.
  *
- * Process-lifetime (no disk persistence — cold restart re-snapshots cleanly;
- * `MakerState.ownStateCursor` + `MakerCommitmentRecord.fills[]` cover resume +
- * in-process replay dedup).
+ * Process-lifetime (no disk persistence — cold restart re-snapshots cleanly, the
+ * fresh snapshot subsuming prior fills; `MakerState.ownStateCursor` covers resume
+ * and the runtime owner-fill dedup set covers in-process replay).
  */
 export interface OwnStateSession {
   /** `false` until `onReady` fires (the snapshot has fully baselined), or while a resync is pending. */
@@ -257,8 +257,8 @@ export function reduceOwnerFill(
     existing.updatedAtUnixSec = now;
   }
 
-  // Append to the commitment's observed-fills array (dedup seed + audit). Does
-  // NOT touch commitment.filledRiskWei6 (owned by the commitment observation).
+  // Append to the commitment's observed-fills array (append-only audit/history).
+  // Does NOT touch commitment.filledRiskWei6 (owned by the commitment observation).
   commitment.fills.push({ txHash: body.txHash, logIndex: body.logIndex, amountWei6: fillRisk.toString(), ts: now });
 
   const cumulativeRiskWei6 = state.positions[posKey]!.riskAmountWei6;

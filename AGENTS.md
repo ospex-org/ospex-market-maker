@@ -473,7 +473,7 @@ Unrealized P&L over `unsettledCount` positions is a future slice (requires `summ
 |---|---|
 | `CommitmentLifecycle` (6 values) | [`src/state/index.ts`](./src/state/index.ts) — `COMMITMENT_LIFECYCLE_STATES` |
 | `MakerPositionStatus` (6 values) | [`src/state/index.ts`](./src/state/index.ts) — `MAKER_POSITION_STATUSES` |
-| `TelemetryKind` (24 values) | [`src/telemetry/index.ts`](./src/telemetry/index.ts) — `TELEMETRY_KINDS` |
+| `TelemetryKind` (see `TELEMETRY_KINDS`) | [`src/telemetry/index.ts`](./src/telemetry/index.ts) — `TELEMETRY_KINDS` |
 | `CandidateSkipReason` (14 values) | [`src/telemetry/index.ts`](./src/telemetry/index.ts) — `CANDIDATE_SKIP_REASONS` |
 | `SoftCancelReason` / `ReplaceReason` | [`src/orders/index.ts`](./src/orders/index.ts) |
 | Risk caps / `headroomForSide` / `canSpendGas` | [`src/risk/index.ts`](./src/risk/index.ts) |

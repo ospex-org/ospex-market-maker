@@ -145,7 +145,7 @@ import { OwnStateQueue } from './own-state-queue.js';
 import { compareAuditVsCanonical, type TrackedDivergence } from './audit-comparator.js';
 import { WakeSignal } from './wake-signal.js';
 import { canSpendGas, requiredPositionModuleAllowanceUSDC, type Market } from '../risk/index.js';
-import { assessStateLoss, dispatchCancel, emptyMakerState, fillDedupKey, isTerminalPositionStatus, toMakerSignedPayload, type CancelDispatch, type MakerCommitmentRecord, type MakerSide, type MakerSignedPayload, type MakerState, type StateLossAssessment, type StateStore } from '../state/index.js';
+import { assessStateLoss, dispatchCancel, emptyMakerState, isTerminalPositionStatus, toMakerSignedPayload, type CancelDispatch, type MakerCommitmentRecord, type MakerSide, type MakerSignedPayload, type MakerState, type StateLossAssessment, type StateStore } from '../state/index.js';
 import { EventLog, eventLogsExist } from '../telemetry/index.js';
 
 // ── injectable seams (the defaults are the real impls; tests override) ───────
@@ -694,13 +694,17 @@ export class Runner {
 
     const { state, status } = this.stateStore.load();
     this.state = state;
-    // Phase 2 PR4b — seed the owner-fill dedup-set from canonical persisted
-    // fills (own-state-sse-plan §2.5.3). Phase 2 keeps the canonical
-    // `fills[]` empty (poll never appends; shadow reducer never writes
-    // canonical state); this seed is forward-compat for Phase 3 cutover.
-    for (const c of Object.values(this.state.commitments)) {
-      for (const f of c.fills) this.ownStateDedupSet.add(fillDedupKey(f.txHash, f.logIndex));
-    }
+    // NB: there is intentionally NO construction-time "boot-seed" of
+    // `ownStateDedupSet` from persisted `commitment.fills[]` (own-state-sse-plan
+    // §2.5.3 proposed one). It was removed as dead-in-practice: the first `onReady`
+    // after any boot/resume either swaps a fresh snapshot or cold-restarts via the
+    // empty-baseline guard — BEFORE any persisted fill is drained (drain gates on
+    // `ready`) — clearing the set either way. The snapshot's position risk already
+    // subsumes prior fills and the server flows only post-snapshot fills live, so
+    // restart-safety against duplicate fills is the snapshot-subsumes path, not a
+    // boot-seed. The set is populated at runtime by `reduceOwnerFill`; overlap
+    // re-deliveries are deduped across a mid-session reconnect (which preserves it).
+    // See runner.test.ts "fill-dedup restart-safety".
     // Fail closed if a dry-run state directory was reused for live. A `dry:<runId>:<n>`
     // synthetic hash can never be a real on-chain commitment — counting one toward
     // exposure, or trying to off-chain-cancel it, corrupts live accounting and spams the

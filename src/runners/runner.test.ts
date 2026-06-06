@@ -2870,6 +2870,77 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
       });
     });
 
+    // ── fill-dedup restart-safety: boot-seed reconstruction (F5 / DEDUP-1) ──
+    //
+    // The constructor re-seeds `ownStateDedupSet` from each persisted
+    // `commitment.fills[]` (index.ts §"seed the owner-fill dedup-set"), the basis
+    // of the soak's "no duplicate fill telemetry across restart" invariant. Every
+    // OTHER seedState carries `fills: []`, so the reconstruction loop is otherwise
+    // unexercised end-to-end. These boot a runner with a NON-EMPTY persisted
+    // `fills[]` and assert the OBSERVABLE dedup outcome (no position-risk bump, no
+    // second `fill` event) — not the internal Set.
+    describe('fill-dedup boot-seed reconstruction (restart-safety)', () => {
+      it('F5: a persisted fill re-seeds the dedup set on boot — a re-delivered fill is deduped (no position bump, no second fill event)', async () => {
+        const config = cfg({ ownState: { subscribe: true, recoveryHoldMs: 0, staleMaxMs: 300000 } });
+        // A persisted commitment carrying ONE already-applied fill (txHash,logIndex).
+        const record = commitmentRecord({ hash: '0xabc', fills: [{ txHash: '0xtx1', logIndex: 0, amountWei6: '100000', ts: 1735689600 }] });
+        const seedState = { ...emptyMakerState(), commitments: { [record.hash]: record } };
+        const { runner, recorder, runPromise, resolvers, triggerKill } = await makePausedSubscribedRunner({ config, seedState });
+
+        // Reach ready WITHOUT a fresh snapshot. With NO persisted cursor the disk
+        // baseline stays live (a snapshot swap would CLEAR + reseed the dedup from
+        // the snapshot's empty fills[], so only the snapshot-less path exercises the
+        // BOOT-SEED reconstruction).
+        recorder.fire('onReady', undefined, { cursor: '' });
+        expect(runner.ownStateSessionView().ready).toBe(true);
+        expect(Object.keys(runner.stateForTest().commitments)).toEqual(['0xabc']); // disk baseline preserved
+        expect(runner.stateForTest().positions['spec-1:away']).toBeUndefined();
+
+        // The server re-delivers the SAME (txHash,logIndex) on resume/overlap, then a
+        // genuinely NEW fill. The boot-seeded dedup must drop the first; the second
+        // must apply — so exactly ONE `fill` fires and the position risk reflects ONE
+        // fill (100000), not two (200000).
+        recorder.fire('onFill', mappableOwnerFill({ commitmentHash: '0xabc', txHash: '0xtx1', logIndex: 0 }));
+        recorder.fire('onFill', mappableOwnerFill({ commitmentHash: '0xabc', txHash: '0xtx2', logIndex: 1 }));
+        await waitFor(() => { resolvers.forEach((r) => r?.()); return readEvents().some((e) => e.kind === 'fill'); });
+        expect(readEvents().filter((e) => e.kind === 'fill')).toHaveLength(1); // re-delivered fill deduped; only the NEW fill emitted
+        expect(runner.stateForTest().positions['spec-1:away']?.riskAmountWei6).toBe('100000'); // one fill, not double-applied
+
+        triggerKill();
+        await runPromise;
+      });
+
+      it('F5 (resume mirror): dedup survives a mid-session reconnect — an overlap-re-delivered fill is dropped on the preserved baseline', async () => {
+        const config = cfg({ ownState: { subscribe: true, recoveryHoldMs: 0, staleMaxMs: 300000 } });
+        const { runner, recorder, runPromise, resolvers, triggerKill } = await makePausedSubscribedRunner({ config });
+        // Establish a baseline carrying commitment 0xabc, then apply a fill so the
+        // RUNTIME dedup carries (0xtx1, 0) and the position holds 100000.
+        recorder.fire('onFrame', { receivedAtMs: 0, kind: 'heartbeat' });
+        recorder.fire('onSnapshot', { commitments: [mappableOwnerCommitment('0xabc')], positions: [], truncated: false, positionsTruncated: false }, { cursor: 's1' });
+        recorder.fire('onReady', undefined, { cursor: 'r1' });
+        recorder.fire('onStatus', 'connected');
+        recorder.fire('onFill', mappableOwnerFill({ commitmentHash: '0xabc', txHash: '0xtx1', logIndex: 0 }));
+        await waitFor(() => { resolvers.forEach((r) => r?.()); return readEvents().some((e) => e.kind === 'fill'); });
+        expect(runner.stateForTest().positions['spec-1:away']?.riskAmountWei6).toBe('100000');
+
+        // A mid-session reconnect: a second onReady with NO new snapshot keeps the
+        // in-memory baseline live and PRESERVES the dedup set (the initial snapshot
+        // cleared `resumedFromPersistedCursor`, so this is the preserve path, not the
+        // empty-baseline cold-restart). The server's overlap re-delivers the same
+        // fill on resume — it must be dropped; a genuinely new fill must apply.
+        recorder.fire('onReady', undefined, { cursor: 'r2' });
+        expect(runner.stateForTest().positions['spec-1:away']?.riskAmountWei6).toBe('100000'); // baseline preserved, not reset
+        recorder.fire('onFill', mappableOwnerFill({ commitmentHash: '0xabc', txHash: '0xtx1', logIndex: 0 })); // overlap re-delivery
+        recorder.fire('onFill', mappableOwnerFill({ commitmentHash: '0xabc', txHash: '0xtx2', logIndex: 1 })); // genuinely new
+        await waitFor(() => { resolvers.forEach((r) => r?.()); return readEvents().filter((e) => e.kind === 'fill').length >= 2; });
+        expect(readEvents().filter((e) => e.kind === 'fill')).toHaveLength(2); // tx1 (initial) + tx2 (new); the re-delivered tx1 deduped
+        expect(runner.stateForTest().positions['spec-1:away']?.riskAmountWei6).toBe('200000'); // tx1 + tx2, NOT tx1 + tx1 + tx2
+
+        triggerKill();
+        await runPromise;
+      });
+    });
+
     // ── §7.2 unknown-own-fill (an SSE fill for a commitment not in canonical state) ──
 
     describe('§7.2 unknown-own-fill', () => {

@@ -174,7 +174,8 @@ describe('EventLog', () => {
   // an incidental contamination doesn't land in the NDJSON event log.
   //
   // Three patterns, applied recursively to every string value:
-  //   1. 0x[hex]{130}  — a bare 65-byte ECDSA signature anywhere in the string.
+  //   1. [hex]{130,}  — a bare 65-byte (or longer) ECDSA-signature-length hex run
+  //      anywhere in the string, whether or not a literal `0x` precedes it.
   //   2. JSON-shape signature key with any 0x-prefixed hex value (catches truncated).
   //   3. JSON-shape signedPayload key marker (structural-leak tag).
   it('redacts a bare 65-byte ECDSA signature embedded in a string value', () => {
@@ -231,6 +232,18 @@ describe('EventLog', () => {
     // Both occurrences get the marker (a single occurrence test would pass even with a bug).
     const matches = String(line?.detail).match(/REDACTED:ecdsa-signature/g) ?? [];
     expect(matches.length).toBe(2);
+  });
+
+  it('redacts a 130-hex signature run NOT prefixed by 0x (embedded mid-hex-blob)', () => {
+    const log = EventLog.open(dir, 'r');
+    // A signature's bytes appearing mid-run in a longer serialized hex blob,
+    // with NO `0x` immediately preceding the 130-hex stretch. The old
+    // 0x-anchored pattern missed this; the relaxed `[hex]{130,}` catches it.
+    const bareHexSig = 'a'.repeat(130);
+    log.emit('error', { detail: `calldata fragment: deadbeef${bareHexSig}` });
+    const line = readLines(log.path)[0];
+    expect(String(line?.detail)).not.toContain(bareHexSig);
+    expect(String(line?.detail)).toMatch(/REDACTED:ecdsa-signature/);
   });
 
   it('redacts sensitive content nested deep inside object string values (recursive walk)', () => {

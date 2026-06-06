@@ -150,9 +150,13 @@ const DENIED_SIGNING_KEYS: ReadonlySet<string> = new Set([
 // secret-scan check below from self-matching on these definitions.
 const HEX_CLASS = '[0-9a-fA-F]';
 // A bare 65-byte ECDSA signature anywhere in a string value — the actual
-// bearer credential. 130 hex chars after `0x` is the threat-relevant length
-// (shorter "0x..." literals can't be replayed against MatchingModule).
-const ECDSA_SIG_PATTERN = new RegExp(`0x${HEX_CLASS}{130}`, 'g');
+// bearer credential. Matches any run of 130+ hex chars (NOT only an
+// `0x`-prefixed exactly-130), so a signature embedded mid-hex-blob — e.g. bytes
+// 65-130 of a longer ABI/calldata hex run, where no `0x` immediately precedes
+// it — is caught too. A belt-and-braces backstop behind the structural
+// `DENIED_SIGNING_KEYS` throw + per-emit allow-list; over-redacting a long
+// non-secret hex run in a log value is acceptable.
+const ECDSA_SIG_PATTERN = new RegExp(`${HEX_CLASS}{130,}`, 'g');
 // JSON-shaped `signature` key/value with any 0x-prefixed hex value (catches
 // truncated leaks too — partial hex isn't replayable on its own, but its
 // presence is a contamination signal). Captures the key + colon + opening

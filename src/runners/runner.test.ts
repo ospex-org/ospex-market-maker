@@ -2870,47 +2870,21 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
       });
     });
 
-    // ── fill-dedup restart-safety: boot-seed reconstruction (F5 / DEDUP-1) ──
+    // ── fill-dedup restart-safety: runtime dedup across reconnect (F5 / DEDUP-1) ──
     //
-    // The constructor re-seeds `ownStateDedupSet` from each persisted
-    // `commitment.fills[]` (index.ts §"seed the owner-fill dedup-set"), the basis
-    // of the soak's "no duplicate fill telemetry across restart" invariant. Every
-    // OTHER seedState carries `fills: []`, so the reconstruction loop is otherwise
-    // unexercised end-to-end. These boot a runner with a NON-EMPTY persisted
-    // `fills[]` and assert the OBSERVABLE dedup outcome (no position-risk bump, no
-    // second `fill` event) — not the internal Set.
-    describe('fill-dedup boot-seed reconstruction (restart-safety)', () => {
-      it('F5: a persisted fill re-seeds the dedup set on boot — a re-delivered fill is deduped (no position bump, no second fill event)', async () => {
-        const config = cfg({ ownState: { subscribe: true, recoveryHoldMs: 0, staleMaxMs: 300000 } });
-        // A persisted commitment carrying ONE already-applied fill (txHash,logIndex).
-        const record = commitmentRecord({ hash: '0xabc', fills: [{ txHash: '0xtx1', logIndex: 0, amountWei6: '100000', ts: 1735689600 }] });
-        const seedState = { ...emptyMakerState(), commitments: { [record.hash]: record } };
-        const { runner, recorder, runPromise, resolvers, triggerKill } = await makePausedSubscribedRunner({ config, seedState });
-
-        // Reach ready WITHOUT a fresh snapshot. With NO persisted cursor the disk
-        // baseline stays live (a snapshot swap would CLEAR + reseed the dedup from
-        // the snapshot's empty fills[], so only the snapshot-less path exercises the
-        // BOOT-SEED reconstruction).
-        recorder.fire('onReady', undefined, { cursor: '' });
-        expect(runner.ownStateSessionView().ready).toBe(true);
-        expect(Object.keys(runner.stateForTest().commitments)).toEqual(['0xabc']); // disk baseline preserved
-        expect(runner.stateForTest().positions['spec-1:away']).toBeUndefined();
-
-        // The server re-delivers the SAME (txHash,logIndex) on resume/overlap, then a
-        // genuinely NEW fill. The boot-seeded dedup must drop the first; the second
-        // must apply — so exactly ONE `fill` fires and the position risk reflects ONE
-        // fill (100000), not two (200000).
-        recorder.fire('onFill', mappableOwnerFill({ commitmentHash: '0xabc', txHash: '0xtx1', logIndex: 0 }));
-        recorder.fire('onFill', mappableOwnerFill({ commitmentHash: '0xabc', txHash: '0xtx2', logIndex: 1 }));
-        await waitFor(() => { resolvers.forEach((r) => r?.()); return readEvents().some((e) => e.kind === 'fill'); });
-        expect(readEvents().filter((e) => e.kind === 'fill')).toHaveLength(1); // re-delivered fill deduped; only the NEW fill emitted
-        expect(runner.stateForTest().positions['spec-1:away']?.riskAmountWei6).toBe('100000'); // one fill, not double-applied
-
-        triggerKill();
-        await runPromise;
-      });
-
-      it('F5 (resume mirror): dedup survives a mid-session reconnect — an overlap-re-delivered fill is dropped on the preserved baseline', async () => {
+    // `ownStateDedupSet` (keyed `(txHash, logIndex)`) drops a fill the SSE already
+    // applied, so a server overlap re-delivery on resume/reconnect can't double-count
+    // exposure or re-emit a `fill`. The set is cleared + reseeded on every baseline
+    // swap (a fresh snapshot's position risk already subsumes prior fills) and
+    // PRESERVED across a mid-session reconnect (no new snapshot) — which is where
+    // overlap re-deliveries are deduped. (The constructor "boot-seed" that re-seeded
+    // the set from persisted `commitment.fills[]` — own-state-sse-plan §2.5.3 — was
+    // removed as dead-in-practice: the first onReady after any real boot/resume swaps
+    // or cold-restarts a fresh snapshot, clearing the boot-seed before any persisted
+    // fill could be re-applied, so the snapshot-subsumes path — not the boot-seed —
+    // is the restart-safety mechanism. See the matching index.ts removal.)
+    describe('fill-dedup restart-safety (runtime dedup across reconnect)', () => {
+      it('F5: dedup survives a mid-session reconnect — an overlap-re-delivered fill is dropped on the preserved baseline', async () => {
         const config = cfg({ ownState: { subscribe: true, recoveryHoldMs: 0, staleMaxMs: 300000 } });
         const { runner, recorder, runPromise, resolvers, triggerKill } = await makePausedSubscribedRunner({ config });
         // Establish a baseline carrying commitment 0xabc, then apply a fill so the

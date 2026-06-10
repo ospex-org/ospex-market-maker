@@ -60,9 +60,9 @@ export type OwnStateTransportStatus = 'connected' | 'reconnecting' | 'degraded' 
  * ONLY the connection-health bits the §5 health gate reads + the in-flight
  * snapshot baseline that `onReady` atomically swaps into `MakerState`.
  *
- * Process-lifetime (no disk persistence — cold restart re-snapshots cleanly, the
- * fresh snapshot subsuming prior fills; `MakerState.ownStateCursor` covers resume
- * and the runtime owner-fill dedup set covers in-process replay).
+ * Process-lifetime (no disk persistence — a process restart cold-starts the
+ * stream and re-snapshots cleanly, the fresh snapshot subsuming prior fills;
+ * the runtime owner-fill dedup set covers in-process replay).
  */
 export interface OwnStateSession {
   /** `false` until `onReady` fires (the snapshot has fully baselined), or while a resync is pending. */

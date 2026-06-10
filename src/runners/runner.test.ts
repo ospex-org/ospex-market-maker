@@ -991,7 +991,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
       sub,
       subscribe,
       get isUnsubscribed(): boolean { return unsubscribed; },
-      /** The options object the runner passed to subscribeOwnState — e.g. `{ address, initialCursor }`. */
+      /** The options object the runner passed to subscribeOwnState — always `{ address }` (every open is cursor-less). */
       get options(): unknown { return capturedOptions; },
       /**
        * Simulate an SDK callback. The SDK delivers `OwnStateEventMeta` as the
@@ -1415,39 +1415,35 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
     await runPromise;
   });
 
-  // ── PR1 — cursor promotion contract (own-state SSE plan §4.3) ────────────
+  // ── Explicit cold start (own-state polling retirement, part 2) ───────────
   //
-  // The resume cursor (`state.ownStateCursor`) advances ONLY when paired with a
-  // real applied effect: a snapshot baseline whose `onReady` swap succeeded
-  // (promoting the ONReady cursor — the SDK's Last-Event-ID contract; the
-  // PR1 page-cursor staging was dropped at the PR3b reconfirm), or a delta whose
-  // reducer applied cleanly (contiguous-success prefix only). A truncated page,
-  // a baseline-less onReady, a reducer throw, and a resync all leave (or clear)
-  // the cursor.
+  // The runner never persists or promotes own-state cursors: every
+  // subscription open is cursor-less, so the SDK always cold-connects with a
+  // fresh snapshot (the authoritative re-grounding). Mid-session reconnect
+  // catchup is the SDK's internal Last-Event-ID job.
 
-  // A SHAPE-MINIMAL own-state commitment — enough to enqueue + to establish a
-  // (cursor-only) baseline page, but NOT enough metadata for the canonical PR3b
-  // mapper, which fails closed and SKIPS the row. Tests that assert a row landed
-  // in the canonical book — or that a DELTA reducer applied cleanly (and so
-  // promoted its cursor) — use `mappableOwnerCommitment` instead.
+  // A SHAPE-MINIMAL own-state commitment — enough to enqueue / fill a snapshot
+  // page, but NOT enough metadata for the canonical PR3b mapper, which fails
+  // closed and SKIPS the row. Tests that assert a row landed in the canonical
+  // book use `mappableOwnerCommitment` instead.
   const MINIMAL_COMMITMENT = (hash: string) => ({
     commitmentHash: hash, filledRiskAmount: '0', riskAmount: '100', expiry: null,
     status: 'open', storedStatus: 'open', nonceInvalidated: false,
   });
 
   /**
-   * Establish a ready baseline (empty snapshot + onReady with NO cursor so the
-   * cursor stays undefined), enqueue the given deltas, then drive ONE drain pass
-   * through the paused loop (wake → resolve debounce). Post PR3b the drain gates
-   * on `ownStateSessionView().ready`, so delta-application tests must establish
-   * ready first — a delta enqueued before onReady stays queued forever.
+   * Establish a ready baseline (empty snapshot + onReady), enqueue the given
+   * deltas, then drive ONE drain pass through the paused loop (wake → resolve
+   * debounce). The drain gates on `ownStateSessionView().ready`, so
+   * delta-application tests must establish ready first — a delta enqueued
+   * before onReady stays queued forever.
    */
   async function drainDeltasWithReadyBaseline(
     deltas: Array<{ kind: string; body: unknown; cursor?: string }>,
   ): Promise<{ runner: Runner; cleanup: () => Promise<void> }> {
     const { runner, recorder, runPromise, sleepCalls, resolvers, triggerKill } = await makePausedSubscribedRunner();
-    recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: false }); // empty meta cursor → no promote
-    recorder.fire('onReady'); // empty meta cursor → ready, cursor stays undefined
+    recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: false });
+    recorder.fire('onReady');
     for (const d of deltas) runner.enqueueOwnStateEvent(d);
     runner.wake();
     await waitFor(() => sleepCalls.filter((ms) => ms === 500).length >= 1);
@@ -1459,196 +1455,49 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
     };
   }
 
-  it('promotes the onReady cursor on a successful baseline swap (§4.3 / SDK Last-Event-ID contract)', async () => {
+  it('boot always subscribes CURSOR-LESS — even when a legacy state file carries a stray ownStateCursor key (explicit cold start)', async () => {
+    // Write a legacy-shaped state file BY HAND: a pre-retirement maker-state.json
+    // carrying the retired `ownStateCursor` field. The loader must tolerate the
+    // unknown key (load cleanly, no state-loss hold) and the boot must NOT offer
+    // it as an initialCursor.
+    StateStore.at(stateDir).flush(emptyMakerState());
+    const statePath = join(stateDir, 'maker-state.json');
+    const legacy = JSON.parse(readFileSync(statePath, 'utf8')) as Record<string, unknown>;
+    legacy.ownStateCursor = 'stale-pre-retirement-cursor';
+    writeFileSync(statePath, JSON.stringify(legacy), 'utf8');
+
     const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
-    expect(runner.ownStateCursorForTest()).toBeUndefined();
-    recorder.fire('onSnapshot', { commitments: [MINIMAL_COMMITMENT('0xa')], positions: [], truncated: false, positionsTruncated: false }, { cursor: 'snap-1' });
-    // Before ready, no cursor is promoted (a snapshot page's frame id is not a
-    // resumable position; only the onReady cursor is).
-    expect(runner.ownStateCursorForTest()).toBeUndefined();
-    recorder.fire('onReady', undefined, { cursor: 'ready-1' });
-    // The onReady cursor — not the snapshot-page cursor — is the persisted resume point.
-    expect(runner.ownStateCursorForTest()).toBe('ready-1');
+    expect(runner.bootAssessment.holdQuoting).toBe(false); // legacy key tolerated — clean load
+    expect(recorder.options).toEqual({ address: DEFAULT_FAKE_MAKER_ADDRESS }); // NO initialCursor, ever
     triggerKill();
     await runPromise;
   });
 
-  it('promotes the onReady cursor, never a snapshot-page cursor (truncated or final) (§4.3)', async () => {
+  it('a baseline-less onReady on a mid-session reconnect keeps the live in-memory baseline (no swap, no cold restart)', async () => {
     const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
-    // Page 1 truncated, page 2 final — NEITHER page's frame id is the resume
-    // point; only the cursor delivered to onReady is a valid Last-Event-ID.
-    recorder.fire('onSnapshot', { commitments: [MINIMAL_COMMITMENT('0xa')], positions: [], truncated: true, positionsTruncated: false }, { cursor: 'page-1-truncated' });
-    recorder.fire('onSnapshot', { commitments: [MINIMAL_COMMITMENT('0xb')], positions: [], truncated: false, positionsTruncated: false }, { cursor: 'page-2-final' });
-    recorder.fire('onReady', undefined, { cursor: 'ready-x' });
-    expect(runner.ownStateCursorForTest()).toBe('ready-x');
-    triggerKill();
-    await runPromise;
-  });
-
-  it('does NOT promote an EMPTY-STRING onReady cursor on a successful baseline swap (`cursor || undefined` → no resume point)', async () => {
-    // The SDK may deliver onReady with an empty-string cursor; the source does
-    // `const promoted = cursor || undefined`, so a real baseline swap still
-    // leaves ownStateCursor undefined (no spurious '' resume point persisted).
-    const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
-    recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: false }, { cursor: 'snap-1' });
-    recorder.fire('onReady', undefined, { cursor: '' }); // explicit empty cursor
-    expect(runner.ownStateSessionView().ready).toBe(true); // baseline DID swap (ready flipped)
-    expect(runner.ownStateCursorForTest()).toBeUndefined(); // ...but no cursor promoted
-    triggerKill();
-    await runPromise;
-  });
-
-  it('does NOT promote a cursor on a baseline-less onReady (resume delivered no snapshot — cursor alone is not state)', async () => {
-    const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
-    // onReady with NO prior snapshot → pendingBaseline is null → no durable
-    // baseline → the cursor must NOT be promoted. (Commit 3 turns this branch
-    // into the empty-baseline cold-restart guard.)
-    recorder.fire('onReady', undefined, { cursor: 'ready-no-baseline' });
-    expect(runner.ownStateCursorForTest()).toBeUndefined();
-    triggerKill();
-    await runPromise;
-  });
-
-  it('resync clears the persisted cursor (a stale resume point must not survive a re-baseline)', async () => {
-    const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
-    recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: false }, { cursor: 'snap-1' });
-    recorder.fire('onReady', undefined, { cursor: 'ready-1' });
-    expect(runner.ownStateCursorForTest()).toBe('ready-1');
-    recorder.fire('onStatus', 'resync');
-    expect(runner.ownStateCursorForTest()).toBeUndefined();
-    triggerKill();
-    await runPromise;
-  });
-
-  it('promotes a delta cursor after its reducer applies (§4.3 delta track)', async () => {
-    // The delta must MAP cleanly for the reducer to apply + promote — post PR3b
-    // a shape-minimal body would throw OwnerMappingError and freeze the cursor.
-    const { runner, cleanup } = await drainDeltasWithReadyBaseline([
-      { kind: 'commitment', body: mappableOwnerCommitment('0xc'), cursor: 'delta-1' },
-    ]);
-    await waitFor(() => runner.ownStateCursorForTest() === 'delta-1');
-    expect(runner.ownStateCursorForTest()).toBe('delta-1');
-    await cleanup();
-  });
-
-  it('freezes cursor promotion at the first reducer throw — a later success cannot leapfrog the failed event (contiguous-success, FM3)', async () => {
-    const { runner, cleanup } = await drainDeltasWithReadyBaseline([
-      // Good → promote 'g1'.
-      { kind: 'commitment', body: mappableOwnerCommitment('0xg1'), cursor: 'g1' },
-      // Bad fill (no maker/taker) → reducer throws → freeze promotion.
-      { kind: 'fill', body: { txHash: '0x1', logIndex: 0 }, cursor: 'g2' },
-      // Good → reduces cleanly, BUT promotion is frozen → its cursor is NOT taken.
-      { kind: 'commitment', body: mappableOwnerCommitment('0xg3'), cursor: 'g3' },
-    ]);
-    // Cursor stays at the last CONTIGUOUS success before the throw, never 'g3'.
-    await waitFor(() => runner.ownStateCursorForTest() === 'g1');
-    expect(runner.ownStateCursorForTest()).toBe('g1');
-    await cleanup();
-  });
-
-  it('an unknown event kind also freezes promotion (never advance past a skipped effect)', async () => {
-    const { runner, cleanup } = await drainDeltasWithReadyBaseline([
-      { kind: 'commitment', body: mappableOwnerCommitment('0xk1'), cursor: 'k1' },
-      { kind: 'made-up-kind', body: {}, cursor: 'k2' },
-      { kind: 'commitment', body: mappableOwnerCommitment('0xk3'), cursor: 'k3' },
-    ]);
-    await waitFor(() => runner.ownStateCursorForTest() === 'k1');
-    expect(runner.ownStateCursorForTest()).toBe('k1');
-    await cleanup();
-  });
-
-  // ── PR1 — boot resume wiring + empty-baseline guard (§4.2) ───────────────
-
-  it('boot WITH a persisted cursor passes it as initialCursor (§4.2)', async () => {
-    StateStore.at(stateDir).flush({ ...emptyMakerState(), ownStateCursor: 'boot-cursor' });
-    const { recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
-    expect(recorder.options).toEqual({ address: DEFAULT_FAKE_MAKER_ADDRESS, initialCursor: 'boot-cursor' });
-    triggerKill();
-    await runPromise;
-  });
-
-  it('boot WITHOUT a persisted cursor omits initialCursor (cold subscribe)', async () => {
-    const { recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
-    expect(recorder.options).toEqual({ address: DEFAULT_FAKE_MAKER_ADDRESS });
-    triggerKill();
-    await runPromise;
-  });
-
-  it('boot resume that DOES deliver a snapshot disarms the guard and promotes the fresh cursor over the boot cursor (§4.2 happy path)', async () => {
-    StateStore.at(stateDir).flush({ ...emptyMakerState(), ownStateCursor: 'boot-cursor' });
-    const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
-    expect((recorder.options as { initialCursor?: string }).initialCursor).toBe('boot-cursor');
-    // The SDK re-snapshots on resume → handleOwnerSnapshot disarms the guard
-    // (resumedFromPersistedCursor=false), so onReady swaps a real baseline.
-    recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: false }, { cursor: 'snap-new' });
-    recorder.fire('onReady', undefined, { cursor: 'ready-new' });
-    expect(runner.ownStateSessionView().ready).toBe(true); // guard did NOT trip
-    expect(runner.ownStateCursorForTest()).toBe('ready-new'); // fresh onReady cursor promoted, boot cursor replaced
-    triggerKill();
-    await runPromise;
-    expect(readEvents().filter((e) => e.kind === 'stream-cold-restart')).toHaveLength(0); // no cold restart
-  });
-
-  it('empty-baseline guard: a resume that delivers no snapshot does NOT flip ready and drops the cursor (cursor alone is not state)', async () => {
-    StateStore.at(stateDir).flush({ ...emptyMakerState(), ownStateCursor: 'boot-cursor' });
-    const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
-    expect(recorder.options).toEqual({ address: DEFAULT_FAKE_MAKER_ADDRESS, initialCursor: 'boot-cursor' });
-    // Resume delivers onReady with NO snapshot → baseline-less resume → guard.
-    recorder.fire('onReady', undefined, { cursor: 'ready-x' });
-    // Synchronous guard effects: NOT ready, cursor dropped.
-    expect(runner.ownStateSessionView().ready).toBe(false);
-    expect(runner.ownStateCursorForTest()).toBeUndefined();
-    triggerKill();
-    await runPromise;
-    expect(readEvents().filter((e) => e.kind === 'stream-cold-restart' && e.reason === 'resume-without-baseline')).toHaveLength(1);
-  });
-
-  it('empty-baseline guard performs the async cold restart — reopens the subscription CURSOR-LESS', async () => {
-    StateStore.at(stateDir).flush({ ...emptyMakerState(), ownStateCursor: 'boot-cursor' });
-    const { runner, recorder, runPromise, sleepCalls, resolvers, triggerKill } = await makePausedSubscribedRunner();
-    expect((recorder.options as { initialCursor?: string }).initialCursor).toBe('boot-cursor');
-    recorder.fire('onReady', undefined, { cursor: 'ready-x' }); // baseline-less → guard wakes
-    // Resolve the debounce so the wake path reaches performOwnStateColdRestart.
-    await waitFor(() => sleepCalls.filter((ms) => ms === 500).length >= 1);
-    const idx = sleepCalls.findIndex((ms) => ms === 500);
-    resolvers[idx]?.();
-    // The reopen is CURSOR-LESS (the guard cleared the cursor → no initialCursor).
-    await waitFor(() => recorder.options !== undefined && (recorder.options as { initialCursor?: string }).initialCursor === undefined);
-    expect(recorder.options).toEqual({ address: DEFAULT_FAKE_MAKER_ADDRESS });
-    expect(runner.ownStateCursorForTest()).toBeUndefined();
-    triggerKill();
-    await runPromise;
-  });
-
-  it('a baseline-less onReady on a mid-session reconnect does NOT cold-restart (in-memory baseline still live)', async () => {
-    const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
-    // Cold connect (no boot cursor): snapshot + ready establishes the baseline.
+    // Cold connect: snapshot + ready establishes the baseline.
     recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: false }, { cursor: 'snap-1' });
     recorder.fire('onReady', undefined, { cursor: 'ready-1' });
     expect(runner.ownStateSessionView().ready).toBe(true);
-    expect(runner.ownStateCursorForTest()).toBe('ready-1');
-    // A reconnect delivers catchup + ready with NO new snapshot. resumedFromPersistedCursor
-    // is false (cold connect), so the guard must NOT trip — the in-memory baseline backs it.
+    // A reconnect delivers catchup + ready with NO new snapshot — the in-memory
+    // baseline still backs the shadow; nothing swaps and nothing restarts.
     recorder.fire('onReady', undefined, { cursor: 'ready-2' });
     expect(runner.ownStateSessionView().ready).toBe(true); // still ready
-    expect(runner.ownStateCursorForTest()).toBe('ready-1'); // unchanged — no new baseline → no promote
     triggerKill();
     await runPromise;
     expect(readEvents().filter((e) => e.kind === 'stream-cold-restart')).toHaveLength(0);
   });
 
-  it('resync clears the persisted cursor AND a subsequent cold-start re-establishes it (shared rebaseline reset)', async () => {
+  it('resync rebaseline: ready drops, and a fresh snapshot + onReady re-establishes it', async () => {
     const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
     recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: false }, { cursor: 'snap-1' });
     recorder.fire('onReady', undefined, { cursor: 'ready-1' });
-    expect(runner.ownStateCursorForTest()).toBe('ready-1');
+    expect(runner.ownStateSessionView().ready).toBe(true);
     recorder.fire('onStatus', 'resync');
-    expect(runner.ownStateCursorForTest()).toBeUndefined();
     expect(runner.ownStateSessionView().ready).toBe(false);
-    // Fresh snapshot after resync re-establishes the cursor.
+    // Fresh snapshot after resync re-establishes the baseline.
     recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: false }, { cursor: 'snap-2' });
     recorder.fire('onReady', undefined, { cursor: 'ready-2' });
-    expect(runner.ownStateCursorForTest()).toBe('ready-2');
     expect(runner.ownStateSessionView().ready).toBe(true);
     triggerKill();
     await runPromise;
@@ -2927,10 +2776,9 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
         expect(runner.stateForTest().positions['spec-1:away']?.riskAmountWei6).toBe('100000');
 
         // A mid-session reconnect: a second onReady with NO new snapshot keeps the
-        // in-memory baseline live and PRESERVES the dedup set (the initial snapshot
-        // cleared `resumedFromPersistedCursor`, so this is the preserve path, not the
-        // empty-baseline cold-restart). The server's overlap re-delivers the same
-        // fill on resume — it must be dropped; a genuinely new fill must apply.
+        // in-memory baseline live and PRESERVES the dedup set. The server's overlap
+        // re-delivers the same fill on resume — it must be dropped; a genuinely new
+        // fill must apply.
         recorder.fire('onReady', undefined, { cursor: 'r2' });
         expect(runner.stateForTest().positions['spec-1:away']?.riskAmountWei6).toBe('100000'); // baseline preserved, not reset
         recorder.fire('onFill', mappableOwnerFill({ commitmentHash: '0xabc', txHash: '0xtx1', logIndex: 0 })); // overlap re-delivery

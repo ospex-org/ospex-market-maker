@@ -519,24 +519,12 @@ export class Runner {
    */
   private currentOwnStateSubscription: Subscription | null = null;
   /**
-   * Whether the CURRENT own-state subscription was opened with a persisted
-   * `initialCursor` (a resume), and no snapshot page has arrived on it yet
-   * (own-state SSE plan §4.2, Phase 3 PR1). Set when `openOwnStateSubscription`
-   * passes an `initialCursor`; cleared the moment a snapshot page arrives
-   * (`handleOwnerSnapshot`) or `onReady` confirms a baseline. The empty-baseline
-   * guard reads it: an `onReady` with `pendingBaseline === null` AND this flag
-   * still set means the resume delivered NO snapshot — there is no durable
-   * baseline for the cursor (a cursor alone is not state), so it cold-restarts.
-   * It does NOT trip on a mid-session reconnect (the in-memory baseline is still
-   * live there, and the flag is already false).
-   */
-  private resumedFromPersistedCursor = false;
-  /**
-   * Set by the empty-baseline guard (`handleOwnerReady`) to request an async
-   * cold restart of the own-state subscription — close + reopen CURSOR-LESS so
-   * the SDK cold-connects with a fresh snapshot. Acted on (and cleared) by
-   * `performOwnStateColdRestart`, which the run loop invokes right after the
-   * wake-path / post-tick `drainOwnState`. The guard cannot do the async
+   * Set by the F1 mapping-degraded self-heal and the §7.2 unknown-own-fill
+   * path to request an async cold restart of the own-state subscription —
+   * close + reopen so the SDK cold-connects with a fresh snapshot. Acted on
+   * (and cleared) by `performOwnStateColdRestart`, which the run loop invokes
+   * right after the wake-path / post-tick `drainOwnState`. The requesters
+   * run inside synchronous handlers / the drain, so they cannot do the async
    * close/reopen itself (it runs inside a synchronous SDK handler).
    */
   private ownStateColdRestartRequested = false;
@@ -1318,30 +1306,15 @@ export class Runner {
     // the loop — defensive at a per-event level (the queue itself is bounded
     // by `OWN_STATE_QUEUE_MAX`).
     const now = this.deps.now();
-    // §4.3 delta cursor track (Phase 3 PR1): promote `state.ownStateCursor` to a
-    // delta's `meta.cursor` ONLY after that delta's reducer + descriptors apply
-    // cleanly, and ONLY for the contiguous-success PREFIX of this drain batch.
-    // `promotionStopped` latches on the FIRST failure/skip so a later success
-    // can't leapfrog a failed/skipped event (which would persist a cursor past
-    // an effect we never applied). This MM-side freeze is the SOLE cursor guard
-    // for deferred reducer throws: the SDK already returned success when the
-    // handler enqueued the event, so it advanced its own running cursor and will
-    // NOT abort the connection for a throw that happens later, here, in the
-    // drain ([[feedback_dont_promote_partial_resume_cursor]] + the FM3 two-layer
-    // model). We promote the event's carried cursor, never the SDK's.
-    let promotionStopped = false;
     // F1: track whether ANY row failed to map this drain, so the self-heal cold
     // restart is requested ONCE after the batch rather than per failed row.
     let mappingFailedThisDrain = false;
     for (const event of drained.events) {
-      // Reducer dispatch AND descriptor application share ONE try/catch so the
-      // cursor-promotion gate has a SINGLE freeze site: promotion happens iff
-      // BOTH the reducer and `applyDescriptors` succeed, and any throw/skip
-      // freezes the rest of the batch identically ([[feedback_enforce_invariant_every_site]]).
-      // A malformed event from an SDK bug / synthetic fixture logs + skips
+      // Reducer dispatch AND descriptor application share one try/catch: a
+      // malformed event from an SDK bug / synthetic fixture logs + skips
       // rather than crashing the loop (defensive; the queue is bounded by
-      // OWN_STATE_QUEUE_MAX). `applyDescriptors` is pure IO and won't realistically
-      // throw, but is inside the try so promotion can't outrun a descriptor failure.
+      // OWN_STATE_QUEUE_MAX). A skipped row leaves canonical state incomplete,
+      // which the F1 self-heal below repairs via a fresh-snapshot cold restart.
       try {
         let descriptors: ReducerDescriptor[];
         switch (event.kind) {
@@ -1364,29 +1337,19 @@ export class Runner {
               detail: `drainOwnState received unrecognized event.kind=${JSON.stringify(event.kind)} — skipping`,
               phase: 'own-state-stream',
             });
-            // An unrecognized event is NOT applied — freeze cursor promotion so
-            // we never advance past an effect we skipped.
-            promotionStopped = true;
             continue;
         }
-        const applied = this.applyDescriptors(descriptors, 'owner');
-        // §7.2: an unknown-own-fill skipped the orphan (no state mutation) and
-        // requested a cursor-less cold restart — freeze promotion so the cursor
-        // never advances past a fill we didn't apply ([[feedback_dont_promote_partial_resume_cursor]]).
-        if (applied.unknownOwnFill) promotionStopped = true;
+        // §7.2: an unknown-own-fill skips the orphan (no state mutation) and
+        // requests a cold restart inside `applyDescriptors` — the fresh
+        // snapshot reconciles the book.
+        this.applyDescriptors(descriptors, 'owner');
       } catch (err) {
         // The PR3a mappers fail closed (`OwnerMappingError`) on a payload missing
         // metadata a Maker*Record requires — emit the dedicated kind + skip the
         // row (never a partial record); other throws are defensive.
         this.emitOwnStateMappingFailure(err, `event.kind=${event.kind}`);
-        promotionStopped = true;
         mappingFailedThisDrain = true;
         continue;
-      }
-      // Success — promote the event's carried cursor (a no-op for the empty-
-      // string sentinel) unless the batch already froze on an earlier failure.
-      if (!promotionStopped && event.cursor) {
-        this.state.ownStateCursor = event.cursor;
       }
     }
     // F1 self-heal: a LIVE-delta mapper failure (e.g. a transient enrichment gap
@@ -3033,19 +2996,15 @@ export class Runner {
         this.handleOwnerFrame(meta);
       },
     };
-    // §4.2 (Phase 3 PR1) — offer the persisted resume cursor as Last-Event-ID
-    // when present. `resumedFromPersistedCursor` arms the empty-baseline guard
-    // for THIS subscription: if the resume delivers no snapshot, `onReady` will
-    // cold-restart cursor-less (a cursor alone is not state). A cursor-less
-    // open (cold start, or the reopen AFTER a cold restart) leaves the flag
-    // false. Built conditionally so `initialCursor: undefined` is never passed
-    // (exactOptionalPropertyTypes).
-    const initialCursor = this.state.ownStateCursor;
-    this.resumedFromPersistedCursor = initialCursor !== undefined;
-    mySub = this.adapter.subscribeOwnState(
-      initialCursor !== undefined ? { address: this.makerAddress, initialCursor } : { address: this.makerAddress },
-      handlers,
-    );
+    // EXPLICIT COLD-START: every subscription opens cursor-less, so the SDK
+    // always cold-connects with a fresh snapshot — the authoritative
+    // re-grounding of the canonical book. The MM deliberately does NOT offer a
+    // persisted resume cursor across process restarts: a cursor is only
+    // meaningful paired with the baseline it indexed, and the baseline book is
+    // not durably persisted in a resumable form ("a cursor alone is not
+    // state"). Mid-session reconnect catchup is the SDK's job — it tracks its
+    // own Last-Event-ID internally for the live subscription.
+    mySub = this.adapter.subscribeOwnState({ address: this.makerAddress }, handlers);
     this.currentOwnStateSubscription = mySub;
   }
 
@@ -3082,18 +3041,12 @@ export class Runner {
    * metadata) emits `owner-mapping-failed` and SKIPS that row rather than
    * materializing a partial record or crashing the whole baseline.
    *
-   * The snapshot page's own SSE-frame cursor is NOT consumed here: the SDK's
-   * `OwnStateEventMeta` contract is that ONLY the cursor delivered to `onReady`
-   * (final baseline complete) is a valid `Last-Event-ID` resume point — a
-   * snapshot page's frame id (truncated pages especially) is not resumable. So
-   * `handleOwnerReady` promotes the `onReady` cursor and this handler ignores
-   * the per-page cursor entirely (own-state SSE plan §4.3).
+   * Cursors are not consumed anywhere in the runner: the MM performs an
+   * explicit cold start (fresh snapshot) on every subscription open, and
+   * mid-session reconnect catchup is the SDK's internal Last-Event-ID job —
+   * so the per-page and `onReady` cursors alike are ignored here.
    */
   private handleOwnerSnapshot(snapshot: OwnerStateSnapshot): void {
-    // A snapshot page means the SDK IS delivering a baseline on this connect
-    // (even a resume that re-snapshots) — so this is no longer a baseline-less
-    // resume; disarm the empty-baseline guard (own-state SSE plan §4.2).
-    this.resumedFromPersistedCursor = false;
     if (this.ownStateSession.pendingBaseline === null) {
       this.ownStateSession.pendingBaseline = {
         commitments: {},
@@ -3138,38 +3091,21 @@ export class Runner {
    * `shadow.positions`; sets `ready: true`; wakes the loop so the next
    * drain sees `ready: true` (PR5 comparator uses this).
    *
-   * INTENTIONAL DIVERGENCE from plan §4.3's single-queue promotion model:
-   * snapshot + ready are processed OUT-OF-BAND (synchronously, here + in
+   * Snapshot + ready are processed OUT-OF-BAND (synchronously, here + in
    * `handleOwnerSnapshot`), NOT enqueued into `ownStateQueue` alongside deltas.
    * This is safe because the SDK buffers deltas until `onReady` when a snapshot
    * is being delivered, so at swap time the delta queue holds no pre-baseline
-   * events; and the `baseline !== null` gate means a reconnect's `onReady`
-   * (baseline already swapped) promotes nothing while catchup deltas stay queued
-   * and promote in-order in `drainOwnState`. The synchronous swap is a plain
-   * object assignment and cannot throw, so §4.4's "swap throws → cursor not
-   * advanced" case is N/A. No leapfrog path exists.
+   * events; and the `baseline !== null` gate means a mid-session reconnect's
+   * `onReady` (baseline already swapped, no fresh snapshot) swaps nothing while
+   * catchup deltas stay queued and apply in-order in `drainOwnState`.
+   *
+   * Every subscription this runner opens is cursor-less (explicit cold start),
+   * so the SDK always delivers a snapshot before the first `onReady` of a
+   * connection — a baseline-less `onReady` can only be a mid-session reconnect
+   * whose in-memory baseline is still live.
    */
-  private handleOwnerReady(cursor: string): void {
+  private handleOwnerReady(_cursor: string): void {
     const baseline = this.ownStateSession.pendingBaseline;
-    // EMPTY-BASELINE GUARD (own-state SSE plan §4.2, "a cursor alone is not
-    // state", Phase 3 PR1): a resume seeded from a persisted cursor that
-    // reaches `onReady` with NO snapshot (`baseline === null`) has no durable
-    // baseline to pair the cursor with — in Phase 2 the shadow is in-memory
-    // only, so a process restart left it empty. Flipping `ready` here would
-    // publish an empty baseline to the comparator (false divergence) and
-    // persisting the cursor would compound it. Drop the cursor and request a
-    // cold restart (close + reopen cursor-less → the SDK sends a fresh
-    // snapshot). Does NOT trip on a mid-session reconnect (in-memory baseline
-    // still live → `resumedFromPersistedCursor` already false). The actual
-    // close/reopen is async, done by `performOwnStateColdRestart` off the wake.
-    if (baseline === null && this.resumedFromPersistedCursor) {
-      this.eventLog.emit('stream-cold-restart', { reason: 'resume-without-baseline' });
-      this.state.ownStateCursor = undefined;
-      this.resumedFromPersistedCursor = false;
-      this.ownStateColdRestartRequested = true;
-      this.wakeSignal.wake(); // so the loop's wake path performs the restart promptly
-      return; // do NOT set ready — an empty shadow must not look ready
-    }
     if (baseline !== null) {
       // Atomic swap — the SSE baseline becomes the CANONICAL book (PR3b source
       // flip). REPLACE `this.state.commitments`/`.positions` wholesale: the
@@ -3187,30 +3123,9 @@ export class Runner {
       this.ownStateSession.truncated = baseline.truncated;
       this.ownStateSession.positionsTruncated = baseline.positionsTruncated;
       this.ownStateSession.pendingBaseline = null;
-      // §4.3 cursor promotion: the baseline is now live in the shadow, so the
-      // cursor that pairs with it is safe to persist. The tick's existing atomic
-      // flush writes it alongside the rest of MakerState. A cursor is promoted
-      // ONLY here (with a real baseline) — never on the baseline-less path the
-      // empty-baseline guard above intercepts, where a resume delivered no
-      // snapshot and a cursor alone is not state.
-      //
-      // Persist the `onReady` cursor — the SDK's `OwnStateEventMeta` contract is
-      // that the cursor delivered to `onReady` (final baseline complete) is the
-      // FIRST cursor safe to persist as a restart `Last-Event-ID`; a snapshot
-      // page's frame id (truncated pages especially) is NOT a resumable
-      // position. The PR1 `pendingBaselineCursor` staging that preferred the
-      // final-page cursor was fail-safe only while the cursor was shadow-only
-      // (every boot-resume cold-restarted via the empty-baseline guard). PR3b
-      // makes resume load-bearing, so this honours the documented contract and
-      // drops the page-cursor staging entirely (own-state SSE plan §4.3, the
-      // mandated pre-flip cursor reconfirm).
-      const promoted = cursor || undefined;
-      if (promoted) this.state.ownStateCursor = promoted;
     }
     // A real baseline was swapped, OR this is a mid-session reconnect whose
-    // in-memory baseline is still live — either way a baseline now backs the
-    // shadow, so the resume guard is satisfied.
-    this.resumedFromPersistedCursor = false;
+    // in-memory baseline is still live — either way a baseline backs the shadow.
     this.ownStateSession.ready = true;
     this.ownStateSession.lastReadyAtMs = Date.now();
     this.ownStateSession.lastEventAtMs = Date.now();
@@ -3371,12 +3286,6 @@ export class Runner {
    *   dependence on the SDK's onFrame-before-onReady ordering.
    * - `ownStateQueue.clear()` — pre-rebaseline deltas would double-count on the
    *   fresh baseline (Hermes #69).
-   * - `state.ownStateCursor` — the resume cursor that indexed the dropped
-   *   baseline is stale; a stale cursor surviving could resume a future boot
-   *   onto a baseline the snapshot replaced (a cursor alone is not state).
-   *   Cleared persisted cursor is written on the next flush.
-   * - `resumedFromPersistedCursor=false` — the next connect's snapshot (or a
-   *   reopen) re-arms it as appropriate.
    * - `ownStateColdRestartRequested=false` — consume any pending cold-restart
    *   request at this drain site ([[feedback_consume_latched_signal_at_drain_site]]):
    *   a server-driven resync already re-baselines on the LIVE socket, so it
@@ -3393,8 +3302,6 @@ export class Runner {
     this.tokenRefreshFailureInFlight = false;
     this.lastFrameAtSec = null;
     this.ownStateQueue.clear();
-    this.state.ownStateCursor = undefined;
-    this.resumedFromPersistedCursor = false;
     this.ownStateColdRestartRequested = false;
     this.firstAuditPollAfterReady = false;
     this.divergenceTracker.clear();
@@ -3424,10 +3331,9 @@ export class Runner {
    * a PERSISTENT enrichment gap that re-trips {@link ownStateMappingDegraded} on
    * every fresh snapshot — is rate-limited to one restart per debounce window (a
    * slow retry, never a tight loop) and surfaces as repeated telemetry rather
-   * than silence. The empty-baseline guard ({@link handleOwnerReady}) and §7.2
-   * keep their own inline request because they reset extra state (cursor /
-   * audit-divergence); this is the shared path for the F1 mapping-degraded
-   * self-heal.
+   * than silence. §7.2 (unknown-own-fill) keeps its own inline request because
+   * it also latches the audit-divergence hold; this is the shared path for the
+   * F1 mapping-degraded self-heal.
    */
   private requestOwnStateColdRestart(reason: string): void {
     this.eventLog.emit('stream-cold-restart', { reason });
@@ -3436,19 +3342,17 @@ export class Runner {
   }
 
   /**
-   * Act on a cold-restart request raised by the empty-baseline guard (own-state
-   * SSE plan §4.2, Phase 3 PR1). The guard runs inside a synchronous SDK
-   * handler, so it can only set `ownStateColdRestartRequested` + wake; this
+   * Act on a cold-restart request (F1 mapping-degraded self-heal, or §7.2
+   * unknown-own-fill). The requesters run inside synchronous SDK handlers /
+   * the drain, so they can only set `ownStateColdRestartRequested` + wake; this
    * async method (invoked off the wake-path / post-tick `drainOwnState`) does the
    * close + reopen. Order matters: close FIRST (the SDK contract + the runner's
    * identity guard mean no handler fires after `await unsubscribe()`), THEN
-   * reset the rebaseline buffers (so no event delivered between the guard and
-   * the close survives), THEN reopen — cursor-less, because the guard already
-   * cleared `state.ownStateCursor`, so `openOwnStateSubscription` omits
-   * `initialCursor` and the SDK cold-connects with a fresh snapshot. Skips if
-   * the runner is shutting down. The flag is consumed up front so a redundant
-   * call (it's invoked after every drain) is a no-op; the reopen is cursor-less
-   * so its own `onReady` can't re-trip the guard.
+   * reset the rebaseline buffers (so no event delivered between the request and
+   * the close survives), THEN reopen — every open is cursor-less, so the SDK
+   * cold-connects with a fresh snapshot. Skips if the runner is shutting down.
+   * The flag is consumed up front so a redundant call (it's invoked after every
+   * drain) is a no-op.
    */
   private async performOwnStateColdRestart(): Promise<void> {
     if (!this.ownStateColdRestartRequested) return;
@@ -4020,11 +3924,6 @@ export class Runner {
    */
   divergenceTrackerSizeForTest(): number {
     return this.divergenceTracker.size;
-  }
-
-  /** Test seam — the in-memory `state.ownStateCursor` (own-state SSE plan §4.1, Phase 3 PR1). */
-  ownStateCursorForTest(): string | undefined {
-    return this.state.ownStateCursor;
   }
 
   /**

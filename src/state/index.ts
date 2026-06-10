@@ -407,25 +407,6 @@ export interface MakerState {
   dailyCounters: Record<string, DailyCounters>;
   /** ISO-8601 — when this state was last flushed. `null` for a never-flushed (fresh) state. */
   lastFlushedAt: string | null;
-  /**
-   * The own-state SSE resume cursor (own-state SSE plan §4.1, Phase 3 PR1) — the
-   * opaque `OwnStateEventMeta.cursor` last *promoted* by the §4.3 promotion
-   * contract (a snapshot baseline whose `onReady` swap succeeded, or a delta
-   * whose reducer applied cleanly). On boot it is offered to the SDK as
-   * `subscribe({ initialCursor })` (Last-Event-ID resume) — but ONLY honored
-   * when paired with a real baseline (the empty-baseline guard cold-restarts
-   * otherwise; in Phase 2 the shadow is not itself durable, so a resume always
-   * falls back to a fresh snapshot — a cursor alone is not state).
-   *
-   * Absent on a fresh / pre-PR1 state file. Unlike the exposure-relevant fields,
-   * a malformed cursor does NOT mark the state `lost`: the validator's
-   * fail-closed posture exists to protect the under-countable soft-cancelled set
-   * (DESIGN §12), which the cursor has no bearing on. A bad/absent cursor
-   * degrades gracefully to a cold subscribe — the fail-SAFE outcome (a fresh
-   * snapshot can never under-count). `| undefined` per the project's
-   * `exactOptionalPropertyTypes` convention so the resync path can clear it.
-   */
-  ownStateCursor?: string | undefined;
 }
 
 export function emptyMakerState(): MakerState {
@@ -646,18 +627,10 @@ function validateMakerState(parsed: unknown): Validated {
     return fail('`pnl` is malformed');
   }
 
-  // ownStateCursor (own-state SSE plan §4.1, Phase 3 PR1) — a DISPOSABLE resume
-  // optimization, NOT exposure-relevant state. The validator's fail-closed
-  // posture protects the under-countable soft-cancelled set (DESIGN §12), which
-  // a cursor has no bearing on, so a malformed/absent cursor degrades GRACEFULLY
-  // (omitted → the boot path does a cold, cursor-less subscribe and the SDK
-  // re-establishes a fresh baseline — fail-SAFE: a fresh snapshot can never
-  // under-count). It does NOT mark the whole state `lost`. Only a present,
-  // non-empty string is honored; the empty string (the SDK's "no resumable
-  // cursor" sentinel) is treated as absent.
-  const ownStateCursor =
-    typeof parsed.ownStateCursor === 'string' && parsed.ownStateCursor.length > 0 ? parsed.ownStateCursor : undefined;
-
+  // NOTE: a legacy state file may carry an `ownStateCursor` key (the pre-cold-
+  // restart-retirement resume cursor) — like any other unknown key it is simply
+  // not picked up here. Process restarts always cold-start the own-state stream
+  // from a fresh snapshot, so there is nothing to resume.
   return {
     ok: true,
     state: {
@@ -668,7 +641,6 @@ function validateMakerState(parsed: unknown): Validated {
       pnl: { realizedUsdcWei6: pnl.realizedUsdcWei6, unrealizedUsdcWei6: pnl.unrealizedUsdcWei6, asOfUnixSec: pnl.asOfUnixSec },
       dailyCounters,
       lastFlushedAt: typeof parsed.lastFlushedAt === 'string' ? parsed.lastFlushedAt : null,
-      ownStateCursor,
     },
   };
 }

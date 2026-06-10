@@ -31,15 +31,15 @@ A commitment's stake is pulled from your wallet **when it's matched**, not when 
 
 ## Own-state-health guard — auto-cancel on a degraded stream
 
-This applies **only when `ownState.subscribe: true`** (the own-state SSE stream is opted in). With the default `subscribe: false` it is entirely dormant.
+In live mode the MM **always** opens its owner-authenticated own-state SSE stream — it is the canonical source of truth for the MM's commitments, fills, and positions. The stream needs your keystore (the SDK mints a bearer token signed by the maker's key), so a live boot refuses without one; this guard is therefore always armed when you run live. In dry-run there is no signer, no subscription is opened, and the guard is inert.
 
-When the MM subscribes to its own-state stream, that stream becomes the source of truth for its commitments, fills, and positions. If the stream degrades — it goes silent, overflows, lags the indexer, fails to authenticate, or diverges from the polled view — the MM can no longer trust its own book, so it **stops posting new quotes** (a `stream-health-hold` telemetry event records it). If there is open exposure when that happens (a `high`-severity hold), the MM also **actively cancels its existing quotes** so no new fills land against a book it can't see:
+If the stream degrades — it goes silent, overflows, lags the indexer, fails to authenticate, or diverges from the per-tick audit cross-check — the MM can no longer trust its own book, so it **stops posting new quotes** (a `stream-health-hold` telemetry event records it). If there is open exposure when that happens (a `high`-severity hold), the MM also **actively cancels its existing quotes** so no new fills land against a book it can't see:
 
 - It pulls every still-matchable `visibleOpen` quote off the relay (gasless — but, like the funding guard, the signed payloads stay matchable on chain until expiry, so the exposure persists until then).
 - Under **`orders.cancelMode: onchain`** it *also* authoritatively cancels them on chain — this **spends POL gas** (gas-gated, and it will **not** touch your emergency reserve), and is the only mode that actually clears the exposure.
 - There is **no `none` opt-out** (unlike the funding guard): a degraded own-state view is treated as a safety event, and pulling your relay quotes is the minimum response. To avoid the on-chain gas spend, leave `orders.cancelMode` at its default `offchain`.
 
-So before you enable `ownState.subscribe: true` with `orders.cancelMode: onchain`, know that a flaky stream can trigger automatic, gas-spending on-chain cancels. Keep POL funded, and watch for `stream-health-hold` / `onchain-cancel` telemetry.
+So before you go live with `orders.cancelMode: onchain`, know that a flaky stream can trigger automatic, gas-spending on-chain cancels. Keep POL funded, and watch for `stream-health-hold` / `onchain-cancel` telemetry.
 
 ## Dry-run first
 

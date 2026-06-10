@@ -212,7 +212,7 @@ export function toSdkSignedPayload(p: MakerSignedPayload): SignedCommitmentPaylo
  * 2. `signedPayloadStatus === 'missing-legacy'` AND `lifecycle === 'softCancelled'`
  *    (book-hidden) → BLOCKED. The public commitments API redacts the signed
  *    fields for hidden rows (M2), so `cancelOnchain({ hash })` would refuse.
- *    No local payload, no `ownState.subscribe` snapshot in M6/A scope.
+ *    No local payload, no own-state snapshot recovery in M6/A scope.
  *    The cancel is unreachable until the operator manually recovers the
  *    payload via owner-auth own-state (Phase 2) or the commitment expires.
  * 3. `signedPayloadStatus === 'missing-legacy'` AND any other lifecycle

@@ -51,22 +51,19 @@
  *     `quote-competitiveness` event per side, or one `competitiveness-unavailable`
  *     if that orderbook somehow isn't populated (the MM's own commitments are
  *     filtered out by `c.maker === this.makerAddress`);
- *   - **fill detection** (live only — DESIGN §10): each tick — before the reconcile so
- *     a fill within this tick dirties the market and the same reconcile re-prices the
- *     imbalance — diff `listOpenCommitments(maker)` against the local
- *     `visibleOpen`/`partiallyFilled` set; per-disappeared-hash `getCommitment(hash)`
- *     → reclassify (`filled` → create / extend a `MakerPositionRecord`, emit `fill`
- *     `{partial:false}`; `expired` → emit `expire`; `cancelled` →
- *     `authoritativelyInvalidated`, no event). A still-listed hash whose
- *     `filledRiskAmount` advanced → bump `filledRiskWei6`, reclassify
- *     `partiallyFilled`, extend the position by the delta, emit `fill`
- *     `{partial:true}`. Bounded reads — one `listOpenCommitments` per tick, one
- *     `getCommitment` per disappeared hash;
+ *   - **audit probes** (live only — DESIGN §10; audit-only since the own-state
+ *     polling retirement): each tick, diff `listOpenCommitments(maker)` +
+ *     per-disappeared-hash `getCommitment(hash)` + one `getPositionStatus(maker)`
+ *     against a per-tick clone of canonical state and converge the CLONE with the
+ *     poll-era classification rules — fills and lifecycle changes reach CANONICAL
+ *     state in real time over the own-state SSE stream, and the divergence
+ *     comparator cross-checks the two views. Bounded reads — one
+ *     `listOpenCommitments` per tick, one `getCommitment` per disappeared hash;
  *   - age-out of expired tracked commitments;
  *   - a prune of old terminal (`expired` / `filled` / `authoritativelyInvalidated`)
  *     commitment records, so a long shadow run's state file stays bounded;
  *   - the per-tick state flush;
- *   - an interruptible sleep clamped to the `pollIntervalMs` floor.
+ *   - an interruptible sleep at the single `ownState.auditPollIntervalMs` cadence.
  *
  * Still TODO follow-ups: P&L (realized over settled / claimed; unrealized over
  * active marked to fair — natural home is the `summary` aggregator that walks
@@ -96,7 +93,7 @@
 
 import { existsSync } from 'node:fs';
 
-import { DEFAULT_PER_IP_STREAM_CAP, POLL_INTERVAL_FLOOR_MS, RESERVED_OWN_STATE_STREAMS, type Config } from '../config/index.js';
+import { DEFAULT_PER_IP_STREAM_CAP, RESERVED_OWN_STATE_STREAMS, type Config } from '../config/index.js';
 import { buildDesiredQuote, inventoryFromState, isExpiredForRelease, matchableCommitmentRiskWei6, reconcileBook, type BookReconciliation, type DesiredQuote, type RetainedPartial, type RetainedPartialReason, type SoftCancelReason } from '../orders/index.js';
 import { OspexStreamError } from '../ospex/index.js';
 import type {
@@ -355,13 +352,11 @@ export class Runner {
 
   private state: MakerState;
   /**
-   * The AUDIT projection of own-state (Phase 3 PR3b source flip). When
-   * `ownState.subscribe` is true the SSE stream writes canonical `this.state`
-   * and the POLL path writes THIS second `MakerState` instead — a slower
-   * cross-check fed to {@link compareAuditVsCanonical}. Process-lifetime, NEVER
-   * flushed (an audit divergence is telemetry, not exposure; the one durable
-   * canonical file stays `this.state`). Unused in backout (`subscribe:false`),
-   * where the poll path remains the canonical writer of `this.state`.
+   * The AUDIT projection of own-state. The SSE stream writes canonical
+   * `this.state`; the per-tick audit probes write THIS second `MakerState`
+   * instead — a slower cross-check fed to {@link compareAuditVsCanonical}.
+   * Process-lifetime, NEVER flushed (an audit divergence is telemetry, not
+   * exposure; the one durable canonical file stays `this.state`).
    */
   private readonly auditState: MakerState = emptyMakerState();
   /**
@@ -430,9 +425,9 @@ export class Runner {
   /**
    * Bounded buffer for SSE events between drains (spec §2.5.2). An overflow drops
    * an owner event, so it degrades composite own-state health (latched at enqueue
-   * via `noteOwnStateOverflow`, Phase 3 PR2): in live + `ownState.subscribe: true`
-   * the §5.1 posting gate then halts NEW posting; in dry-run / poll-only it stays
-   * telemetry-only. Never alters canonical state directly / never sets `fundingHold`.
+   * via `noteOwnStateOverflow`, Phase 3 PR2): in live mode the §5.1 posting gate
+   * then halts NEW posting; in dry-run it stays telemetry-only. Never alters
+   * canonical state directly / never sets `fundingHold`.
    */
   private readonly ownStateQueue = new OwnStateQueue();
   /**
@@ -489,7 +484,7 @@ export class Runner {
    * Latch (Phase 3 PR3b source flip) — `true` while a canonical own-state MAPPER
    * failed during baseline accumulation or a delta (`OwnerMappingError`, or any
    * other throw the drain catch funnels through {@link emitOwnStateMappingFailure}).
-   * When the SSE is the CANONICAL writer (`subscribe:true`), a skipped row means
+   * The SSE is the CANONICAL writer, so a skipped row means
    * `MakerState` is MISSING an owned commitment/position — so own-state cannot be
    * considered healthy (it would undercount exposure and allow posting on an
    * incomplete book). ANDed into the edge mirror ({@link recomputeOwnStateHealth})
@@ -511,9 +506,9 @@ export class Runner {
    */
   private auditPollFailedThisCycle = false;
   /**
-   * The currently-active own-state SSE subscription (Phase 2 PR4a). `null`
-   * when `config.ownState.subscribe` is false OR while the runner is
-   * resubscribing (resync path lands in PR4b). All event handlers re-check
+   * The currently-active own-state SSE subscription. `null` in dry-run (no
+   * owner identity → never opened) OR while the runner is resubscribing
+   * (resync / cold-restart paths). All event handlers re-check
    * `subscription === this.currentOwnStateSubscription` before any side-effect
    * — per `[[feedback_async_lifecycle_invariant]]` an aborted subscription's
    * callbacks MUST NOT mutate shadow state, enqueue events, or call `wake()`.
@@ -638,21 +633,14 @@ export class Runner {
         'Runner: live mode (config.mode.dryRun=false) requires a signed adapter — build it with createLiveOspexAdapter(config, signer), not createOspexAdapter(config)',
       );
     }
-    // Own-state SSE subscription (Phase 2 PR4a) is opt-in via `config.ownState.subscribe`.
-    // Boot refuses if the operator asked for the stream but provided no maker address
-    // (dry-run, or live without `runRun` resolving the signer's address): the SDK's
-    // bearer-token mint signs with the signer's key and the token's `address` claim
-    // must match — without a maker address there's no `address` to scope the subscription.
-    if (this.config.ownState.subscribe && opts.makerAddress === undefined) {
-      throw new Error(
-        'Runner: `config.ownState.subscribe: true` requires a `makerAddress` — the own-state SSE stream is owner-authenticated, scoped to the signer\'s address. Set `mode.dryRun: false` AND `wallet.keystorePath` so `runRun` can resolve the signer.',
-      );
-    }
-    // Live mode needs the maker address (fill detection + competitiveness self-exclusion).
+    // Live mode needs the maker address: the own-state SSE stream — the canonical
+    // state driver, always on in live mode since OS-Phase 4 — is owner-authenticated
+    // (the SDK's bearer-token mint signs with the signer's key and the token's
+    // `address` claim must match), and competitiveness self-exclusion needs it too.
     // `runRun` resolves it from `signer.getAddress()` before constructing the Runner.
     if (!this.config.mode.dryRun && opts.makerAddress === undefined) {
       throw new Error(
-        'Runner: live mode (config.mode.dryRun=false) requires `makerAddress` (the signer\'s wallet) — `runRun` passes it from `signer.getAddress()`.',
+        'Runner: live mode (config.mode.dryRun=false) requires `makerAddress` (the signer\'s wallet) — the own-state SSE stream is owner-authenticated, scoped to the signer\'s address. `runRun` passes it from `signer.getAddress()`.',
       );
     }
     this.makerAddress = opts.makerAddress === undefined ? null : (opts.makerAddress.toLowerCase() as Hex);
@@ -674,10 +662,6 @@ export class Runner {
     this.eventLog = EventLog.open(this.config.telemetry.logDir, opts.runId);
 
     this.deps.log(`[runner] starting run ${opts.runId} — chain ${this.adapter.chainId}, api ${this.adapter.apiUrl}, mode ${this.config.mode.dryRun ? 'dry-run' : 'live'}`);
-
-    if (this.config.pollIntervalMs < POLL_INTERVAL_FLOOR_MS) {
-      this.deps.log(`[runner] pollIntervalMs=${this.config.pollIntervalMs}ms is below the ${POLL_INTERVAL_FLOOR_MS}ms floor — clamping to ${POLL_INTERVAL_FLOOR_MS}ms`);
-    }
 
     // Stream-budget guardrail: each odds subscription is one core-api SSE connection,
     // counted against the per-IP cap shared with the (deferred) own-state streams. Warn
@@ -1023,8 +1007,8 @@ export class Runner {
    * (It is NOT a tick-wide clock — `reconcileMarkets` samples its own `now` afterward, and that
    * sample can legitimately differ across the sweep's awaited cancels.)
    *
-   * Audit interaction (source flip): this mutates `this.state` (the SSE-canonical book under
-   * `subscribe:true`) mid-tick, AFTER `detectFills` reseeded `auditState` from the pre-sweep book.
+   * Audit interaction: this mutates `this.state` (the SSE-canonical book)
+   * mid-tick, AFTER `detectFills` reseeded `auditState` from the pre-sweep book.
    * So on a tick where the hold is driven by a POSTING-only latch (indexer-lag / audit-divergence /
    * recovery hold) while transport is instant-healthy — the one case {@link runAuditComparator}
    * also runs — the comparator can momentarily see canonical `softCancelled` vs audit `visibleOpen`.
@@ -1109,17 +1093,12 @@ export class Runner {
   }
 
   private sleepMs(): number {
-    // Cadence selection (PR3b source flip): when subscribe is true the SSE
-    // stream drives own-state in real time and the per-tick poll is only the
-    // slower AUDIT cross-check + the reconcile/settle/funding/ageOut sweep, so
-    // pace the tick at `ownState.auditPollIntervalMs` (default 60s, range
-    // 10–300s — its own floor, NOT the trading `POLL_INTERVAL_FLOOR_MS`, which
-    // exists to bound the poll-CANONICAL trading cadence in backout). In backout
-    // (subscribe:false) the poll IS the trading cadence → the trading floor applies.
-    if (this.config.ownState.subscribe) {
-      return this.config.ownState.auditPollIntervalMs;
-    }
-    return Math.max(this.config.pollIntervalMs, POLL_INTERVAL_FLOOR_MS);
+    // Single cadence since OS-Phase 4: the SSE stream drives own-state in real
+    // time and the per-tick poll is only the slower AUDIT cross-check + the
+    // reconcile/settle/funding/ageOut sweep, so the tick paces at
+    // `ownState.auditPollIntervalMs` (default 60s, range 10–300s). Dry-run
+    // ticks at the same cadence.
+    return this.config.ownState.auditPollIntervalMs;
   }
 
   /**
@@ -1300,11 +1279,11 @@ export class Runner {
    * - `stream-health-degraded {reason: 'queue-overflow', shadowReady, queueCapacity}` — the composite-health overflow latch tripped (a dropped owner event).
    * - `stream-would-hold {reason: 'queue-overflow', exposureWei6}` — emitted IFF open exposure > 0; informational marker that the overflow happened with exposure at risk.
    *   The overflow degrades composite own-state health (`recomputeOwnStateHealth`).
-   *   In **live + `ownState.subscribe: true`** the §5.1 posting gate then halts NEW
-   *   posting and emits `stream-health-hold` (top-of-`reconcileMarkets` early-out +
-   *   the authoritative `submitQuote` re-check). In **dry-run / poll-only** the gate
-   *   is inert, so this stays telemetry-only and never alters canonical trading
-   *   state (never sets `fundingHold` / runs `fundingCancelSweep`).
+   *   In **live mode** the §5.1 posting gate then halts NEW posting and emits
+   *   `stream-health-hold` (top-of-`reconcileMarkets` early-out + the
+   *   authoritative `submitQuote` re-check). In **dry-run** the gate is inert,
+   *   so this stays telemetry-only and never alters canonical trading state
+   *   (never sets `fundingHold` / runs `fundingCancelSweep`).
    *
    * Event dispatch (Phase 3 PR3b — the source flip): each queued event is routed
    * by `kind` to the appropriate owner reducer, which now writes **canonical
@@ -1317,8 +1296,8 @@ export class Runner {
    * after `onReady` has established the baseline — a delta applied to an
    * unestablished book would corrupt it. Pre-ready deltas stay queued (the SDK
    * buffers too; `resetOwnStateForRebaseline` clears the queue on resync; the
-   * enqueue-time overflow latch bounds growth). In backout (`subscribe:false`)
-   * `ready` never flips, so this is a no-op.
+   * enqueue-time overflow latch bounds growth). In dry-run no subscription is
+   * opened, so `ready` never flips and this is a no-op.
    */
   private drainOwnState(): void {
     if (!this.ownStateSession.ready) return;
@@ -1371,9 +1350,9 @@ export class Runner {
             break;
           case 'fill':
             // The reducer needs our address for the maker/taker disambiguation.
-            // When subscribe is true, makerAddress is non-null (boot refuses
-            // otherwise); the empty-string fallback is defensive against a
-            // misconfigured drain path with no subscription.
+            // A subscription only opens when makerAddress is non-null; the
+            // empty-string fallback is defensive against a misconfigured drain
+            // path with no subscription.
             descriptors = reduceOwnerFill(this.state, event.body as Fill, this.ownStateDedupSet, this.makerAddress ?? '', now);
             break;
           case 'positionStatus':
@@ -1442,14 +1421,16 @@ export class Runner {
     let ticks = 0;
     let bootApprovalsApplied = false;
     try {
-      // Phase 2 PR4a — open the owner-authenticated own-state SSE stream BEFORE
-      // the first tick when opted in. The SDK's `subscribe` returns synchronously
-      // so the handle is captured (and identity-checked by every handler) before
-      // any callback can fire. Subscription stays open across ticks; the `finally`
-      // below unsubscribes on every shutdown path. INSIDE the `try` so a
-      // synchronous throw from the SDK (auth misconfiguration, network init
-      // failure) still runs `unregister()` + cleanup (Hermes #68 review blocker 3).
-      if (this.config.ownState.subscribe && this.makerAddress !== null) {
+      // Open the owner-authenticated own-state SSE stream BEFORE the first tick
+      // whenever an owner identity exists (always the case in live mode — boot
+      // refuses live without `makerAddress`; dry-run has no signer and stays
+      // unsubscribed). The SDK's `subscribe` returns synchronously so the handle
+      // is captured (and identity-checked by every handler) before any callback
+      // can fire. Subscription stays open across ticks; the `finally` below
+      // unsubscribes on every shutdown path. INSIDE the `try` so a synchronous
+      // throw from the SDK (auth misconfiguration, network init failure) still
+      // runs `unregister()` + cleanup (Hermes #68 review blocker 3).
+      if (this.makerAddress !== null) {
         this.openOwnStateSubscription();
       }
       while (!this.stopRequested) {
@@ -1489,7 +1470,7 @@ export class Runner {
         // latches firstAuditPollAfterReady when applicable, and runs the comparator
         // when preconditions hold. Read-only on canonical state (never writes
         // `MakerState`); besides emitting `divergence` it sets the posting-only latch 5
-        // (`auditDivergenceUnresolved`, PR2c-ii) that gates NEW posting in live+subscribe.
+        // (`auditDivergenceUnresolved`, PR2c-ii) that gates NEW posting in live mode.
         this.runAuditComparator();
         if (this.stopRequested) break;
         if (this.maxTicks !== undefined && ticks >= this.maxTicks) break;
@@ -1542,42 +1523,20 @@ export class Runner {
   }
 
   /**
-   * One iteration: discovery → reference-odds refresh → fill detection (live) →
-   * position-status poll (live) → soft-cancelled-fill convergence (live) → per-market
-   * reconcile → age-out → terminal-record prune → flush. Fill detection +
-   * soft-cancelled-fill convergence run *before* the reconcile so a fill within this
-   * tick dirties the market and the same reconcile re-prices the now-imbalanced book.
+   * One iteration: discovery → reference-odds refresh → audit probes (live) →
+   * settle/claim + funding (live) → per-market reconcile → age-out →
+   * terminal-record prune → flush.
    *
-   * **Fail-closed on lost fill visibility (live mode).** Four gates, same outcome
-   * (skip reconcile + ageOut, markets stay dirty, next tick retries):
-   *   1. `detectFills` can't read the maker's open commitments
-   *      (`listOpenCommitments` threw) → also skips the position poll.
-   *   2. `detectFills` saw a *past-expiry* tracked commitment disappear from
-   *      the open-commitments listing but the per-hash `getCommitment` lookup
-   *      threw — the past-expiry-and-disappeared combo is the sharp case
-   *      because `ageOut` would otherwise terminalize the record and release
-   *      its headroom without knowing whether a late fill landed. Future-expiry
-   *      lookup failures stay non-fatal: the record stays live + counted, the
-   *      next tick retries (Hermes review-PR23-late).
-   *   3. `pollPositionStatus` can't read the maker's positions
-   *      (`getPositionStatus` threw) AND any non-terminal `softCancelled`
-   *      commitment exists in local state. Soft-cancelled commitments are
-   *      API-hidden from `listOpenCommitments`, so a stale-signed-payload
-   *      match on one is detectable ONLY through the position poll —
-   *      proceeding without that read could submit replacements on
-   *      already-matched exposure and let `ageOut` terminalize a record that
-   *      a taker just filled. With no softCancelled records, the maker's
-   *      own posted-commitment fills are fully covered by `detectFills`, so
-   *      a position-poll failure is non-fatal.
-   *   4. `reconcileSoftCancelledFills`'s per-hash `getCommitment` lookup threw
-   *      for a `softCancelled` record (a network error, or a 404 for a still-
-   *      matchable signed payload). That record's stale payload could have just
-   *      matched on chain; reading the throw as "unfilled" and letting `ageOut`
-   *      terminalize it would lose the fill. The record stays `softCancelled`
-   *      and the tick fails closed (gate 3's outer block must already have been
-   *      entered — this step only runs when the position poll didn't trip its gate).
-   * `pruneTerminalCommitments` still runs (it only touches already-terminal
-   * records, which are safe).
+   * **Audit probes never gate trading (OS-Phase 4).** The own-state SSE stream
+   * is the canonical state driver; the three per-tick probes (`detectFills`,
+   * `pollPositionStatus`, `reconcileSoftCancelledFills`) only converge the
+   * per-tick AUDIT clone the divergence comparator cross-checks against
+   * canonical state. A probe failure marks `auditPollFailedThisCycle` — the
+   * comparator skips the cycle and preserves latch state — while the tick
+   * proceeds: protection against trading on stale state is the §5 composite
+   * stream-health gate (which holds posting and, with open exposure, fires the
+   * §5.1 cancel-sweep), not a tick cascade. The pre-Phase-4 fail-closed gates
+   * existed for the poll-canonical backout path, which is retired.
    */
   private async tick(tick: number): Promise<void> {
     this.eventLog.emit('tick-start', { tick });
@@ -1588,45 +1547,32 @@ export class Runner {
         this.nextDiscoveryAtTick = tick + this.jitteredDiscoveryInterval();
       }
       await this.refreshTrackedOdds({ ranDiscovery });
-      let liveStateReadOk = true;
-      if (!this.config.mode.dryRun) liveStateReadOk = await this.detectFills();
-      if (liveStateReadOk) {
-        let positionPollOk = true;
-        if (!this.config.mode.dryRun) positionPollOk = await this.pollPositionStatus();
-        const hasSoftCancelled = !this.config.mode.dryRun && Object.values(this.state.commitments).some((r) => r.lifecycle === 'softCancelled');
-        if (positionPollOk || !hasSoftCancelled) {
-          // Soft-cancelled-fill convergence (live only) — runs after detectFills + the
-          // position poll, before settle/reconcile/ageOut. It probes each softCancelled
-          // record's authoritative cumulative fill via `getCommitment` and converges the
-          // commitment record (NOT the position — that's the poll's job). A probe failure
-          // fails closed the same way a lost position poll does: skip settle + reconcile +
-          // ageOut so a record that may have just matched isn't terminalized on local time.
-          let softCancelledFillOk = true;
-          if (!this.config.mode.dryRun) softCancelledFillOk = await this.reconcileSoftCancelledFills();
-          if (softCancelledFillOk) {
-            if (!this.config.mode.dryRun) await this.settleAndClaim();
-            if (!this.config.mode.dryRun) await this.checkFunding(); // funding guard (C1a) — sets fundingHold before the posting decision below
-            if (!this.config.mode.dryRun && this.fundingHold) await this.fundingCancelSweep(); // funding guard (C1b) — actively pull/cancel existing quotes while underfunded, per underfundedCancelMode (reconcileMarkets below is gated by fundingHold anyway)
-            if (this.config.ownState.subscribe) await this.checkIndexerLag(); // §5 latch 6 (PR2c-i) — poll own-state health, set indexerLagDegraded BEFORE reconcileMarkets' §5.1 posting gate reads it (subscribe-gated, not dryRun: runs for observability in dry-run+subscribe, gate dormant there)
-            // §5.1 active cancel-sweep (PR3b-ii) — derive the own-state-health hold ONCE per tick
-            // (AFTER checkIndexerLag so latch 6 is fresh; this is the call that fires the enter/clear
-            // edge). While the high-severity hold is active (degraded own-state + open exposure) we
-            // actively pull/cancel our quotes; reconcileMarkets below re-reads the now-settled hold
-            // (idempotent — no transition) and early-outs on it. Dormant until subscribe flips: in
-            // dry-run / poll-only, updateStreamHealthHold returns false, so the sweep never runs.
-            {
-              const streamHealthNow = this.deps.now();
-              if (this.updateStreamHealthHold(streamHealthNow)) await this.streamHealthCancelSweep(streamHealthNow);
-            }
-            await this.reconcileMarkets();
-            await this.maybeOnchainCancelRecoveredSoftCancels(); // cancelMode:onchain only — authoritatively cancel matched soft-cancels (self-guards offchain/dry-run); after reconcileMarkets so the freed side re-quotes next tick
-            this.ageOut();
-          }
-          // else: live mode + a softCancelled-fill probe (`getCommitment`) failed — skip settleAndClaim + reconcile + ageOut (fail-closed; the record stays softCancelled, markets stay dirty for next-tick retry).
-        }
-        // else: live mode + getPositionStatus failed AND softCancelled records exist — skip settleAndClaim + reconcile + ageOut (fail-closed; markets stay dirty for next-tick retry).
+      if (!this.config.mode.dryRun) {
+        // Audit probes (OS-Phase 4): converge the per-tick audit clone the
+        // comparator cross-checks against canonical state. Probe failures mark
+        // `auditPollFailedThisCycle` (comparator skips, latches preserved) and
+        // never gate the rest of the tick.
+        await this.detectFills();
+        await this.pollPositionStatus();
+        await this.reconcileSoftCancelledFills();
+        await this.settleAndClaim();
+        await this.checkFunding(); // funding guard (C1a) — sets fundingHold before the posting decision below
+        if (this.fundingHold) await this.fundingCancelSweep(); // funding guard (C1b) — actively pull/cancel existing quotes while underfunded, per underfundedCancelMode (reconcileMarkets below is gated by fundingHold anyway)
       }
-      // else: live mode + listOpenCommitments failed — skip all state-mutating live steps this tick (fail-closed; the markets stay dirty for next-tick retry).
+      if (this.makerAddress !== null) await this.checkIndexerLag(); // §5 latch 6 (PR2c-i) — poll own-state health, set indexerLagDegraded BEFORE reconcileMarkets' §5.1 posting gate reads it (address-gated like the subscription itself, not dryRun: runs for observability in a dry-run that carries an owner identity, gate dormant there)
+      // §5.1 active cancel-sweep (PR3b-ii) — derive the own-state-health hold ONCE per tick
+      // (AFTER checkIndexerLag so latch 6 is fresh; this is the call that fires the enter/clear
+      // edge). While the high-severity hold is active (degraded own-state + open exposure) we
+      // actively pull/cancel our quotes; reconcileMarkets below re-reads the now-settled hold
+      // (idempotent — no transition) and early-outs on it. In dry-run,
+      // updateStreamHealthHold returns false, so the sweep never runs.
+      {
+        const streamHealthNow = this.deps.now();
+        if (this.updateStreamHealthHold(streamHealthNow)) await this.streamHealthCancelSweep(streamHealthNow);
+      }
+      await this.reconcileMarkets();
+      await this.maybeOnchainCancelRecoveredSoftCancels(); // cancelMode:onchain only — authoritatively cancel matched soft-cancels (self-guards offchain/dry-run); after reconcileMarkets so the freed side re-quotes next tick
+      this.ageOut();
       this.pruneTerminalCommitments();
     } catch (err) {
       this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'tick' });
@@ -2777,11 +2723,16 @@ export class Runner {
   }
 
   /**
-   * Live-mode fill detection (DESIGN §10, §14). Each tick — *before* the per-market
-   * reconcile so a fill detected here dirties the market and the same tick's
-   * reconcile re-prices the now-imbalanced book — list the maker's open commitments
-   * via `commitments.list({maker, status:[open,partially_filled]})`, diff against
-   * the local `visibleOpen`/`partiallyFilled` set, and:
+   * Live-mode AUDIT probe over the maker's open commitments (DESIGN §10, §14;
+   * audit-only since OS-Phase 4 — fills reach canonical state in real time over
+   * the own-state stream). Each tick: reseed the audit clone from canonical,
+   * list the maker's open commitments via `commitments.list({maker,
+   * status:[open,partially_filled]})`, diff against the clone's
+   * `visibleOpen`/`partiallyFilled` set, and converge the CLONE with the same
+   * classification rules the poll-canonical era used (state-driving descriptors
+   * — fill / expire / position-transition / mark-dirty — are suppressed by
+   * `applyDescriptors(source:'audit')`; only the clone's records mutate, and the
+   * divergence comparator then cross-checks clone vs canonical):
    *
    *   - **Still listed, `filledRiskAmount` advanced** → partial-fill bump: extend the
    *     record's `filledRiskWei6`, reclassify `partiallyFilled`, extend the position
@@ -2809,27 +2760,17 @@ export class Runner {
    *       `expire`; else `nonceInvalidated` → `'authoritativelyInvalidated'`; else
    *       log `UnexpectedFillStatus` (a genuinely live commitment shouldn't vanish).
    *
-   * Local **past-local-expiry** records are INCLUDED in the diff: the chain commitment
-   * may have filled just before expiry, and `ageOut` (which runs after this step in
-   * the same tick) reclassifies on local time alone — without this step's per-hash
-   * `getCommitment` it would terminalize a record whose actual on-chain status is
-   * `filled`, silently losing the position.
+   * Local **past-local-expiry** records are INCLUDED in the diff so the audit
+   * clone classifies a just-before-expiry fill the same way canonical did when
+   * the stream delivered it — keeping the comparator's views aligned.
    *
-   * **Fail closed.** Returns `false` in two cases:
-   *   1. `listOpenCommitments` threw — the runner has no visibility into which
-   *      commitments filled / expired / were cancelled.
-   *   2. The per-hash `getCommitment` lookup threw for a *past-expiry* tracked
-   *      commitment that had disappeared from the listing. Without the lookup
-   *      we can't tell if it filled, expired, or was cancelled before vanishing,
-   *      and `ageOut` (running after this step in the same tick) would otherwise
-   *      terminalize the record on local time alone — releasing headroom + the
-   *      reconcile then submitting replacements on possibly-already-matched
-   *      exposure. Future-expiry lookup failures stay non-fatal (the record
-   *      stays live + counted; the next tick retries) — only the past-expiry
-   *      combo trips the gate (Hermes review-PR23-late).
-   * Either way the caller MUST skip the position poll, the reconcile, and
-   * `ageOut`. The other disappearances in the same tick still classify normally;
-   * only the failing past-expiry hash escalates to a tick-wide fail-closed.
+   * **Audit failures never gate trading.** A thrown `listOpenCommitments`, or a
+   * thrown per-hash `getCommitment` for a disappeared row, marks
+   * `auditPollFailedThisCycle`: the clone is left partially converged, so the
+   * comparator must not read it as a validated "clean" (it would wrongly clear
+   * a real divergence) — `runAuditComparator` skips the cycle and preserves
+   * latch state. Protection against trading on stale canonical state is the §5
+   * composite stream-health gate, not this probe.
    *
    * Bounded reads (DESIGN §10): one `listOpenCommitments` per tick at
    * `max(maxOpenCommitments × 2, 50)`; one `getCommitment` per disappeared hash
@@ -2838,26 +2779,17 @@ export class Runner {
    *
    * Soft-cancelled records are NOT tracked here (they're API-hidden from
    * `listOpenCommitments`, so a per-hash poll would be O(softCancelled count)
-   * forever). A taker matching a soft-cancelled commitment via the stale signed
-   * payload is caught by `pollPositionStatus` (one aggregate call) below — and
-   * `tick()` fails closed when that poll throws while any non-terminal
-   * `softCancelled` records exist, so a lost-poll tick can't terminalize a
-   * record that just filled.
+   * forever). The audit clone's soft-cancelled rows converge in
+   * `reconcileSoftCancelledFills`; canonically, a taker matching a
+   * soft-cancelled commitment via the stale signed payload arrives over the
+   * stream as a `fill` + hidden commitment update.
    */
-  private async detectFills(): Promise<boolean> {
-    if (this.makerAddress === null) return true; // dry-run path — defensive (the caller skips); treat as ok so the rest of the tick proceeds
-    // PR3b source flip: when subscribe is true the SSE stream is the canonical
-    // own-state writer, so the poll path runs as a best-effort AUDIT over a fresh
-    // clone of canonical (`this.auditState`) — cross-checking SSE-derived fills
-    // against the API. detectFills is the first poll method in the tick, so it
-    // (re)seeds the audit state from canonical for the whole audit cycle. An
-    // audit failure NEVER gates trading (returns true): the §5 health gate owns
-    // SSE fail-closed. In backout (subscribe:false) the poll IS canonical
-    // (writes this.state) and a failure gates the tick fail-closed as before.
-    const subscribe = this.config.ownState.subscribe;
-    if (subscribe) this.reseedAuditState();
-    const target = subscribe ? this.auditState : this.state;
-    const source: 'poll' | 'audit' = subscribe ? 'audit' : 'poll';
+  private async detectFills(): Promise<void> {
+    if (this.makerAddress === null) return; // dry-run path — defensive (the caller skips)
+    // detectFills is the first audit probe in the tick, so it (re)seeds the
+    // audit state from canonical for the whole audit cycle.
+    this.reseedAuditState();
+    const target = this.auditState;
     const now = this.deps.now();
     const reducerConfig = { expiryReleaseGraceSeconds: this.config.orders.expiryReleaseGraceSeconds };
     const localOpen = new Map<string, MakerCommitmentRecord>();
@@ -2867,7 +2799,7 @@ export class Runner {
       // just before expiry must be classified before `ageOut` terminalizes the record).
       localOpen.set(r.hash, r);
     }
-    if (localOpen.size === 0) return true; // nothing tracked → nothing to detect
+    if (localOpen.size === 0) return; // nothing tracked → nothing to audit
 
     const listLimit = Math.max(this.config.risk.maxOpenCommitments * 2, 50);
     let apiList: Commitment[];
@@ -2875,28 +2807,22 @@ export class Runner {
       apiList = await this.adapter.listOpenCommitments(this.makerAddress, listLimit);
     } catch (err) {
       this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'fill-detection' });
-      if (subscribe) this.auditPollFailedThisCycle = true; // audit didn't observe the API → must not validate/clear divergence
-      return subscribe ? true : false; // backout: fail closed (skip live writes + ageOut); audit: never gates trading
+      this.auditPollFailedThisCycle = true; // audit didn't observe the API → must not validate/clear divergence
+      return;
     }
     const apiByHash = new Map<string, Commitment>();
     for (const c of apiList) apiByHash.set(c.commitmentHash, c);
 
-    let pastExpiryLookupFailed = false;
-
-    // Pass 1 — still-listed commitments (partial-fill bumps).
+    // Pass 1 — still-listed commitments (partial-fill bumps on the clone).
     for (const [, record] of localOpen) {
       const apiCommitment = apiByHash.get(record.hash);
       if (apiCommitment === undefined) continue; // disappeared — handled below
       const observation: PolledCommitmentObservation = { kind: 'still-listed', record, apiCommitment };
       const descriptors = reducePolledCommitmentObservation(target, observation, now, reducerConfig);
-      const result = this.applyDescriptors(descriptors, source);
-      if (result.pastExpiryLookupFailed) pastExpiryLookupFailed = true;
+      this.applyDescriptors(descriptors, 'audit');
     }
 
     // Pass 2 — disappeared hashes (per-hash `getCommitment`, then reducer classifies).
-    // Past-expiry lookup failures escalate to fail-closed (the reducer signals via
-    // descriptor; `applyDescriptors` ORs into the result). Future-expiry lookup
-    // failures are non-fatal — the record stays live + counted, next tick retries.
     for (const [hash, record] of localOpen) {
       if (apiByHash.has(hash)) continue;
       let observation: PolledCommitmentObservation;
@@ -2909,14 +2835,11 @@ export class Runner {
         // per-hash getCommitment threw). The clone still carries the canonical
         // value for it, so the comparator must NOT read that as a validated
         // "clean" and clear a prior divergence — mark the audit cycle incomplete.
-        // (Backout still fails closed only via pastExpiryLookupFailed below.)
-        if (subscribe) this.auditPollFailedThisCycle = true;
+        this.auditPollFailedThisCycle = true;
       }
       const descriptors = reducePolledCommitmentObservation(target, observation, now, reducerConfig);
-      const result = this.applyDescriptors(descriptors, source);
-      if (result.pastExpiryLookupFailed) pastExpiryLookupFailed = true;
+      this.applyDescriptors(descriptors, 'audit');
     }
-    return subscribe ? true : !pastExpiryLookupFailed;
   }
 
   /**
@@ -2993,14 +2916,15 @@ export class Runner {
    * this method is purely IO + signal aggregation.
    *
    * The `source` tag distinguishes the canonical SSE writer (`'owner'`) from the
-   * AUDIT poll (`'audit'`, post PR3b): an audit-source pass runs the poll
-   * reducers against `this.auditState` purely to feed the divergence comparator,
-   * so it MUST NOT re-emit `fill` / `position-transition` telemetry (the SSE
-   * canonical path already emitted those) nor re-dirty markets (the audit must
-   * never drive posting). Audit suppresses those; it keeps `emit-error` +
-   * `emit-expire` (audit-internal anomalies) and the fail-closed signals.
+   * AUDIT poll (`'audit'`): an audit-source pass runs the poll reducers against
+   * `this.auditState` purely to feed the divergence comparator, so it MUST NOT
+   * re-emit `fill` / `position-transition` telemetry (the SSE canonical path
+   * already emitted those) nor re-dirty markets (the audit must never drive
+   * posting). Audit suppresses those; it keeps `emit-error` (audit-internal
+   * anomalies) and the orchestrator signals. (The pre-OS-Phase-4 `'poll'`
+   * source — the poll-canonical backout — is retired.)
    */
-  private applyDescriptors(descriptors: ReducerDescriptor[], source: 'poll' | 'owner' | 'audit'): ApplyDescriptorsResult {
+  private applyDescriptors(descriptors: ReducerDescriptor[], source: 'owner' | 'audit'): ApplyDescriptorsResult {
     const result: ApplyDescriptorsResult = { pastExpiryLookupFailed: false, softCancelledProbeFailed: false, unknownOwnFill: false };
     const audit = source === 'audit';
     for (const d of descriptors) {
@@ -3058,13 +2982,12 @@ export class Runner {
    * identity-guard inside the handlers can compare against
    * `this.currentOwnStateSubscription` correctly on the very first event.
    *
-   * PR3b source flip: the handlers feed the SSE-derived deltas into the
-   * `ownStateQueue`; `drainOwnState` then applies them to the CANONICAL
-   * `MakerState` via the PR3a mappers (this is now the canonical own-state
-   * writer when `subscribe:true`). The snapshot/`onReady` handlers write the
-   * `ownStateSession` baseline + swap it into `MakerState`. (In backout —
-   * `subscribe:false` — this subscription is never opened and the poll path
-   * remains the canonical writer.)
+   * The handlers feed the SSE-derived deltas into the `ownStateQueue`;
+   * `drainOwnState` then applies them to the CANONICAL `MakerState` via the
+   * PR3a mappers — the stream is the canonical own-state writer (OS-Phase 3
+   * source flip, always-on in live mode since OS-Phase 4). The
+   * snapshot/`onReady` handlers write the `ownStateSession` baseline + swap it
+   * into `MakerState`.
    */
   private openOwnStateSubscription(): void {
     if (this.makerAddress === null) return; // guarded by caller; defensive
@@ -3731,12 +3654,11 @@ export class Runner {
   /**
    * §5.1 own-state-health posting gate (own-state SSE plan, Hermes-locked).
    * Returns `true` — meaning {@link reconcileMarkets} must refuse NEW posting —
-   * when the runner is LIVE and SUBSCRIBED and the composite own-state health is
-   * degraded: we can't trust our own commitment/fill/position view, so adding (or
-   * compounding) exposure is unsafe. Inert in dry-run (nothing posts) and in
-   * poll-only mode (`subscribe: false` ⇒ no SSE health to assess), mirroring the
-   * funding guard's live-only hold; the gate therefore stays DORMANT until PR3b
-   * flips `subscribe: true`.
+   * when the runner is LIVE and the composite own-state health is degraded: we
+   * can't trust our own commitment/fill/position view, so adding (or
+   * compounding) exposure is unsafe. Inert in dry-run (nothing posts, and no
+   * subscription exists to assess), mirroring the funding guard's live-only
+   * hold. Always armed in live mode — the stream is always on (OS-Phase 4).
    *
    * Emits `stream-health-hold` ONLY on an enter/clear transition (a sustained
    * hold must not spam the log — same discipline as {@link setFundingHold}),
@@ -3750,7 +3672,7 @@ export class Runner {
    * matches mid-hold). The telemetry label is the enter-edge snapshot, not a guarantee.
    */
   private updateStreamHealthHold(nowSec: number): boolean {
-    const holding = !this.config.mode.dryRun && this.config.ownState.subscribe && !this.ownStateHealthy(nowSec);
+    const holding = !this.config.mode.dryRun && !this.ownStateHealthy(nowSec);
     if (holding === this.streamHealthHolding) return holding; // no transition — stay quiet
     this.streamHealthHolding = holding;
     if (holding) {
@@ -3779,10 +3701,11 @@ export class Runner {
    * let the MM add exposure, mirroring {@link checkFunding}'s read-failure posture
    * (always fail-closed here — no opt-out knob, unlike `fundingGuard.failClosedOnReadError`).
    * The latch holds its value between polls; {@link ownStateHealthy} reads it on each
-   * posting decision. The caller gates this to `ownState.subscribe` (the own-state gate
-   * is subscribe-only); it runs in dry-run+subscribe too (observability — the §5.1
-   * posting gate is dormant there). (The audit comparator, by contrast, does NOT run in
-   * dry-run: its `auditState` is poll-fed and the poll is `!dryRun`-gated — see
+   * posting decision. The caller gates this on `makerAddress` (the same predicate
+   * that opens the subscription); it runs in a dry-run that carries an owner
+   * identity too (observability — the §5.1 posting gate is dormant there). (The
+   * audit comparator, by contrast, does NOT run in dry-run: its `auditState` is
+   * audit-probe-fed and the probes are `!dryRun`-gated — see
    * {@link runAuditComparator}.) No signer / token (global probe).
    */
   private async checkIndexerLag(): Promise<void> {
@@ -3861,7 +3784,7 @@ export class Runner {
    * drives a single `divergence` telemetry emit per tick.
    *
    * Precondition gate (Hermes-required):
-   *   - `config.ownState.subscribe: true` — the stream is even opted in;
+   *   - live mode — the audit probes that feed `auditState` are `!dryRun`-gated;
    *   - `instantOwnStateHealthy(now)` — the FULL instantaneous mirror: the edge
    *     latches (ready + connected + no overflow / fatal / positionsTruncated +
    *     no token-refresh failure) AND `transportFresh` (latch 2 — a frame within
@@ -3900,15 +3823,14 @@ export class Runner {
       // poll completed this tick; the comparator runs FROM the next tick.)
       return;
     }
-    if (!this.config.ownState.subscribe) return;
     // The audit comparator is a LIVE-mode cross-check: `this.auditState` is fed
-    // ONLY by the poll path (detectFills/pollPositionStatus/reconcileSoftCancelledFills),
-    // which is gated behind `!dryRun` in `tick()`. In dry-run + subscribe the SSE
-    // still populates canonical `this.state` (for observability) but `auditState`
-    // stays empty, so comparing them would emit a CONSTANT false `divergence`
-    // (every canonical row reads as `missing-in-audit`) and latch
-    // `auditDivergenceUnresolved` — corrupting the very signal a dry-run+subscribe
-    // operator watches. Skip the comparison when the audit poll didn't run.
+    // ONLY by the audit probes (detectFills/pollPositionStatus/reconcileSoftCancelledFills),
+    // which are gated behind `!dryRun` in `tick()`. In a dry-run that carries an
+    // owner identity the SSE still populates canonical `this.state` (for
+    // observability) but `auditState` stays empty, so comparing them would emit
+    // a CONSTANT false `divergence` (every canonical row reads as
+    // `missing-in-audit`) and latch `auditDivergenceUnresolved` — corrupting the
+    // very signal such an operator watches. Skip when the audit probes didn't run.
     if (this.config.mode.dryRun) return;
     // The audit reseeds `auditState` from canonical BEFORE polling, so a FAILED
     // audit read this cycle leaves `auditState === canonical` (no API observation
@@ -4133,25 +4055,20 @@ export class Runner {
    * book-hidden + matchable on chain, just partially matched — `reconcileSoftCancelledFills`
    * keeps owning it, and the risk engine counts the remainder); `f >= risk` → `filled`.
    *
-   * **Fail-closed.** If `getCommitment(hash)` throws — a network error, or a 404 for a
-   * still-matchable signed payload — we must NOT treat the record as resolved /
-   * unfilled or let `ageOut` terminalize it this tick: it could have just matched. The
-   * record stays `softCancelled`, an `error` (`class: 'SoftCancelledProbeFailed'`) is
-   * emitted, and the step returns `false` so `tick()` skips `settleAndClaim` /
-   * `reconcileMarkets` / `ageOut` (the same fail-closed posture as a lost position
-   * poll). Returns `true` when every probe succeeded — or when there were no
-   * `softCancelled` records (nothing to do).
+   * **Audit failures never gate trading (OS-Phase 4).** If `getCommitment(hash)`
+   * throws — a network error, or a 404 for a still-matchable signed payload —
+   * the clone's record stays `softCancelled`, an `error`
+   * (`class: 'SoftCancelledProbeFailed'`) is emitted, and the cycle is marked
+   * `auditPollFailedThisCycle` so the comparator doesn't validate/clear a real
+   * divergence off a partially converged clone. Canonically, a fill on a
+   * soft-cancelled row arrives over the stream.
    */
-  private async reconcileSoftCancelledFills(): Promise<boolean> {
-    if (this.makerAddress === null) return true; // dry-run path — defensive (the caller skips); treat as ok
-    // PR3b: AUDIT over this.auditState when subscribe (cross-check; never gates
-    // trading); canonical this.state in backout (poll-canonical, fail-closed).
-    const subscribe = this.config.ownState.subscribe;
-    const target = subscribe ? this.auditState : this.state;
-    const source: 'poll' | 'audit' = subscribe ? 'audit' : 'poll';
+  private async reconcileSoftCancelledFills(): Promise<void> {
+    if (this.makerAddress === null) return; // dry-run path — defensive (the caller skips)
+    const target = this.auditState;
     const now = this.deps.now();
     const softCancelled = Object.values(target.commitments).filter((r) => r.lifecycle === 'softCancelled');
-    if (softCancelled.length === 0) return true; // nothing soft-cancelled → nothing to converge
+    if (softCancelled.length === 0) return; // nothing soft-cancelled → nothing to converge
     let allProbesOk = true;
     for (const record of softCancelled) {
       let observation:
@@ -4164,23 +4081,25 @@ export class Runner {
         observation = { kind: 'probe-failed', record, err };
       }
       const descriptors = reducePolledSoftCancelledObservation(target, observation, now);
-      const result = this.applyDescriptors(descriptors, source);
+      const result = this.applyDescriptors(descriptors, 'audit');
       if (result.softCancelledProbeFailed) allProbesOk = false;
     }
-    if (subscribe && !allProbesOk) this.auditPollFailedThisCycle = true; // a probe failed → audit observation incomplete; don't validate/clear divergence
-    return subscribe ? true : allProbesOk; // audit never gates trading
+    if (!allProbesOk) this.auditPollFailedThisCycle = true; // a probe failed → audit observation incomplete; don't validate/clear divergence
   }
 
   /**
-   * Live-mode position-status poll (DESIGN §10). One aggregate `getPositionStatus(maker)`
-   * call per tick — closes the soft-cancelled-then-matched gap that `detectFills`'s
-   * commitment-list diff can't see (a soft-cancelled commitment is API-hidden, so its
-   * stale-signed-payload match isn't visible until the indexer publishes the
-   * resulting position). For each position the API reports (`active`, `pendingSettle`,
-   * `claimable`) on `(speculationId, positionType)`, if the local
-   * `MakerPositionRecord.riskAmountWei6` is short, create / extend it by the delta,
-   * dirty the corresponding tracked market (a new on-chain fill changes the book
-   * imbalance), and emit `fill` `{ source: 'position-poll', … }`.
+   * Live-mode position-status AUDIT probe (DESIGN §10; audit-only since
+   * OS-Phase 4 — canonical position status arrives over the stream). One
+   * aggregate `getPositionStatus(maker)` call per tick converges the audit
+   * clone's positions, including the soft-cancelled-then-matched gap that
+   * `detectFills`'s commitment-list diff can't see (a soft-cancelled commitment
+   * is API-hidden, so its stale-signed-payload match isn't visible until the
+   * indexer publishes the resulting position). For each position the API
+   * reports (`active`, `pendingSettle`, `claimable`) on
+   * `(speculationId, positionType)`, if the clone's
+   * `MakerPositionRecord.riskAmountWei6` is short, create / extend it by the
+   * delta (the state-driving fill / mark-dirty / transition descriptors are
+   * suppressed by `applyDescriptors(source:'audit')` — only the clone mutates).
    *
    * The position record's contest / sport / team context comes from two
    * sources: an *existing* `MakerPositionRecord` carries its own denormalized
@@ -4214,45 +4133,39 @@ export class Runner {
    * risk → `fill` event) AND a creation at a non-`active` status (no transition
    * event — the position has no prior local status to transition *from*).
    *
-   * Returns `false` on a `getPositionStatus` throw (logged as `error`
-   * `phase: 'position-poll'`). The caller in `tick()` fails closed
-   * (skips reconcile + ageOut) only when local state holds any non-terminal
-   * `softCancelled` commitment — those are the records whose stale-signed-payload
-   * fills are visible ONLY through this poll. When no softCancelled records
-   * exist, `detectFills` has already covered the maker's posted commitments
-   * and the tick proceeds. (Hermes review-PR23 §4 + round-2.)
+   * On a `getPositionStatus` throw (logged as `error` `phase: 'position-poll'`)
+   * the cycle is marked `auditPollFailedThisCycle` — the comparator skips and
+   * preserves latch state; the tick proceeds (audit never gates trading,
+   * OS-Phase 4). Canonically, position status arrives over the stream's
+   * `positionStatus` events.
    */
-  private async pollPositionStatus(): Promise<boolean> {
-    if (this.makerAddress === null) return true; // dry-run path — defensive (the caller skips); treat as ok
-    // PR3b: AUDIT over this.auditState when subscribe (cross-check; never gates
-    // trading); canonical this.state in backout. detectFills already reseeded
-    // this.auditState from canonical this tick, so the position convergence
-    // resolves identity against the audit clone's commitments.
-    const subscribe = this.config.ownState.subscribe;
-    const target = subscribe ? this.auditState : this.state;
-    const source: 'poll' | 'audit' = subscribe ? 'audit' : 'poll';
+  private async pollPositionStatus(): Promise<void> {
+    if (this.makerAddress === null) return; // dry-run path — defensive (the caller skips)
+    // detectFills already reseeded this.auditState from canonical this tick, so
+    // the position convergence resolves identity against the audit clone's
+    // commitments.
+    const target = this.auditState;
     const now = this.deps.now();
     let status: PositionStatus;
     try {
       status = await this.adapter.getPositionStatus(this.makerAddress);
     } catch (err) {
       this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'position-poll' });
-      if (subscribe) this.auditPollFailedThisCycle = true; // audit didn't observe the API → must not validate/clear divergence
-      return subscribe ? true : false; // backout: caller fails closed iff non-terminal softCancelled commitments exist; audit: never gates
+      this.auditPollFailedThisCycle = true; // audit didn't observe the API → must not validate/clear divergence
+      return;
     }
     for (const p of status.active) {
       const descriptors = reducePolledPositionObservation(target, 'active', p as PolledPositionInput, undefined, undefined, now);
-      this.applyDescriptors(descriptors, source);
+      this.applyDescriptors(descriptors, 'audit');
     }
     for (const p of status.pendingSettle) {
       const descriptors = reducePolledPositionObservation(target, 'pendingSettle', p as PolledPositionInput, p.result, p.predictedWinSide, now);
-      this.applyDescriptors(descriptors, source);
+      this.applyDescriptors(descriptors, 'audit');
     }
     for (const p of status.claimable) {
       const descriptors = reducePolledPositionObservation(target, 'claimable', p as PolledPositionInput, p.result, undefined, now);
-      this.applyDescriptors(descriptors, source);
+      this.applyDescriptors(descriptors, 'audit');
     }
-    return true;
   }
 
   /**

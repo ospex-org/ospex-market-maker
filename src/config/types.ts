@@ -42,9 +42,6 @@ export type UnderfundedCancelMode = (typeof UNDERFUNDED_CANCEL_MODES)[number];
 export const LOG_LEVELS = ['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent'] as const;
 export type LogLevel = (typeof LOG_LEVELS)[number];
 
-/** Enforced floor for `pollIntervalMs` (DESIGN §7) — the runner clamps + warns below this. */
-export const POLL_INTERVAL_FLOOR_MS = 30_000;
-
 /**
  * The conservative per-IP SSE-connection cap on `ospex-core-api` (its default
  * `MAX_STREAM_CONNECTIONS_PER_IP`). Every open odds subscription — and, once they
@@ -91,27 +88,15 @@ export interface OddsConfig {
 }
 
 /**
- * Own-state SSE stream config (Phase 2 PR3 — wakeable runner infrastructure).
- * Phase 2 PR3 ships the queue + wake-signal primitives only; the SSE
- * subscription itself lands in PR4 (which will add `subscribe: boolean` to
- * this section). PR3's runner builds `OwnStateShadow` + drains the (still-empty)
- * queue at each wake / tick boundary — `debounceMs` governs how long the loop
- * waits between a `wake()` and the corresponding shadow drain so SSE bursts
- * coalesce into a single drain pass.
+ * Own-state SSE stream config. The owner-authenticated own-state stream is the
+ * canonical state driver (OS-Phase 3 source flip) and is ALWAYS ON in live
+ * mode (OS-Phase 4 retired the poll-driven backout): a live boot opens the
+ * subscription, and the per-tick poll survives only as the slow audit
+ * cross-check feeding the divergence comparator. Dry-run never subscribes —
+ * the stream is owner-authenticated and dry-run has no signer; its own-state
+ * surface stays inert.
  */
 export interface OwnStateConfig {
-  /**
-   * Open the maker's owner-authenticated own-state SSE stream at boot
-   * (Phase 2 PR4a). Default `false` — Phase 2 is opt-in until the comparator
-   * (PR5) is wired and soak-validated. When `true`, the runner refuses to
-   * boot in dry-run / without a `makerAddress` (the SDK's bearer-token mint
-   * needs a signer that owns the configured address).
-   *
-   * Phase 2 shadow-only invariant: when the stream is open, events flow into
-   * `OwnStateShadow` ONLY — canonical `MakerState` writes still come from
-   * the poll path. Phase 3 cutover flips the source.
-   */
-  subscribe: boolean;
   /**
    * Coalescing window after a wake fires before the loop drains the queue
    * (own-state-sse-plan §2.5.1). Range 250-1000ms; default 500ms.
@@ -130,10 +115,12 @@ export interface OwnStateConfig {
    */
   divergenceToleranceMs: number;
   /**
-   * Cadence (ms) of the own-state health poll (`client.ownState.health()`) that
-   * drives the `indexerLagDegraded` health latch (own-state SSE plan §5/A4).
-   * Selected only when `subscribe: true`. Range 10000-300000ms; default 60000ms.
-   * (Phase 3 PR2 ships the knob; the poll itself lands in PR2c.)
+   * The runner's single tick cadence (ms) since OS-Phase 4: paces the audit
+   * cross-check poll, the own-state health poll (`client.ownState.health()`,
+   * which drives the `indexerLagDegraded` latch — own-state SSE plan §5/A4),
+   * and the reconcile/settle/funding/ageOut sweep. Fills and lifecycle changes
+   * arrive in real time over the stream; nothing trading-critical waits on
+   * this interval. Range 10000-300000ms; default 60000ms.
    */
   auditPollIntervalMs: number;
   /**
@@ -232,7 +219,7 @@ export interface OrdersConfig {
    * `MatchingModule.cancelCommitment` (gas-gated, reserve-preserving), the only mode that
    * actually drops the exposure. Governs BOTH the routine partial-remainder / recovered
    * soft-cancel paths AND the §5.1 own-state-health active cancel-sweep (PR3b-ii) when
-   * `ownState.subscribe: true` and a high-severity stream-health hold is active. (No `none`
+   * a high-severity stream-health hold is active in live mode. (No `none`
    * opt-out — see `fundingGuard.underfundedCancelMode` for the guard that has one.)
    */
   cancelMode: CancelMode;
@@ -244,7 +231,7 @@ export interface FundingGuardConfig {
   /**
    * Minimum interval between on-chain funding re-reads (USDC balance + PositionModule
    * allowance). The check runs at most this often regardless of tick cadence — funding
-   * changes slowly and the reads cost RPC. Independent of `pollIntervalMs`.
+   * changes slowly and the reads cost RPC. Independent of `ownState.auditPollIntervalMs`.
    */
   checkIntervalMs: number;
   /**
@@ -305,6 +292,5 @@ export interface Config {
   state: StateConfig;
   killSwitchFile: string;
   killCancelOnChain: boolean;
-  pollIntervalMs: number;
   mode: ModeConfig;
 }

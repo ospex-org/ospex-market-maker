@@ -3,9 +3,10 @@
  * (own-state SSE plan §7, Phase 3 PR3b — the SOURCE FLIP).
  *
  * Before PR3b the owner reducers wrote a narrow audit-only `OwnStateShadow` and
- * the POLL path was canonical. PR3b inverts that: when `ownState.subscribe` is
- * true the SSE stream is the CANONICAL writer of `MakerState` and the poll path
- * is demoted to a slower AUDIT source (compared via `compareAuditVsCanonical`).
+ * the POLL path was canonical. PR3b inverted that (and OS-Phase 4 retired the
+ * poll-canonical backout): the SSE stream is the CANONICAL writer of
+ * `MakerState` and the per-tick probes are a slower AUDIT source (compared via
+ * `compareAuditVsCanonical`).
  * So these reducers now write `MakerState` directly, via the pure PR3a mappers
  * in `owner-mapping.ts` (`mapOwner{Commitment,Position}ToMaker` /
  * `mapPositionStatusEventToMaker`), and emit the same `mark-dirty` /

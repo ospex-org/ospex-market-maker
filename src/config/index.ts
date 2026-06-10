@@ -24,7 +24,6 @@ import {
   EXPIRY_MODES,
   KNOWN_SPORTS,
   LOG_LEVELS,
-  POLL_INTERVAL_FLOOR_MS,
   SPREAD_MODES,
   SUPPORTED_MARKETS,
   type ApprovalMode,
@@ -217,7 +216,7 @@ function def<T>(value: unknown, fallback: T, validate: (v: unknown) => T): T {
 const ROOT_KEYS = [
   'wallet', 'rpcUrl', 'apiUrl', 'chainId', 'marketSelection', 'discovery', 'odds', 'ownState', 'pricing',
   'risk', 'gas', 'approvals', 'orders', 'fundingGuard', 'settlement', 'telemetry', 'state', 'killSwitchFile',
-  'killCancelOnChain', 'pollIntervalMs', 'mode',
+  'killCancelOnChain', 'mode',
 ] as const;
 const WALLET_KEYS = ['keystorePath'] as const;
 const MARKET_SELECTION_KEYS = [
@@ -226,7 +225,7 @@ const MARKET_SELECTION_KEYS = [
 ] as const;
 const DISCOVERY_KEYS = ['everyNTicks', 'jitterPct'] as const;
 const ODDS_KEYS = ['subscribe', 'maxRealtimeChannels'] as const;
-const OWN_STATE_KEYS = ['subscribe', 'debounceMs', 'divergenceToleranceMs', 'auditPollIntervalMs', 'indexerLagMaxSeconds', 'staleMaxMs', 'recoveryHoldMs'] as const;
+const OWN_STATE_KEYS = ['debounceMs', 'divergenceToleranceMs', 'auditPollIntervalMs', 'indexerLagMaxSeconds', 'staleMaxMs', 'recoveryHoldMs'] as const;
 const PRICING_KEYS = ['mode', 'economics', 'direct', 'quoteBothSides', 'minEdgeBps', 'maxPerQuotePctOfCapital'] as const;
 const ECONOMICS_KEYS = [
   'capitalUSDC', 'targetMonthlyReturnPct', 'daysHorizon', 'estGamesPerDay', 'fillRateAssumption',
@@ -331,7 +330,6 @@ export function parseConfig(raw: unknown, env: EnvLike = {}): Config {
 
   const ownStateObj = section(root, 'ownState', OWN_STATE_KEYS);
   const ownState: OwnStateConfig = {
-    subscribe: def(ownStateObj.subscribe, false, (v) => asBoolean(v, 'ownState.subscribe')),
     debounceMs: def(ownStateObj.debounceMs, 500, (v) =>
       asNumberInRange(v, 'ownState.debounceMs', 250, 1000, { minInclusive: true, maxInclusive: true }),
     ),
@@ -477,7 +475,6 @@ export function parseConfig(raw: unknown, env: EnvLike = {}): Config {
     state,
     killSwitchFile: def(root.killSwitchFile, './KILL', (v) => asNonEmptyString(v, 'killSwitchFile')),
     killCancelOnChain: def(root.killCancelOnChain, false, (v) => asBoolean(v, 'killCancelOnChain')),
-    pollIntervalMs: def(root.pollIntervalMs, POLL_INTERVAL_FLOOR_MS, (v) => asPositiveInt(v, 'pollIntervalMs')),
     mode,
   };
   if (apiUrl !== undefined) config.apiUrl = apiUrl;

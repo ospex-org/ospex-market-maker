@@ -26,7 +26,7 @@ marketSelection:
   contestDenyList: []              # optional: never these contestIds
 
 discovery:
-  everyNTicks: 10                  # run discovery every N ticks (10 * 30s = ~5 min)
+  everyNTicks: 10                  # run discovery every N ticks (10 × the 60s tick = ~10 min)
   jitterPct: 0.2                   # +/- jitter on the discovery interval
 
 odds:
@@ -37,30 +37,26 @@ odds:
                                    #   streams from one host — keep this (plus ~3 reserved for own-state streams) under it, or raise
                                    #   the server cap. The runner warns at boot if the budget would be exceeded.
 
-ownState:
-  subscribe: false                 # Phase 3 cutover — opt-in to the owner-authenticated own-state SSE stream. Default false
-                                   #   until the cutover is soak-validated (§9 coverage matrix). `true` requires `mode.dryRun:
-                                   #   false` AND a `wallet.keystorePath` (the SDK mints a bearer token signed by the maker's key).
-                                   #   When true the SSE stream is the CANONICAL own-state writer and drives quote timing; the
-                                   #   poll path demotes to the 60s audit floor.
-  debounceMs: 500                  # Phase 2 PR3 — coalescing window (250-1000ms) after a wake fires before the runner drains the
+ownState:                          # The owner-authenticated own-state SSE stream is the CANONICAL own-state source and is
+                                   #   ALWAYS ON in live mode (it needs `wallet.keystorePath` — the SDK mints a bearer token
+                                   #   signed by the maker's key; live boot refuses without one). Dry-run never subscribes.
+                                   #   The per-tick poll survives only as a slow audit cross-check (divergence comparator).
+  debounceMs: 500                  # coalescing window (250-1000ms) after a wake fires before the runner drains the
                                    #   own-state queue. SSE bursts of N events within this window collapse to a single drain pass.
-                                   #   When subscribe:true these drains apply canonical own-state writes; in backout (subscribe:false)
-                                   #   the SSE is not opened and the poll path stays canonical.
-  divergenceToleranceMs: 5000      # Phase 2 PR5 — comparator suppresses divergences while EITHER the canonical/SSE-side last
-                                   #   observation OR the audit/poll-side last observation is within this window (1000-60000ms;
+  divergenceToleranceMs: 5000      # comparator suppresses divergences while EITHER the canonical/SSE-side last
+                                   #   observation OR the audit-side last observation is within this window (1000-60000ms;
                                    #   default 5000).
-                                   #   Persistent mismatch past this window is emitted regardless. Tune up if your poll interval is
-                                   #   large + SSE-vs-poll skew is expected; tune down for tighter divergence detection.
-  auditPollIntervalMs: 60000       # Phase 3 PR2 — cadence (10000-300000ms) of the own-state health poll that drives the
-                                   #   indexerLagDegraded health latch. Selected only when subscribe:true. Knob ships in PR2; the
-                                   #   poll itself lands in PR2c.
-  indexerLagMaxSeconds: 30         # Phase 3 PR2 — /v1/health/own-state indexerLagSeconds threshold (5-300s) at/above which the
-                                   #   indexerLagDegraded latch trips and gates posting. (Knob in PR2; latch in PR2c.)
-  staleMaxMs: 60000                # Phase 3 PR2 — transport-freshness window (30000-300000ms): the composite health predicate
+                                   #   Persistent mismatch past this window is emitted regardless. Tune up if your audit interval is
+                                   #   large + SSE-vs-audit skew is expected; tune down for tighter divergence detection.
+  auditPollIntervalMs: 60000       # the runner's single tick cadence (10000-300000ms): paces the audit cross-check, the
+                                   #   own-state health poll (indexerLagDegraded latch), and the reconcile/settle/funding sweep.
+                                   #   Fills arrive in real time over the stream — nothing trading-critical waits on this.
+  indexerLagMaxSeconds: 30         # /v1/health/own-state indexerLagSeconds threshold (5-300s) at/above which the
+                                   #   indexerLagDegraded latch trips and gates posting.
+  staleMaxMs: 60000                # transport-freshness window (30000-300000ms): the composite health predicate
                                    #   requires a frame (onFrame, incl. heartbeats) within this window. Floor stays above the
-                                   #   server's ~20s heartbeat so a quiet wallet's heartbeats keep it fresh. (Latch wired in PR2b.)
-  recoveryHoldMs: 30000            # Phase 3 PR2 — recovery hold (0-300000ms): after all health latches read healthy, the composite
+                                   #   server's ~20s heartbeat so a quiet wallet's heartbeats keep it fresh.
+  recoveryHoldMs: 30000            # recovery hold (0-300000ms): after all health latches read healthy, the composite
                                    #   stays UNhealthy until they've been continuously healthy this long — prevents flapping the
                                    #   posting gate on a brief recovery blip.
 
@@ -122,7 +118,7 @@ orders:
                                     #   "onchain" — authoritatively cancelCommitment the remainder on chain (costs POL gas,
                                     #     gas-gated WITHOUT the emergency reserve), then re-quote the freed side. Use this for
                                     #     long-lived / match-time quotes where a remainder would otherwise block the side for hours.
-                                    # ALSO governs the §5.1 own-state-health active cancel-sweep (when ownState.subscribe:true):
+                                    # ALSO governs the §5.1 own-state-health active cancel-sweep (live mode):
                                     #   on a high-severity stream-health hold the MM pulls its quotes off the relay ("offchain")
                                     #   and, under "onchain", authoritatively cancels them too. No "none" opt-out there.
 
@@ -155,8 +151,6 @@ state:
 
 killSwitchFile: ./KILL
 killCancelOnChain: false            # false = soft stop (pulled quotes expire on their own); true = hard stop (gas, uses reserve)
-
-pollIntervalMs: 30000               # enforced floor 30000 (see DESIGN §7); paces discovery + fill detection, not odds
 
 mode:
   dryRun: true                      # MASTER SAFETY FLAG. true = compute everything, post nothing.

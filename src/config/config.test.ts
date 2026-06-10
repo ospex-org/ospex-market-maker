@@ -10,14 +10,12 @@ describe('parseConfig', () => {
     expect(c.wallet.keystorePath).toBeUndefined();
     expect(c.chainId).toBe(137);
     expect(c.mode.dryRun).toBe(true);
-    expect(c.pollIntervalMs).toBe(30_000);
     expect(c.marketSelection.markets).toEqual(['moneyline']);
     expect(c.marketSelection.sports).toEqual(['mlb']);
     expect(c.marketSelection.maxTrackedContests).toBe(5);
     expect(c.discovery.everyNTicks).toBe(10);
     expect(c.odds.subscribe).toBe(true);
     expect(c.odds.maxRealtimeChannels).toBe(5);
-    expect(c.ownState.subscribe).toBe(false);
     expect(c.ownState.debounceMs).toBe(500);
     expect(c.ownState.divergenceToleranceMs).toBe(5000);
     expect(c.ownState.auditPollIntervalMs).toBe(60000);
@@ -166,7 +164,7 @@ describe('loadConfig', () => {
     expect(c.apiUrl).toBeUndefined(); // blank in the example → uses the SDK default
     expect(c.chainId).toBe(137);
     expect(c.mode.dryRun).toBe(true);
-    expect(c.pollIntervalMs).toBe(30_000);
+    expect(c.ownState.auditPollIntervalMs).toBe(60000);
     expect(c.marketSelection.sports).toEqual(['mlb']);
     expect(c.marketSelection.markets).toEqual(['moneyline']);
     expect(c.pricing.mode).toBe('economics');

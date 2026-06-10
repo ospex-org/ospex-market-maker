@@ -58,6 +58,11 @@ function cfg(overrides: Record<string, unknown> = {}): Config {
     state: { dir: stateDir },
     killSwitchFile: join(stateDir, 'KILL'),
     orders: { expirySeconds: 120 },
+    // The harness clock is frozen at T0, so the §5.1 recovery hold (latch 8)
+    // would never elapse — default it to 0 so a live test whose stub stream
+    // reaches ready+connected+fresh is immediately healthy. Recovery-hold
+    // tests override `ownState` wholesale (shallow spread) and set their own.
+    ownState: { recoveryHoldMs: 0 },
     ...overrides,
   });
 }
@@ -97,6 +102,10 @@ function makeRunner(opts: { config?: Config; adapter?: OspexAdapter; runId?: str
     vi.spyOn(adapter, 'getOddsSnapshot').mockRejectedValue(new Error('makeRunner: getOddsSnapshot not stubbed — pass an `adapter` (see `spiedAdapter`) if your test exercises odds'));
     vi.spyOn(adapter, 'subscribeOdds').mockRejectedValue(new Error('makeRunner: subscribeOdds not stubbed — pass an `adapter` (see `spiedAdapter`) if your test exercises odds'));
     vi.spyOn(adapter, 'getSpeculation').mockRejectedValue(new Error('makeRunner: getSpeculation not stubbed — pass an `adapter` (see `spiedAdapter`) if your test exercises the reconcile'));
+    // Boot opens the own-state subscription whenever a makerAddress is present
+    // (always-on since OS-Phase 4) — stub it inert so no real SSE handshake
+    // happens. Tests that exercise the stream pass their own adapter + recorder.
+    vi.spyOn(adapter, 'subscribeOwnState').mockImplementation(() => ({ unsubscribe: () => Promise.resolve() }));
   }
   // Default the maker address to the fake signer's address for any live-mode test that
   // doesn't override it — keeps the live-execution tests (which all use the same fake
@@ -347,6 +356,36 @@ function submitRecorder(): { fn: (args: SubmitCommitmentArgs) => Promise<SubmitC
 const MOCK_OWN_STATE_HEALTH: OwnStateHealth = { indexerLagSeconds: 0, lastIndexedAt: '2026-01-01T00:00:00Z', lagSource: 'test' };
 
 /**
+ * The default `subscribeOwnState` stub for {@link liveSpiedAdapter}: live boots
+ * always open the own-state subscription (OS-Phase 4), so every live-mode test
+ * needs one that (a) makes no network call and (b) drives the §5.1 composite
+ * health to healthy — otherwise the posting gate holds and, with open exposure,
+ * the active cancel-sweep would soft-cancel the test's seeded quotes each tick.
+ *
+ * It fires, on a microtask (the runner assigns its subscription handle right
+ * after `subscribe` returns — events fired synchronously would fail the
+ * identity guard): `onFrame` (transportFresh anchor at the frozen clock) →
+ * `onReady` → `onStatus('connected')`. It deliberately fires NO snapshot:
+ * `onReady` with no pending baseline flips `ready` without a baseline swap, so
+ * state a test seeded via `StateStore.flush` BEFORE boot survives as canonical.
+ * (A real cold connect always snapshots before ready — tests exercising real
+ * stream semantics use `makeOwnStateRecorder` and fire their own sequence.)
+ * Combined with cfg()'s `recoveryHoldMs: 0`, the composite is healthy from
+ * tick 1.
+ */
+function autoHealthyOwnStateStub(): OspexAdapter['subscribeOwnState'] {
+  return ((_opts: unknown, handlers: unknown) => {
+    const h = handlers as Record<string, ((...args: unknown[]) => void) | undefined>;
+    queueMicrotask(() => {
+      h.onFrame?.({ receivedAtMs: 0, kind: 'heartbeat' });
+      h.onReady?.({ cursor: '' });
+      h.onStatus?.('connected');
+    });
+    return { unsubscribe: () => Promise.resolve() };
+  }) as unknown as OspexAdapter['subscribeOwnState'];
+}
+
+/**
  * A *signed* adapter (`createLiveOspexAdapter`, so `isLive()` is true) with the same
  * reads spied as {@link spiedAdapter}, plus the live writes: `submitCommitment`
  * defaults to rejecting (a test that triggers a submit must stub it via `writes`),
@@ -406,9 +445,12 @@ function liveSpiedAdapter(
   // Default `readBalances` returns saturated USDC so exact-mode auto-approve isn't wallet-bound below the cap ceiling
   // unless a test explicitly underfunds the wallet. Other balances are non-zero placeholders.
   vi.spyOn(adapter, 'readBalances').mockImplementation(reads?.readBalances ?? ((owner: Hex) => Promise.resolve({ owner, chainId: 137, native: 1_000_000_000_000_000_000n, usdc: 2n ** 255n, link: 0n, usdcAddress: '0xusdc' as Hex, linkAddress: '0xlink' as Hex })));
-  // Default the indexer-lag probe (latch 6, PR2c-i) to healthy so a live subscribe-true
+  // Default the indexer-lag probe (latch 6, PR2c-i) to healthy so a live
   // test doesn't fail-closed on the per-tick health poll; latch-6 tests override it.
   vi.spyOn(adapter, 'getOwnStateHealth').mockImplementation(reads?.getOwnStateHealth ?? (() => Promise.resolve(MOCK_OWN_STATE_HEALTH)));
+  // Live boots always open the own-state subscription (OS-Phase 4): default to
+  // the auto-healthy stub. Stream-semantics tests re-spy with their recorder.
+  vi.spyOn(adapter, 'subscribeOwnState').mockImplementation(autoHealthyOwnStateStub());
   return adapter;
 }
 
@@ -692,27 +734,14 @@ describe('Runner — tick loop', () => {
     expect(existsSync(join(stateDir, 'maker-state.json'))).toBe(true);
   });
 
-  it('clamps pollIntervalMs to the floor and logs the clamp once', async () => {
-    const sleepMsCalls: number[] = [];
-    const lines: string[] = [];
-    await makeRunner({
-      config: cfg({ pollIntervalMs: 5000 }),
-      maxTicks: 3,
-      deps: { sleep: (ms) => { sleepMsCalls.push(ms); return Promise.resolve(); }, log: (l) => lines.push(l) },
-    }).run();
-    expect(sleepMsCalls).toEqual([30000, 30000]); // 3 ticks → 2 sleeps (the loop exits after tick 3 before sleeping)
-    expect(lines.filter((l) => /clamping to 30000ms/.test(l))).toHaveLength(1);
-  });
+  // ── tick cadence (sleepMs — single knob since OS-Phase 4) ────────────────
 
-  // ── PR3b source flip — tick cadence selection (sleepMs) ──────────────────
-
-  it('subscribe:true paces the tick at auditPollIntervalMs (the SSE stream drives own-state real-time; the poll is the slower AUDIT cross-check)', async () => {
+  it('the tick paces at auditPollIntervalMs — the single cadence knob (the SSE stream drives own-state real-time; the per-tick poll is only the AUDIT cross-check)', async () => {
     const sleepMsCalls: number[] = [];
-    // auditPollIntervalMs:10000 is the config-min — legal AND BELOW the 30000 trading
-    // floor. This is the bite-gap case: a regression that clamped the subscribe
-    // cadence to POLL_INTERVAL_FLOOR_MS (as the backout path does) would yield 30000,
-    // NOT 10000. (A value above the floor, e.g. 45000, would pass either way.)
-    const config = cfg({ ownState: { subscribe: true, auditPollIntervalMs: 10000 } });
+    // auditPollIntervalMs:10000 is the config-min — legal AND below the retired
+    // trading floor (30000). A regression that re-introduced a floor clamp on
+    // the tick cadence would yield 30000, NOT 10000.
+    const config = cfg({ ownState: { auditPollIntervalMs: 10000 } });
     const adapter = createOspexAdapter(config);
     vi.spyOn(adapter, 'listContests').mockResolvedValue([]);
     vi.spyOn(adapter, 'getOwnStateHealth').mockResolvedValue(MOCK_OWN_STATE_HEALTH);
@@ -722,22 +751,18 @@ describe('Runner — tick loop', () => {
       config, adapter, maxTicks: 3, makerAddress: DEFAULT_FAKE_MAKER_ADDRESS as Hex,
       deps: { sleep: (ms) => { sleepMsCalls.push(ms); return Promise.resolve(); } },
     }).run();
-    // 3 ticks → 2 poll-deadline sleeps, each at auditPollIntervalMs (NOT clamped to the 30000 trading floor).
+    // 3 ticks → 2 poll-deadline sleeps, each at auditPollIntervalMs.
     expect(sleepMsCalls).toEqual([10000, 10000]);
   });
 
-  it('subscribe:false (backout) paces the tick at the trading pollIntervalMs/floor, NOT auditPollIntervalMs', async () => {
+  it('dry-run paces at the same auditPollIntervalMs cadence (no subscription, no separate trading cadence)', async () => {
     const sleepMsCalls: number[] = [];
-    // pollIntervalMs above the floor + a distinct auditPollIntervalMs that MUST be ignored in backout.
-    const config = cfg({ pollIntervalMs: 40000, ownState: { subscribe: false, auditPollIntervalMs: 45000 } });
-    const adapter = createOspexAdapter(config);
-    vi.spyOn(adapter, 'listContests').mockResolvedValue([]);
+    const config = cfg({ ownState: { auditPollIntervalMs: 45000 } }); // dryRun default true; no makerAddress → never subscribes
     await makeRunner({
-      config, maxTicks: 3, adapter,
+      config, maxTicks: 3,
       deps: { sleep: (ms) => { sleepMsCalls.push(ms); return Promise.resolve(); } },
     }).run();
-    // Trading cadence = max(pollIntervalMs, POLL_INTERVAL_FLOOR_MS) = 40000; the audit interval is unused in backout.
-    expect(sleepMsCalls).toEqual([40000, 40000]);
+    expect(sleepMsCalls).toEqual([45000, 45000]);
   });
 
   it('warns at boot when odds.maxRealtimeChannels + reserved own-state streams would exceed the core-api per-IP cap', () => {
@@ -785,7 +810,7 @@ describe('Runner — wakeable loop (Phase 2 PR3)', () => {
 
     // Wait for tick 1 to complete and the first main-wait sleep to be entered.
     await waitFor(() => sleepCalls.length >= 1);
-    expect(sleepCalls[0]).toBe(30_000);
+    expect(sleepCalls[0]).toBe(60_000);
 
     runner.wake(); // aborts the composed signal → sleep 1 resolves via the abort listener
     await waitFor(() => sleepCalls.length >= 2);
@@ -796,7 +821,7 @@ describe('Runner — wakeable loop (Phase 2 PR3)', () => {
     if (resolveDebounce === undefined) throw new Error('expected debounce resolver');
     resolveDebounce();
     await waitFor(() => sleepCalls.length >= 3);
-    expect(sleepCalls[2]).toBeLessThanOrEqual(30_000); // remaining wait of the original deadline
+    expect(sleepCalls[2]).toBeLessThanOrEqual(60_000); // remaining wait of the original deadline (auditPollIntervalMs cadence)
 
     // Kill the runner so the loop exits — verifies wake didn't promote to tick.
     triggerKill();
@@ -855,7 +880,7 @@ describe('Runner — wakeable loop (Phase 2 PR3)', () => {
     const runPromise = runner.run();
 
     await waitFor(() => sleepCalls.length >= 1);
-    expect(sleepCalls[0]).toBe(30_000); // main wait
+    expect(sleepCalls[0]).toBe(60_000); // main wait
 
     runner.wake(); // wake 1: aborts main wait → outcome wake
     await waitFor(() => sleepCalls.length >= 2);
@@ -896,8 +921,8 @@ describe('Runner — wakeable loop (Phase 2 PR3)', () => {
     await runner.run();
     const events = readEvents();
     expect(events.filter((e) => e.kind === 'tick-start').map((e) => e.tick)).toEqual([1, 2, 3]);
-    // Same `[30000, 30000]` shape the pre-PR3 test (Runner — tick loop / clamps pollIntervalMs ...) asserted.
-    expect(sleepMsCalls).toEqual([30_000, 30_000]);
+    // Two main waits at the default auditPollIntervalMs (the single cadence since OS-Phase 4).
+    expect(sleepMsCalls).toEqual([60_000, 60_000]);
   });
 });
 
@@ -990,8 +1015,8 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
     };
   }
 
-  it('does NOT open the SSE subscription when config.ownState.subscribe=false (default)', async () => {
-    const config = cfg(); // subscribe defaults false
+  it('does NOT open the SSE subscription without an owner identity (dry-run, no makerAddress)', async () => {
+    const config = cfg(); // dry-run default; makeRunner passes no makerAddress for a non-live adapter
     const recorder = makeOwnStateRecorder();
     const adapter = createOspexAdapter(config);
     vi.spyOn(adapter, 'listContests').mockResolvedValue([]);
@@ -1001,8 +1026,8 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
     expect(recorder.handler('onReady')).toBeUndefined();
   });
 
-  it('opens the SSE subscription on boot when config.ownState.subscribe=true', async () => {
-    const config = cfg({ ownState: { subscribe: true } });
+  it('opens the SSE subscription on boot whenever a makerAddress is present (always-on since OS-Phase 4 — no opt-in flag)', async () => {
+    const config = cfg({ ownState: { recoveryHoldMs: 0 } });
     const recorder = makeOwnStateRecorder();
     const adapter = createOspexAdapter(config);
     vi.spyOn(adapter, 'listContests').mockResolvedValue([]);
@@ -1014,13 +1039,17 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
     expect(recorder.isUnsubscribed).toBe(true);
   });
 
-  it('boot refuses subscribe=true without a maker address (dry-run can\'t mint the bearer token)', () => {
-    const config = cfg({ ownState: { subscribe: true } }); // mode.dryRun stays true by default
-    expect(() => makeRunner({ config })).toThrow(/own-state SSE stream is owner-authenticated/);
+  it('boot refuses LIVE mode without a maker address (the always-on own-state stream is owner-authenticated)', () => {
+    const config = cfg({ mode: { dryRun: false } });
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([]));
+    // Construct directly: makeRunner would default the maker address for a live adapter.
+    expect(
+      () => new Runner({ config, adapter, stateStore: StateStore.at(config.state.dir), runId: RUN_ID, deps: { ...noopDeps } }),
+    ).toThrow(/own-state SSE stream is owner-authenticated/);
   });
 
   it('lifecycle invariant — a stale-sub handler must NOT mutate shadow / enqueue / wake (adversarial)', async () => {
-    const config = cfg({ ownState: { subscribe: true } });
+    const config = cfg({ ownState: { recoveryHoldMs: 0 } });
     const recorder = makeOwnStateRecorder();
     const adapter = createOspexAdapter(config);
     vi.spyOn(adapter, 'listContests').mockResolvedValue([]);
@@ -1066,7 +1095,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
   async function makePausedSubscribedRunner(
     opts: { config?: Config; adapter?: OspexAdapter; deps?: Partial<RunnerDeps>; seedState?: MakerState } = {},
   ) {
-    const config = opts.config ?? cfg({ ownState: { subscribe: true } });
+    const config = opts.config ?? cfg({ ownState: { recoveryHoldMs: 0 } });
     const recorder = makeOwnStateRecorder();
     let adapter = opts.adapter;
     if (adapter === undefined) {
@@ -1720,7 +1749,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
     it('ownStateHealthy() gate is false until the latches stay healthy for recoveryHoldMs, then true', async () => {
       let t = T0;
       const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner({
-        config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 30000 } }),
+        config: cfg({ ownState: { recoveryHoldMs: 30000 } }),
         deps: { now: () => t },
       });
       fireHealthyBaseline(recorder); // eligibility anchored at t === T0
@@ -1736,7 +1765,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
 
     it('recoveryHoldMs:0 → the gate is satisfied the instant the latches are healthy', async () => {
       const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner({
-        config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 0 } }),
+        config: cfg({ ownState: { recoveryHoldMs: 0 } }),
       });
       fireHealthyBaseline(recorder);
       expect(runner.ownStateHealthyForTest()).toBe(true);
@@ -1750,7 +1779,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
         // Large staleMaxMs: the single fireHealthyBaseline frame must stay fresh
         // across the clock advance to T0+60 so transportFresh (latch 2) doesn't
         // confound what this test isolates — the recovery hold (latch 8).
-        config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 30000, staleMaxMs: 300000 } }),
+        config: cfg({ ownState: { recoveryHoldMs: 30000, staleMaxMs: 300000 } }),
         deps: { now: () => t },
       });
       fireHealthyBaseline(recorder); // anchored at T0
@@ -1773,7 +1802,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
 
     it('a fatal stream error trips the mirror; onStatus(connected) clears it (Phase-2 fatal input preserved)', async () => {
       const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner({
-        config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 0 } }),
+        config: cfg({ ownState: { recoveryHoldMs: 0 } }),
       });
       fireHealthyBaseline(recorder);
       expect(runner.ownStateSessionView().healthy).toBe(true);
@@ -1796,7 +1825,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
 
     it('§5.1 live gate halts NEW posting while own-state is unhealthy (no submit, even with a quotable market)', async () => {
       StateStore.at(stateDir).flush(emptyMakerState()); // clean state → no boot-loss hold; isolate the §5.1 gate as the sole halt
-      const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: true } });
+      const config = cfg({ mode: { dryRun: false } });
       const submit = submitRecorder();
       const recorder = makeOwnStateRecorder();
       const adapter = liveSpiedAdapter(config, () => Promise.resolve([contestView({ contestId: '1234' })]), { submitCommitment: submit.fn });
@@ -1810,7 +1839,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
     });
 
     it('§5.1 entered telemetry: severity LOW when there is no open exposure', async () => {
-      const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: true } });
+      const config = cfg({ mode: { dryRun: false } });
       const adapter = liveSpiedAdapter(config, () => Promise.resolve([]));
       const { runPromise, triggerKill } = await makePausedSubscribedRunner({ config, adapter, seedState: emptyMakerState() });
       triggerKill();
@@ -1821,7 +1850,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
     });
 
     it('§5.1 entered telemetry: severity HIGH when there is open exposure to protect', async () => {
-      const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: true } });
+      const config = cfg({ mode: { dryRun: false } });
       const record = commitmentRecord({ hash: '0xexposed' }); // visibleOpen, 250000 wei6, future expiry
       const adapter = liveSpiedAdapter(
         config, () => Promise.resolve([]), undefined, undefined, undefined,
@@ -1839,7 +1868,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
 
     it('§5.1 live gate clears + resumes posting once own-state becomes healthy', async () => {
       StateStore.at(stateDir).flush(emptyMakerState());
-      const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: true, recoveryHoldMs: 0 } });
+      const config = cfg({ mode: { dryRun: false }, ownState: { recoveryHoldMs: 0 } });
       const submit = submitRecorder();
       const adapter = liveSpiedAdapter(config, () => Promise.resolve([contestView({ contestId: '1234' })]), { submitCommitment: submit.fn });
       const { runner, recorder, runPromise, resolvers, triggerKill } = await makePausedSubscribedRunner({ config, adapter });
@@ -1858,7 +1887,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
 
     it('setStreamOverflowDegradedForTest recomputes composite health with NO intervening event (seam mirrors every production latch site)', async () => {
       const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner({
-        config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 0 } }),
+        config: cfg({ ownState: { recoveryHoldMs: 0 } }),
       });
       fireHealthyBaseline(recorder);
       expect(runner.ownStateSessionView().healthy).toBe(true);
@@ -1874,7 +1903,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
 
     it('a REAL queue overflow through drainShadow flips a previously-healthy mirror false (production recompute path, not the seam)', async () => {
       const { runner, recorder, runPromise, resolvers, triggerKill } = await makePausedSubscribedRunner({
-        config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 0 } }),
+        config: cfg({ ownState: { recoveryHoldMs: 0 } }),
       });
       fireHealthyBaseline(recorder);
       expect(runner.ownStateSessionView().healthy).toBe(true);
@@ -1891,7 +1920,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
     });
 
     it('§5.1 + funding: the stream-health-hold edge still emits when fundingHold ALSO halts the same pass (above-dispatch placement)', async () => {
-      const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: true }, fundingGuard: { underfundedCancelMode: 'none' } });
+      const config = cfg({ mode: { dryRun: false }, fundingGuard: { underfundedCancelMode: 'none' } });
       const record = commitmentRecord({ hash: '0xfund' }); // visibleOpen, 250000 wei6 → required > 0
       StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { [record.hash]: record } });
       const recorder = makeOwnStateRecorder();
@@ -1916,7 +1945,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
       const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner({
         // Large staleMaxMs so the fireHealthyBaseline frame stays fresh across the
         // advance to T0+100 — isolates the recovery hold from transportFresh.
-        config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 30000, staleMaxMs: 300000 } }),
+        config: cfg({ ownState: { recoveryHoldMs: 30000, staleMaxMs: 300000 } }),
         deps: { now: () => t },
       });
       fireHealthyBaseline(recorder); // anchored at T0
@@ -1932,7 +1961,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
 
     it('§5.1 race: a same-tick overflow during tick I/O (after a healthy shadow) halts posting before reconcile — no submit (Hermes #73)', async () => {
       StateStore.at(stateDir).flush(emptyMakerState()); // clean state → no boot/funding hold; isolate the §5.1 gate
-      const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: true, recoveryHoldMs: 0 } });
+      const config = cfg({ mode: { dryRun: false }, ownState: { recoveryHoldMs: 0 } });
       const submit = submitRecorder();
       const recorder = makeOwnStateRecorder();
       let injected = false;
@@ -1988,7 +2017,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
 
     it('§5.1 race 2: an overflow AFTER the top reconcile gate (mid-getSpeculation, before submit) is refused at the submit site (Hermes #73 r2)', async () => {
       StateStore.at(stateDir).flush(emptyMakerState()); // clean state → no boot/funding hold; isolate the §5.1 gate
-      const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: true, recoveryHoldMs: 0 } });
+      const config = cfg({ mode: { dryRun: false }, ownState: { recoveryHoldMs: 0 } });
       const submit = submitRecorder();
       const recorder = makeOwnStateRecorder();
       let healthyFired = false;
@@ -2040,7 +2069,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
 
     it('§5.1 race 3: own-state degrading INSIDE the SDK submit (the beforePost boundary) refuses the POST (Hermes #73 r3)', async () => {
       StateStore.at(stateDir).flush(emptyMakerState()); // clean state → no boot/funding hold; isolate the §5.1 gate
-      const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: true, recoveryHoldMs: 0 } });
+      const config = cfg({ mode: { dryRun: false }, ownState: { recoveryHoldMs: 0 } });
       const submit = submitRecorder();
       const recorder = makeOwnStateRecorder();
       let healthyFired = false;
@@ -2104,7 +2133,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
     describe('latch 2 — transportFresh + latch 7 — tokenRefreshFailureInFlight', () => {
       it('the edge mirror is healthy without a frame, but the gate is NOT (transportFresh is gate-only, not a stored mirror bit)', async () => {
         const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner({
-          config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 0 } }),
+          config: cfg({ ownState: { recoveryHoldMs: 0 } }),
         });
         // Baseline + connected, but NO frame — exercises the deliberate split.
         recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: false }, { cursor: 's1' });
@@ -2123,7 +2152,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
       it('latch 2: the gate goes false when no frame arrives within staleMaxMs — while the edge mirror stays healthy', async () => {
         let t = T0;
         const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner({
-          config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 0, staleMaxMs: 60000 } }),
+          config: cfg({ ownState: { recoveryHoldMs: 0, staleMaxMs: 60000 } }),
           deps: { now: () => t },
         });
         fireHealthyBaseline(recorder); // frame + baseline + connected at T0
@@ -2143,7 +2172,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
       it('latch 2 gap-detect: a frame after a staleness gap (with NO intervening read) RESTARTS the recovery hold', async () => {
         let t = T0;
         const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner({
-          config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 30000, staleMaxMs: 60000 } }),
+          config: cfg({ ownState: { recoveryHoldMs: 30000, staleMaxMs: 60000 } }),
           deps: { now: () => t },
         });
         fireHealthyBaseline(recorder); // frame + healthy, anchored at T0
@@ -2164,7 +2193,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
       it('latch 2 gap-detect boundary: a frame at EXACTLY gap == staleMaxMs resets the hold (inclusive >=, paired with transportFresh\'s exclusive <)', async () => {
         let t = T0;
         const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner({
-          config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 30000, staleMaxMs: 60000 } }),
+          config: cfg({ ownState: { recoveryHoldMs: 30000, staleMaxMs: 60000 } }),
           deps: { now: () => t },
         });
         fireHealthyBaseline(recorder); // frame + healthy, anchored at T0
@@ -2187,7 +2216,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
       it('latch 2 read-time decay: reading the gate during a staleness window clears the recovery-hold anchor', async () => {
         let t = T0;
         const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner({
-          config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 30000, staleMaxMs: 60000 } }),
+          config: cfg({ ownState: { recoveryHoldMs: 30000, staleMaxMs: 60000 } }),
           deps: { now: () => t },
         });
         fireHealthyBaseline(recorder);
@@ -2206,7 +2235,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
       it('latch 2: a heartbeat frame keeps transportFresh alive on a quiet wallet (no domain event needed)', async () => {
         let t = T0;
         const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner({
-          config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 0, staleMaxMs: 60000 } }),
+          config: cfg({ ownState: { recoveryHoldMs: 0, staleMaxMs: 60000 } }),
           deps: { now: () => t },
         });
         fireHealthyBaseline(recorder); // frame at T0
@@ -2224,7 +2253,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
 
       it('latch 7: a token-refresh stream error trips the mirror; a frame clears it (auth recovered)', async () => {
         const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner({
-          config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 0 } }),
+          config: cfg({ ownState: { recoveryHoldMs: 0 } }),
         });
         fireHealthyBaseline(recorder);
         expect(runner.ownStateSessionView().healthy).toBe(true);
@@ -2246,7 +2275,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
 
       it('latch 7: a token-MINT error (initial connect) does NOT trip latch 7 — only token-refresh does', async () => {
         const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner({
-          config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 0 } }),
+          config: cfg({ ownState: { recoveryHoldMs: 0 } }),
         });
         fireHealthyBaseline(recorder);
         recorder.fire('onError', new OspexStreamError('mint failed', { reason: 'connection_failed', phase: 'token-mint' }));
@@ -2258,7 +2287,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
 
       it('latch 7 backstop: onStatus(connected) clears the token-refresh latch even with no frame', async () => {
         const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner({
-          config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 0 } }),
+          config: cfg({ ownState: { recoveryHoldMs: 0 } }),
         });
         fireHealthyBaseline(recorder);
         recorder.fire('onError', new OspexStreamError('refresh failed', { reason: 'connection_failed', phase: 'token-refresh' }));
@@ -2271,7 +2300,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
 
       it('latch 7: a resync rebaseline clears the token-refresh latch (fresh connection, independent auth)', async () => {
         const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner({
-          config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 0 } }),
+          config: cfg({ ownState: { recoveryHoldMs: 0 } }),
         });
         fireHealthyBaseline(recorder);
         recorder.fire('onError', new OspexStreamError('refresh failed', { reason: 'connection_failed', phase: 'token-refresh' }));
@@ -2307,7 +2336,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
         // comparator detects a real commitment-lifecycle + commitment-filled field
         // divergence — NOT the dry-run empty-audit `missing-in-audit` artifact.
         const t = T0; // fixed injected clock → the baseline frame stays fresh regardless of real wall-clock
-        const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: true, recoveryHoldMs: 0, staleMaxMs: 60000 } });
+        const config = cfg({ mode: { dryRun: false }, ownState: { recoveryHoldMs: 0, staleMaxMs: 60000 } });
         const adapter = liveDivergentAdapter(config, '0xdiv');
         const { runner, recorder, runPromise, resolvers, triggerKill } = await makePausedSubscribedRunner({
           config,
@@ -2331,12 +2360,12 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
 
       it('comparator SKIPS the audit when transport is STALE even though the edge mirror is healthy (gates on instantOwnStateHealthy, not shadow.healthy)', async () => {
         let t = T0;
-        const adapter = createOspexAdapter(cfg({ ownState: { subscribe: true } }));
+        const adapter = createOspexAdapter(cfg({ ownState: { recoveryHoldMs: 0 } }));
         vi.spyOn(adapter, 'listContests').mockResolvedValue([]);
         vi.spyOn(adapter, 'listOpenCommitments').mockResolvedValue([]);
         vi.spyOn(adapter, 'getOwnStateHealth').mockResolvedValue(MOCK_OWN_STATE_HEALTH);
         const { runner, recorder, runPromise, sleepCalls, resolvers, triggerKill } = await makePausedSubscribedRunner({
-          config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 0, staleMaxMs: 60000 } }),
+          config: cfg({ ownState: { recoveryHoldMs: 0, staleMaxMs: 60000 } }),
           adapter,
           deps: { now: () => t },
         });
@@ -2370,7 +2399,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
         // (the regression this test must catch).
         let t = T0;
         const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner({
-          config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 30000, staleMaxMs: 300000 } }),
+          config: cfg({ ownState: { recoveryHoldMs: 30000, staleMaxMs: 300000 } }),
           deps: { now: () => t },
         });
         fireHealthyBaseline(recorder); // transport healthy + recovery-hold anchor stamped at T0
@@ -2395,7 +2424,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
         // 0xdiv6 at visibleOpen/'0'; the audit poll converges it UP to filled →
         // a genuine field divergence. Health lag 9999 trips latch 6 (posting-only).
         const t = T0;
-        const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: true, recoveryHoldMs: 0, staleMaxMs: 60000 } });
+        const config = cfg({ mode: { dryRun: false }, ownState: { recoveryHoldMs: 0, staleMaxMs: 60000 } });
         const adapter = liveDivergentAdapter(config, '0xdiv6', mkHealth(9999)); // lag >> threshold → latch degrades via the real poll
         const { runner, recorder, runPromise, resolvers, triggerKill } = await makePausedSubscribedRunner({
           config,
@@ -2416,12 +2445,12 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
 
       it('checkIndexerLag is throttled to auditPollIntervalMs (one poll per window, regardless of tick count)', async () => {
         let t = T0;
-        const adapter = createOspexAdapter(cfg({ ownState: { subscribe: true } }));
+        const adapter = createOspexAdapter(cfg({ ownState: { recoveryHoldMs: 0 } }));
         vi.spyOn(adapter, 'listContests').mockResolvedValue([]);
         vi.spyOn(adapter, 'listOpenCommitments').mockResolvedValue([]);
         const healthSpy = vi.spyOn(adapter, 'getOwnStateHealth').mockResolvedValue(mkHealth(0));
         const { recorder, runPromise, sleepCalls, resolvers, triggerKill } = await makePausedSubscribedRunner({
-          config: cfg({ ownState: { subscribe: true, auditPollIntervalMs: 60000 } }),
+          config: cfg({ ownState: { auditPollIntervalMs: 60000 } }),
           adapter,
           deps: { now: () => t },
         });
@@ -2440,12 +2469,12 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
       it('latch 6: a poll reporting lag >= threshold degrades (telemetry once); a later in-bounds poll clears it', async () => {
         let t = T0;
         let lag = 999; // >> indexerLagMaxSeconds (default 30)
-        const adapter = createOspexAdapter(cfg({ ownState: { subscribe: true } }));
+        const adapter = createOspexAdapter(cfg({ ownState: { recoveryHoldMs: 0 } }));
         vi.spyOn(adapter, 'listContests').mockResolvedValue([]);
         vi.spyOn(adapter, 'listOpenCommitments').mockResolvedValue([]);
         vi.spyOn(adapter, 'getOwnStateHealth').mockImplementation(() => Promise.resolve(mkHealth(lag)));
         const { runner, recorder, runPromise, sleepCalls, resolvers, triggerKill } = await makePausedSubscribedRunner({
-          config: cfg({ ownState: { subscribe: true, auditPollIntervalMs: 10000, indexerLagMaxSeconds: 30 } }),
+          config: cfg({ ownState: { auditPollIntervalMs: 10000, indexerLagMaxSeconds: 30 } }),
           adapter,
           deps: { now: () => t },
         });
@@ -2470,12 +2499,12 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
 
       it('latch 6 FAILS CLOSED when the health poll throws (degraded + error telemetry, reason: poll-failed)', async () => {
         const t = T0;
-        const adapter = createOspexAdapter(cfg({ ownState: { subscribe: true } }));
+        const adapter = createOspexAdapter(cfg({ ownState: { recoveryHoldMs: 0 } }));
         vi.spyOn(adapter, 'listContests').mockResolvedValue([]);
         vi.spyOn(adapter, 'listOpenCommitments').mockResolvedValue([]);
         vi.spyOn(adapter, 'getOwnStateHealth').mockRejectedValue(new Error('own-state health endpoint down'));
         const { runner, recorder, runPromise, resolvers, triggerKill } = await makePausedSubscribedRunner({
-          config: cfg({ ownState: { subscribe: true } }),
+          config: cfg({ ownState: { recoveryHoldMs: 0 } }),
           adapter,
           deps: { now: () => t },
         });
@@ -2490,13 +2519,13 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
 
       it('latch 6: a NON-FINITE indexerLagSeconds reading fails closed (poll-failed), it does NOT pass through as indexer-lag', async () => {
         const t = T0;
-        const adapter = createOspexAdapter(cfg({ ownState: { subscribe: true } }));
+        const adapter = createOspexAdapter(cfg({ ownState: { recoveryHoldMs: 0 } }));
         vi.spyOn(adapter, 'listContests').mockResolvedValue([]);
         vi.spyOn(adapter, 'listOpenCommitments').mockResolvedValue([]);
         // A malformed wire value (e.g. JSON `1e400` → Infinity) the SDK's z.number() still accepts.
         vi.spyOn(adapter, 'getOwnStateHealth').mockResolvedValue({ indexerLagSeconds: Infinity, lastIndexedAt: '2026-01-01T00:00:00Z', lagSource: 'sync_state' });
         const { runner, recorder, runPromise, resolvers, triggerKill } = await makePausedSubscribedRunner({
-          config: cfg({ ownState: { subscribe: true } }),
+          config: cfg({ ownState: { recoveryHoldMs: 0 } }),
           adapter,
           deps: { now: () => t },
         });
@@ -2513,7 +2542,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
 
       it('§5.1 live: an indexer-lag degradation halts posting even with a quotable market + healthy transport (the halt is latch 6, not the transport)', async () => {
         StateStore.at(stateDir).flush(emptyMakerState()); // clean state → no boot/funding hold; isolate the indexer-lag gate
-        const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: true, recoveryHoldMs: 0 } });
+        const config = cfg({ mode: { dryRun: false }, ownState: { recoveryHoldMs: 0 } });
         const submit = submitRecorder();
         const recorder = makeOwnStateRecorder();
         let healthyFired = false;
@@ -2549,14 +2578,14 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
         expect(events.filter((e) => e.kind === 'stream-health-hold' && e.state === 'entered')).toHaveLength(1);
       });
 
-      it('poll-only mode (subscribe: false) does NOT poll the indexer-lag probe', async () => {
-        const config = cfg({ ownState: { subscribe: false } }); // poll-only — the own-state gate is dormant
+      it('a boot without an owner identity (dry-run, no makerAddress) does NOT poll the indexer-lag probe', async () => {
+        const config = cfg(); // dry-run default; no makerAddress → no subscription, no own-state gate
         const adapter = createOspexAdapter(config);
         vi.spyOn(adapter, 'listContests').mockResolvedValue([]);
         const healthSpy = vi.spyOn(adapter, 'getOwnStateHealth').mockResolvedValue(mkHealth(0));
         const runner = makeRunner({ config, adapter, maxTicks: 3 });
         await runner.run();
-        expect(healthSpy).not.toHaveBeenCalled(); // checkIndexerLag is gated on ownState.subscribe
+        expect(healthSpy).not.toHaveBeenCalled(); // checkIndexerLag is gated on makerAddress (same predicate as the subscription)
         expect(runner.indexerLagDegradedForTest()).toBe(false);
       });
     });
@@ -2578,7 +2607,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
       it('latch 5 holds the POSTING gate but does NOT reset the recovery-hold anchor — clears immediately, no re-earn (recoveryHoldMs > 0, biting)', async () => {
         let t = T0;
         const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner({
-          config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 30000, staleMaxMs: 300000 } }),
+          config: cfg({ ownState: { recoveryHoldMs: 30000, staleMaxMs: 300000 } }),
           deps: { now: () => t },
         });
         fireHealthyBaseline(recorder); // anchor stamped at T0
@@ -2603,7 +2632,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
         // comparison is CLEAN. Latch 5 is manually pre-set (a previously-latched
         // persistent divergence); the next clean comparison must clear it.
         const t = T0;
-        const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: true, recoveryHoldMs: 0, staleMaxMs: 60000 } });
+        const config = cfg({ mode: { dryRun: false }, ownState: { recoveryHoldMs: 0, staleMaxMs: 60000 } });
         const adapter = liveSpiedAdapter(
           config, () => Promise.resolve([]), undefined, undefined, undefined,
           { listOpenCommitments: () => Promise.resolve([]), getOwnStateHealth: () => Promise.resolve(MOCK_OWN_STATE_HEALTH) },
@@ -2635,7 +2664,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
           // LIVE mode — the audit poll (hence the comparator) only runs in live. The
           // canonical SSE book gets 0xdiv5 at visibleOpen/'0'; the audit poll converges
           // it UP to filled → a GENUINE field divergence (not the empty-audit artifact).
-          const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: true, recoveryHoldMs: 0, staleMaxMs: 60000, divergenceToleranceMs: 5000 } });
+          const config = cfg({ mode: { dryRun: false }, ownState: { recoveryHoldMs: 0, staleMaxMs: 60000, divergenceToleranceMs: 5000 } });
           const adapter = liveDivergentAdapter(config, '0xdiv5');
           const { runner, recorder, runPromise, resolvers, triggerKill } = await makePausedSubscribedRunner({
             config,
@@ -2670,7 +2699,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
         // `divergence` + latching auditDivergenceUnresolved (corrupting the very signal
         // an operator watches before going live). Regression guard for that gate.
         const t = T0; // fixed clock → the baseline frame stays transport-fresh
-        const config = cfg({ mode: { dryRun: true }, ownState: { subscribe: true, recoveryHoldMs: 0, staleMaxMs: 60000 } });
+        const config = cfg({ mode: { dryRun: true }, ownState: { recoveryHoldMs: 0, staleMaxMs: 60000 } });
         const { runner, recorder, runPromise, resolvers, triggerKill } = await makePausedSubscribedRunner({
           config,
           deps: { now: () => t },
@@ -2690,7 +2719,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
 
       it('latch 5: a resync rebaseline clears the latch (the prior divergence verdict is moot on a fresh baseline)', async () => {
         const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner({
-          config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 0 } }),
+          config: cfg({ ownState: { recoveryHoldMs: 0 } }),
         });
         fireHealthyBaseline(recorder);
         runner.setAuditDivergenceUnresolvedForTest(true);
@@ -2709,7 +2738,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
         // without any successful observation. Live mode (the audit only runs live);
         // getPositionStatus throws every tick so each audit cycle fails.
         const t = T0;
-        const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: true, recoveryHoldMs: 0, staleMaxMs: 300000 } });
+        const config = cfg({ mode: { dryRun: false }, ownState: { recoveryHoldMs: 0, staleMaxMs: 300000 } });
         const adapter = liveSpiedAdapter(config, () => Promise.resolve([]), undefined, undefined, undefined, {
           listOpenCommitments: () => Promise.resolve([]),
           getPositionStatus: () => Promise.reject(new Error('audit poll API down')),
@@ -2735,7 +2764,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
         // row's true state, so the (unconverged) clone must NOT be read as "clean"
         // to clear a prior auditDivergenceUnresolved.
         const t = T0;
-        const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: true, recoveryHoldMs: 0, staleMaxMs: 300000 } });
+        const config = cfg({ mode: { dryRun: false }, ownState: { recoveryHoldMs: 0, staleMaxMs: 300000 } });
         const adapter = liveSpiedAdapter(config, () => Promise.resolve([]), undefined, undefined, undefined, {
           listOpenCommitments: () => Promise.resolve([]), // 0xdis "disappeared" from the open book (Pass 1 finds nothing)
           getCommitment: (h) => Promise.reject(new Error(`per-hash audit lookup down (${h})`)), // Pass 2 per-hash lookup throws
@@ -2759,7 +2788,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
 
       it('a canonical mapping failure during the baseline latches own-state UNHEALTHY (incomplete book holds the §5.1 gate); a clean rebaseline clears it', async () => {
         const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner({
-          config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 0, staleMaxMs: 300000 } }),
+          config: cfg({ ownState: { recoveryHoldMs: 0, staleMaxMs: 300000 } }),
         });
         // Healthy transport, but the snapshot carries a MALFORMED owner commitment
         // (empty sport → mapOwnerCommitmentToMaker fails closed + skips the row).
@@ -2787,7 +2816,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
 
       it('F1: a LIVE-delta mapping failure SELF-HEALS via a cursor-less cold restart — recovers WITHOUT a manual resync', async () => {
         const { runner, recorder, runPromise, resolvers, triggerKill } = await makePausedSubscribedRunner({
-          config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 0, staleMaxMs: 300000 } }),
+          config: cfg({ ownState: { recoveryHoldMs: 0, staleMaxMs: 300000 } }),
         });
         fireHealthyBaseline(recorder);
         expect(runner.ownStateHealthyForTest()).toBe(true);
@@ -2826,7 +2855,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
 
       it('F1: a PERSISTENT mapping gap re-trips a cold restart on each fresh baseline (rate-limited by the wake-path, not a busy loop), then recovers when it clears', async () => {
         const { runner, recorder, runPromise, resolvers, triggerKill } = await makePausedSubscribedRunner({
-          config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 0, staleMaxMs: 300000 } }),
+          config: cfg({ ownState: { recoveryHoldMs: 0, staleMaxMs: 300000 } }),
         });
         const restarts = () => readEvents().filter((e) => e.kind === 'stream-cold-restart' && e.reason === 'mapping-degraded').length;
         fireHealthyBaseline(recorder);
@@ -2885,7 +2914,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
     // is the restart-safety mechanism. See the matching index.ts removal.)
     describe('fill-dedup restart-safety (runtime dedup across reconnect)', () => {
       it('F5: dedup survives a mid-session reconnect — an overlap-re-delivered fill is dropped on the preserved baseline', async () => {
-        const config = cfg({ ownState: { subscribe: true, recoveryHoldMs: 0, staleMaxMs: 300000 } });
+        const config = cfg({ ownState: { recoveryHoldMs: 0, staleMaxMs: 300000 } });
         const { runner, recorder, runPromise, resolvers, triggerKill } = await makePausedSubscribedRunner({ config });
         // Establish a baseline carrying commitment 0xabc, then apply a fill so the
         // RUNTIME dedup carries (0xtx1, 0) and the position holds 100000.
@@ -2920,7 +2949,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
     describe('§7.2 unknown-own-fill', () => {
       it('an SSE fill for a commitmentHash NOT in canonical state emits `unknown-own-fill`, holds posting, cold-restarts, and does NOT materialize an orphan position', async () => {
         const { runner, recorder, runPromise, resolvers, triggerKill } = await makePausedSubscribedRunner({
-          config: cfg({ ownState: { subscribe: true, recoveryHoldMs: 0, staleMaxMs: 300000 } }),
+          config: cfg({ ownState: { recoveryHoldMs: 0, staleMaxMs: 300000 } }),
         });
         // Establish a HEALTHY, EMPTY baseline — the posting gate is healthy and
         // the canonical book has NO commitments, so the fill below is an orphan.
@@ -3002,7 +3031,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
 
       it('AUDIT→CANONICAL ISOLATION: the audit converges its clone UP without mutating the SSE-canonical book (shallow-clone proof)', async () => {
         const t = T0;
-        const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: true, recoveryHoldMs: 0, staleMaxMs: 60000 } });
+        const config = cfg({ mode: { dryRun: false }, ownState: { recoveryHoldMs: 0, staleMaxMs: 60000 } });
         const adapter = isoAuditAdapter(config);
         const { runner, recorder, runPromise, resolvers, triggerKill } = await makePausedSubscribedRunner({
           config, adapter, deps: { now: () => t },
@@ -3040,7 +3069,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
         // discriminator: it stays at 1 forever when the audit is suppressed (the market
         // never re-dirties), but grows every audit cycle if `if (audit) break` is dropped.
         const t = T0;
-        const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: true, recoveryHoldMs: 0, staleMaxMs: 60000 } });
+        const config = cfg({ mode: { dryRun: false }, ownState: { recoveryHoldMs: 0, staleMaxMs: 60000 } });
         const apiBump: Commitment = orderbookEntry({
           commitmentHash: ISO_HASH, maker: DEFAULT_FAKE_MAKER_ADDRESS, contestId: '1',
           positionType: 0, oddsTick: 250, riskAmount: '500000',
@@ -3095,7 +3124,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
   });
 
   it('sync throw from openOwnStateSubscription propagates AND runs the finally cleanup — unregister called (Hermes #68 blocker 3)', async () => {
-    const config = cfg({ ownState: { subscribe: true } });
+    const config = cfg({ ownState: { recoveryHoldMs: 0 } });
     const adapter = createOspexAdapter(config);
     vi.spyOn(adapter, 'listContests').mockResolvedValue([]);
     // SDK throws on subscribe (auth misconfiguration / network init failure).
@@ -4212,31 +4241,7 @@ describe('Runner — fill detection', () => {
     expect(listOpenSpy).not.toHaveBeenCalled();
   });
 
-  it('backout (subscribe:false): the POLL writes the CANONICAL book (stateForTest), the audit book stays empty (PR3b inversion)', async () => {
-    // In backout there is no SSE stream — the poll path remains the canonical
-    // writer of `this.state` and `this.auditState` is unused (never reseeded).
-    const record = commitmentRecord({ hash: '0xrealAway', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '250000', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 1 });
-    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xrealAway': record } });
-    const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: false } });
-    const apiFilled: Commitment = orderbookEntry({ commitmentHash: '0xrealAway', maker: DEFAULT_FAKE_MAKER_ADDRESS, contestId: '1234', positionType: 1, oddsTick: 200, riskAmount: '250000', filledRiskAmount: '250000', remainingRiskAmount: '0', status: 'filled', isLive: false });
-    const adapter = liveSpiedAdapter(
-      config, () => Promise.resolve([]), undefined, undefined, undefined,
-      { listOpenCommitments: () => Promise.resolve([]), getCommitment: (h) => h === '0xrealAway' ? Promise.resolve(apiFilled) : Promise.reject(new Error('unknown hash')) },
-    );
-    // No SSE handlers are installed in backout — the subscription is never opened.
-    const subscribeSpy = vi.spyOn(adapter, 'subscribeOwnState');
-    const runner = makeRunner({ config, adapter, maxTicks: 1 });
-    await runner.run();
-    expect(subscribeSpy).not.toHaveBeenCalled(); // no SSE stream opened in backout
-
-    // The poll-derived fill landed in the CANONICAL book; the audit book is empty.
-    expect(runner.stateForTest().commitments['0xrealAway']?.lifecycle).toBe('filled');
-    expect(runner.stateForTest().positions['spec-1234:home']?.riskAmountWei6).toBe('250000');
-    expect(runner.auditStateForTest().commitments).toEqual({});
-    expect(runner.auditStateForTest().positions).toEqual({});
-  });
-
-  it('a fully-filled commitment is reclassified `filled`, a position is created, the market is dirtied, and a `fill` event fires (partial:false)', async () => {
+  it('a fully-filled commitment is reclassified `filled` on the AUDIT clone; canonical state and telemetry stay untouched (audit-only since OS-Phase 4)', async () => {
     const record = commitmentRecord({ hash: '0xrealAway', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '250000', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 1 });
     StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xrealAway': record } });
     const config = cfg({ mode: { dryRun: false } });
@@ -4245,12 +4250,14 @@ describe('Runner — fill detection', () => {
       config, () => Promise.resolve([]), undefined, undefined, undefined,
       { listOpenCommitments: () => Promise.resolve([]), getCommitment: (h) => h === '0xrealAway' ? Promise.resolve(apiFilled) : Promise.reject(new Error('unknown hash')) },
     );
-    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    const runner = makeRunner({ config, adapter, maxTicks: 1 });
+    await runner.run();
 
-    const reloaded = StateStore.at(stateDir).load().state;
-    expect(reloaded.commitments['0xrealAway']?.lifecycle).toBe('filled');
-    expect(reloaded.commitments['0xrealAway']?.filledRiskWei6).toBe('250000');
-    expect(reloaded.positions['spec-1234:home']).toMatchObject({
+    // The AUDIT clone converged: disappeared + API `filled` → lifecycle filled,
+    // fill delta applied, position created — all on the clone only.
+    expect(runner.auditStateForTest().commitments['0xrealAway']?.lifecycle).toBe('filled');
+    expect(runner.auditStateForTest().commitments['0xrealAway']?.filledRiskWei6).toBe('250000');
+    expect(runner.auditStateForTest().positions['spec-1234:home']).toMatchObject({
       speculationId: 'spec-1234', contestId: '1234', side: 'home',
       riskAmountWei6: '250000',
       // (oddsTick − 100) / 100 × risk = (200 − 100) / 100 × 250000 = 250000
@@ -4258,16 +4265,15 @@ describe('Runner — fill detection', () => {
       status: 'active',
     });
 
-    const fills = readEvents().filter((e) => e.kind === 'fill');
-    expect(fills).toHaveLength(1);
-    expect(fills[0]).toMatchObject({
-      commitmentHash: '0xrealAway', speculationId: 'spec-1234', contestId: '1234',
-      takerSide: 'away', makerSide: 'home', positionType: 1, makerOddsTick: 200,
-      newFillWei6: '250000', filledRiskWei6: '250000', partial: false,
-    });
+    // Canonical state untouched (the stream is the only canonical writer) and
+    // the audit-source `fill` emit is suppressed.
+    const reloaded = StateStore.at(stateDir).load().state;
+    expect(reloaded.commitments['0xrealAway']?.lifecycle).toBe('visibleOpen');
+    expect(reloaded.positions).toEqual({});
+    expect(readEvents().filter((e) => e.kind === 'fill')).toHaveLength(0);
   });
 
-  it('a partial-fill bump (still listed; `filledRiskAmount` advanced) → record reclassified `partiallyFilled`, position extended by the delta, market dirtied, `fill` event (partial:true)', async () => {
+  it('a partial-fill bump (still listed; `filledRiskAmount` advanced) → AUDIT clone reclassified `partiallyFilled` + position extended by the delta; canonical state and `fill` telemetry untouched (audit-only since OS-Phase 4)', async () => {
     const record = commitmentRecord({ hash: '0xrealAway', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '500000', lifecycle: 'visibleOpen', filledRiskWei6: '100000', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 1 });
     StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xrealAway': record } });
     const config = cfg({ mode: { dryRun: false } });
@@ -4277,17 +4283,21 @@ describe('Runner — fill detection', () => {
       config, () => Promise.resolve([]), undefined, undefined, undefined,
       { listOpenCommitments: () => Promise.resolve([apiPartial]) },
     );
-    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    const runner = makeRunner({ config, adapter, maxTicks: 1 });
+    await runner.run();
 
+    expect(runner.auditStateForTest().commitments['0xrealAway']?.lifecycle).toBe('partiallyFilled');
+    expect(runner.auditStateForTest().commitments['0xrealAway']?.filledRiskWei6).toBe('300000');
+    expect(runner.auditStateForTest().positions['spec-1234:home']?.riskAmountWei6).toBe('200000'); // delta only — counts the *new* fill
+    expect(runner.auditStateForTest().positions['spec-1234:home']?.counterpartyRiskWei6).toBe('200000'); // 200000 × (200 − 100) / 100
+
+    // Canonical state untouched (the stream is the only canonical writer);
+    // the audit-source `fill` emit (and any mark-dirty) is suppressed.
     const reloaded = StateStore.at(stateDir).load().state;
-    expect(reloaded.commitments['0xrealAway']?.lifecycle).toBe('partiallyFilled');
-    expect(reloaded.commitments['0xrealAway']?.filledRiskWei6).toBe('300000');
-    expect(reloaded.positions['spec-1234:home']?.riskAmountWei6).toBe('200000'); // delta only — counts the *new* fill
-    expect(reloaded.positions['spec-1234:home']?.counterpartyRiskWei6).toBe('200000'); // 200000 × (200 − 100) / 100
-
-    const fills = readEvents().filter((e) => e.kind === 'fill');
-    expect(fills).toHaveLength(1);
-    expect(fills[0]).toMatchObject({ partial: true, newFillWei6: '200000', filledRiskWei6: '300000' });
+    expect(reloaded.commitments['0xrealAway']?.lifecycle).toBe('visibleOpen');
+    expect(reloaded.commitments['0xrealAway']?.filledRiskWei6).toBe('100000');
+    expect(reloaded.positions).toEqual({});
+    expect(readEvents().filter((e) => e.kind === 'fill')).toHaveLength(0);
   });
 
   it('a disappeared commitment whose API status is `expired` → record reclassified `expired`, an `expire` event (no `fill`)', async () => {
@@ -4308,7 +4318,7 @@ describe('Runner — fill detection', () => {
     expect(events.some((e) => e.kind === 'fill')).toBe(false);
   });
 
-  it('a disappeared commitment that is TRULY on-chain-cancelled (storedStatus `cancelled`) → record reclassified `authoritativelyInvalidated`, no event', async () => {
+  it('a disappeared commitment that is TRULY on-chain-cancelled (storedStatus `cancelled`) → AUDIT clone reclassified `authoritativelyInvalidated`; canonical untouched, no event', async () => {
     const record = commitmentRecord({ hash: '0xcancelled', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 1 });
     StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xcancelled': record } });
     const config = cfg({ mode: { dryRun: false } });
@@ -4318,14 +4328,16 @@ describe('Runner — fill detection', () => {
       config, () => Promise.resolve([]), undefined, undefined, undefined,
       { listOpenCommitments: () => Promise.resolve([]), getCommitment: () => Promise.resolve(apiCancelled) },
     );
-    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    const runner = makeRunner({ config, adapter, maxTicks: 1 });
+    await runner.run();
 
-    const reloaded = StateStore.at(stateDir).load().state;
-    expect(reloaded.commitments['0xcancelled']?.lifecycle).toBe('authoritativelyInvalidated');
+    expect(runner.auditStateForTest().commitments['0xcancelled']?.lifecycle).toBe('authoritativelyInvalidated');
+    // Canonical untouched — the stream is the only canonical writer.
+    expect(StateStore.at(stateDir).load().state.commitments['0xcancelled']?.lifecycle).toBe('visibleOpen');
     expect(readEvents().some((e) => e.kind === 'fill' || e.kind === 'expire')).toBe(false);
   });
 
-  it('a disappeared commitment that is merely BOOK-HIDDEN (effective `cancelled`, but storedStatus `partially_filled`, not nonce-invalidated) → reclassified `softCancelled` (NOT released), the fill converged commitment-only, latent remainder preserved (Hermes review-2)', async () => {
+  it('a disappeared commitment that is merely BOOK-HIDDEN (effective `cancelled`, but storedStatus `partially_filled`, not nonce-invalidated) → AUDIT clone reclassified `softCancelled` (NOT released), the fill converged commitment-only on the clone; canonical + telemetry untouched (Hermes review-2)', async () => {
     // Post-book-visibility-split, a hidden row (book_visible=false) reports effective status
     // 'cancelled' while its signed payload stays matchable on chain. detectFills must NOT read
     // that as an authoritative invalidation and release the headroom — it must classify off
@@ -4339,18 +4351,22 @@ describe('Runner — fill detection', () => {
       config, () => Promise.resolve([]), undefined, undefined, undefined,
       { listOpenCommitments: () => Promise.resolve([]), getCommitment: (h) => (h === '0xhidden' ? Promise.resolve(apiHidden) : Promise.reject(new Error('unknown hash'))) },
     );
-    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    const runner = makeRunner({ config, adapter, maxTicks: 1 });
+    await runner.run();
 
+    expect(runner.auditStateForTest().commitments['0xhidden']?.lifecycle).toBe('softCancelled'); // NOT authoritativelyInvalidated — the remainder is still matchable on chain
+    expect(runner.auditStateForTest().commitments['0xhidden']?.filledRiskWei6).toBe('200000'); // the observed fill converged commitment-only on the clone
+    expect(runner.auditStateForTest().positions['spec-1234:home']).toBeUndefined(); // NO position created — pollPositionStatus owns positions (no double-count)
+
+    // Canonical untouched + the audit-source `fill` emit is suppressed.
     const reloaded = StateStore.at(stateDir).load().state;
-    expect(reloaded.commitments['0xhidden']?.lifecycle).toBe('softCancelled'); // NOT authoritativelyInvalidated — the remainder is still matchable on chain
-    expect(reloaded.commitments['0xhidden']?.filledRiskWei6).toBe('200000'); // the observed fill converged commitment-only
-    expect(reloaded.positions['spec-1234:home']).toBeUndefined(); // NO position created — pollPositionStatus owns positions (no double-count)
-    const fills = readEvents().filter((e) => e.kind === 'fill');
-    expect(fills).toHaveLength(1);
-    expect(fills[0]).toMatchObject({ source: 'softcancel-recovery', commitmentHash: '0xhidden', newFillWei6: '200000', filledRiskWei6: '200000', partial: true });
+    expect(reloaded.commitments['0xhidden']?.lifecycle).toBe('partiallyFilled');
+    expect(reloaded.commitments['0xhidden']?.filledRiskWei6).toBe('0');
+    expect(reloaded.positions).toEqual({});
+    expect(readEvents().filter((e) => e.kind === 'fill')).toHaveLength(0);
   });
 
-  it('a disappeared commitment reported effective `cancelled` AND nonce-invalidated (storedStatus still `open`) → released `authoritativelyInvalidated` (a nonce-floor raise IS authoritative, even when storedStatus isn\'t `cancelled`)', async () => {
+  it('a disappeared commitment reported effective `cancelled` AND nonce-invalidated (storedStatus still `open`) → AUDIT clone released `authoritativelyInvalidated` (a nonce-floor raise IS authoritative, even when storedStatus isn\'t `cancelled`); canonical untouched', async () => {
     // Under the current effective-status core-api a nonce-invalidated commitment reports effective
     // status 'cancelled'; the canonical signal is `nonceInvalidated`, which must still release.
     const record = commitmentRecord({ hash: '0xnonce', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '250000', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 1 });
@@ -4361,10 +4377,11 @@ describe('Runner — fill detection', () => {
       config, () => Promise.resolve([]), undefined, undefined, undefined,
       { listOpenCommitments: () => Promise.resolve([]), getCommitment: (h) => (h === '0xnonce' ? Promise.resolve(apiNonce) : Promise.reject(new Error('unknown hash'))) },
     );
-    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    const runner = makeRunner({ config, adapter, maxTicks: 1 });
+    await runner.run();
 
-    const reloaded = StateStore.at(stateDir).load().state;
-    expect(reloaded.commitments['0xnonce']?.lifecycle).toBe('authoritativelyInvalidated'); // nonce floor raised → headroom released
+    expect(runner.auditStateForTest().commitments['0xnonce']?.lifecycle).toBe('authoritativelyInvalidated'); // nonce floor raised → released on the clone
+    expect(StateStore.at(stateDir).load().state.commitments['0xnonce']?.lifecycle).toBe('visibleOpen'); // canonical untouched
     expect(readEvents().some((e) => e.kind === 'fill' || e.kind === 'expire')).toBe(false);
   });
 
@@ -4391,7 +4408,7 @@ describe('Runner — fill detection', () => {
     expect(events.some((e) => e.kind === 'error' && e.class === 'UnexpectedFillStatus')).toBe(false);
   });
 
-  it('a disappeared FUTURE-expiry commitment reported raw "open" but nonce-invalidated → authoritativelyInvalidated, NO UnexpectedFillStatus', async () => {
+  it('a disappeared FUTURE-expiry commitment reported raw "open" but nonce-invalidated → AUDIT clone `authoritativelyInvalidated`, NO UnexpectedFillStatus; canonical untouched', async () => {
     const record = commitmentRecord({ hash: '0xinvalidated', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 1 });
     StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xinvalidated': record } });
     const config = cfg({ mode: { dryRun: false } });
@@ -4400,10 +4417,11 @@ describe('Runner — fill detection', () => {
       config, () => Promise.resolve([]), undefined, undefined, undefined,
       { listOpenCommitments: () => Promise.resolve([]), getCommitment: () => Promise.resolve(apiInvalidated) },
     );
-    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    const runner = makeRunner({ config, adapter, maxTicks: 1 });
+    await runner.run();
 
-    const reloaded = StateStore.at(stateDir).load().state;
-    expect(reloaded.commitments['0xinvalidated']?.lifecycle).toBe('authoritativelyInvalidated');
+    expect(runner.auditStateForTest().commitments['0xinvalidated']?.lifecycle).toBe('authoritativelyInvalidated');
+    expect(StateStore.at(stateDir).load().state.commitments['0xinvalidated']?.lifecycle).toBe('visibleOpen'); // canonical untouched
     const events = readEvents();
     expect(events.some((e) => e.kind === 'error' && e.class === 'UnexpectedFillStatus')).toBe(false);
     expect(events.some((e) => e.kind === 'expire')).toBe(false);
@@ -4441,7 +4459,7 @@ describe('Runner — fill detection', () => {
     expect(events.some((e) => e.kind === 'fill')).toBe(false);
   });
 
-  it('a per-hash `getCommitment` failure on a FUTURE-expiry record is logged (phase fill-detection-lookup) and other disappeared hashes are still processed — detectFills still returns true (the record stays live + counted, next tick retries)', async () => {
+  it('a per-hash `getCommitment` failure on a FUTURE-expiry record is logged (phase fill-detection-lookup) and other disappeared hashes still converge on the AUDIT clone; canonical untouched, next tick retries', async () => {
     const recordA = commitmentRecord({ hash: '0xfilled', speculationId: 'spec-A', contestId: 'A', makerSide: 'home', oddsTick: 200, riskAmountWei6: '250000', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 1 });
     const recordB = commitmentRecord({ hash: '0xbroken', speculationId: 'spec-B', contestId: 'B', makerSide: 'home', oddsTick: 200, riskAmountWei6: '250000', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 1 });
     StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xfilled': recordA, '0xbroken': recordB } });
@@ -4451,25 +4469,26 @@ describe('Runner — fill detection', () => {
       config, () => Promise.resolve([]), undefined, undefined, undefined,
       { listOpenCommitments: () => Promise.resolve([]), getCommitment: (h) => h === '0xfilled' ? Promise.resolve(apiFilled) : Promise.reject(new Error('lookup failed')) },
     );
-    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    const runner = makeRunner({ config, adapter, maxTicks: 1 });
+    await runner.run();
 
+    expect(runner.auditStateForTest().commitments['0xfilled']?.lifecycle).toBe('filled'); // processed normally on the clone
+    expect(runner.auditStateForTest().commitments['0xbroken']?.lifecycle).toBe('visibleOpen'); // unchanged — the lookup error skipped it
+    // Canonical untouched (the stream is the only canonical writer); the audit-source fill emit is suppressed.
     const reloaded = StateStore.at(stateDir).load().state;
-    expect(reloaded.commitments['0xfilled']?.lifecycle).toBe('filled'); // processed normally
-    expect(reloaded.commitments['0xbroken']?.lifecycle).toBe('visibleOpen'); // unchanged — the lookup error skipped it
+    expect(reloaded.commitments['0xfilled']?.lifecycle).toBe('visibleOpen');
+    expect(reloaded.commitments['0xbroken']?.lifecycle).toBe('visibleOpen');
     const events = readEvents();
     expect(events.find((e) => e.kind === 'error' && e.phase === 'fill-detection-lookup')).toMatchObject({ commitmentHash: '0xbroken', detail: 'lookup failed' });
-    expect(events.filter((e) => e.kind === 'fill')).toHaveLength(1);
+    expect(events.filter((e) => e.kind === 'fill')).toHaveLength(0);
   });
 
-  it('a per-hash `getCommitment` failure on a PAST-expiry disappeared record → detectFills fails closed (no reconcile, no ageOut); record stays visibleOpen for next-tick retry (Hermes review-PR23-late)', async () => {
-    // The sharp case: without the per-hash status we can't tell if the disappeared
-    // record filled-then-expired, expired cleanly, or was cancelled. ageOut would
-    // otherwise terminalize it to `expired` and release its headroom, and the
-    // reconcile would submit replacements on exposure that may have just filled.
-    // Future-expiry lookup failures stay non-fatal (covered by the test above);
-    // only past-expiry trips the gate.
-    // (Numeric contestId so live `submitCommitment`'s `BigInt(contestId)` doesn't throw — the
-    // absence of a submit must prove the fail-closed gate worked, not a downstream BigInt error.)
+  it('a per-hash `getCommitment` failure on a PAST-expiry disappeared record marks the audit cycle failed but the tick PROCEEDS — reconcile runs and ageOut terminalizes the canonical record (protection lives in the stream + comparator since OS-Phase 4)', async () => {
+    // Pre-OS-Phase-4 this failed closed (no reconcile, no ageOut) because the poll
+    // was the canonical writer and a missed just-before-expiry fill would be lost.
+    // Now the stream delivers fills in real time and the divergence comparator
+    // cross-checks; the probe failure only marks the audit cycle incomplete.
+    // The canonical record is past expiry + grace, so ageOut terminalizes it.
     const record = commitmentRecord({ hash: '0xpastExpiry', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '250000', lifecycle: 'visibleOpen', expiryUnixSec: T0 - 100 /* past expiry + the 60s grace */, postedAtUnixSec: T0 - 200 });
     StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xpastExpiry': record } });
     const config = cfg({ mode: { dryRun: false } });
@@ -4482,19 +4501,19 @@ describe('Runner — fill detection', () => {
       undefined,
       { listOpenCommitments: () => Promise.resolve([]), getCommitment: () => Promise.reject(new Error('lookup 503')) },
     );
-    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    const runner = makeRunner({ config, adapter, maxTicks: 1 });
+    await runner.run();
 
     const events = readEvents();
     expect(events.find((e) => e.kind === 'error' && e.phase === 'fill-detection-lookup')).toMatchObject({ commitmentHash: '0xpastExpiry', detail: 'lookup 503' });
-    expect(submit.calls).toHaveLength(0); // reconcile skipped
-    expect(events.some((e) => e.kind === 'submit' || e.kind === 'replace' || e.kind === 'soft-cancel')).toBe(false);
-    expect(events.some((e) => e.kind === 'quote-intent')).toBe(false); // reconcileMarkets never ran
-    expect(events.some((e) => e.kind === 'expire')).toBe(false); // ageOut skipped — record NOT terminalized
-    expect(StateStore.at(stateDir).load().state.commitments['0xpastExpiry']?.lifecycle).toBe('visibleOpen'); // unchanged
+    expect(events.some((e) => e.kind === 'quote-intent')).toBe(true); // reconcileMarkets RAN — the probe failure no longer gates the tick
+    expect(submit.calls.length).toBeGreaterThan(0); // fresh quotes posted (the expired record occupies no side)
+    expect(events.some((e) => e.kind === 'expire' && e.commitmentHash === '0xpastExpiry')).toBe(true); // ageOut ran — canonical terminalized off the local clock
+    expect(StateStore.at(stateDir).load().state.commitments['0xpastExpiry']?.lifecycle).toBe('expired');
+    expect(runner.auditStateForTest().commitments['0xpastExpiry']?.lifecycle).toBe('visibleOpen'); // the audit clone stays unconverged (the cycle is marked failed)
   });
 
-  it('mixed past-expiry + future-expiry getCommitment failures → still fails closed (the past-expiry one is enough)', async () => {
-    // If ANY past-expiry lookup fails, the tick fails closed even if other lookups succeed.
+  it('mixed past-expiry + future-expiry getCommitment failures → both logged, audit cycle marked failed, and the tick still PROCEEDS (reconcile + ageOut run — OS-Phase 4)', async () => {
     const past = commitmentRecord({ hash: '0xpast', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '250000', lifecycle: 'visibleOpen', expiryUnixSec: T0 - 100 /* past expiry + the 60s grace */, postedAtUnixSec: T0 - 200 });
     const future = commitmentRecord({ hash: '0xfuture', speculationId: 'spec-5678', contestId: '5678', makerSide: 'away', oddsTick: 200, riskAmountWei6: '250000', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 1 });
     StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xpast': past, '0xfuture': future } });
@@ -4510,13 +4529,13 @@ describe('Runner — fill detection', () => {
     );
     await makeRunner({ config, adapter, maxTicks: 1 }).run();
 
-    expect(submit.calls).toHaveLength(0); // reconcile skipped — the past-expiry failure trumped the future-expiry one
     const events = readEvents();
     expect(events.filter((e) => e.kind === 'error' && e.phase === 'fill-detection-lookup')).toHaveLength(2); // both logged
-    expect(events.some((e) => e.kind === 'expire')).toBe(false); // ageOut skipped, both records intact
+    expect(submit.calls.length).toBeGreaterThan(0); // reconcile RAN — probe failures no longer gate the tick
+    expect(events.some((e) => e.kind === 'expire' && e.commitmentHash === '0xpast')).toBe(true); // ageOut ran on canonical state
     const reloaded = StateStore.at(stateDir).load().state;
-    expect(reloaded.commitments['0xpast']?.lifecycle).toBe('visibleOpen');
-    expect(reloaded.commitments['0xfuture']?.lifecycle).toBe('visibleOpen');
+    expect(reloaded.commitments['0xpast']?.lifecycle).toBe('expired'); // past expiry + grace → terminalized off the local clock
+    expect(reloaded.commitments['0xfuture']?.lifecycle).toBe('visibleOpen'); // future expiry — untouched
   });
 
   it('the `assessCompetitiveness` orderbook excludes the MM\'s own commitments (`c.maker === this.makerAddress` filter)', async () => {
@@ -4534,6 +4553,11 @@ describe('Runner — fill detection', () => {
       config, () => Promise.resolve([contestView({ contestId: 'A' })]),
       undefined, { getSpeculation: (id) => Promise.resolve(speculationView(id, true, book)) },
     );
+    // A makerAddress means the runner opens the own-state subscription at boot
+    // (always-on since OS-Phase 4) and polls the indexer-lag probe — stub both
+    // inert/healthy on this signerless read adapter (no real SSE handshake/HTTP).
+    vi.spyOn(adapter, 'subscribeOwnState').mockImplementation(() => ({ unsubscribe: () => Promise.resolve() }));
+    vi.spyOn(adapter, 'getOwnStateHealth').mockResolvedValue(MOCK_OWN_STATE_HEALTH);
     await makeRunner({ config, adapter, maxTicks: 1, makerAddress: DEFAULT_FAKE_MAKER_ADDRESS as Hex }).run();
 
     const comps = readEvents().filter((e) => e.kind === 'quote-competitiveness');
@@ -4548,10 +4572,11 @@ describe('Runner — fill detection', () => {
 // ── review-PR23 fixes (fill-detection blockers + position-status poll) ───────
 
 describe('Runner — fill detection — past-local-expiry classification (review-PR23 B1, B2)', () => {
-  it('a visibleOpen record past local expiry whose API status is `filled` is reclassified BEFORE ageOut terminalizes it (the fill is not lost)', async () => {
-    // The bug Hermes reproduced: tick order is detectFills → reconcile → ageOut, and the previous
-    // detectFills skipped records past local expiry; ageOut then marked them `expired` without
-    // calling getCommitment. A fill that landed right before expiry was permanently missed.
+  it('a visibleOpen record past local expiry whose API status is `filled` is reclassified `filled` on the AUDIT clone (past-local-expiry records are included in the audit diff); canonical untouched', async () => {
+    // The original bug Hermes reproduced: the poll skipped records past local expiry,
+    // losing a just-before-expiry fill. The audit clone keeps the same inclusion rule
+    // so the comparator's view classifies these records the way the stream did.
+    // (Within the 60s release grace, so canonical ageOut does not terminalize it.)
     const record = commitmentRecord({ hash: '0xrealAway', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '250000', lifecycle: 'visibleOpen', expiryUnixSec: T0 - 10 /* past-expiry */, postedAtUnixSec: T0 - 200 });
     StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xrealAway': record } });
     const config = cfg({ mode: { dryRun: false } });
@@ -4560,18 +4585,22 @@ describe('Runner — fill detection — past-local-expiry classification (review
       config, () => Promise.resolve([]), undefined, undefined, undefined,
       { listOpenCommitments: () => Promise.resolve([]), getCommitment: () => Promise.resolve(apiFilled) },
     );
-    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    const runner = makeRunner({ config, adapter, maxTicks: 1 });
+    await runner.run();
 
+    expect(runner.auditStateForTest().commitments['0xrealAway']?.lifecycle).toBe('filled'); // classified on the clone, not skipped as already-expired
+    expect(runner.auditStateForTest().commitments['0xrealAway']?.filledRiskWei6).toBe('250000');
+    expect(runner.auditStateForTest().positions['spec-1234:home']?.riskAmountWei6).toBe('250000');
+    // Canonical untouched: inside the release grace, ageOut holds off too.
     const reloaded = StateStore.at(stateDir).load().state;
-    expect(reloaded.commitments['0xrealAway']?.lifecycle).toBe('filled'); // detectFills classified it BEFORE ageOut got a chance to call it `expired`
-    expect(reloaded.commitments['0xrealAway']?.filledRiskWei6).toBe('250000');
-    expect(reloaded.positions['spec-1234:home']?.riskAmountWei6).toBe('250000');
+    expect(reloaded.commitments['0xrealAway']?.lifecycle).toBe('visibleOpen');
+    expect(reloaded.positions).toEqual({});
     const events = readEvents();
-    expect(events.find((e) => e.kind === 'fill' && e.commitmentHash === '0xrealAway')).toMatchObject({ partial: false, newFillWei6: '250000', source: 'commitment-diff' });
-    expect(events.some((e) => e.kind === 'expire' && e.commitmentHash === '0xrealAway')).toBe(false); // ageOut's `expire` did not fire
+    expect(events.filter((e) => e.kind === 'fill')).toHaveLength(0); // audit-source fill emit suppressed
+    expect(events.some((e) => e.kind === 'expire' && e.commitmentHash === '0xrealAway')).toBe(false); // ageOut's `expire` did not fire (within grace)
   });
 
-  it('a disappeared `expired` API status with prior unobserved filledRiskAmount applies the partial fill BEFORE terminalizing — the position records the matched portion', async () => {
+  it('a disappeared `expired` API status with prior unobserved filledRiskAmount applies the partial fill BEFORE terminalizing on the AUDIT clone; canonical past-grace record is terminalized by ageOut (one canonical `expire`)', async () => {
     const record = commitmentRecord({ hash: '0xpartialThenExpired', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '500000', lifecycle: 'visibleOpen', filledRiskWei6: '0', expiryUnixSec: T0 - 100 /* past expiry + the 60s grace */, postedAtUnixSec: T0 - 200 });
     StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xpartialThenExpired': record } });
     const config = cfg({ mode: { dryRun: false } });
@@ -4581,19 +4610,25 @@ describe('Runner — fill detection — past-local-expiry classification (review
       config, () => Promise.resolve([]), undefined, undefined, undefined,
       { listOpenCommitments: () => Promise.resolve([]), getCommitment: () => Promise.resolve(apiExpired) },
     );
-    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    const runner = makeRunner({ config, adapter, maxTicks: 1 });
+    await runner.run();
 
+    expect(runner.auditStateForTest().commitments['0xpartialThenExpired']?.lifecycle).toBe('expired'); // terminalized on the clone
+    expect(runner.auditStateForTest().commitments['0xpartialThenExpired']?.filledRiskWei6).toBe('100000'); // the partial fill was applied first
+    expect(runner.auditStateForTest().positions['spec-1234:home']?.riskAmountWei6).toBe('100000'); // clone position records the matched portion
+    expect(runner.auditStateForTest().positions['spec-1234:home']?.counterpartyRiskWei6).toBe('100000'); // 100000 × (200 − 100) / 100
+    // Canonical: the fill never lands (stream-only), but ageOut terminalizes the
+    // past-grace record off the local clock with the one canonical `expire`.
     const reloaded = StateStore.at(stateDir).load().state;
-    expect(reloaded.commitments['0xpartialThenExpired']?.lifecycle).toBe('expired'); // terminalized
-    expect(reloaded.commitments['0xpartialThenExpired']?.filledRiskWei6).toBe('100000'); // the partial fill was applied
-    expect(reloaded.positions['spec-1234:home']?.riskAmountWei6).toBe('100000'); // position records the matched portion
-    expect(reloaded.positions['spec-1234:home']?.counterpartyRiskWei6).toBe('100000'); // 100000 × (200 − 100) / 100
+    expect(reloaded.commitments['0xpartialThenExpired']?.lifecycle).toBe('expired');
+    expect(reloaded.commitments['0xpartialThenExpired']?.filledRiskWei6).toBe('0');
+    expect(reloaded.positions).toEqual({});
     const events = readEvents();
-    expect(events.find((e) => e.kind === 'fill' && e.commitmentHash === '0xpartialThenExpired')).toMatchObject({ partial: false, newFillWei6: '100000' });
-    expect(events.find((e) => e.kind === 'expire' && e.commitmentHash === '0xpartialThenExpired')).toBeDefined(); // expire still fires (the terminal status was 'expired')
+    expect(events.filter((e) => e.kind === 'fill')).toHaveLength(0); // audit-source fill emit suppressed
+    expect(events.filter((e) => e.kind === 'expire' && e.commitmentHash === '0xpartialThenExpired')).toHaveLength(1); // ageOut's canonical expire only (the audit-clone expire emit is suppressed)
   });
 
-  it('a disappeared TRULY-cancelled (storedStatus `cancelled`) commitment with prior unobserved filledRiskAmount applies the partial fill BEFORE terminalizing', async () => {
+  it('a disappeared TRULY-cancelled (storedStatus `cancelled`) commitment with prior unobserved filledRiskAmount applies the partial fill BEFORE terminalizing on the AUDIT clone; canonical untouched', async () => {
     const record = commitmentRecord({ hash: '0xpartialThenCancelled', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '500000', lifecycle: 'visibleOpen', filledRiskWei6: '0', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 5 });
     StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xpartialThenCancelled': record } });
     const config = cfg({ mode: { dryRun: false } });
@@ -4602,14 +4637,18 @@ describe('Runner — fill detection — past-local-expiry classification (review
       config, () => Promise.resolve([]), undefined, undefined, undefined,
       { listOpenCommitments: () => Promise.resolve([]), getCommitment: () => Promise.resolve(apiCancelled) },
     );
-    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    const runner = makeRunner({ config, adapter, maxTicks: 1 });
+    await runner.run();
 
+    expect(runner.auditStateForTest().commitments['0xpartialThenCancelled']?.lifecycle).toBe('authoritativelyInvalidated');
+    expect(runner.auditStateForTest().commitments['0xpartialThenCancelled']?.filledRiskWei6).toBe('100000');
+    expect(runner.auditStateForTest().positions['spec-1234:home']?.riskAmountWei6).toBe('100000');
+    // Canonical untouched + suppressed audit telemetry.
     const reloaded = StateStore.at(stateDir).load().state;
-    expect(reloaded.commitments['0xpartialThenCancelled']?.lifecycle).toBe('authoritativelyInvalidated');
-    expect(reloaded.commitments['0xpartialThenCancelled']?.filledRiskWei6).toBe('100000');
-    expect(reloaded.positions['spec-1234:home']?.riskAmountWei6).toBe('100000');
+    expect(reloaded.commitments['0xpartialThenCancelled']?.lifecycle).toBe('visibleOpen');
+    expect(reloaded.positions).toEqual({});
     const events = readEvents();
-    expect(events.find((e) => e.kind === 'fill' && e.commitmentHash === '0xpartialThenCancelled')).toMatchObject({ partial: false, newFillWei6: '100000' });
+    expect(events.filter((e) => e.kind === 'fill')).toHaveLength(0);
     expect(events.some((e) => e.kind === 'expire' && e.commitmentHash === '0xpartialThenCancelled')).toBe(false); // cancelled is not expired
   });
 });
@@ -4631,7 +4670,7 @@ describe('Runner — expiry-release grace', () => {
     expect(readEvents().some((e) => e.kind === 'expire')).toBe(false);
   });
 
-  it('a disappeared API `expired` status with a FULL cumulative fill becomes `filled` even inside the grace window (authoritative full fill wins)', async () => {
+  it('a disappeared API `expired` status with a FULL cumulative fill becomes `filled` on the AUDIT clone even inside the grace window (authoritative full fill wins); canonical untouched', async () => {
     const now = T0;
     const record = commitmentRecord({ hash: '0xgracefull', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '250000', filledRiskWei6: '0', lifecycle: 'visibleOpen', expiryUnixSec: now - 30, postedAtUnixSec: now - 200 });
     StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xgracefull': record } });
@@ -4639,13 +4678,17 @@ describe('Runner — expiry-release grace', () => {
     // API reports effective 'expired', but the cumulative fill is FULL (== risk) — a full fill is authoritative and must become `filled`, never held as partiallyFilled.
     const apiFull: Commitment = orderbookEntry({ commitmentHash: '0xgracefull', maker: DEFAULT_FAKE_MAKER_ADDRESS, contestId: '1234', positionType: 1, oddsTick: 200, riskAmount: '250000', filledRiskAmount: '250000', remainingRiskAmount: '0', status: 'expired', isLive: false });
     const adapter = liveSpiedAdapter(config, () => Promise.resolve([]), undefined, undefined, undefined, { listOpenCommitments: () => Promise.resolve([]), getCommitment: () => Promise.resolve(apiFull) });
-    await makeRunner({ config, adapter, maxTicks: 1, deps: { now: () => now } }).run();
+    const runner = makeRunner({ config, adapter, maxTicks: 1, deps: { now: () => now } });
+    await runner.run();
 
+    expect(runner.auditStateForTest().commitments['0xgracefull']?.lifecycle).toBe('filled'); // full fill wins over the grace hold on the clone
+    expect(runner.auditStateForTest().commitments['0xgracefull']?.filledRiskWei6).toBe('250000');
+    expect(runner.auditStateForTest().positions['spec-1234:home']?.riskAmountWei6).toBe('250000');
+    // Canonical untouched (within grace, ageOut holds off too) + suppressed audit fill emit.
     const reloaded = StateStore.at(stateDir).load().state;
-    expect(reloaded.commitments['0xgracefull']?.lifecycle).toBe('filled'); // full fill wins over the grace hold
-    expect(reloaded.commitments['0xgracefull']?.filledRiskWei6).toBe('250000');
-    expect(reloaded.positions['spec-1234:home']?.riskAmountWei6).toBe('250000');
-    expect(readEvents().find((e) => e.kind === 'fill' && e.commitmentHash === '0xgracefull')).toMatchObject({ partial: false });
+    expect(reloaded.commitments['0xgracefull']?.lifecycle).toBe('visibleOpen');
+    expect(reloaded.positions).toEqual({});
+    expect(readEvents().filter((e) => e.kind === 'fill')).toHaveLength(0);
   });
 
   it('a thrown on-chain cancel (SDK rejects) leaves the commitment COUNTED — not authoritativelyInvalidated (fails closed)', async () => {
@@ -4672,19 +4715,21 @@ describe('Runner — expiry-release grace', () => {
   });
 });
 
-// ── soft-cancelled-fill convergence (live only) ──────────────────────────────
+// ── soft-cancelled-fill convergence (live only; AUDIT-only since OS-Phase 4) ─
 //
-// `reconcileSoftCancelledFills` — the tick step (after detectFills + the position poll,
-// before settle/reconcile/ageOut, live mode only) that closes the split-brain where a
-// commitment the MM soft-cancelled off-chain still matched on chain via its stale signed
-// payload. `detectFills`'s commitment-list diff can't see soft-cancelled rows (they're
-// API-hidden), so this step probes each `softCancelled` record's AUTHORITATIVE cumulative
-// `filledRiskAmount` via `getCommitment(hash)` and converges the COMMITMENT record only
-// (filledRiskWei6 + lifecycle) — never the position (that's `pollPositionStatus`'s job;
-// touching it here would double-count). Convergence is cumulative (never additive, never
-// decreasing), clamps to the commitment's risk, and derives lifecycle from the clamped
-// amount (NOT from API status). Fail-closed: a `getCommitment` throw keeps the record
-// softCancelled, emits `error` class SoftCancelledProbeFailed, and skips reconcile + ageOut.
+// `reconcileSoftCancelledFills` — the audit probe (after detectFills + the position poll,
+// live mode only) that converges the AUDIT clone for the split-brain where a commitment
+// the MM soft-cancelled off-chain still matched on chain via its stale signed payload.
+// `detectFills`'s commitment-list diff can't see soft-cancelled rows (they're API-hidden),
+// so this step probes each `softCancelled` record's AUTHORITATIVE cumulative
+// `filledRiskAmount` via `getCommitment(hash)` and converges the CLONE's commitment record
+// only (filledRiskWei6 + lifecycle) — never the position (that's `pollPositionStatus`'s
+// job; touching it here would double-count). Convergence is cumulative (never additive,
+// never decreasing), clamps to the commitment's risk, and derives lifecycle from the
+// clamped amount (NOT from API status). Canonical state is written by the own-state
+// stream only; a `getCommitment` throw keeps the clone's record softCancelled, emits
+// `error` class SoftCancelledProbeFailed, and marks the audit cycle failed (the
+// comparator skips) — the tick proceeds.
 
 describe('Runner — soft-cancelled-fill convergence', () => {
   it('a softCancelled record whose API cumulative fill is 0 → stays softCancelled, NO position mutation, no `fill` event (idempotent no-op)', async () => {
@@ -4707,8 +4752,7 @@ describe('Runner — soft-cancelled-fill convergence', () => {
     expect(readEvents().some((e) => e.kind === 'fill')).toBe(false); // no fill event
   });
 
-  it('a softCancelled record with a partial cumulative fill (0 < filled < risk) → filledRiskWei6 updated, lifecycle STAYS `softCancelled` (still book-hidden + matchable, just partially matched), market dirtied + same-tick reconcile re-prices, `fill` event {source: softcancel-recovery, partial: true}, NO position mutation', async () => {
-    // Tracked market (discovery) so the convergence can dirty it and the same tick's reconcile re-prices.
+  it('a softCancelled record with a partial cumulative fill (0 < filled < risk) → AUDIT clone filledRiskWei6 updated, lifecycle STAYS `softCancelled` (still book-hidden + matchable, just partially matched), NO position mutation; canonical + `fill` telemetry untouched (audit-only since OS-Phase 4)', async () => {
     const softCancelled = commitmentRecord({ hash: '0xsc', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '500000', filledRiskWei6: '0', lifecycle: 'softCancelled', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 5, updatedAtUnixSec: T0 - 5 });
     StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xsc': softCancelled } });
     const config = cfg({ mode: { dryRun: false }, odds: { subscribe: false } });
@@ -4723,26 +4767,24 @@ describe('Runner — soft-cancelled-fill convergence', () => {
       undefined,
       { getCommitment: (h) => (h === '0xsc' ? Promise.resolve(apiPartial) : Promise.reject(new Error('unknown hash'))) },
     );
-    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    const runner = makeRunner({ config, adapter, maxTicks: 1 });
+    await runner.run();
 
+    expect(runner.auditStateForTest().commitments['0xsc']?.lifecycle).toBe('softCancelled'); // STAYS softCancelled — a partial fill does not promote a book-hidden row into the visible set
+    expect(runner.auditStateForTest().commitments['0xsc']?.filledRiskWei6).toBe('200000');
+    expect(runner.auditStateForTest().positions['spec-1234:home']).toBeUndefined(); // NO position created by this path — pollPositionStatus owns positions
+
+    // Canonical untouched (the stream is the only canonical writer); the audit-source
+    // fill emit is suppressed and the audit never dirties markets.
     const reloaded = StateStore.at(stateDir).load().state;
-    expect(reloaded.commitments['0xsc']?.lifecycle).toBe('softCancelled'); // STAYS softCancelled — a partial fill does not promote a book-hidden row into the visible set
-    expect(reloaded.commitments['0xsc']?.filledRiskWei6).toBe('200000');
-    expect(reloaded.commitments['0xsc']?.updatedAtUnixSec).toBe(T0);
-    expect(reloaded.positions['spec-1234:home']).toBeUndefined(); // NO position created by this path — pollPositionStatus owns positions
-
-    const fills = readEvents().filter((e) => e.kind === 'fill');
-    expect(fills).toHaveLength(1);
-    expect(fills[0]).toMatchObject({
-      source: 'softcancel-recovery', commitmentHash: '0xsc', speculationId: 'spec-1234', contestId: '1234',
-      takerSide: 'away', makerSide: 'home', positionType: 1, makerOddsTick: 200,
-      newFillWei6: '200000', filledRiskWei6: '200000', partial: true,
-    });
-    // The market was dirtied → the same-tick reconcile ran on it (submitted quotes); proof the dirty flag propagated.
-    expect(submit.calls.length).toBeGreaterThan(0);
+    expect(reloaded.commitments['0xsc']?.lifecycle).toBe('softCancelled');
+    expect(reloaded.commitments['0xsc']?.filledRiskWei6).toBe('0');
+    expect(reloaded.commitments['0xsc']?.updatedAtUnixSec).toBe(T0 - 5);
+    expect(reloaded.positions).toEqual({});
+    expect(readEvents().filter((e) => e.kind === 'fill')).toHaveLength(0);
   });
 
-  it('a softCancelled record whose API cumulative fill >= risk → clamp to risk, lifecycle `filled`, NO position mutation', async () => {
+  it('a softCancelled record whose API cumulative fill >= risk → AUDIT clone clamps to risk, lifecycle `filled`, NO position mutation; canonical untouched', async () => {
     const softCancelled = commitmentRecord({ hash: '0xsc', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '250000', filledRiskWei6: '0', lifecycle: 'softCancelled', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 5, updatedAtUnixSec: T0 - 5 });
     StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xsc': softCancelled } });
     const config = cfg({ mode: { dryRun: false } });
@@ -4752,15 +4794,17 @@ describe('Runner — soft-cancelled-fill convergence', () => {
       config, () => Promise.resolve([]), undefined, undefined, undefined,
       { getCommitment: (h) => (h === '0xsc' ? Promise.resolve(apiFilled) : Promise.reject(new Error('unknown hash'))) },
     );
-    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    const runner = makeRunner({ config, adapter, maxTicks: 1 });
+    await runner.run();
 
+    expect(runner.auditStateForTest().commitments['0xsc']?.lifecycle).toBe('filled');
+    expect(runner.auditStateForTest().commitments['0xsc']?.filledRiskWei6).toBe('250000');
+    expect(runner.auditStateForTest().positions['spec-1234:home']).toBeUndefined(); // NO position created by this path
+    // Canonical untouched + the audit-source fill emit is suppressed.
     const reloaded = StateStore.at(stateDir).load().state;
-    expect(reloaded.commitments['0xsc']?.lifecycle).toBe('filled');
-    expect(reloaded.commitments['0xsc']?.filledRiskWei6).toBe('250000');
-    expect(reloaded.positions['spec-1234:home']).toBeUndefined(); // NO position created by this path
-    const fills = readEvents().filter((e) => e.kind === 'fill');
-    expect(fills).toHaveLength(1);
-    expect(fills[0]).toMatchObject({ source: 'softcancel-recovery', commitmentHash: '0xsc', newFillWei6: '250000', filledRiskWei6: '250000', partial: false });
+    expect(reloaded.commitments['0xsc']?.lifecycle).toBe('softCancelled');
+    expect(reloaded.commitments['0xsc']?.filledRiskWei6).toBe('0');
+    expect(readEvents().filter((e) => e.kind === 'fill')).toHaveLength(0);
     expect(readEvents().some((e) => e.kind === 'error' && e.class === 'SoftCancelledOverFillClamp')).toBe(false); // exactly-at-risk is not an over-fill
   });
 
@@ -4784,7 +4828,7 @@ describe('Runner — soft-cancelled-fill convergence', () => {
     expect(readEvents().some((e) => e.kind === 'fill')).toBe(false);
   });
 
-  it('an API cumulative fill ABOVE the commitment risk → clamp to risk + a warning telemetry (SoftCancelledOverFillClamp); lifecycle `filled`', async () => {
+  it('an API cumulative fill ABOVE the commitment risk → AUDIT clone clamps to risk + a warning telemetry (SoftCancelledOverFillClamp — error emits survive the audit path); lifecycle `filled` on the clone, canonical untouched', async () => {
     const softCancelled = commitmentRecord({ hash: '0xsc', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '250000', filledRiskWei6: '0', lifecycle: 'softCancelled', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 5, updatedAtUnixSec: T0 - 5 });
     StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xsc': softCancelled } });
     const config = cfg({ mode: { dryRun: false } });
@@ -4794,15 +4838,18 @@ describe('Runner — soft-cancelled-fill convergence', () => {
       config, () => Promise.resolve([]), undefined, undefined, undefined,
       { getCommitment: (h) => (h === '0xsc' ? Promise.resolve(apiOverfill) : Promise.reject(new Error('unknown hash'))) },
     );
-    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    const runner = makeRunner({ config, adapter, maxTicks: 1 });
+    await runner.run();
 
-    const reloaded = StateStore.at(stateDir).load().state;
-    expect(reloaded.commitments['0xsc']?.filledRiskWei6).toBe('250000'); // CLAMPED to risk (the validator rejects filledRiskWei6 > riskAmountWei6)
-    expect(reloaded.commitments['0xsc']?.lifecycle).toBe('filled');
+    expect(runner.auditStateForTest().commitments['0xsc']?.filledRiskWei6).toBe('250000'); // CLAMPED to risk (the validator rejects filledRiskWei6 > riskAmountWei6)
+    expect(runner.auditStateForTest().commitments['0xsc']?.lifecycle).toBe('filled');
     const events = readEvents();
     expect(events.find((e) => e.kind === 'error' && e.class === 'SoftCancelledOverFillClamp')).toMatchObject({ commitmentHash: '0xsc', phase: 'softcancel-recovery' });
-    // The fill event reflects the clamped amounts, not the raw API cumulative.
-    expect(events.find((e) => e.kind === 'fill')).toMatchObject({ source: 'softcancel-recovery', newFillWei6: '250000', filledRiskWei6: '250000', partial: false });
+    // Canonical untouched; the audit-source fill emit is suppressed.
+    const reloaded = StateStore.at(stateDir).load().state;
+    expect(reloaded.commitments['0xsc']?.lifecycle).toBe('softCancelled');
+    expect(reloaded.commitments['0xsc']?.filledRiskWei6).toBe('0');
+    expect(events.filter((e) => e.kind === 'fill')).toHaveLength(0);
   });
 
   it('the visible detectFills path and the soft-cancel path see the same cumulative on the same commitment → whichever runs first applies it, the other no-ops (no double-count)', async () => {
@@ -4826,10 +4873,12 @@ describe('Runner — soft-cancelled-fill convergence', () => {
     expect(readEvents().some((e) => e.kind === 'fill')).toBe(false); // already at the cumulative → no second fill emitted
   });
 
-  it('a `getCommitment` probe failure for a softCancelled record fails closed — the step returns false / the tick skips reconcile + ageOut, the record is PRESERVED softCancelled (not aged out, not zeroed), `error` SoftCancelledProbeFailed emitted', async () => {
-    // The stale signed payload could have matched on chain at any moment; a probe failure must NOT be read as
-    // "unfilled/resolved" or let ageOut terminalize the record. Past-local-expiry (so ageOut WOULD otherwise
-    // expire it) makes the fail-closed bite — the record must stay softCancelled, not become `expired`.
+  it('a `getCommitment` probe failure for a softCancelled record marks the audit cycle failed (`error` SoftCancelledProbeFailed) but the tick PROCEEDS — reconcile + ageOut run, the record is preserved softCancelled (within the release grace)', async () => {
+    // Pre-OS-Phase-4 this failed closed (skipped reconcile + ageOut). Now the stream
+    // owns canonical fills; the probe failure only marks the audit cycle incomplete
+    // (the comparator skips — it must not validate/clear divergence off an
+    // unconverged clone). The record is 1s past expiry, inside the 60s release
+    // grace, so ageOut leaves it softCancelled either way.
     const stale = commitmentRecord({ hash: '0xsc', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '250000', filledRiskWei6: '0', lifecycle: 'softCancelled', expiryUnixSec: T0 - 1, postedAtUnixSec: T0 - 100, updatedAtUnixSec: T0 - 100 });
     StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xsc': stale } });
     const config = cfg({ mode: { dryRun: false } });
@@ -4842,21 +4891,23 @@ describe('Runner — soft-cancelled-fill convergence', () => {
       undefined,
       { getCommitment: () => Promise.reject(new Error('commitment API 503')) },
     );
-    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    const runner = makeRunner({ config, adapter, maxTicks: 1 });
+    await runner.run();
 
     const reloaded = StateStore.at(stateDir).load().state;
-    expect(reloaded.commitments['0xsc']?.lifecycle).toBe('softCancelled'); // PRESERVED — ageOut skipped, not terminalized to `expired`
+    expect(reloaded.commitments['0xsc']?.lifecycle).toBe('softCancelled'); // preserved — within grace, ageOut leaves it
     expect(reloaded.commitments['0xsc']?.filledRiskWei6).toBe('0'); // not zeroed / not mutated
     const events = readEvents();
     expect(events.find((e) => e.kind === 'error' && e.class === 'SoftCancelledProbeFailed')).toMatchObject({ commitmentHash: '0xsc', phase: 'softcancel-recovery', detail: 'commitment API 503' });
-    expect(submit.calls).toHaveLength(0); // reconcile skipped — no replacement quotes on unverified exposure
-    expect(events.some((e) => e.kind === 'expire')).toBe(false); // ageOut did not run
+    expect(submit.calls.length).toBeGreaterThan(0); // reconcile RAN — the probe failure no longer gates the tick (OS-Phase 4)
+    expect(events.some((e) => e.kind === 'expire')).toBe(false); // within grace — not aged out
+    expect(runner.auditStateForTest().commitments['0xsc']?.lifecycle).toBe('softCancelled'); // the audit clone stays unconverged (cycle marked failed)
   });
 
-  it('the soft-cancel path does NOT extend the position aggregate (decoupled from pollPositionStatus, which owns position convergence — no double-count)', async () => {
-    // A softCancelled commitment that converges to `filled` here, with a pre-existing position record on the
-    // same (speculationId, side). The position poll reports the SAME aggregate the position already holds (a
-    // no-op for the poll); the soft-cancel step converges the commitment but must leave the position untouched.
+  it('the soft-cancel path does NOT extend the AUDIT clone\'s position aggregate (decoupled from pollPositionStatus, which owns position convergence — no double-count); canonical untouched', async () => {
+    // A softCancelled commitment that converges to `filled` on the clone, with a pre-existing position record
+    // on the same (speculationId, side). The position poll reports the SAME aggregate the position already
+    // holds (a no-op); the soft-cancel step converges the clone's commitment but must leave the position alone.
     const softCancelled = commitmentRecord({ hash: '0xsc', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '250000', filledRiskWei6: '0', lifecycle: 'softCancelled', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 5, updatedAtUnixSec: T0 - 5 });
     StateStore.at(stateDir).flush({
       ...emptyMakerState(),
@@ -4877,28 +4928,33 @@ describe('Runner — soft-cancelled-fill convergence', () => {
       config, () => Promise.resolve([]), undefined, undefined, undefined,
       { getPositionStatus: () => Promise.resolve(withPos), getCommitment: (h) => (h === '0xsc' ? Promise.resolve(apiFilled) : Promise.reject(new Error('unknown hash'))) },
     );
-    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    const runner = makeRunner({ config, adapter, maxTicks: 1 });
+    await runner.run();
 
+    // The AUDIT clone's position aggregate is UNCHANGED — the soft-cancel step never extended it (no 500000 double-count).
+    expect(runner.auditStateForTest().positions['spec-1234:home']?.riskAmountWei6).toBe('250000');
+    expect(runner.auditStateForTest().positions['spec-1234:home']?.counterpartyRiskWei6).toBe('250000');
+    // The clone's commitment converged.
+    expect(runner.auditStateForTest().commitments['0xsc']?.lifecycle).toBe('filled');
+    expect(runner.auditStateForTest().commitments['0xsc']?.filledRiskWei6).toBe('250000');
+    // Canonical untouched: the commitment stays softCancelled, the position keeps its seeded aggregate.
     const reloaded = StateStore.at(stateDir).load().state;
-    // The position aggregate is UNCHANGED — the soft-cancel step never extended it (no 500000 double-count).
+    expect(reloaded.commitments['0xsc']?.lifecycle).toBe('softCancelled');
+    expect(reloaded.commitments['0xsc']?.filledRiskWei6).toBe('0');
     expect(reloaded.positions['spec-1234:home']?.riskAmountWei6).toBe('250000');
-    expect(reloaded.positions['spec-1234:home']?.counterpartyRiskWei6).toBe('250000');
-    // The commitment converged.
-    expect(reloaded.commitments['0xsc']?.lifecycle).toBe('filled');
-    expect(reloaded.commitments['0xsc']?.filledRiskWei6).toBe('250000');
-    // Exactly one fill — the soft-cancel recovery; the position-poll no-op'd (already caught up).
-    const fills = readEvents().filter((e) => e.kind === 'fill');
-    expect(fills).toHaveLength(1);
-    expect(fills[0]).toMatchObject({ source: 'softcancel-recovery' });
+    // No fill telemetry — both audit-source emits are suppressed.
+    expect(readEvents().filter((e) => e.kind === 'fill')).toHaveLength(0);
   });
 
-  it('TWO TICKS: a softCancelled record recovered to a PARTIAL fill STAYS softCancelled on the next tick — never released to authoritativelyInvalidated, latent remainder preserved (Hermes review-2 regression)', async () => {
-    // The blocker Hermes caught: tick 1 recovers the hidden soft-cancelled commitment; if recovery
-    // promoted it to `partiallyFilled`, tick 2's detectFills would include it in localOpen, fail to
-    // find it in the (book-filtered) listOpenCommitments, take the disappeared-hash path, read its
-    // effective `cancelled` status, and wrongly release the still-matchable remainder. Keeping it
-    // `softCancelled` (owned by reconcileSoftCancelledFills, never in detectFills's visible set) is
-    // the invariant under test. Run two ticks against the SAME hidden partial cumulative.
+  it('TWO TICKS: an AUDIT clone softCancelled record converged to a PARTIAL fill STAYS softCancelled on the next cycle — never released to authoritativelyInvalidated, latent remainder preserved (Hermes review-2 regression)', async () => {
+    // The blocker Hermes caught (now an audit-clone invariant): if convergence
+    // promoted the record to `partiallyFilled`, the next cycle's detectFills would
+    // include it in the clone's localOpen, fail to find it in the (book-filtered)
+    // listOpenCommitments, take the disappeared-hash path, read its effective
+    // `cancelled` status, and wrongly release the still-matchable remainder on the
+    // clone. Keeping it `softCancelled` (owned by reconcileSoftCancelledFills,
+    // never in detectFills's visible set) is the invariant under test. Run two
+    // ticks against the SAME hidden partial cumulative.
     const softCancelled = commitmentRecord({ hash: '0xsc', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '500000', filledRiskWei6: '0', lifecycle: 'softCancelled', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 5, updatedAtUnixSec: T0 - 5 });
     StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xsc': softCancelled } });
     const config = cfg({ mode: { dryRun: false } });
@@ -4908,24 +4964,26 @@ describe('Runner — soft-cancelled-fill convergence', () => {
       config, () => Promise.resolve([]), undefined, undefined, undefined,
       { listOpenCommitments: () => Promise.resolve([]), getCommitment: (h) => (h === '0xsc' ? Promise.resolve(apiPartialHidden) : Promise.reject(new Error('unknown hash'))) },
     );
-    await makeRunner({ config, adapter, maxTicks: 2 }).run();
+    const runner = makeRunner({ config, adapter, maxTicks: 2 });
+    await runner.run();
 
+    // After the 2nd audit cycle (the clone reseeds from canonical each tick and re-converges):
+    expect(runner.auditStateForTest().commitments['0xsc']?.lifecycle).toBe('softCancelled'); // NOT authoritativelyInvalidated (the pre-fix bug)
+    expect(runner.auditStateForTest().commitments['0xsc']?.filledRiskWei6).toBe('200000'); // remainder (300000) still counted toward latent exposure
+    // Canonical untouched across both ticks; the audit-source fill emits are suppressed.
     const reloaded = StateStore.at(stateDir).load().state;
-    expect(reloaded.commitments['0xsc']?.lifecycle).toBe('softCancelled'); // after the 2nd tick — NOT authoritativelyInvalidated (the pre-fix bug)
-    expect(reloaded.commitments['0xsc']?.filledRiskWei6).toBe('200000'); // remainder (300000) still counted toward latent exposure
-    // The recovery fired once (tick 1); tick 2 saw the same cumulative → no second fill, and detectFills never touched the softCancelled record.
-    const fills = readEvents().filter((e) => e.kind === 'fill');
-    expect(fills).toHaveLength(1);
-    expect(fills[0]).toMatchObject({ source: 'softcancel-recovery', filledRiskWei6: '200000', partial: true });
+    expect(reloaded.commitments['0xsc']?.lifecycle).toBe('softCancelled');
+    expect(reloaded.commitments['0xsc']?.filledRiskWei6).toBe('0');
+    expect(readEvents().filter((e) => e.kind === 'fill')).toHaveLength(0);
   });
 });
 
 describe('Runner — fail-closed on lost fill visibility (review-PR23 B3)', () => {
-  it('live mode: a `listOpenCommitments` failure SKIPS reconcile (no live writes) and ageOut (no terminalization on unverified fill state); the market stays dirty for next-tick retry', async () => {
-    // Without the fail-closed fix, the runner would proceed to reconcile on a tracked-quoteable market
-    // with no fill visibility, submitting a fresh commitment based on stale exposure state.
-    // (Numeric contestId so live `submitCommitment`'s `BigInt(contestId)` doesn't throw — the absence
-    // of a submit must prove the *fail-closed gate* worked, not a downstream BigInt error.)
+  it('live mode: a `listOpenCommitments` failure marks the audit cycle failed (`error` phase fill-detection) but the tick PROCEEDS — reconcile + ageOut still run (audit never gates trading, OS-Phase 4)', async () => {
+    // Pre-OS-Phase-4 this failed closed (no reconcile, no ageOut) because the poll
+    // was the canonical fill writer. Now the stream delivers fills in real time;
+    // protection against trading on stale state is the §5 composite stream-health
+    // gate + the divergence comparator, not a tick cascade.
     const record = commitmentRecord({ hash: '0xtracked', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '250000', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 1 });
     StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xtracked': record } });
     const config = cfg({ mode: { dryRun: false } });
@@ -4943,10 +5001,9 @@ describe('Runner — fail-closed on lost fill visibility (review-PR23 B3)', () =
 
     const events = readEvents();
     expect(events.find((e) => e.kind === 'error' && e.phase === 'fill-detection')).toMatchObject({ detail: 'API 503' });
-    expect(submit.calls).toHaveLength(0); // reconcile was skipped — no submit despite the tracked market being quoteable
-    expect(events.some((e) => e.kind === 'submit' || e.kind === 'replace' || e.kind === 'soft-cancel')).toBe(false);
-    expect(events.some((e) => e.kind === 'quote-intent')).toBe(false); // reconcileMarkets never ran
-    expect(StateStore.at(stateDir).load().state.commitments['0xtracked']?.lifecycle).toBe('visibleOpen'); // ageOut didn't run either
+    expect(events.some((e) => e.kind === 'quote-intent')).toBe(true); // reconcileMarkets RAN despite the probe failure
+    expect(submit.calls.length).toBeGreaterThan(0); // the empty side got a fresh quote
+    expect(StateStore.at(stateDir).load().state.commitments['0xtracked']?.lifecycle).toBe('visibleOpen'); // future expiry — ageOut (which ran) leaves it
   });
 
   it('dry-run mode: a `listOpenCommitments` failure is irrelevant — detectFills doesn\'t run in dry-run, so the reconcile proceeds normally', async () => {
@@ -4972,13 +5029,12 @@ describe('Runner — position-status poll (review-PR23 B4)', () => {
     };
   }
 
-  it('a position the API reports but local state is missing → `MakerPositionRecord` created + `fill` event (source: position-poll). Context (contestId, sport, teams) is copied from the matching local commitment. The same soft-cancelled commitment ALSO converges via the soft-cancelled-fill step (its own `getCommitment` probe) — distinct telemetry, no double-counted position.', async () => {
+  it('a position the API reports but local state is missing → `MakerPositionRecord` created on the AUDIT clone (context copied from the matching local commitment); the same soft-cancelled commitment ALSO converges on the clone via the soft-cancelled-fill step — no double-counted position; canonical + telemetry untouched', async () => {
     // Setup: a soft-cancelled commitment (a quote we pulled off-chain). A taker matched it via the
     // stale signed payload before expiry → the chain has a position the commitment-list diff can't see.
-    // The position poll catches the POSITION; the soft-cancelled-fill step catches the COMMITMENT
-    // (probing its authoritative cumulative fill via getCommitment) — the two paths are decoupled, so
-    // the position is recorded exactly once (the poll) and the commitment record converges exactly once
-    // (the new step) without double-counting.
+    // The position poll converges the clone's POSITION; the soft-cancelled-fill step converges the
+    // clone's COMMITMENT (probing its authoritative cumulative fill via getCommitment) — the two
+    // paths are decoupled, so the clone's position is recorded exactly once without double-counting.
     const softCancelled = commitmentRecord({ hash: '0xstaleSignedPayload', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '250000', lifecycle: 'softCancelled', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 5, updatedAtUnixSec: T0 - 5 });
     StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xstaleSignedPayload': softCancelled } });
     const config = cfg({ mode: { dryRun: false } });
@@ -4988,24 +5044,23 @@ describe('Runner — position-status poll (review-PR23 B4)', () => {
       config, () => Promise.resolve([]), undefined, undefined, undefined,
       { getPositionStatus: () => Promise.resolve(withActivePosition('spec-1234', 1 /* home */, 0.25, 0.25)), getCommitment: (h) => (h === '0xstaleSignedPayload' ? Promise.resolve(apiFilled) : Promise.reject(new Error('unknown hash'))) },
     );
-    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    const runner = makeRunner({ config, adapter, maxTicks: 1 });
+    await runner.run();
 
-    const reloaded = StateStore.at(stateDir).load().state;
-    expect(reloaded.positions['spec-1234:home']).toMatchObject({
+    expect(runner.auditStateForTest().positions['spec-1234:home']).toMatchObject({
       speculationId: 'spec-1234', contestId: '1234', side: 'home',
       sport: softCancelled.sport, awayTeam: softCancelled.awayTeam, homeTeam: softCancelled.homeTeam, // copied from the source commitment
-      riskAmountWei6: '250000', counterpartyRiskWei6: '250000', // 0.25 USDC × 1e6 — counted ONCE (the poll), not double-counted by the new step
+      riskAmountWei6: '250000', counterpartyRiskWei6: '250000', // 0.25 USDC × 1e6 — counted ONCE (the poll), not double-counted by the soft-cancel step
       status: 'active',
     });
-    // The commitment now converges from its authoritative cumulative fill — no longer stranded softCancelled.
-    expect(reloaded.commitments['0xstaleSignedPayload']?.lifecycle).toBe('filled');
-    expect(reloaded.commitments['0xstaleSignedPayload']?.filledRiskWei6).toBe('250000');
-    const fills = readEvents().filter((e) => e.kind === 'fill');
-    // Two fills, one per path — the position-poll (the position) and the soft-cancel recovery (the commitment).
-    expect(fills.filter((e) => e.source === 'position-poll')).toHaveLength(1);
-    expect(fills.find((e) => e.source === 'position-poll')).toMatchObject({ speculationId: 'spec-1234', makerSide: 'home', positionType: 1, newFillWei6: '250000', cumulativeRiskWei6: '250000' });
-    expect(fills.filter((e) => e.source === 'softcancel-recovery')).toHaveLength(1);
-    expect(fills.find((e) => e.source === 'softcancel-recovery')).toMatchObject({ commitmentHash: '0xstaleSignedPayload', speculationId: 'spec-1234', makerSide: 'home', positionType: 1, newFillWei6: '250000', filledRiskWei6: '250000', partial: false });
+    // The clone's commitment converges from its authoritative cumulative fill — no longer stranded softCancelled.
+    expect(runner.auditStateForTest().commitments['0xstaleSignedPayload']?.lifecycle).toBe('filled');
+    expect(runner.auditStateForTest().commitments['0xstaleSignedPayload']?.filledRiskWei6).toBe('250000');
+    // Canonical untouched (the stream is the only canonical writer); both audit-source fill emits are suppressed.
+    const reloaded = StateStore.at(stateDir).load().state;
+    expect(reloaded.positions).toEqual({});
+    expect(reloaded.commitments['0xstaleSignedPayload']?.lifecycle).toBe('softCancelled');
+    expect(readEvents().filter((e) => e.kind === 'fill')).toHaveLength(0);
   });
 
   it('a `getPositionStatus` response that matches local state is a no-op (idempotent — no `fill` event, no position update on subsequent ticks)', async () => {
@@ -5065,14 +5120,13 @@ describe('Runner — position-status poll (review-PR23 B4)', () => {
     expect(submit.calls.length).toBeGreaterThan(0); // reconcile still ran — no softCancelled records, so the position poll failure isn't a lost-fill risk
   });
 
-  it('a `getPositionStatus` failure WITH a non-terminal softCancelled record fails closed — reconcile + ageOut skipped, markets stay dirty for next-tick retry (review-PR23 round 2)', async () => {
-    // Setup: a softCancelled commitment whose stale signed payload could have been
-    // matched on chain at any point before expiry. The commitment-list diff (detectFills)
-    // can't see soft-cancelled commitments — the position poll is the ONLY way to learn
-    // about that match. If the poll fails, we MUST NOT (a) submit replacement quotes on
-    // exposure we may already have, or (b) terminalize the record via ageOut while a
-    // taker may have just filled it. Even a past-local-expiry record stays softCancelled
-    // this tick — next tick retries the poll.
+  it('a `getPositionStatus` failure WITH a non-terminal softCancelled record marks the audit cycle failed (`error` phase position-poll) but the tick PROCEEDS — reconcile + ageOut run (audit never gates trading, OS-Phase 4)', async () => {
+    // Pre-OS-Phase-4 this failed closed: the poll was the only way to learn about a
+    // stale-signed-payload match, so a poll failure blocked reconcile + ageOut. Now
+    // such a match arrives canonically over the own-state stream (fill + position
+    // events); the poll failure only marks the audit cycle incomplete (the comparator
+    // skips and preserves latch state). The record is 1s past expiry — inside the 60s
+    // release grace — so ageOut (which DOES run) leaves it softCancelled.
     const stale = commitmentRecord({ hash: '0xstaleSignedPayload', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '250000', lifecycle: 'softCancelled', expiryUnixSec: T0 - 1, postedAtUnixSec: T0 - 100, updatedAtUnixSec: T0 - 100 });
     StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xstaleSignedPayload': stale } });
     const config = cfg({ mode: { dryRun: false } });
@@ -5089,9 +5143,9 @@ describe('Runner — position-status poll (review-PR23 B4)', () => {
 
     const events = readEvents();
     expect(events.find((e) => e.kind === 'error' && e.phase === 'position-poll')).toMatchObject({ detail: 'positions API 500' });
-    expect(submit.calls).toHaveLength(0); // reconcile skipped — no replacement quotes posted on unverified exposure
+    expect(submit.calls.length).toBeGreaterThan(0); // reconcile RAN — the poll failure no longer gates the tick
     const reloaded = StateStore.at(stateDir).load().state;
-    expect(reloaded.commitments['0xstaleSignedPayload']?.lifecycle).toBe('softCancelled'); // ageOut skipped — record NOT terminalized to `expired`
+    expect(reloaded.commitments['0xstaleSignedPayload']?.lifecycle).toBe('softCancelled'); // within the release grace — ageOut leaves it
     expect(events.some((e) => e.kind === 'expire')).toBe(false);
   });
 });
@@ -5150,29 +5204,31 @@ describe('Runner — position-status transitions (Phase 3 c-ii)', () => {
     };
   }
 
-  it('a position the API has moved from active → pendingSettle is updated locally + emits `position-transition` (fromStatus active, toStatus pendingSettle, result, predictedWinSide)', async () => {
+  it('a position the API has moved from active → pendingSettle is updated on the AUDIT clone (status + result); canonical state and `position-transition` telemetry untouched (audit-only since OS-Phase 4)', async () => {
     StateStore.at(stateDir).flush(seedActiveHomePosition('spec-1234', '1234'));
     const config = cfg({ mode: { dryRun: false } });
     const adapter = liveSpiedAdapter(
       config, () => Promise.resolve([]), undefined, undefined, undefined,
       { getPositionStatus: () => Promise.resolve(withPendingSettlePosition('spec-1234', 1, 0.25, 0.25, 'won', 'home')) },
     );
-    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    const runner = makeRunner({ config, adapter, maxTicks: 1 });
+    await runner.run();
 
+    expect(runner.auditStateForTest().positions['spec-1234:home']?.status).toBe('pendingSettle');
+    expect(runner.auditStateForTest().positions['spec-1234:home']?.riskAmountWei6).toBe('250000'); // risk unchanged — pure status transition
+    expect(runner.auditStateForTest().positions['spec-1234:home']?.result).toBe('won'); // result captured on the clone (PR g-iii-a rules unchanged)
+
+    // Canonical untouched (the stream is the only canonical writer); the
+    // audit-source transition/fill emits are suppressed.
     const reloaded = StateStore.at(stateDir).load().state;
-    expect(reloaded.positions['spec-1234:home']?.status).toBe('pendingSettle');
-    expect(reloaded.positions['spec-1234:home']?.riskAmountWei6).toBe('250000'); // risk unchanged — pure status transition
-    // result is captured from the ClaimablePositionView.result on transition (PR g-iii-a) — closes the realized-P&L window-clip loophole when the position later auto-claims.
-    expect(reloaded.positions['spec-1234:home']?.result).toBe('won');
-
+    expect(reloaded.positions['spec-1234:home']?.status).toBe('active');
+    expect(reloaded.positions['spec-1234:home']?.result).toBeUndefined();
     const events = readEvents();
-    const transitions = events.filter((e) => e.kind === 'position-transition');
-    expect(transitions).toHaveLength(1);
-    expect(transitions[0]).toMatchObject({ speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', positionType: 1, fromStatus: 'active', toStatus: 'pendingSettle', result: 'won', predictedWinSide: 'home' });
-    expect(events.some((e) => e.kind === 'fill')).toBe(false); // status-only transition, no fill
+    expect(events.filter((e) => e.kind === 'position-transition')).toHaveLength(0);
+    expect(events.some((e) => e.kind === 'fill')).toBe(false);
   });
 
-  it('a position the API has moved from pendingSettle → claimable is updated locally + emits `position-transition` (result carried, predictedWinSide omitted — claimable view does not surface it)', async () => {
+  it('a position the API has moved from pendingSettle → claimable is updated on the AUDIT clone (result carried); canonical + telemetry untouched', async () => {
     const state = seedActiveHomePosition('spec-1234', '1234');
     state.positions['spec-1234:home']!.status = 'pendingSettle';
     StateStore.at(stateDir).flush(state);
@@ -5181,51 +5237,52 @@ describe('Runner — position-status transitions (Phase 3 c-ii)', () => {
       config, () => Promise.resolve([]), undefined, undefined, undefined,
       { getPositionStatus: () => Promise.resolve(withClaimablePosition('spec-1234', 1, 0.25, 0.25, 'won')) },
     );
-    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    const runner = makeRunner({ config, adapter, maxTicks: 1 });
+    await runner.run();
 
-    expect(StateStore.at(stateDir).load().state.positions['spec-1234:home']?.status).toBe('claimable');
-    const transitions = readEvents().filter((e) => e.kind === 'position-transition');
-    expect(transitions).toHaveLength(1);
-    expect(transitions[0]).toMatchObject({ fromStatus: 'pendingSettle', toStatus: 'claimable', result: 'won' });
-    expect(transitions[0]?.predictedWinSide).toBeUndefined(); // not on the claimable view
+    expect(runner.auditStateForTest().positions['spec-1234:home']?.status).toBe('claimable');
+    expect(runner.auditStateForTest().positions['spec-1234:home']?.result).toBe('won');
+    expect(StateStore.at(stateDir).load().state.positions['spec-1234:home']?.status).toBe('pendingSettle'); // canonical untouched
+    expect(readEvents().filter((e) => e.kind === 'position-transition')).toHaveLength(0); // audit-source transition emit suppressed
   });
 
-  it('a position the API has moved from active → claimable (skipping pendingSettle within the poll window) is a single forward transition (one `position-transition` event)', async () => {
+  it('a position the API has moved from active → claimable (skipping pendingSettle within the poll window) is a single forward step on the AUDIT clone; canonical + telemetry untouched', async () => {
     StateStore.at(stateDir).flush(seedActiveHomePosition('spec-1234', '1234'));
     const config = cfg({ mode: { dryRun: false } });
     const adapter = liveSpiedAdapter(
       config, () => Promise.resolve([]), undefined, undefined, undefined,
       { getPositionStatus: () => Promise.resolve(withClaimablePosition('spec-1234', 1, 0.25, 0.25, 'won')) },
     );
-    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    const runner = makeRunner({ config, adapter, maxTicks: 1 });
+    await runner.run();
 
-    expect(StateStore.at(stateDir).load().state.positions['spec-1234:home']?.status).toBe('claimable');
-    const transitions = readEvents().filter((e) => e.kind === 'position-transition');
-    expect(transitions).toHaveLength(1);
-    expect(transitions[0]).toMatchObject({ fromStatus: 'active', toStatus: 'claimable' });
+    expect(runner.auditStateForTest().positions['spec-1234:home']?.status).toBe('claimable');
+    expect(StateStore.at(stateDir).load().state.positions['spec-1234:home']?.status).toBe('active'); // canonical untouched
+    expect(readEvents().filter((e) => e.kind === 'position-transition')).toHaveLength(0);
   });
 
-  it('a position first observed directly in claimable (no prior local record) is CREATED with status claimable + emits `fill` (the position\'s birth — NO `position-transition` event)', async () => {
+  it('a position first observed directly in claimable (no prior local record) is CREATED on the AUDIT clone with status claimable; canonical + telemetry untouched (the birth `fill` emit is audit-suppressed)', async () => {
     // The soft-cancelled-stale-payload path can land a position straight into pendingSettle/claimable
-    // (the indexer is slow OR the speculation scored fast). We must record the maker's risk and at
-    // the right status — but it's a birth, not a transition, so no transition event.
+    // (the indexer is slow OR the speculation scored fast). The clone records the maker's risk at the
+    // right status — a birth, not a transition.
     const softCancelled = commitmentRecord({ hash: '0xstale', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, lifecycle: 'softCancelled', riskAmountWei6: '250000' });
     StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xstale': softCancelled } });
     const config = cfg({ mode: { dryRun: false } });
-    // The same stale-payload match the poll surfaces also converges the commitment via the
-    // soft-cancelled-fill step (its own getCommitment probe → cumulative fill == risk → `filled`),
-    // which emits its own `fill` (source: softcancel-recovery). This test is about the POSITION
-    // birth path, so it asserts on the position-poll fill specifically (and the absence of a transition).
+    // The same stale-payload match the poll surfaces also converges the clone's commitment via the
+    // soft-cancelled-fill step (its own getCommitment probe → cumulative fill == risk → `filled`).
     const apiFilled: Commitment = orderbookEntry({ commitmentHash: '0xstale', maker: DEFAULT_FAKE_MAKER_ADDRESS, contestId: '1234', positionType: 1, oddsTick: 200, riskAmount: '250000', filledRiskAmount: '250000', remainingRiskAmount: '0', status: 'cancelled', isLive: false });
     const adapter = liveSpiedAdapter(
       config, () => Promise.resolve([]), undefined, undefined, undefined,
       { getPositionStatus: () => Promise.resolve(withClaimablePosition('spec-1234', 1, 0.25, 0.25, 'won')), getCommitment: (h) => (h === '0xstale' ? Promise.resolve(apiFilled) : Promise.reject(new Error('unknown hash'))) },
     );
-    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    const runner = makeRunner({ config, adapter, maxTicks: 1 });
+    await runner.run();
 
-    expect(StateStore.at(stateDir).load().state.positions['spec-1234:home']).toMatchObject({ status: 'claimable', riskAmountWei6: '250000', counterpartyRiskWei6: '250000' });
+    expect(runner.auditStateForTest().positions['spec-1234:home']).toMatchObject({ status: 'claimable', riskAmountWei6: '250000', counterpartyRiskWei6: '250000' });
+    // Canonical untouched; all audit-source fill/transition emits are suppressed.
+    expect(StateStore.at(stateDir).load().state.positions).toEqual({});
     const events = readEvents();
-    expect(events.filter((e) => e.kind === 'fill' && e.source === 'position-poll')).toHaveLength(1); // the position's birth — counted once
+    expect(events.filter((e) => e.kind === 'fill')).toHaveLength(0);
     expect(events.some((e) => e.kind === 'position-transition')).toBe(false);
   });
 
@@ -5271,7 +5328,7 @@ describe('Runner — position-status transitions (Phase 3 c-ii)', () => {
     expect(events.some((e) => e.kind === 'fill')).toBe(false);
   });
 
-  it('a poll carrying BOTH a risk delta AND a forward status transition emits both `fill` and `position-transition`', async () => {
+  it('a poll carrying BOTH a risk delta AND a forward status transition converges both on the AUDIT clone; canonical + telemetry untouched (the audit emits neither `fill` nor `position-transition`)', async () => {
     // E.g. the speculation just scored AND the indexer just caught up on a prior fill the maker
     // missed — first poll observes the position with more risk AND in a non-`active` bucket.
     const state = seedActiveHomePosition('spec-1234', '1234', '100000', '100000'); // local: 0.10 USDC
@@ -5281,26 +5338,26 @@ describe('Runner — position-status transitions (Phase 3 c-ii)', () => {
       config, () => Promise.resolve([]), undefined, undefined, undefined,
       { getPositionStatus: () => Promise.resolve(withPendingSettlePosition('spec-1234', 1, 0.25, 0.25, 'won', 'home')) }, // API: 0.25 USDC risk, pendingSettle
     );
-    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    const runner = makeRunner({ config, adapter, maxTicks: 1 });
+    await runner.run();
 
+    expect(runner.auditStateForTest().positions['spec-1234:home']?.status).toBe('pendingSettle');
+    expect(runner.auditStateForTest().positions['spec-1234:home']?.riskAmountWei6).toBe('250000'); // 0.10 + 0.15 delta on the clone
+
+    // Canonical untouched; both audit-source emits suppressed.
     const reloaded = StateStore.at(stateDir).load().state;
-    expect(reloaded.positions['spec-1234:home']?.status).toBe('pendingSettle');
-    expect(reloaded.positions['spec-1234:home']?.riskAmountWei6).toBe('250000'); // 0.10 + 0.15 delta
-
+    expect(reloaded.positions['spec-1234:home']?.status).toBe('active');
+    expect(reloaded.positions['spec-1234:home']?.riskAmountWei6).toBe('100000');
     const events = readEvents();
-    const fills = events.filter((e) => e.kind === 'fill');
-    expect(fills).toHaveLength(1);
-    expect(fills[0]).toMatchObject({ source: 'position-poll', newFillWei6: '150000', cumulativeRiskWei6: '250000' });
-    const transitions = events.filter((e) => e.kind === 'position-transition');
-    expect(transitions).toHaveLength(1);
-    expect(transitions[0]).toMatchObject({ fromStatus: 'active', toStatus: 'pendingSettle' });
+    expect(events.filter((e) => e.kind === 'fill')).toHaveLength(0);
+    expect(events.filter((e) => e.kind === 'position-transition')).toHaveLength(0);
   });
 
-  it('an existing position whose source commitment was pruned (long-running game) still transitions — context comes from the position record\'s own denormalized fields (Hermes review-PR24)', async () => {
+  it('an existing position whose source commitment was pruned (long-running game) still transitions on the AUDIT clone — context comes from the position record\'s own denormalized fields (Hermes review-PR24); canonical untouched', async () => {
     // The realistic case: maker fills a commitment at T=0; the commitment becomes `filled`;
     // `pruneTerminalCommitments` deletes the filled record after ~1h; the game scores T+hours
     // later and the API moves the position from `active` to `pendingSettle`. Requiring a
-    // still-retained source commitment would strand the position in stale `active` status.
+    // still-retained source commitment would strand the clone's position in stale `active` status.
     StateStore.at(stateDir).flush({
       ...emptyMakerState(),
       // No commitments — the source commitment was pruned post-fill.
@@ -5313,15 +5370,14 @@ describe('Runner — position-status transitions (Phase 3 c-ii)', () => {
       config, () => Promise.resolve([]), undefined, undefined, undefined,
       { getPositionStatus: () => Promise.resolve(withPendingSettlePosition('spec-1234', 1, 0.25, 0.25, 'won', 'home')) },
     );
-    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    const runner = makeRunner({ config, adapter, maxTicks: 1 });
+    await runner.run();
 
-    const reloaded = StateStore.at(stateDir).load().state;
-    expect(reloaded.positions['spec-1234:home']?.status).toBe('pendingSettle');
+    expect(runner.auditStateForTest().positions['spec-1234:home']?.status).toBe('pendingSettle');
     const events = readEvents();
-    expect(events.some((e) => e.kind === 'error' && e.class === 'PositionWithoutCommitment')).toBe(false); // no false alarm
-    const transitions = events.filter((e) => e.kind === 'position-transition');
-    expect(transitions).toHaveLength(1);
-    expect(transitions[0]).toMatchObject({ fromStatus: 'active', toStatus: 'pendingSettle', contestId: '1234', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD' }); // context from the existing record
+    expect(events.some((e) => e.kind === 'error' && e.class === 'PositionWithoutCommitment')).toBe(false); // no false alarm — the existing record supplies its own context
+    expect(events.filter((e) => e.kind === 'position-transition')).toHaveLength(0); // audit-source transition emit suppressed
+    expect(StateStore.at(stateDir).load().state.positions['spec-1234:home']?.status).toBe('active'); // canonical untouched
   });
 });
 
@@ -5810,36 +5866,42 @@ describe('Runner — auto-settle + auto-claim (Phase 3 e-i)', () => {
     expect((event as { result?: string }).result).toBeUndefined();
   });
 
-  it('upgrade path: a pre-(g-iii-a) claimable record (status:claimable, result:undefined) gets `result` stamped when a fresh position-poll carries it, even though risk + status are unchanged — then auto-claim emits claim.result (Hermes review-PR34 blocker)', async () => {
-    // Reproduces Hermes' upgrade-path repro: persisted state has a claimable
-    // record from before this PR (no result field); the position-poll observes
-    // it again with API result:'push'. The early-return gate must NOT short-
-    // circuit on `!riskGrew && !statusChanged` alone — a result delta is also a
-    // state change. Without the fix the runner returns early, never stamps
-    // result, and auto-claim emits claim WITHOUT result.
+  it('upgrade path: a pre-(g-iii-a) claimable record (status:claimable, result:undefined) gets `result` stamped when a stream positionStatus event carries it, even though risk + status are unchanged — then auto-claim emits claim.result (Hermes review-PR34 blocker; canonical path is the stream since OS-Phase 4)', async () => {
+    // Hermes' upgrade-path repro, on the canonical writer: persisted state has a
+    // claimable record from before (g-iii-a) (no result field); the own-state
+    // stream delivers a positionStatus event for the same bucket with
+    // result:'push'. The same-status apply must NOT drop the result delta —
+    // without it, auto-claim emits claim WITHOUT result. (The position-poll now
+    // converges only the audit clone; the stream is the sole canonical writer.)
     StateStore.at(stateDir).flush({
       ...emptyMakerState(),
       positions: { '5678:home': claimableRecord('5678', '5678', 'home') }, // result: undefined
     });
     const claim = ensureClaimRecorder(70_000n, 30_000_000_000n, 250_000n); // payout=stake (refund)
-    // The API poll returns the same claimable bucket + risk, plus result:'push'.
-    // The view shape matches `ClaimablePositionView`: positionType 1 = home.
-    const pollResponse: PositionStatus = {
-      active: [],
-      pendingSettle: [],
-      claimable: [{ positionId: '0xp', speculationId: '5678', positionType: 1, team: 'X', opponent: 'Y', market: 'moneyline', oddsDecimal: null, riskAmountUSDC: 0.25, profitAmountUSDC: 0.25, result: 'push', estimatedPayoutUSDC: 0.25, estimatedPayoutWei6: '250000' }],
-      totals: { activeCount: 0, pendingSettleCount: 0, claimableCount: 1, estimatedPayoutUSDC: 0.25, estimatedPayoutWei6: '250000', pendingSettlePayoutUSDC: 0, pendingSettlePayoutWei6: '0' },
-    };
     const config = cfg({ mode: { dryRun: false }, settlement: { autoSettleOwn: false, autoClaimOwn: true, continueOnGasBudgetExhausted: false } });
     const adapter = liveSpiedAdapter(
       config, () => Promise.resolve([]),
       { ensureSpeculationSettled: settleRecorder().fn, ensurePositionClaimed: claim.fn },
-      undefined, undefined,
-      { getPositionStatus: () => Promise.resolve(pollResponse) },
     );
+    // Like autoHealthyOwnStateStub, but also delivers the canonical positionStatus
+    // event (claimable + result:'push', positionType 1 = home) before tick 1's
+    // pre-tick drain. No snapshot — the flushed state above survives as canonical.
+    vi.spyOn(adapter, 'subscribeOwnState').mockImplementation(((_opts: unknown, handlers: unknown) => {
+      const h = handlers as Record<string, ((...args: unknown[]) => void) | undefined>;
+      queueMicrotask(() => {
+        h.onFrame?.({ receivedAtMs: 0, kind: 'heartbeat' });
+        h.onReady?.({ cursor: '' });
+        h.onStatus?.('connected');
+        h.onPositionStatus?.(
+          { address: DEFAULT_FAKE_MAKER_ADDRESS, speculationId: '5678', positionType: 1, status: 'claimable', result: 'push', sourceUpdatedAt: '2026-01-01T00:00:00.000Z' },
+          { cursor: '' },
+        );
+      });
+      return { unsubscribe: () => Promise.resolve() };
+    }) as unknown as OspexAdapter['subscribeOwnState']);
     await makeRunner({ config, adapter, maxTicks: 1 }).run();
 
-    // The position record now has the API's result stamped.
+    // The canonical position record now has the stream's result stamped.
     const reloaded = StateStore.at(stateDir).load().state;
     expect(reloaded.positions['5678:home']?.result).toBe('push');
     // And the auto-claim emit carries it, closing the realized-P&L loophole.
@@ -6521,7 +6583,11 @@ describe('Runner — cancelMode: onchain (D2 — authoritative cancel of retaine
     // → tick 1 applies and stamps lastReconciledAt (the precondition for the round-3 throttle hole).
     const partial = commitmentRecord({ hash: '0xpart', speculationId: 'spec-1234', contestId: '1234', makerSide: 'away', lifecycle: 'partiallyFilled', oddsTick: 200, riskAmountWei6: '500000', filledRiskWei6: '200000', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 10, updatedAtUnixSec: T0 - 10 });
     StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xpart': partial } });
-    const config = cfg({ mode: { dryRun: false }, odds: { subscribe: false }, orders: { expirySeconds: 120, cancelMode: 'onchain', replaceOnOddsMoveBps: 100_000, staleAfterSeconds: 90 } });
+    // staleMaxMs maxed out: the advancing clock (+40s per tick) would otherwise decay the
+    // own-state transport latch by tick 3 (the auto-healthy stub frames once at boot) and the
+    // §5.1 stream-health cancel-sweep would fire EXTRA on-chain cancels — this test is about
+    // the reconcile retry cadence, not the sweep.
+    const config = cfg({ mode: { dryRun: false }, odds: { subscribe: false }, ownState: { recoveryHoldMs: 0, staleMaxMs: 300_000 }, orders: { expirySeconds: 120, cancelMode: 'onchain', replaceOnOddsMoveBps: 100_000, staleAfterSeconds: 90 } });
     let attempts = 0;
     const adapter = liveSpiedAdapter(config, () => Promise.resolve([contestView({ contestId: '1234', matchTime: new Date(matchTimeSec * 1000).toISOString() })]), {
       submitCommitment: submitRecorder().fn,
@@ -6590,16 +6656,20 @@ describe('Runner — cancelMode: onchain (PR3 — authoritative cancel of recove
     };
   }
   // A recovered soft-cancel: the MM soft-cancelled a quote off-chain (→ softCancelled), then a taker
-  // matched the stale signed payload on chain. reconcileSoftCancelledFills converges its cumulative
-  // fill (it STAYS softCancelled with filledRiskWei6 > 0 — PR2); under cancelMode:onchain this step
-  // authoritatively cancels the still-latent remainder rather than letting it ride to expiry.
+  // matched the stale signed payload on chain. The own-state stream writes the match into canonical
+  // state (it STAYS softCancelled with filledRiskWei6 > 0; reconcileSoftCancelledFills converges the
+  // AUDIT clone only since OS-Phase 4); under cancelMode:onchain the sweep authoritatively cancels
+  // the still-latent remainder rather than letting it ride to expiry.
   function recoveredScApi(filledRiskAmount: string, riskAmount = '500000', storedStatus: Commitment['storedStatus'] = 'partially_filled'): Commitment {
     return orderbookEntry({ commitmentHash: '0xsc', maker: DEFAULT_FAKE_MAKER_ADDRESS, contestId: '1234', positionType: 1, oddsTick: 200, riskAmount, filledRiskAmount, remainingRiskAmount: (BigInt(riskAmount) - BigInt(filledRiskAmount)).toString(), status: 'cancelled', storedStatus, isLive: false });
   }
 
   it('cancelMode:onchain: a recovered soft-cancel (matched after the off-chain pull) is authoritatively cancelled on chain → authoritativelyInvalidated + onchain-cancel + gas accrued; never the off-chain DELETE (it would 409)', async () => {
-    // filledRiskWei6 starts 0; getCommitment reports a cumulative 200000 → reconcileSoftCancelledFills converges (stays softCancelled), then this step cancels the latent remainder.
-    const sc = commitmentRecord({ hash: '0xsc', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '500000', filledRiskWei6: '0', lifecycle: 'softCancelled', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 5, updatedAtUnixSec: T0 - 5 });
+    // Seed the matched soft-cancel canonically (filledRiskWei6 200000 > 0 — since OS-Phase 4 the
+    // stream writes the match into canonical state; the soft-cancel probe is audit-only). The
+    // sweep then cancels the latent remainder. getCommitment is stubbed so the audit probe
+    // converges cleanly (it sees the same cumulative).
+    const sc = commitmentRecord({ hash: '0xsc', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, riskAmountWei6: '500000', filledRiskWei6: '200000', lifecycle: 'softCancelled', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 5, updatedAtUnixSec: T0 - 5 });
     StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xsc': sc } });
     const config = cfg({ mode: { dryRun: false }, orders: { expirySeconds: 120, cancelMode: 'onchain' }, gas: { maxDailyGasPOL: 1, emergencyReservePOL: 0.2 } });
     const cancel = cancelOnchainRecorder();
@@ -6614,9 +6684,8 @@ describe('Runner — cancelMode: onchain (PR3 — authoritative cancel of recove
     expect(offchainCancels).not.toContain('0xsc'); // never the off-chain DELETE (a matched commitment 409s)
     const reloaded = StateStore.at(stateDir).load().state;
     expect(reloaded.commitments['0xsc']?.lifecycle).toBe('authoritativelyInvalidated');
-    expect(reloaded.commitments['0xsc']?.filledRiskWei6).toBe('200000'); // the matched portion is recorded; the remainder is now cancelled
+    expect(reloaded.commitments['0xsc']?.filledRiskWei6).toBe('200000'); // the matched portion stays recorded; the remainder is now cancelled
     const events = readEvents();
-    expect(events.find((e) => e.kind === 'fill' && e.source === 'softcancel-recovery' && e.commitmentHash === '0xsc')).toBeDefined(); // the recovery fill fired first (the match)
     expect(events.find((e) => e.kind === 'onchain-cancel' && e.commitmentHash === '0xsc')).toMatchObject({ speculationId: 'spec-1234', makerSide: 'home', txHash: '0xrecoverytx' });
     expect(reloaded.dailyCounters[todayUTC()]?.gasPolWei).toBe(cancel.gasPolWeiPerCall.toString()); // gas accrued
   });
@@ -7077,7 +7146,7 @@ describe('Runner — §5.1 stream-health active cancel-sweep (PR3b-ii)', () => {
 
   it('offchain (default): high-severity hold pulls visible quotes off the relay (soft-cancel reason "stream-health"), no on-chain cancel; exposure still counted (softCancelled rides to expiry)', async () => {
     const record = seedOne();
-    const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: true } }); // orders.cancelMode defaults to 'offchain'
+    const config = cfg({ mode: { dryRun: false } }); // orders.cancelMode defaults to 'offchain'
     const offchainCancels: Hex[] = [];
     const cancelOnchain = cancelOnchainRecorder();
     const submit = submitRecorder();
@@ -7105,7 +7174,7 @@ describe('Runner — §5.1 stream-health active cancel-sweep (PR3b-ii)', () => {
 
   it('onchain: soft-cancels then authoritatively cancels on chain → authoritativelyInvalidated (drops from exposure)', async () => {
     const record = seedOne();
-    const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: true }, orders: { cancelMode: 'onchain' }, gas: { maxDailyGasPOL: 1, emergencyReservePOL: 0.2 } });
+    const config = cfg({ mode: { dryRun: false }, orders: { cancelMode: 'onchain' }, gas: { maxDailyGasPOL: 1, emergencyReservePOL: 0.2 } });
     const offchainCancels: Hex[] = [];
     const cancelOnchain = cancelOnchainRecorder();
     const adapter = liveSpiedAdapter(
@@ -7125,7 +7194,7 @@ describe('Runner — §5.1 stream-health active cancel-sweep (PR3b-ii)', () => {
 
   it('no open exposure (low-severity hold): the sweep is a no-op — no off-chain pull, no on-chain cancel, severity LOW', async () => {
     StateStore.at(stateDir).flush(emptyMakerState()); // hold trips (unhealthy) but exposure is 0
-    const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: true }, orders: { cancelMode: 'onchain' } });
+    const config = cfg({ mode: { dryRun: false }, orders: { cancelMode: 'onchain' } });
     const offchainCancels: Hex[] = [];
     const cancelOnchain = cancelOnchainRecorder();
     const adapter = liveSpiedAdapter(
@@ -7145,7 +7214,7 @@ describe('Runner — §5.1 stream-health active cancel-sweep (PR3b-ii)', () => {
 
   it('dry-run + subscribe: the §5.1 gate is dormant → no hold, no sweep, no cancel even with exposure', async () => {
     const record = seedOne();
-    const config = cfg({ mode: { dryRun: true }, ownState: { subscribe: true }, orders: { cancelMode: 'onchain' } });
+    const config = cfg({ mode: { dryRun: true }, orders: { cancelMode: 'onchain' } });
     const offchainCancels: Hex[] = [];
     const cancelOnchain = cancelOnchainRecorder();
     const adapter = liveSpiedAdapter(
@@ -7167,7 +7236,7 @@ describe('Runner — §5.1 stream-health active cancel-sweep (PR3b-ii)', () => {
     const record = seedOne();
     const POL = 10n ** 18n;
     StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { [record.hash]: record }, dailyCounters: { [todayUTC()]: { gasPolWei: POL.toString(), feeUsdcWei6: '0' } } }); // today's spend already at the full cap
-    const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: true }, orders: { cancelMode: 'onchain' }, gas: { maxDailyGasPOL: 1, emergencyReservePOL: 0 } });
+    const config = cfg({ mode: { dryRun: false }, orders: { cancelMode: 'onchain' }, gas: { maxDailyGasPOL: 1, emergencyReservePOL: 0 } });
     const cancelOnchain = cancelOnchainRecorder();
     const adapter = liveSpiedAdapter(
       config, () => Promise.resolve([]),
@@ -7191,7 +7260,7 @@ describe('Runner — §5.1 stream-health active cancel-sweep (PR3b-ii)', () => {
     const record: MakerCommitmentRecord = commitmentRecord({ hash: '0xsh', contestId: 'contest-sh', speculationId: 'spec-sh', makerSide: 'away', riskAmountWei6: '250000', filledRiskWei6: '0', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 10, updatedAtUnixSec: T0 - 10, signedPayloadStatus: 'missing-legacy' });
     delete record.signedPayload; // missing-legacy MUST have no signedPayload (the validator rejects the inconsistency)
     StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { [record.hash]: record } });
-    const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: true }, orders: { cancelMode: 'onchain' }, gas: { maxDailyGasPOL: 1, emergencyReservePOL: 0.2 } });
+    const config = cfg({ mode: { dryRun: false }, orders: { cancelMode: 'onchain' }, gas: { maxDailyGasPOL: 1, emergencyReservePOL: 0.2 } });
     const offchainCancels: Hex[] = [];
     const cancelOnchain = cancelOnchainRecorder();
     const adapter = liveSpiedAdapter(
@@ -7210,7 +7279,7 @@ describe('Runner — §5.1 stream-health active cancel-sweep (PR3b-ii)', () => {
 
   it('offchain: a transient off-chain pull failure (cancelCommitmentOffchain throws) leaves the record visibleOpen for the next held tick; the second tick lands the pull', async () => {
     const record = seedOne();
-    const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: true } });
+    const config = cfg({ mode: { dryRun: false } });
     let attempts = 0;
     const adapter = liveSpiedAdapter(
       config, () => Promise.resolve([]),
@@ -7230,7 +7299,7 @@ describe('Runner — §5.1 stream-health active cancel-sweep (PR3b-ii)', () => {
 
   it('coexists with the funding sweep (both onchain): a record cancelled by the funding sweep is NOT double-cancelled by the stream-health sweep', async () => {
     const record = seedOne();
-    const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: true }, orders: { cancelMode: 'onchain' }, fundingGuard: { underfundedCancelMode: 'onchain' }, gas: { maxDailyGasPOL: 1, emergencyReservePOL: 0.2 } });
+    const config = cfg({ mode: { dryRun: false }, orders: { cancelMode: 'onchain' }, fundingGuard: { underfundedCancelMode: 'onchain' }, gas: { maxDailyGasPOL: 1, emergencyReservePOL: 0.2 } });
     const cancelOnchain = cancelOnchainRecorder();
     const adapter = liveSpiedAdapter(
       config, () => Promise.resolve([]),
@@ -7261,7 +7330,7 @@ describe('Runner — §5.1 stream-health active cancel-sweep (PR3b-ii)', () => {
     const b: MakerCommitmentRecord = commitmentRecord({ hash: '0xsh-b', contestId: 'contest-b', speculationId: 'spec-b', makerSide: 'home', riskAmountWei6: '250000', filledRiskWei6: '0', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 10, updatedAtUnixSec: T0 - 10, signedPayloadStatus: 'missing-legacy' });
     delete b.signedPayload;
     StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { [a.hash]: a, [b.hash]: b }, dailyCounters: { [todayUTC()]: { gasPolWei: (10n ** 18n).toString(), feeUsdcWei6: '0' } } }); // cap exhausted → canSpendGas denies on the FIRST pre-pass candidate
-    const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: true }, orders: { cancelMode: 'onchain' }, gas: { maxDailyGasPOL: 1, emergencyReservePOL: 0 } });
+    const config = cfg({ mode: { dryRun: false }, orders: { cancelMode: 'onchain' }, gas: { maxDailyGasPOL: 1, emergencyReservePOL: 0 } });
     const offchainCancels: Hex[] = [];
     const cancelOnchain = cancelOnchainRecorder();
     const adapter = liveSpiedAdapter(
@@ -7283,7 +7352,7 @@ describe('Runner — §5.1 stream-health active cancel-sweep (PR3b-ii)', () => {
     const inv: MakerCommitmentRecord = commitmentRecord({ hash: '0xinv', contestId: 'contest-inv', speculationId: 'spec-inv', makerSide: 'away', riskAmountWei6: '250000', filledRiskWei6: '0', lifecycle: 'authoritativelyInvalidated', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 10, updatedAtUnixSec: T0 - 10 });
     const live: MakerCommitmentRecord = commitmentRecord({ hash: '0xlive', contestId: 'contest-live', speculationId: 'spec-live', makerSide: 'home', riskAmountWei6: '250000', filledRiskWei6: '0', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 10, updatedAtUnixSec: T0 - 10 });
     StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { [inv.hash]: inv, [live.hash]: live } });
-    const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: true }, orders: { cancelMode: 'onchain' }, gas: { maxDailyGasPOL: 1, emergencyReservePOL: 0.2 } });
+    const config = cfg({ mode: { dryRun: false }, orders: { cancelMode: 'onchain' }, gas: { maxDailyGasPOL: 1, emergencyReservePOL: 0.2 } });
     const cancelOnchain = cancelOnchainRecorder();
     const adapter = liveSpiedAdapter(
       config, () => Promise.resolve([]),
@@ -7296,29 +7365,21 @@ describe('Runner — §5.1 stream-health active cancel-sweep (PR3b-ii)', () => {
     expect(cancelOnchain.calls).toEqual(['0xlive']); // 0xinv skipped by the lifecycle filter; exposure stayed > 0 (0xlive) so the sweep did NOT early-return
   });
 
-  it('subscribe:false (poll-only backout): the sweep is DORMANT — no hold, no cancel, even live with open exposure', async () => {
-    const record = seedOne();
-    const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: false }, orders: { cancelMode: 'onchain' } }); // poll-canonical (the default merge posture)
-    const offchainCancels: Hex[] = [];
-    const cancelOnchain = cancelOnchainRecorder();
-    const adapter = liveSpiedAdapter(
-      config, () => Promise.resolve([]),
-      { cancelCommitmentOffchain: (h) => { offchainCancels.push(h); return Promise.resolve(); }, cancelCommitmentOnchain: cancelOnchain.fn },
-      undefined, undefined,
-      { listOpenCommitments: () => Promise.resolve([openFixture(record)]) },
-    ); // no SSE subscription at all in poll-only mode
-    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+  it('dry-run: the sweep is DORMANT — no hold, no cancel (the gate is live-only; no subscription exists to assess)', async () => {
+    seedOne();
+    const config = cfg({ orders: { cancelMode: 'onchain' } }); // dry-run default; no makerAddress → never subscribes
+    const events0 = readEvents();
+    expect(events0.some((e) => e.kind === 'stream-health-hold')).toBe(false);
+    await makeRunner({ config, maxTicks: 1 }).run();
     const events = readEvents();
-    expect(events.some((e) => e.kind === 'stream-health-hold')).toBe(false); // §5.1 gate dormant when subscribe:false
-    expect(offchainCancels).toEqual([]);
-    expect(cancelOnchain.calls).toEqual([]);
+    expect(events.some((e) => e.kind === 'stream-health-hold')).toBe(false); // §5.1 gate inert in dry-run
     expect(events.some((e) => e.kind === 'soft-cancel' && e.reason === 'stream-health')).toBe(false);
-    expect(StateStore.at(stateDir).load().state.commitments['0xsh']?.lifecycle).toBe('visibleOpen'); // untouched — byte-identical backout
+    expect(StateStore.at(stateDir).load().state.commitments['0xsh']?.lifecycle).toBe('visibleOpen'); // untouched
   });
 
   it('offchain: a partiallyFilled remainder is NOT pulled (rides to expiry) and emits no partial-remainder-retained', async () => {
     const record = seedOne({ hash: '0xpf', lifecycle: 'partiallyFilled', riskAmountWei6: '250000', filledRiskWei6: '100000' });
-    const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: true } }); // offchain default
+    const config = cfg({ mode: { dryRun: false } }); // offchain default
     const offchainCancels: Hex[] = [];
     const adapter = liveSpiedAdapter(
       config, () => Promise.resolve([]),
@@ -7337,7 +7398,7 @@ describe('Runner — §5.1 stream-health active cancel-sweep (PR3b-ii)', () => {
 
   it('onchain: a partiallyFilled remainder IS authoritatively cancelled on chain → authoritativelyInvalidated (never the off-chain DELETE)', async () => {
     const record = seedOne({ hash: '0xpf', lifecycle: 'partiallyFilled', riskAmountWei6: '250000', filledRiskWei6: '100000' });
-    const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: true }, orders: { cancelMode: 'onchain' }, gas: { maxDailyGasPOL: 1, emergencyReservePOL: 0.2 } });
+    const config = cfg({ mode: { dryRun: false }, orders: { cancelMode: 'onchain' }, gas: { maxDailyGasPOL: 1, emergencyReservePOL: 0.2 } });
     const offchainCancels: Hex[] = [];
     const cancelOnchain = cancelOnchainRecorder();
     const adapter = liveSpiedAdapter(
@@ -7357,7 +7418,7 @@ describe('Runner — §5.1 stream-health active cancel-sweep (PR3b-ii)', () => {
     const a = commitmentRecord({ hash: '0xa', contestId: 'contest-a', speculationId: 'spec-a', makerSide: 'away', riskAmountWei6: '250000', filledRiskWei6: '0', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 10, updatedAtUnixSec: T0 - 10 });
     const b = commitmentRecord({ hash: '0xb', contestId: 'contest-b', speculationId: 'spec-b', makerSide: 'home', riskAmountWei6: '250000', filledRiskWei6: '0', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 10, updatedAtUnixSec: T0 - 10 });
     StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { [a.hash]: a, [b.hash]: b } });
-    const config = cfg({ mode: { dryRun: false }, ownState: { subscribe: true }, orders: { cancelMode: 'onchain' }, gas: { maxDailyGasPOL: 1, emergencyReservePOL: 0.2 } });
+    const config = cfg({ mode: { dryRun: false }, orders: { cancelMode: 'onchain' }, gas: { maxDailyGasPOL: 1, emergencyReservePOL: 0.2 } });
     const attempted: Hex[] = [];
     const adapter = liveSpiedAdapter(
       config, () => Promise.resolve([]),

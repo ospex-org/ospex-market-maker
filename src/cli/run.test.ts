@@ -146,6 +146,11 @@ describe('runRun — live mode wiring', () => {
     vi.spyOn(adapter, 'approveUSDC').mockRejectedValue(new Error('liveDiscoveryFindsNothing: approveUSDC not stubbed'));
     // Wallet balance is read in exact-mode auto-approve; default to saturated USDC so the bound never bites these tests.
     vi.spyOn(adapter, 'readBalances').mockResolvedValue({ owner: '0xowner' as Hex, chainId: 137, native: 10n ** 18n, usdc: 2n ** 255n, link: 0n, usdcAddress: '0xusdc' as Hex, linkAddress: '0xlink' as Hex });
+    // A live boot always opens the own-state subscription (OS-Phase 4) and polls
+    // own-state health each tick — stub both so no real SSE auth handshake or
+    // HTTP probe leaves the test process.
+    vi.spyOn(adapter, 'subscribeOwnState').mockImplementation((() => ({ unsubscribe: () => Promise.resolve() })) as unknown as OspexAdapter['subscribeOwnState']);
+    vi.spyOn(adapter, 'getOwnStateHealth').mockResolvedValue({ indexerLagSeconds: 0, lastIndexedAt: '2026-01-01T00:00:00Z', lagSource: 'test' });
     return adapter;
   }
 

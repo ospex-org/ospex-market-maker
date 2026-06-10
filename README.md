@@ -64,23 +64,27 @@ cast wallet new ~/.foundry/keystores ospex-mm    # Foundry generates the key, pr
                                                   # — or `cast wallet import ospex-mm` for an existing key
 ```
 
-Point the config at that path (`wallet.keystorePath`, or the `OSPEX_KEYSTORE_PATH` env var). You also bring your own RPC URL — Alchemy, Infura, or QuickNode (the public Polygon RPCs are rate-limited and unreliable; there is no default). The MM prompts for the keystore passphrase only when it needs to sign.
+Point the config at that file with an **absolute path** (`wallet.keystorePath`, or the `OSPEX_KEYSTORE_PATH` env var) — the path is used verbatim, so `~` is not expanded. A keystore is only needed for live mode: `doctor --address <0x…>`, `quote --dry-run`, and `run --dry-run` sign nothing, so `wallet.keystorePath` can stay blank until you go live. You also bring your own RPC URL — Alchemy, Infura, or QuickNode (the public Polygon RPCs are rate-limited and unreliable; there is no default). The MM prompts for the keystore passphrase only when it needs to sign.
 
-## Quick start (intended flow — fills in as the implementation lands)
+## Quick start
 
 ```bash
 yarn install
 yarn build
 
 cp ospex-mm.example.yaml ospex-mm.yaml
-# edit ospex-mm.yaml — wallet.keystorePath, rpcUrl, pricing.economics (capital + target return), risk caps
+# edit ospex-mm.yaml — rpcUrl, pricing.economics (capital + target return), risk caps.
+# wallet.keystorePath can stay blank until you go live — nothing before `run --live` signs anything.
 
-yarn mm doctor                       # readiness: balances (USDC + POL), PositionModule allowance, API/RPC, state
+yarn mm doctor --address <0xYou>     # readiness: balances (USDC + POL), PositionModule allowance, API/RPC, state — fully read-only
+                                     #   (--address is optional — without it the chain checks SKIP; if you pass one, use the
+                                     #    wallet you'll actually fund — doctor FAILs a 0-POL wallet)
 yarn mm quote --dry-run <contestId>  # one-shot: fetch reference odds, compute a two-sided quote, print the breakdown
+                                     #   (to pick a contestId, see "Find a quote target" in docs/QUICKSTART.md §5)
 yarn mm run --dry-run                # shadow mode: the full loop, posts nothing — let it run a while
 yarn mm summary                      # aggregate the NDJSON event logs into the run metrics — read this before going live
-# then, deliberately: set mode.dryRun: false in the config AND pass --live (the two-key model);
-# OSPEX_KEYSTORE_PASSPHRASE=… in the env, else a no-echo TTY prompt
+# then, deliberately: set wallet.keystorePath (absolute path) and mode.dryRun: false in the config
+# AND pass --live (the two-key model); OSPEX_KEYSTORE_PASSPHRASE=… in the env, else a no-echo TTY prompt
 OSPEX_KEYSTORE_PASSPHRASE=… yarn mm run --live
 ```
 
@@ -90,7 +94,7 @@ See **[`docs/QUICKSTART.md`](docs/QUICKSTART.md)** for the walkthrough and **[`d
 
 ## Configuration
 
-The annotated reference config is **[`ospex-mm.example.yaml`](ospex-mm.example.yaml)** — copy it, fill in wallet / rpc / pricing / risk, run. A novice typically touches only `wallet`, `rpcUrl`, `pricing.economics`, and maybe `risk`. The full schema and the rationale for every field are in `docs/DESIGN.md §7`. Defaults are conservative and `dryRun: true`.
+The annotated reference config is **[`ospex-mm.example.yaml`](ospex-mm.example.yaml)** — copy it, fill in rpc / pricing / risk (wallet only when you go live), run. A novice typically touches only `rpcUrl`, `pricing.economics`, and maybe `risk` — plus `wallet` when going live. The full schema and the rationale for every field are in `docs/DESIGN.md §7`. Defaults are conservative and `dryRun: true`.
 
 ## Architecture (brief — full design in `docs/DESIGN.md`)
 
@@ -105,7 +109,8 @@ This is **experimental software**, provided **without warranty**. Wagering and o
 ```bash
 yarn smoke          # runs install / build / typecheck / lint / test / mm --help in series; fails fast on first error
                     # — or run the steps individually:
-yarn install        # pulls @ospex/sdk from its pinned GitHub Release tarball (see package.json) + transitive deps
+yarn install        # pulls @ospex/sdk from its pinned GitHub Release tarball + transitive deps
+                    # — package.json / yarn.lock are the source of truth for the pinned version (v0.6.2 at the time of writing)
 yarn build          # tsc -> dist/
 yarn typecheck      # tsc --noEmit
 yarn test           # vitest

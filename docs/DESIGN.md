@@ -269,14 +269,16 @@ Mechanism: the presence of a file at `killSwitchFile` (config; default `./KILL`)
 
 ## 7. Config schema
 
-A YAML file (`--config <path>`, default `./ospex-mm.yaml`), validated at boot — invalid or missing required values → exit `1` with a message naming the problem. Env vars override individual fields (`OSPEX_KEYSTORE_PATH`, `OSPEX_RPC_URL`, `OSPEX_API_URL`, `OSPEX_CHAIN_ID`, plus `OSPEX_MM_*`). The repo ships `ospex-mm.example.yaml` — the MLB + moneyline starter config below, conservative caps, `dryRun: true`, short `fixed-seconds` expiry — which doubles as the onboarding doc. A novice typically touches only `wallet`, `rpcUrl`, `pricing.economics`, and maybe `risk`.
+A YAML file (`--config <path>`, default `./ospex-mm.yaml`), validated at boot — invalid or missing required values → exit `1` with a message naming the problem. Env vars override individual fields (`OSPEX_KEYSTORE_PATH`, `OSPEX_RPC_URL`, `OSPEX_API_URL`, `OSPEX_CHAIN_ID`, plus `OSPEX_MM_*`). The repo ships `ospex-mm.example.yaml` — the MLB + moneyline starter config below, conservative caps, `dryRun: true`, short `fixed-seconds` expiry — which doubles as the onboarding doc. A novice typically touches only `rpcUrl`, `pricing.economics`, and maybe `risk` — plus `wallet` when going live.
 
 ```yaml
 # ospex-mm.example.yaml — annotated reference config (v0)
 
 wallet:
-  keystorePath: ~/.foundry/keystores/ospex-mm   # Foundry v3 keystore; prompts for passphrase on sign.
-                                                 # (Or set OSPEX_KEYSTORE_PATH instead.)
+  keystorePath: ""   # Blank = no keystore (read-only / dry-run — doctor WARNs, nothing signs). For live
+                     #   mode: the ABSOLUTE path to a Foundry v3 keystore (used verbatim — `~` is NOT
+                     #   expanded; a set-but-missing path is a doctor FAIL), or OSPEX_KEYSTORE_PATH.
+                     #   Prompts for the passphrase only when signing.
 
 rpcUrl: ""            # REQUIRED. Alchemy / Infura / QuickNode URL for the chain. No public-RPC default.
 apiUrl: ""            # Optional. Defaults to the production Ospex core API URL.

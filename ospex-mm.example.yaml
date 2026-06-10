@@ -1,14 +1,19 @@
 # ospex-mm.example.yaml — annotated reference config (v0)
 #
-# Copy this to ospex-mm.yaml, fill in wallet / rpcUrl / pricing / risk, and run.
+# Copy this to ospex-mm.yaml, fill in rpcUrl / pricing / risk (wallet only when
+# you go live), and run.
 # Defaults are conservative and dry-run. Going live requires BOTH mode.dryRun:
 # false here AND the --live flag on the command (the two-key model — see
 # docs/DESIGN.md §8 and docs/OPERATOR_SAFETY.md). The full schema and the
 # rationale for every field are in docs/DESIGN.md §7.
 
 wallet:
-  keystorePath: ~/.foundry/keystores/ospex-mm   # Foundry v3 keystore; prompts for passphrase on sign.
-                                                 # (Or set OSPEX_KEYSTORE_PATH instead.)
+  keystorePath: ""   # Blank = no keystore — right for read-only / dry-run use (`doctor --address <0x…>`,
+                     #   `quote --dry-run`, and `run --dry-run` sign nothing; doctor reports an advisory
+                     #   WARN). For live mode set the ABSOLUTE path to a Foundry v3 keystore — e.g.
+                     #   /home/you/.foundry/keystores/ospex-mm — or set OSPEX_KEYSTORE_PATH. The path is
+                     #   used verbatim (`~` is NOT expanded), and a set-but-missing path is a doctor FAIL.
+                     #   Prompts for the passphrase only when signing.
 
 rpcUrl: ""            # REQUIRED. Alchemy / Infura / QuickNode URL for the chain. No public-RPC default.
 apiUrl: ""            # Optional. Defaults to the production Ospex core API URL.

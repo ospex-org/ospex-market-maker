@@ -5,16 +5,17 @@
 ## 1. Prerequisites
 
 - Node 20+, [Yarn](https://classic.yarnpkg.com/) 1.x.
-- A [Foundry](https://book.getfoundry.sh/) keystore for the wallet the maker will use:
-
-  ```bash
-  mkdir -p ~/.foundry/keystores
-  cast wallet new ~/.foundry/keystores ospex-mm     # generates a fresh key; prints only the address
-  # — or: cast wallet import ospex-mm                # import an existing private key
-  ```
-
 - An RPC URL for Polygon (Alchemy / Infura / QuickNode). No public-RPC default — the public Polygon endpoints are rate-limited and unreliable.
-- USDC (for stakes) and POL/MATIC (for gas — approvals, on-chain cancels, settle, claim) in that wallet. The MM does **not** need LINK.
+- **For live mode only** — everything below `run --live` is read-only / signs nothing, so you can skip these for a dry-run:
+  - A [Foundry](https://book.getfoundry.sh/) keystore for the wallet the maker will use:
+
+    ```bash
+    mkdir -p ~/.foundry/keystores
+    cast wallet new ~/.foundry/keystores ospex-mm     # generates a fresh key; prints only the address
+    # — or: cast wallet import ospex-mm                # import an existing private key
+    ```
+
+  - USDC (for stakes) and POL/MATIC (for gas — approvals, on-chain cancels, settle, claim) in that wallet. The MM does **not** need LINK.
 
 ## 2. Install & build
 
@@ -22,6 +23,8 @@
 yarn install
 yarn build
 ```
+
+`yarn install` pulls `@ospex/sdk` from its pinned GitHub Release tarball — `package.json` / `yarn.lock` are the source of truth for the pinned version (v0.6.2 at the time of writing); there is nothing SDK-related to install separately.
 
 Then run the CLI as `yarn mm <command>` (which is `node dist/cli/index.js`), or `yarn dev <command>` to run it via `tsx` without a build. To put the `ospex-mm` binary on your PATH instead: `yarn link` (or `npm link`) after `yarn build`, then `ospex-mm <command>`.
 
@@ -31,15 +34,17 @@ Then run the CLI as `yarn mm <command>` (which is `node dist/cli/index.js`), or 
 cp ospex-mm.example.yaml ospex-mm.yaml
 ```
 
-Edit `ospex-mm.yaml` — at minimum `wallet.keystorePath`, `rpcUrl`, and `pricing.economics` (your capital and target monthly return; the math derives the quoting spread and refuses to start if your targets don't add up). Review the `risk` caps — they're conservative by default; lower them further if you want. The annotated config explains every field; the rationale is in [`DESIGN.md`](DESIGN.md) §7.
+Edit `ospex-mm.yaml` — at minimum `rpcUrl` and `pricing.economics` (your capital and target monthly return; the math derives the quoting spread and refuses to start if your targets don't add up). Review the `risk` caps — they're conservative by default; lower them further if you want. The annotated config explains every field; the rationale is in [`DESIGN.md`](DESIGN.md) §7.
+
+`wallet.keystorePath` can stay blank (the example's default) for everything in §4–§7 — `doctor --address <0x…>`, `quote --dry-run`, and `run --dry-run` sign nothing. When you go live (§8), set it to the **absolute** path of your keystore file — the path is used verbatim, so `~` is **not** expanded (`/home/you/.foundry/keystores/ospex-mm`, not `~/.foundry/keystores/ospex-mm`). A blank path is an advisory `WARN` in `doctor`; a path that is set but points at a missing file is a `FAIL`.
 
 ## 4. Check readiness — `yarn mm doctor`
 
 ```bash
-yarn mm doctor                # add --address <0x…> to skip the keystore passphrase prompt; --json for a machine-readable envelope
+yarn mm doctor --address <0x…>   # fully read-only — no keystore, no passphrase prompt; --json for a machine-readable envelope
 ```
 
-Reports your wallet's USDC and POL balances, the `PositionModule` USDC allowance, API + RPC reachability, and the persisted-state integrity check — plus a "Ready to" matrix: *dry-run shadow* (boots whenever nothing's broken — the shadow loop posts nothing, so it needs no keystore) and *post commitments* (the live prereqs — a usable keystore, a resolved address, `mode.dryRun: false`, a funded/approved wallet). Exits `0` unless something is broken; a `WARN` (no keystore yet, low POL, allowance below the cap ceiling, …) is advisory.
+Reports that wallet's USDC and POL balances, the `PositionModule` USDC allowance, API + RPC reachability, and the persisted-state integrity check — plus a "Ready to" matrix: *dry-run shadow* (boots whenever nothing's broken — the shadow loop posts nothing, so it needs no keystore) and *post commitments* (the live prereqs — a usable keystore, a resolved address, `mode.dryRun: false`, a funded/approved wallet). Exits `0` unless something is broken; a `WARN` (no keystore yet, low POL, allowance below the cap ceiling, …) is advisory. Note the keystore semantics: a blank `wallet.keystorePath` is a `WARN` (fine for dry-run), but a path that points at a missing file is a `FAIL` — don't set it until the keystore exists, and use an absolute path (no `~` expansion). Without `--address` (and with no keystore configured) the chain-side checks are `SKIP`ped and doctor still verifies config, API, and state. If you do pass `--address`, use the wallet you actually intend to fund — doctor treats a wallet with zero POL as a `FAIL` (it can't send any transaction), which also flips the "Ready to" matrix to NO.
 
 ## 5. Preview a quote — `yarn mm quote --dry-run`
 
@@ -48,6 +53,26 @@ yarn mm quote --dry-run <contestId>   # one-shot: reference odds → fair value 
 ```
 
 Computes what the MM would quote for that contest (or refuses with a clear message if the contest is closed, has no open moneyline speculation, or has no reference odds). It never posts. Use it to sanity-check your pricing config before running the loop.
+
+### Find a quote target
+
+`quote --dry-run` refuses a contest that is already **scored or voided**, has **no open moneyline speculation**, or has **no reference odds**. There is no MM command that lists candidates yet (the run loop discovers its own targets; `quote` is the manual one-shot), so query the public API directly. This is the same query the runner's discovery starts from — upcoming verified contests:
+
+```bash
+# upcoming verified contests starting within the next 24 hours (window: 1–168, default 72):
+curl -s 'https://api.ospex.org/v1/contests?status=verified&window=24&limit=200'
+```
+
+Pick a contest whose `speculations[]` contains an entry with `"type": "moneyline"` and `"speculationStatus": 0` (0 = open, still taking commitments) and pass its `contestId` to `quote`. With [`jq`](https://jqlang.org/):
+
+```bash
+curl -s 'https://api.ospex.org/v1/contests?status=verified&window=24&limit=200' \
+  | jq '[.contests[]
+         | select(any(.speculations[]?; .type == "moneyline" and .speculationStatus == 0))
+         | {contestId, awayTeam, homeTeam, matchTime}]'
+```
+
+The endpoint lists **upcoming** contests only (start time between now and now + `window` hours). An empty list means there is genuinely nothing to quote right now — contests exist only after someone creates and verifies them on chain, and outside your configured sports' game hours (or in the off-season) the board can be empty. Likewise, `quote` against a contest that has since been scored refuses with a clear message — both are expected states, not setup problems. `run --dry-run` (§6) discovers its own targets with a stricter version of this query — verified contests further filtered to your configured `marketSelection.sports`, the `maxStartsWithinHours` start window, and the tracking cap — and just sits idle until a quotable market appears.
 
 ## 6. Run the shadow loop — `yarn mm run --dry-run`
 
@@ -71,7 +96,7 @@ Aggregates the NDJSON event logs into the §2.3 run metrics: ticks, the candidat
 
 ## 8. Going live (the two-key model)
 
-Live requires **both**: `mode.dryRun: false` in your config **and** the `--live` flag on the command. `--live` without the config flag is refused; `--dry-run` always forces dry-run. The keystore passphrase comes from `OSPEX_KEYSTORE_PASSPHRASE` (preferred for non-interactive runs), else a no-echo TTY prompt; `--address` with `--live` is refused (the signer determines the maker wallet). Use a *fresh* `state.dir` for live — a directory polluted with prior dry-run synthetic commitments is refused at boot.
+Live requires **both**: `mode.dryRun: false` in your config **and** the `--live` flag on the command. `--live` without the config flag is refused; `--dry-run` always forces dry-run. If you ran dry-run with a blank `wallet.keystorePath`, set it now — the **absolute** path to your keystore file (no `~` expansion), or the `OSPEX_KEYSTORE_PATH` env var. The keystore passphrase comes from `OSPEX_KEYSTORE_PASSPHRASE` (preferred for non-interactive runs), else a no-echo TTY prompt; `--address` with `--live` is refused (the signer determines the maker wallet). Use a *fresh* `state.dir` for live — a directory polluted with prior dry-run synthetic commitments is refused at boot.
 
 ```bash
 # after setting mode.dryRun: false in ospex-mm.yaml, with a fresh state.dir:

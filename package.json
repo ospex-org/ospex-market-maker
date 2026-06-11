@@ -1,6 +1,6 @@
 {
   "name": "ospex-market-maker",
-  "version": "0.0.0",
+  "version": "0.1.0-alpha.1",
   "private": true,
   "description": "Reference market maker for Ospex — a zero-vig peer-to-peer sports prediction protocol on Polygon. Clone, configure, run.",
   "license": "MIT",

@@ -1,0 +1,31 @@
+# Changelog
+
+All notable changes to `ospex-market-maker` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [semver](https://semver.org/) — pre-1.0, a minor bump may change the CLI or config surface.
+
+## [Unreleased]
+
+—
+
+## [0.1.0-alpha.1] — 2026-06-12
+
+First tagged release. The full v0 command surface is implemented (793 unit tests) and the live path has been exercised end-to-end on Polygon mainnet in small, controlled runs — posting, partial fills, soft and on-chain cancels, expiry, stream reconnects, process restarts, and the score → settle → claim lifecycle. Distribution is clone-and-run at this tag; nothing is published to npm.
+
+### Added
+
+- The complete CLI surface: `doctor`, `quote --dry-run`, `run --dry-run`, `run --live`, `cancel-stale [--authoritative]`, `status`, and `summary` — each with a `--json` envelope where applicable; see the README "Current status" section and `AGENTS.md` for the report schemas.
+- Pricing (vig strip → fair value → spread → two-sided quote), a worst-case-loss-by-outcome risk engine with per-commitment / contest / team / sport / bankroll caps, the order reconcile, persistent single-process JSON state, and NDJSON telemetry with `summary` aggregation including realized P&L.
+- Live mode is own-state-stream-driven: the owner-authenticated SSE stream is the canonical writer of the maker's commitments, fills, and positions; per-tick polls survive only as an audit cross-check.
+- Operator safety rails: two-key live gating (`mode.dryRun: false` AND `--live`), the boot-time state-loss fail-safe, wallet-bounded boot auto-approve (`exact` mode default), a daily POL gas budget with an emergency reserve, the funding guard, auto-settle / auto-claim, and an off-chain (plus optional on-chain) cancel sweep on shutdown.
+
+### Alpha safety envelope
+
+- **Moneyline only**, and only on speculations that already exist — the MM is not a speculation seeder.
+- **Dry-run first.** `mode.dryRun: true` is the default; go live deliberately with tiny caps.
+- **Single-process local state** — one MM process per state dir / maker wallet; the JSON state file is not multi-process safe.
+- **An off-chain cancel removes a quote from the public book but does NOT invalidate the signed payload** — a taker already holding it can still match it until expiry (default ≈ 2 minutes). Remainder safety after a partial fill therefore relies on short expiries or the on-chain paths (`killCancelOnChain: true`, `cancel-stale --authoritative`).
+- **No unrealized P&L yet** (realized P&L is wired); no `raiseMinNonce` bulk invalidation — on-chain cancels are per-commitment.
+- **Bring your own RPC URL and Foundry keystore** — there are no defaults, and raw private keys are never accepted. `wallet.keystorePath` is used verbatim (`~` is not expanded; use an absolute path) and can stay blank until you go live.
+
+### Pinned
+
+- `@ospex/sdk` v0.6.2, resolved from its GitHub Release tarball (`package.json` / `yarn.lock` are the source of truth). Node ≥ 20.

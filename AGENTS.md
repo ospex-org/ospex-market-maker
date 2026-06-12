@@ -35,13 +35,14 @@ Numeric values that can exceed `Number.MAX_SAFE_INTEGER` (USDC wei6, POL wei18, 
 |---|---|---|---|---|---|
 | `doctor [--address <0x…>] [--json]` | config, keystore, API/RPC reachability, wallet balances + allowance, state file | — (read-only) | `{schemaVersion:1, doctor: DoctorReport}` | no FAIL checks | any FAIL (config invalid, API/RPC unreachable, keystore set but missing, …); a WARN does NOT fail |
 | `quote --dry-run <contestId> [--json]` | config, contest + reference odds | — (read-only) | `{schemaVersion:1, quote: QuoteReport}` | `pipeline:'computed' && canQuote:true` | refused (closed, no open speculation, no reference odds, etc.) |
+| `candidates [--sport <sport>] [--hours <n>] [--json]` | config, games schedule, contests, per-candidate odds snapshots | — (read-only, signer-free) | `{schemaVersion:1, candidates: CandidatesReport}` | listing succeeded — an **empty result is a valid answer** (exit 0) | operational throw only (config invalid, API unreachable, bad flag) |
 | `run --dry-run [--address <0x…>] [--keystore <p>] [--ignore-missing-state]` | config, state, contests, odds | state, telemetry log | (no `--json`) | graceful shutdown (KILL file / SIGTERM/SIGINT) | startup refusal (config invalid, state-loss without override, …) |
 | `run --live [--keystore <p>] [--ignore-missing-state] [--yes]` | same + signed adapter | state, telemetry log, **on chain** | (no `--json`) | graceful shutdown | refusal (`mode.dryRun:true` + `--live` mismatch, no keystore, prompt rejected, `--yes`-requiring config without it, ...) |
 | `cancel-stale [--authoritative] [--keystore <p>] [--ignore-missing-state] [--json]` | config, state | state (lifecycle stamps), telemetry log, **off-chain DELETE; on-chain cancelCommitment if `--authoritative`** | `{schemaVersion:1, cancelStale: CancelStaleReport}` | clean cleanup | any `errored > 0` or `gasDenied > 0` (incomplete sweep); refusal (`mode.dryRun:true`, no keystore, state-loss without override, dry: synthetic hash in state, ...) |
 | `status [--address <0x…>] [--json]` | config, state, (optional) live `positions.status` | — (read-only) | `{schemaVersion:1, status: StatusReport}` | always 0 (informational; operational throws map to 1 via the CLI wrapper) | only on operational throw |
 | `summary [--since <ts>] [--json]` | NDJSON event logs under `telemetry.logDir` | — (read-only) | `{schemaVersion:1, summary: RunSummary}` | always 0 (informational; operational throws map to 1) | only on operational throw or malformed `--since` |
 
-Authoritative source for argument parsing: [`src/cli/index.ts`](./src/cli/index.ts). Each command delegates to a `runX(opts, deps): Report` in its sibling module (`doctor.ts`, `quote.ts`, `run.ts`, `cancel-stale.ts`, `status.ts`, `summary.ts`).
+Authoritative source for argument parsing: [`src/cli/index.ts`](./src/cli/index.ts). Each command delegates to a `runX(opts, deps): Report` in its sibling module (`doctor.ts`, `quote.ts`, `candidates.ts`, `run.ts`, `cancel-stale.ts`, `status.ts`, `summary.ts`).
 
 ### 2.2 DoctorReport (envelope: `{schemaVersion:1, doctor: …}`)
 
@@ -191,6 +192,70 @@ interface RunSummary {
 ```
 
 The `summary` command threads `config.gas.nativeTokenUSDCPrice` into `summarize` when `config.gas.reportInUSDC: true`, populating `liveMetrics.gas.totalUsdcEquivWei6`.
+
+### 2.7 CandidatesReport (envelope: `{schemaVersion:1, candidates: …}`)
+
+The quote-target / setup-target preflight. Read-only and signer-free (no keystore, no writes). Each in-window game/contest gets exactly one `kind`; the allow-list **annotates** (`inContestAllowList`) but never hides; the deny-list skips (`skipReason: 'deny-list'`).
+
+```typescript
+interface CandidatesReport {
+  generatedAt: string;                   // ISO-8601 UTC
+  config: { sports: string[];
+            hours: number;              // the games leg's window (1-720)
+            contestsHours: number;      // the contests leg's effective window: min(hours, 168) — the contests
+                                        //   API caps at 168h while the games API allows 720h. Beyond 168h only
+                                        //   game rows are visible, so a created game out there classifies
+                                        //   needs_verification with contestStatus: null
+            maxTrackedContests: number;
+            requireReferenceOdds: boolean; contestAllowListSize: number };
+  summary: {
+    gamesAvailableToCreate: number;      // == count of kind 'setup'
+    quoteReady: number;
+    needsContest: number;                // planning-doc parity alias — always == gamesAvailableToCreate
+    needsMoneylineSpeculation: number;
+    needsVerification: number;
+    skipped: Record<string, number>;     // by skipReason; only nonzero reasons present
+  };
+  truncated: boolean;                    // a pagination bound was hit — the listing may be incomplete
+  items: CandidateItem[];                // sorted: kind priority (quote_ready, needs_moneyline_speculation,
+                                         //   needs_verification, setup, skipped), then matchTime ascending
+}
+
+interface CandidateItem {
+  kind: 'quote_ready' | 'needs_moneyline_speculation' | 'needs_verification' | 'setup' | 'skipped';
+  gameId: string | null;                 // stable schedule id — key on this, never slug; null when no game row joined
+  slug: string | null;                   // display-only; mutable (doubleheader renames)
+  sport: string;
+  awayTeam: string;                      // full team names, always
+  homeTeam: string;
+  matchTime: string;                     // ISO-8601 UTC
+  status: string | null;                 // game status ('upcoming' | 'live' | 'final' | 'postponed' | 'cancelled'); null when no game row
+  hasOdds: boolean | null;
+  canCreateContest: boolean | null;
+  contestCreated: boolean;
+  contestId: string | null;
+  moneylineSpeculationId: string | null; // the open moneyline speculation, when one exists
+  recommendedAction: 'quote' | 'seed_moneyline_speculation' | 'wait_for_verification'
+                   | 'create_contest_then_seed_moneyline' | null;   // null on 'skipped'
+  contestStatus?: string | null;         // ALWAYS present on quote_ready / needs_moneyline_speculation / needs_verification
+                                         //   ('verified' / 'unverified' / …; null = contest row not visible yet);
+                                         //   on 'skipped' only when the skip is contest-backed; never on 'setup'
+  referenceOdds?: { awayAmerican: number | null; homeAmerican: number | null } | null;  // 'quote_ready' only
+  inContestAllowList?: boolean;          // contest-backed items; present iff marketSelection.contestAllowList is non-empty
+  skipReason?: 'started-or-live' | 'no-odds' | 'no-reference-odds' | 'cannot-create-contest'
+             | 'deny-list' | 'not-quotable-status' | 'game-status-postponed-or-cancelled';  // 'skipped' only
+}
+```
+
+Classification table (one `kind` per item):
+
+| kind | condition | recommendedAction |
+|---|---|---|
+| `quote_ready` | contest `verified` + open `moneyline` speculation + (odds present, when `requireReferenceOdds`) | `quote` |
+| `needs_moneyline_speculation` | contest `verified`, no open moneyline speculation | `seed_moneyline_speculation` |
+| `needs_verification` | game created but contest not yet `verified` (or contest row not visible yet) | `wait_for_verification` |
+| `setup` | game upcoming, `contestCreated=false`, `canCreateContest=true`, `hasOdds=true` | `create_contest_then_seed_moneyline` |
+| `skipped` | anything else in the window — see `skipReason` | `null` |
 
 ---
 
@@ -476,6 +541,7 @@ Unrealized P&L over `unsettledCount` positions is a future slice (requires `summ
 | `MakerPositionStatus` (6 values) | [`src/state/index.ts`](./src/state/index.ts) — `MAKER_POSITION_STATUSES` |
 | `TelemetryKind` (see `TELEMETRY_KINDS`) | [`src/telemetry/index.ts`](./src/telemetry/index.ts) — `TELEMETRY_KINDS` |
 | `CandidateSkipReason` (14 values) | [`src/telemetry/index.ts`](./src/telemetry/index.ts) — `CANDIDATE_SKIP_REASONS` |
+| `CandidatesSkipReason` (7 values — the `candidates` CLI discovery vocabulary, distinct from the runner's) | [`src/cli/candidates.ts`](./src/cli/candidates.ts) — `CANDIDATES_SKIP_REASONS` |
 | `SoftCancelReason` / `ReplaceReason` | [`src/orders/index.ts`](./src/orders/index.ts) |
 | Risk caps / `headroomForSide` / `canSpendGas` | [`src/risk/index.ts`](./src/risk/index.ts) |
 
@@ -492,6 +558,18 @@ Question → command. Pipes use `jq` notation for clarity.
 ospex-mm doctor --address 0x… --json | jq '.doctor.ready.postCommitments'
 # { "ok": true|false, "reason": "…" }
 ```
+
+**"What could the MM quote right now? What needs setting up first?"**
+```
+ospex-mm candidates --json | jq '.candidates.summary'
+# quote-ready contest ids, ready to feed to `quote --dry-run`:
+ospex-mm candidates --json | jq '.candidates.items[] | select(.kind == "quote_ready")
+                                 | {contestId, awayTeam, homeTeam, matchTime, referenceOdds}'
+# upcoming games someone could turn into contests:
+ospex-mm candidates --json | jq '.candidates.items[] | select(.kind == "setup")
+                                 | {gameId, awayTeam, homeTeam, matchTime}'
+```
+Read-only + signer-free; an empty `items` is a valid board state (exit 0). Check `.candidates.truncated` before treating the listing as complete.
 
 **"What would the MM quote on contest C if I asked right now?"**
 ```

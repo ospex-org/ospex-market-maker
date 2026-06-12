@@ -125,7 +125,7 @@ program
   .description('Read-only operator preflight: contests the MM could quote right now (verified + open moneyline speculation + reference odds) plus upcoming games that can be turned into quotable contests. Signer-free — no keystore, no passphrase prompt, no writes. An empty listing is a valid answer (exit 0).')
   .option('-c, --config <path>', 'path to the config YAML', DEFAULT_CONFIG_PATH)
   .option('--sport <sport>', 'restrict to one sport (default: config marketSelection.sports)')
-  .option('--hours <n>', 'look-ahead window in hours, integer 1-720 (default: config marketSelection.maxStartsWithinHours)')
+  .option('--hours <n>', 'look-ahead window in hours, integer 1-720 (default: config marketSelection.maxStartsWithinHours). The games leg uses the full window; the contests leg is capped at 168h — the contests API max')
   .option('--json', 'emit a JSON envelope { schemaVersion: 1, candidates: … } on stdout')
   .action(async (opts: { config: string; sport?: string; hours?: string; json?: boolean }) => {
     const config = loadConfigOrExit(opts.config);

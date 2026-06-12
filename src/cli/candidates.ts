@@ -144,6 +144,14 @@ export interface CandidatesReport {
   config: {
     sports: Sport[];
     hours: number;
+    /**
+     * The contests leg's effective window: `min(hours, 168)` — the contests
+     * API caps its window at 168h while the games API allows 720h. Beyond
+     * 168h only game rows are visible, so a created game out there classifies
+     * `needs_verification` with `contestStatus: null` (its contest row can't
+     * be listed) rather than its true contest status.
+     */
+    contestsHours: number;
     maxTrackedContests: number;
     requireReferenceOdds: boolean;
     contestAllowListSize: number;
@@ -159,6 +167,14 @@ export interface CandidatesReport {
 export const MIN_HOURS = 1;
 /** The games API's maximum look-ahead window. */
 export const MAX_HOURS = 720;
+/**
+ * The contests API's maximum look-ahead window — narrower than the games API's
+ * {@link MAX_HOURS} (a request above it is rejected with a 400, not clamped).
+ * The contests leg of the listing is capped here so a long `--hours` window
+ * still returns the full games/setup side; the report's `config.contestsHours`
+ * carries the effective value.
+ */
+export const MAX_CONTEST_HOURS = 168;
 
 /** Resolve `--sport` (validated against the known sports) or fall back to the config's sports. Throws on an unknown value — the CLI maps it to `fail()`. */
 export function resolveSports(flag: string | undefined, config: Config): Sport[] {
@@ -268,11 +284,14 @@ export async function runCandidates(opts: CandidatesOpts): Promise<CandidatesRep
   const generated = now();
   const nowMs = generated.getTime();
   const windowEndMs = nowMs + hours * 3_600_000;
+  // The contests API rejects windows above 168h (the games API allows 720) —
+  // cap the contests leg rather than letting one 400 kill the whole preflight.
+  const contestsHours = Math.min(hours, MAX_CONTEST_HOURS);
 
   // 1. Fetch the full schedule window + the contests window (all statuses).
   const [gamesResult, contestsResult] = await Promise.all([
     fetchGamesWindow(adapter, sports, hours),
-    fetchContestsWindow(adapter, sports, hours),
+    fetchContestsWindow(adapter, sports, contestsHours),
   ]);
 
   const sportSet = new Set<string>(sports);
@@ -366,7 +385,9 @@ export async function runCandidates(opts: CandidatesOpts): Promise<CandidatesRep
     }
 
     // No contest row in the window. A created game without one is awaiting
-    // creation indexing / verification — same operator action either way.
+    // creation indexing / verification — same operator action either way —
+    // or sits beyond the contests leg's 168h cap, where contest rows can't
+    // be listed at all.
     if (game !== undefined && (game.contestCreated || game.contestId !== null)) {
       items.push(finalize({ ...base, kind: 'needs_verification', recommendedAction: 'wait_for_verification', contestStatus: null }));
       return;
@@ -416,6 +437,7 @@ export async function runCandidates(opts: CandidatesOpts): Promise<CandidatesRep
     config: {
       sports,
       hours,
+      contestsHours,
       maxTrackedContests: config.marketSelection.maxTrackedContests,
       requireReferenceOdds: config.marketSelection.requireReferenceOdds,
       contestAllowListSize: config.marketSelection.contestAllowList.length,
@@ -529,8 +551,9 @@ export function renderCandidatesReportJson(report: CandidatesReport, out: { writ
 export function renderCandidatesReportText(report: CandidatesReport, out: { write(s: string): void }): void {
   const c = report.config;
   out.write(`ospex-mm candidates — generated ${report.generatedAt}\n`);
+  const windowNote = c.contestsHours < c.hours ? ` (contests leg capped at ${c.contestsHours}h — the contests API max)` : '';
   out.write(
-    `Sports: ${c.sports.join(', ')}   Window: next ${c.hours}h   requireReferenceOdds: ${c.requireReferenceOdds}   allow-list: ${
+    `Sports: ${c.sports.join(', ')}   Window: next ${c.hours}h${windowNote}   requireReferenceOdds: ${c.requireReferenceOdds}   allow-list: ${
       c.contestAllowListSize === 0 ? '(empty)' : `${c.contestAllowListSize} id(s) — annotated, never filtered`
     }\n\n`);
 

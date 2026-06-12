@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import type { Contest, ContestOddsSnapshot, Game, GamesListOptions, Speculation } from '@ospex/sdk';
+import type { Contest, ContestOddsSnapshot, ContestsListOptions, Game, GamesListOptions, Speculation } from '@ospex/sdk';
 
 import { parseConfig, type Config } from '../config/index.js';
 import { OspexAdapter, type OspexClientLike } from '../ospex/index.js';
@@ -419,6 +419,7 @@ describe('runCandidates — report envelope + determinism', () => {
     expect(parsed.candidates.config).toEqual({
       sports: ['mlb'],
       hours: 24,
+      contestsHours: 24, // == hours while within the contests API's 168h max
       maxTrackedContests: 5,
       requireReferenceOdds: true,
       contestAllowListSize: 0,
@@ -581,6 +582,21 @@ describe('runCandidates — adapter options + pagination', () => {
     const report = await run(adapter, config, { sports: config.marketSelection.sports });
     expect(captured[0]?.sport).toBeUndefined();
     expect(report.items.map((i) => i.gameId)).toEqual(['g-mlb']); // the nhl game is outside the selected sports
+  });
+
+  it('caps the contests leg at 168h while the games leg gets the full --hours window (the two APIs have asymmetric maxima)', async () => {
+    const gamesOpts: GamesListOptions[] = [];
+    const contestsOpts: ContestsListOptions[] = [];
+    const adapter = fakeAdapter({
+      games: { list: (options?: GamesListOptions) => { gamesOpts.push(options ?? {}); return Promise.resolve([]); } },
+      contests: { list: (options?: ContestsListOptions) => { contestsOpts.push(options ?? {}); return Promise.resolve([]); } },
+    });
+    const report = await run(adapter, cfg(), { hours: 720 });
+    expect(gamesOpts[0]?.hours).toBe(720);
+    expect(contestsOpts[0]?.hours).toBe(168); // above it the contests API 400s — one leg must not kill the preflight
+    expect(report.config.hours).toBe(720);
+    expect(report.config.contestsHours).toBe(168);
+    expect(candidatesExitCode(report)).toBe(0);
   });
 
   it('paginates games until a short page; flags truncated when the page bound is hit (never a silent partial answer)', async () => {

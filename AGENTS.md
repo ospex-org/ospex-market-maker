@@ -200,7 +200,13 @@ The quote-target / setup-target preflight. Read-only and signer-free (no keystor
 ```typescript
 interface CandidatesReport {
   generatedAt: string;                   // ISO-8601 UTC
-  config: { sports: string[]; hours: number; maxTrackedContests: number;
+  config: { sports: string[];
+            hours: number;              // the games leg's window (1-720)
+            contestsHours: number;      // the contests leg's effective window: min(hours, 168) — the contests
+                                        //   API caps at 168h while the games API allows 720h. Beyond 168h only
+                                        //   game rows are visible, so a created game out there classifies
+                                        //   needs_verification with contestStatus: null
+            maxTrackedContests: number;
             requireReferenceOdds: boolean; contestAllowListSize: number };
   summary: {
     gamesAvailableToCreate: number;      // == count of kind 'setup'

@@ -59,7 +59,8 @@ Computes what the MM would quote for that contest (or refuses with a clear messa
 `quote --dry-run` refuses a contest that is already **scored or voided**, has **no open moneyline speculation**, or has **no reference odds**. Use the `candidates` preflight to see — in one read-only, signer-free listing — what is quotable right now *and* what could be turned into a quotable contest:
 
 ```bash
-yarn mm candidates                  # human table; --sport <sport> / --hours <n> to narrow the window
+yarn mm candidates                  # human table; --sport <sport> / --hours <n> to set the window (1-720h;
+                                    #   the contests leg caps at the contests API's 168h max)
 yarn mm candidates --json           # { schemaVersion: 1, candidates: … } envelope for scripts/agents
 ```
 

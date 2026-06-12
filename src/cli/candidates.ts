@@ -338,8 +338,11 @@ export async function runCandidates(opts: CandidatesOpts): Promise<CandidatesRep
         items.push(finalize(skipped(base, 'started-or-live', contestStatus)));
         return;
       }
-    } else if (Date.parse(base.matchTime) < nowMs) {
-      // Contest-only item whose matchTime has passed.
+    }
+    if (Date.parse(base.matchTime) < nowMs) {
+      // matchTime has passed — every item, game-backed or contest-only. Covers
+      // the writer's status-poll lag (a just-started game can briefly still
+      // read `upcoming`): nothing past its start is ever actionable.
       items.push(finalize(skipped(base, 'started-or-live', contestStatus)));
       return;
     }

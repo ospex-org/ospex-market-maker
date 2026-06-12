@@ -231,7 +231,9 @@ interface CandidateItem {
   moneylineSpeculationId: string | null; // the open moneyline speculation, when one exists
   recommendedAction: 'quote' | 'seed_moneyline_speculation' | 'wait_for_verification'
                    | 'create_contest_then_seed_moneyline' | null;   // null on 'skipped'
-  contestStatus?: string | null;         // contest-backed kinds ('verified' / 'unverified' / …; null = contest row not visible yet)
+  contestStatus?: string | null;         // ALWAYS present on quote_ready / needs_moneyline_speculation / needs_verification
+                                         //   ('verified' / 'unverified' / …; null = contest row not visible yet);
+                                         //   on 'skipped' only when the skip is contest-backed; never on 'setup'
   referenceOdds?: { awayAmerican: number | null; homeAmerican: number | null } | null;  // 'quote_ready' only
   inContestAllowList?: boolean;          // contest-backed items; present iff marketSelection.contestAllowList is non-empty
   skipReason?: 'started-or-live' | 'no-odds' | 'no-reference-odds' | 'cannot-create-contest'

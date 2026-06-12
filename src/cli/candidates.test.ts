@@ -382,6 +382,11 @@ describe('runCandidates — skip reasons', () => {
     const report = await run(adapterFor([], [contestWith({ matchTime: '2026-06-12T15:00:00Z' })]));
     expect(report.items[0]).toMatchObject({ kind: 'skipped', skipReason: 'started-or-live' });
   });
+
+  it('a game whose matchTime has passed but whose status still reads upcoming (writer poll lag) → started-or-live', async () => {
+    const report = await run(adapterFor([gameWith({ matchTime: '2026-06-12T15:55:00Z', status: 'upcoming' })], []));
+    expect(report.items[0]).toMatchObject({ kind: 'skipped', skipReason: 'started-or-live' });
+  });
 });
 
 // ── 5. envelope shape, summary arithmetic, sort order ────────────────────────

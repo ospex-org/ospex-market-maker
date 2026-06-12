@@ -60,6 +60,11 @@ import {
   type Contest,
   type ContestOddsSnapshot,
   type ContestsListOptions,
+  type Game,
+  type GameSport,
+  type GameStatus,
+  type GameTeam,
+  type GamesListOptions,
   type Hex,
   type MarketType,
   type MoneylineOdds,
@@ -105,6 +110,10 @@ export type {
   CommitmentStatus,
   ContestOddsSnapshot,
   ContestsListOptions,
+  GameSport,
+  GameStatus,
+  GameTeam,
+  GamesListOptions,
   Hex,
   MarketType,
   MoneylineOdds,
@@ -181,6 +190,30 @@ export interface SpeculationView {
   orderbook?: Commitment[];
 }
 
+/**
+ * A game from the writer-managed schedule (`client.games.list`), with the SDK's
+ * `externalIds` (provider-named feed identifiers) dropped at this boundary —
+ * DESIGN §16 forbids provider names past `src/ospex/`, and the canonical UX
+ * hides them anyway ("user passes gameId; SDK resolves the rest").
+ *
+ * `gameId` is the stable identifier — always key on it; `slug` is display-only
+ * and mutable (the writer renames slugs on doubleheader detect / reschedule).
+ */
+export interface GameView {
+  gameId: string;
+  slug: string;
+  sport: GameSport;
+  /** ISO-8601 string. */
+  matchTime: string;
+  status: GameStatus;
+  homeTeam: GameTeam;
+  awayTeam: GameTeam;
+  hasOdds: boolean;
+  contestCreated: boolean;
+  contestId: string | null;
+  canCreateContest: boolean;
+}
+
 // ── the structural subset of `OspexClient` the adapter uses ──────────────────
 //
 // Picking from `OspexClient`'s actual types keeps the test fake honest — any
@@ -193,6 +226,7 @@ export interface SpeculationView {
 
 export type OspexClientLike = {
   contests: Pick<OspexClient['contests'], 'get' | 'list'>;
+  games: Pick<OspexClient['games'], 'list'>;
   speculations: Pick<OspexClient['speculations'], 'list' | 'get'>;
   commitments: Pick<
     OspexClient['commitments'],
@@ -319,6 +353,19 @@ export class OspexAdapter {
   async listSpeculations(options: SpeculationsListOptions = {}): Promise<SpeculationView[]> {
     const speculations = await this.client.speculations.list(options);
     return speculations.map(toSpeculationView);
+  }
+
+  /**
+   * One page of the writer-managed upcoming-games schedule (`client.games.list`)
+   * as neutral {@link GameView}s. The window is `[now, now + hours]` by
+   * `matchTime`. The API defaults `availableOnly` to **true** (only uncreated,
+   * creatable, upcoming games) — callers that need the full schedule (e.g. to
+   * classify already-created or started games) must pass `availableOnly: false`
+   * explicitly. The server caps `limit` at 200; paginate with `offset`.
+   */
+  async listGames(options: GamesListOptions = {}): Promise<GameView[]> {
+    const games = await this.client.games.list(options);
+    return games.map(toGameView);
   }
 
   /**
@@ -712,6 +759,23 @@ function toContestView(c: Contest): ContestView {
     status: c.status,
     referenceGameId: c.jsonoddsId ?? null,
     speculations: c.speculations.map(toSpeculationView),
+  };
+}
+
+function toGameView(g: Game): GameView {
+  return {
+    gameId: g.gameId,
+    slug: g.slug,
+    sport: g.sport,
+    matchTime: g.matchTime,
+    status: g.status,
+    homeTeam: g.homeTeam,
+    awayTeam: g.awayTeam,
+    hasOdds: g.hasOdds,
+    contestCreated: g.contestCreated,
+    contestId: g.contestId,
+    canCreateContest: g.canCreateContest,
+    // g.externalIds is deliberately dropped — provider-named feed ids stay behind this boundary (DESIGN §16).
   };
 }
 

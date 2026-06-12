@@ -4,7 +4,10 @@ All notable changes to `ospex-market-maker` are recorded here. The format follow
 
 ## [Unreleased]
 
-—
+### Added
+
+- `ospex-mm candidates [--sport <sport>] [--hours <n>] [--json]` — a **read-only, signer-free** operator preflight (no keystore, no passphrase prompt, no writes) that lists **both quote candidates and setup candidates** in one pass. Each in-window game/contest gets exactly one classification: `quote_ready` (contest `verified` + open `moneyline` speculation + reference odds present when `requireReferenceOdds`), `needs_moneyline_speculation` (verified, no open moneyline speculation), `needs_verification` (contest created but not yet verified), `setup` (game upcoming with `contestCreated=false`, `canCreateContest=true`, `hasOdds=true`), or `skipped` with a reason (`started-or-live` / `no-odds` / `no-reference-odds` / `cannot-create-contest` / `deny-list` / `not-quotable-status` / `game-status-postponed-or-cancelled`). `--json` emits a `{ schemaVersion: 1, candidates: … }` envelope (items sorted by kind priority then matchTime; `truncated: true` when a pagination bound was hit). The allow-list annotates contest-backed items with `inContestAllowList` but never hides them; the deny-list skips. An empty listing is a valid answer and exits 0. See `AGENTS.md` §2.7 for the envelope schema.
+- `OspexAdapter.listGames` over the SDK's `client.games.list` (`@ospex/sdk` ≥ 0.6.x games surface) — full-schedule reads pass `availableOnly: false` explicitly; the games rows' provider-named `externalIds` are dropped at the adapter boundary (`GameView`) and never surfaced in CLI output.
 
 ## [0.1.0-alpha.1] — 2026-06-12
 

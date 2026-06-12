@@ -1,6 +1,6 @@
 # Quickstart
 
-> **Alpha.** The full command surface is wired: `doctor`, `quote --dry-run`, `run --dry-run` (the shadow loop — posts nothing), `run --live` (executes submits + off-chain cancels via the SDK, stream-driven own-state tracking — fills + position status arrive in real time over the owner-authenticated own-state SSE stream — boot-time auto-approve with a wallet-bounded target, the daily POL gas-budget verdict, auto-settle + auto-claim of the maker's own positions, and the on-chain kill path on shutdown when `killCancelOnChain: true`), `cancel-stale [--authoritative]` (the one-shot operator cleanup — off-chain by default, on-chain per record with the flag), `status` (read-only state snapshot + optional live `positions.status(maker)` totals), and `summary` (including live-mode metrics and realized P&L). Unrealized P&L and the `raiseMinNonce` bulk-invalidate optimization are still ahead — see the README's *[Current status](../README.md#current-status)*. The live path has been exercised end-to-end on Polygon mainnet in small, controlled runs; treat it as alpha — dry-run first, tiny caps.
+> **Alpha.** The full command surface is wired: `doctor`, `quote --dry-run`, `candidates` (the read-only quote/setup-target preflight — see §5), `run --dry-run` (the shadow loop — posts nothing), `run --live` (executes submits + off-chain cancels via the SDK, stream-driven own-state tracking — fills + position status arrive in real time over the owner-authenticated own-state SSE stream — boot-time auto-approve with a wallet-bounded target, the daily POL gas-budget verdict, auto-settle + auto-claim of the maker's own positions, and the on-chain kill path on shutdown when `killCancelOnChain: true`), `cancel-stale [--authoritative]` (the one-shot operator cleanup — off-chain by default, on-chain per record with the flag), `status` (read-only state snapshot + optional live `positions.status(maker)` totals), and `summary` (including live-mode metrics and realized P&L). Unrealized P&L and the `raiseMinNonce` bulk-invalidate optimization are still ahead — see the README's *[Current status](../README.md#current-status)*. The live path has been exercised end-to-end on Polygon mainnet in small, controlled runs; treat it as alpha — dry-run first, tiny caps.
 
 ## 1. Prerequisites
 
@@ -56,7 +56,16 @@ Computes what the MM would quote for that contest (or refuses with a clear messa
 
 ### Find a quote target
 
-`quote --dry-run` refuses a contest that is already **scored or voided**, has **no open moneyline speculation**, or has **no reference odds**. There is no MM command that lists candidates yet (the run loop discovers its own targets; `quote` is the manual one-shot), so query the public API directly. This is the same query the runner's discovery starts from — upcoming verified contests:
+`quote --dry-run` refuses a contest that is already **scored or voided**, has **no open moneyline speculation**, or has **no reference odds**. Use the `candidates` preflight to see — in one read-only, signer-free listing — what is quotable right now *and* what could be turned into a quotable contest:
+
+```bash
+yarn mm candidates                  # human table; --sport <sport> / --hours <n> to narrow the window
+yarn mm candidates --json           # { schemaVersion: 1, candidates: … } envelope for scripts/agents
+```
+
+Every game/contest in the window gets exactly one classification: `quote_ready` (verified contest + open moneyline speculation + reference odds — pass its `contestId` straight to `quote --dry-run`), `needs_moneyline_speculation` (verified, but nobody has seeded the moneyline market), `needs_verification` (contest created, oracle verification pending), `setup` (an upcoming game with reference odds and no contest yet — someone must create and verify a contest on chain before anyone can quote it), or `skipped` (with a reason — started/postponed, no odds, deny-listed, …). The command never writes and needs no keystore; an empty listing exits 0 — that's a valid board state, not a setup problem. When `marketSelection.contestAllowList` is non-empty, contest-backed items carry `inContestAllowList` so you can see what a live run would actually quote — discovery annotates, it never hides.
+
+If you prefer to query the public API directly, this is the contest query the runner's discovery (and `candidates`'s contest leg) starts from — upcoming verified contests:
 
 ```bash
 # upcoming verified contests starting within the next 24 hours (window: 1–168, default 72):
@@ -72,7 +81,7 @@ curl -s 'https://api.ospex.org/v1/contests?status=verified&window=24&limit=200' 
          | {contestId, awayTeam, homeTeam, matchTime}]'
 ```
 
-The endpoint lists **upcoming** contests only (start time between now and now + `window` hours). An empty list means there is genuinely nothing to quote right now — contests exist only after someone creates and verifies them on chain, and outside your configured sports' game hours (or in the off-season) the board can be empty. Likewise, `quote` against a contest that has since been scored refuses with a clear message — both are expected states, not setup problems. `run --dry-run` (§6) discovers its own targets with a stricter version of this query — verified contests further filtered to your configured `marketSelection.sports`, the `maxStartsWithinHours` start window, and the tracking cap — and just sits idle until a quotable market appears.
+The endpoint lists **upcoming** contests only (start time between now and now + `window` hours). An empty list means there is genuinely nothing to quote right now — contests exist only after someone creates and verifies them on chain, and outside your configured sports' game hours (or in the off-season) the board can be empty (`candidates` shows whether games are at least *creatable* in that window). Likewise, `quote` against a contest that has since been scored refuses with a clear message — both are expected states, not setup problems. `run --dry-run` (§6) discovers its own targets with a stricter version of this query — verified contests further filtered to your configured `marketSelection.sports`, the `maxStartsWithinHours` start window, and the tracking cap — and just sits idle until a quotable market appears.
 
 ## 6. Run the shadow loop — `yarn mm run --dry-run`
 

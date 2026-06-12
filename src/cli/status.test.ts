@@ -95,6 +95,7 @@ function adapterWithLivePositions(totals: PositionStatus['totals']): OspexAdapte
   const ps: PositionStatus = { active: [], pendingSettle: [], claimable: [], totals };
   const client: OspexClientLike = {
     contests: { get: notStubbed('contests.get'), list: notStubbed('contests.list') },
+    games: { list: notStubbed('games.list') },
     speculations: { list: notStubbed('speculations.list'), get: notStubbed('speculations.get') },
     commitments: {
       list: notStubbed('commitments.list'), get: notStubbed('commitments.get'),
@@ -125,6 +126,7 @@ function adapterWithLivePositionsThrowing(err: Error): OspexAdapter {
   const notStubbed = (name: string) => () => Promise.reject(new Error(`fake.${name}: not stubbed`));
   const client: OspexClientLike = {
     contests: { get: notStubbed('contests.get'), list: notStubbed('contests.list') },
+    games: { list: notStubbed('games.list') },
     speculations: { list: notStubbed('speculations.list'), get: notStubbed('speculations.get') },
     commitments: {
       list: notStubbed('commitments.list'), get: notStubbed('commitments.get'),

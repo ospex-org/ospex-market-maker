@@ -61,6 +61,7 @@ function fakeAdapter(client: ClientOverrides = {}, ctx = { chainId: 137 as const
   const notStubbed = (name: string) => () => Promise.reject(new Error(`fake.${name}: not stubbed`));
   const full: OspexClientLike = {
     contests: { get: notStubbed('contests.get'), list: notStubbed('contests.list'), ...client.contests },
+    games: { list: notStubbed('games.list'), ...client.games },
     speculations: { list: notStubbed('speculations.list'), get: notStubbed('speculations.get'), ...client.speculations },
     commitments: {
       list: notStubbed('commitments.list'), get: notStubbed('commitments.get'),

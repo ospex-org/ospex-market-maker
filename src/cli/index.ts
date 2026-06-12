@@ -2,8 +2,9 @@
 /**
  * `ospex-mm` — reference market maker CLI for Ospex.
  *
- * Command surface (DESIGN §3): `doctor`, `quote`, `run`, `cancel-stale`, `status`,
- * `summary`. Wired so far: `doctor` + `quote --dry-run` (strictly read-only),
+ * Command surface (DESIGN §3): `doctor`, `quote`, `candidates`, `run`,
+ * `cancel-stale`, `status`, `summary`. Wired so far: `doctor` + `quote --dry-run`
+ * + `candidates` (strictly read-only),
  * `run --dry-run` (the shadow loop — posts nothing) + `run --live` (executes the
  * reconcile's submits / off-chain cancels on chain — the two-key model from
  * DESIGN §8 gates it — plus fill detection, the position-status poll, boot-time
@@ -24,17 +25,18 @@
  *     "no" answer from `doctor`'s dry-run-shadow readiness or `quote`'s `canQuote`,
  *     an unavailable `run` mode).
  *
- * The per-command logic lives in `./doctor.ts` / `./quote.ts` / `./run.ts` /
- * `./summary.ts` as functions returning typed reports (or, for `run`, just running
- * the loop); this module is the thin commander wrapper — parse args, load config,
- * build the adapter, call the function, render, exit.
+ * The per-command logic lives in `./doctor.ts` / `./quote.ts` / `./candidates.ts`
+ * / `./run.ts` / `./summary.ts` as functions returning typed reports (or, for
+ * `run`, just running the loop); this module is the thin commander wrapper —
+ * parse args, load config, build the adapter, call the function, render, exit.
  */
 
 import { Command } from 'commander';
 
-import { loadConfig, type Config } from '../config/index.js';
+import { loadConfig, type Config, type Sport } from '../config/index.js';
 import { createOspexAdapter, type Hex } from '../ospex/index.js';
 import { CancelStaleRefused, cancelStaleExitCode, renderCancelStaleReportJson, renderCancelStaleReportText, runCancelStale } from './cancel-stale.js';
+import { candidatesExitCode, renderCandidatesReportJson, renderCandidatesReportText, resolveHours, resolveSports, runCandidates } from './candidates.js';
 import { doctorExitCode, renderDoctorReportJson, renderDoctorReportText, runDoctor } from './doctor.js';
 import { quoteExitCode, renderQuoteReportJson, renderQuoteReportText, runQuote } from './quote.js';
 import { RunRefused, runRun } from './run.js';
@@ -116,6 +118,32 @@ program
     if (opts.json === true) renderQuoteReportJson(report, stdout);
     else renderQuoteReportText(report, stdout);
     process.exit(quoteExitCode(report));
+  });
+
+program
+  .command('candidates')
+  .description('Read-only operator preflight: contests the MM could quote right now (verified + open moneyline speculation + reference odds) plus upcoming games that can be turned into quotable contests. Signer-free — no keystore, no passphrase prompt, no writes. An empty listing is a valid answer (exit 0).')
+  .option('-c, --config <path>', 'path to the config YAML', DEFAULT_CONFIG_PATH)
+  .option('--sport <sport>', 'restrict to one sport (default: config marketSelection.sports)')
+  .option('--hours <n>', 'look-ahead window in hours, integer 1-720 (default: config marketSelection.maxStartsWithinHours)')
+  .option('--json', 'emit a JSON envelope { schemaVersion: 1, candidates: … } on stdout')
+  .action(async (opts: { config: string; sport?: string; hours?: string; json?: boolean }) => {
+    const config = loadConfigOrExit(opts.config);
+    let sports: Sport[];
+    let hours: number;
+    try {
+      sports = resolveSports(opts.sport, config);
+      hours = resolveHours(opts.hours, config);
+    } catch (e) {
+      return fail((e as Error).message);
+    }
+    const adapter = createOspexAdapter(config);
+    const report = await runCandidates({ config, adapter, sports, hours }).catch((e: unknown): never =>
+      fail(`candidates failed: ${(e as Error).message}`),
+    );
+    if (opts.json === true) renderCandidatesReportJson(report, stdout);
+    else renderCandidatesReportText(report, stdout);
+    process.exit(candidatesExitCode(report));
   });
 
 program

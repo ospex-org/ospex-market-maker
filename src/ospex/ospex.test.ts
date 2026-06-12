@@ -11,6 +11,7 @@ import type {
   PublicVisibleCommitment,
   Contest,
   ContestOddsSnapshot,
+  Game,
   Hex,
   MoneylineOdds,
   OddsSubscribeArgs,
@@ -75,6 +76,21 @@ const SAMPLE_CONTEST_NO_LINKAGE: Contest = {
   status: 'verified',
   jsonoddsId: null,
   speculations: [],
+};
+
+const SAMPLE_GAME: Game = {
+  gameId: 'game-1',
+  slug: 'nym-lad-2026-05-11',
+  sport: 'mlb',
+  matchTime: '2026-05-12T01:30:00Z',
+  status: 'upcoming',
+  homeTeam: { name: 'Los Angeles Dodgers', abbreviation: 'LAD' },
+  awayTeam: { name: 'New York Mets', abbreviation: 'NYM' },
+  hasOdds: true,
+  contestCreated: false,
+  contestId: null,
+  canCreateContest: true,
+  externalIds: { jsonodds: 'ext-1', sportspage: null, rundown: null },
 };
 
 const SAMPLE_ODDS: ContestOddsSnapshot = {
@@ -204,6 +220,7 @@ function makeFakeClient(overrides: DeepPartial<OspexClientLike> = {}): OspexClie
   const notStubbed = (name: string) => () => Promise.reject(new Error(`fake.${name}: not stubbed in this test`));
   return {
     contests: { get: notStubbed('contests.get'), list: notStubbed('contests.list'), ...overrides.contests },
+    games: { list: notStubbed('games.list'), ...overrides.games },
     speculations: { list: notStubbed('speculations.list'), get: notStubbed('speculations.get'), ...overrides.speculations },
     commitments: {
       list: notStubbed('commitments.list'),
@@ -355,6 +372,38 @@ describe('OspexAdapter — contest views', () => {
     const view = await adapter.getContest('contest-1');
     expect(view.speculations[0]?.orderbook).toEqual([SAMPLE_COMMITMENT]);
     expect(view.speculations[1]?.orderbook).toBeUndefined(); // SAMPLE_SPECULATION_CLOSED has no orderbook in the SDK shape
+  });
+});
+
+describe('OspexAdapter — games', () => {
+  it('listGames passes options through and maps to GameView (externalIds dropped — DESIGN §16)', async () => {
+    let received: unknown = null;
+    const adapter = adapterWith({
+      games: {
+        list: (options) => {
+          received = options;
+          return Promise.resolve([SAMPLE_GAME]);
+        },
+      },
+    });
+    const list = await adapter.listGames({ sport: 'mlb', hours: 24, availableOnly: false, limit: 200, offset: 0 });
+    expect(received).toEqual({ sport: 'mlb', hours: 24, availableOnly: false, limit: 200, offset: 0 });
+    expect(list).toEqual([
+      {
+        gameId: 'game-1',
+        slug: 'nym-lad-2026-05-11',
+        sport: 'mlb',
+        matchTime: '2026-05-12T01:30:00Z',
+        status: 'upcoming',
+        homeTeam: { name: 'Los Angeles Dodgers', abbreviation: 'LAD' },
+        awayTeam: { name: 'New York Mets', abbreviation: 'NYM' },
+        hasOdds: true,
+        contestCreated: false,
+        contestId: null,
+        canCreateContest: true,
+      },
+    ]);
+    expect((list[0] as unknown as Record<string, unknown>).externalIds).toBeUndefined();
   });
 });
 

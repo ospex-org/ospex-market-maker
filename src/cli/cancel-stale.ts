@@ -78,12 +78,15 @@
  * (`--json` envelope or human text), and so tests can assert on the outcome.
  *
  * **Exit code**: `0` on a clean cleanup; `1` if any per-record write errored
- * (`errored > 0`) or a gas-budget verdict denied an on-chain cancel
- * (`gasDenied > 0`). Operators wiring this into automation can rely on the exit
- * code to detect an incomplete sweep without parsing the JSON envelope.
+ * (`errored > 0`), a gas-budget verdict denied an on-chain cancel
+ * (`gasDenied > 0`), or a legacy book-hidden record had no recoverable signed
+ * payload so the authoritative cancel was blocked (`blockedMissingPayload > 0`).
+ * Operators wiring this into automation can rely on the exit code to detect an
+ * incomplete sweep without parsing the JSON envelope.
  */
 
 import type { Config } from '../config/index.js';
+import { isExpiredForRelease } from '../orders/index.js';
 import {
   createLiveOspexAdapter,
   unlockKeystoreSigner,
@@ -285,10 +288,18 @@ export async function runCancelStale(opts: CancelStaleOpts, deps: CancelStaleDep
 
   const wallNow = now();
   const staleAfter = opts.config.orders.staleAfterSeconds;
+  const grace = opts.config.orders.expiryReleaseGraceSeconds;
   const stale = Object.values(state.commitments).filter(
     (r) =>
       (r.lifecycle === 'visibleOpen' || r.lifecycle === 'softCancelled' || r.lifecycle === 'partiallyFilled') &&
-      r.postedAtUnixSec + staleAfter <= wallNow,
+      r.postedAtUnixSec + staleAfter <= wallNow &&
+      // Skip records already past `expiry + grace`: dead on chain (the contract won't
+      // match them), so an off-chain DELETE / on-chain `cancelCommitment` is pointless —
+      // it burns gas and an on-chain revert against a dead commitment would falsely flip
+      // the exit code. The runner's `ageOut` reclassifies these to `expired` on its next
+      // tick. Same shared `isExpiredForRelease` + `orders.expiryReleaseGraceSeconds` grace
+      // every other cancel sweep uses, so the release predicate can't drift.
+      !isExpiredForRelease(r.expiryUnixSec, wallNow, grace),
   );
 
   const report: CancelStaleReport = {
@@ -510,9 +521,11 @@ export async function runCancelStale(opts: CancelStaleOpts, deps: CancelStaleDep
 
 /**
  * Exit code policy. `0` on a clean cleanup; `1` if any per-record write
- * errored (`errored > 0`) or a gas-budget verdict denied an on-chain cancel
- * (`gasDenied > 0`). Operators wiring this into automation can rely on the
- * exit code to detect an incomplete sweep without parsing the JSON envelope.
+ * errored (`errored > 0`), a gas-budget verdict denied an on-chain cancel
+ * (`gasDenied > 0`), or a legacy book-hidden record's authoritative cancel was
+ * blocked for a missing signed payload (`blockedMissingPayload > 0`). Operators
+ * wiring this into automation can rely on the exit code to detect an incomplete
+ * sweep without parsing the JSON envelope.
  */
 export function cancelStaleExitCode(report: CancelStaleReport): number {
   // `blockedMissingPayload` (M6/A) is also an incomplete sweep — the operator

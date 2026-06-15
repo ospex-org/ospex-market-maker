@@ -1,7 +1,8 @@
 /**
  * `ospex-mm cancel-stale [--authoritative]` — one-shot operator command that pulls
- * every tracked commitment whose age has crossed `orders.staleAfterSeconds`. Two
- * flavours, distinguished by `--authoritative`:
+ * every still-matchable tracked commitment whose age has crossed
+ * `orders.staleAfterSeconds` (already-expired records are skipped — see Filter below).
+ * Two flavours, distinguished by `--authoritative`:
  *
  *   - default — gasless off-chain cancels only (`adapter.cancelCommitmentOffchain`).
  *     Removes the quotes from the API book so takers stop seeing them, but anyone
@@ -35,7 +36,10 @@
  * pull, now `softCancelled` with `filledRiskWei6 > 0` — skipped off-chain like any
  * softCancelled, the matched portion preserved). Matches the shutdown / on-chain-kill posture in
  * `src/runners/index.ts`. Filter: `postedAtUnixSec + orders.staleAfterSeconds <=
- * now`. Already-terminal records (`filled` / `expired` /
+ * now` AND not already past `expiry + orders.expiryReleaseGraceSeconds` (a record
+ * dead on chain has nothing matchable to invalidate — left for the runner's `ageOut`
+ * to reclassify `expired`; same shared `isExpiredForRelease` predicate every other
+ * sweep uses). Already-terminal records (`filled` / `expired` /
  * `authoritativelyInvalidated`) are excluded — there's nothing matchable left.
  *
  * Order of operations (`runCancelStale`): the cheap, no-passphrase checks run
@@ -315,7 +319,7 @@ export async function runCancelStale(opts: CancelStaleOpts, deps: CancelStaleDep
     runId,
   };
   if (stale.length === 0) {
-    log(`[cancel-stale] nothing to do — no tracked commitments older than orders.staleAfterSeconds (${staleAfter}s).`);
+    log(`[cancel-stale] nothing to do — no still-matchable tracked commitments older than orders.staleAfterSeconds (${staleAfter}s).`);
     // Conditional flush: only flush if the state was loaded (i.e. there was
     // a prior `maker-state.json`). A `fresh` state means there's no file on
     // disk — flushing an empty one would erase the state-loss signal a

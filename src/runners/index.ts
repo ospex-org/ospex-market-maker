@@ -670,7 +670,7 @@ export class Runner {
     // `ownStateDedupSet` from persisted `commitment.fills[]` (own-state-sse-plan
     // §2.5.3 proposed one). It was removed as dead-in-practice: the first `onReady`
     // after any boot/resume either swaps a fresh snapshot or cold-restarts via the
-    // empty-baseline guard — BEFORE any persisted fill is drained (drain gates on
+    // mapping-degraded self-heal — BEFORE any persisted fill is drained (drain gates on
     // `ready`) — clearing the set either way. The snapshot's position risk already
     // subsumes prior fills and the server flows only post-snapshot fills live, so
     // restart-safety against duplicate fills is the snapshot-subsumes path, not a
@@ -1160,9 +1160,9 @@ export class Runner {
         await this.deps.sleep(this.config.ownState.debounceMs, this.abortController.signal);
         if (this.abortController.signal.aborted) return;
         this.drainOwnState();
-        // §4.2 (Phase 3 PR1) — the empty-baseline guard wakes the loop after
-        // requesting a cold restart; perform it here, off the wake, now that
-        // we're in an async context. No-op unless requested.
+        // A requested cold restart (mapping-degraded self-heal / unknown-own-fill)
+        // wakes the loop; perform it here, off the wake, now that we're in an
+        // async context. No-op unless requested.
         await this.performOwnStateColdRestart();
         // Consume any wakes that arrived OUTSIDE the begin/endWait pair (during
         // the debounce window). Their queue contents are covered by the drain
@@ -1426,8 +1426,8 @@ export class Runner {
         this.drainOwnState(); // own-state-sse-plan §"Drain placement" — pre-tick drain
         await this.tick(ticks);
         this.drainOwnState(); // §"Drain placement" — post-tick drain catches events that arrived during tick IO
-        // §4.2 (Phase 3 PR1) — belt-and-braces cold-restart hook for a guard
-        // that tripped during tick IO (before the loop returned to the wait).
+        // Belt-and-braces cold-restart hook for a request that tripped during
+        // tick IO (before the loop returned to the wait).
         await this.performOwnStateColdRestart();
         // PR5 — comparator pass. Records that this tick completed (lastPollObsAtMs),
         // latches firstAuditPollAfterReady when applicable, and runs the comparator
@@ -3235,7 +3235,7 @@ export class Runner {
     if (status === 'resync') {
       // The upcoming fresh snapshot is authoritative — drop every buffer the
       // prior baseline seeded. Centralized in `resetOwnStateForRebaseline` so the
-      // resync path and the empty-baseline cold-restart path clear the SAME set
+      // resync path and the mapping-degraded cold-restart path clear the SAME set
       // ([[feedback_enforce_invariant_every_site]] + [[feedback_reset_event_clears_dependent_buffers]]).
       this.resetOwnStateForRebaseline();
     } else if (status === 'connected') {
@@ -3269,7 +3269,7 @@ export class Runner {
   /**
    * Clear every shadow/cursor buffer that a RE-BASELINE invalidates — shared by
    * the server-driven resync path (`handleOwnerStatus('resync')`) and the
-   * MM-driven empty-baseline cold restart (`performOwnStateColdRestart`). The
+   * MM-driven cold restart (`performOwnStateColdRestart`). The
    * upcoming fresh snapshot is authoritative, so all of these MUST be dropped at
    * one site or stale state double-applies onto the new baseline:
    * - `ready=false` / `pendingBaseline=null` — a partial pre-rebaseline snapshot

@@ -12,6 +12,10 @@ node_modules/
 
 # operator's real config + runtime state — only ospex-mm.example.yaml is committed
 # (anchored with / so these don't match src/state/, src/telemetry/, etc.)
+# NOTE: only the literal ./state/ name is ignored. For live runs put state.dir at an
+# ABSOLUTE path OUTSIDE this repo — maker-state.json holds signed EIP-712 bearer payloads;
+# an in-repo state.dir under any other name (e.g. ./live-state/) is NOT ignored and would
+# be committed. See docs/OPERATOR_SAFETY.md (Sensitive local state).
 /ospex-mm.yaml
 /state/
 /telemetry/

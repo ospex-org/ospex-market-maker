@@ -1,7 +1,8 @@
 /**
  * `ospex-mm cancel-stale [--authoritative]` — one-shot operator command that pulls
- * every tracked commitment whose age has crossed `orders.staleAfterSeconds`. Two
- * flavours, distinguished by `--authoritative`:
+ * every still-matchable tracked commitment whose age has crossed
+ * `orders.staleAfterSeconds` (already-expired records are skipped — see Filter below).
+ * Two flavours, distinguished by `--authoritative`:
  *
  *   - default — gasless off-chain cancels only (`adapter.cancelCommitmentOffchain`).
  *     Removes the quotes from the API book so takers stop seeing them, but anyone
@@ -35,7 +36,10 @@
  * pull, now `softCancelled` with `filledRiskWei6 > 0` — skipped off-chain like any
  * softCancelled, the matched portion preserved). Matches the shutdown / on-chain-kill posture in
  * `src/runners/index.ts`. Filter: `postedAtUnixSec + orders.staleAfterSeconds <=
- * now`. Already-terminal records (`filled` / `expired` /
+ * now` AND not already past `expiry + orders.expiryReleaseGraceSeconds` (a record
+ * dead on chain has nothing matchable to invalidate — left for the runner's `ageOut`
+ * to reclassify `expired`; same shared `isExpiredForRelease` predicate every other
+ * sweep uses). Already-terminal records (`filled` / `expired` /
  * `authoritativelyInvalidated`) are excluded — there's nothing matchable left.
  *
  * Order of operations (`runCancelStale`): the cheap, no-passphrase checks run
@@ -78,12 +82,15 @@
  * (`--json` envelope or human text), and so tests can assert on the outcome.
  *
  * **Exit code**: `0` on a clean cleanup; `1` if any per-record write errored
- * (`errored > 0`) or a gas-budget verdict denied an on-chain cancel
- * (`gasDenied > 0`). Operators wiring this into automation can rely on the exit
- * code to detect an incomplete sweep without parsing the JSON envelope.
+ * (`errored > 0`), a gas-budget verdict denied an on-chain cancel
+ * (`gasDenied > 0`), or a legacy book-hidden record had no recoverable signed
+ * payload so the authoritative cancel was blocked (`blockedMissingPayload > 0`).
+ * Operators wiring this into automation can rely on the exit code to detect an
+ * incomplete sweep without parsing the JSON envelope.
  */
 
 import type { Config } from '../config/index.js';
+import { isExpiredForRelease } from '../orders/index.js';
 import {
   createLiveOspexAdapter,
   unlockKeystoreSigner,
@@ -285,10 +292,18 @@ export async function runCancelStale(opts: CancelStaleOpts, deps: CancelStaleDep
 
   const wallNow = now();
   const staleAfter = opts.config.orders.staleAfterSeconds;
+  const grace = opts.config.orders.expiryReleaseGraceSeconds;
   const stale = Object.values(state.commitments).filter(
     (r) =>
       (r.lifecycle === 'visibleOpen' || r.lifecycle === 'softCancelled' || r.lifecycle === 'partiallyFilled') &&
-      r.postedAtUnixSec + staleAfter <= wallNow,
+      r.postedAtUnixSec + staleAfter <= wallNow &&
+      // Skip records already past `expiry + grace`: dead on chain (the contract won't
+      // match them), so an off-chain DELETE / on-chain `cancelCommitment` is pointless —
+      // it burns gas and an on-chain revert against a dead commitment would falsely flip
+      // the exit code. The runner's `ageOut` reclassifies these to `expired` on its next
+      // tick. Same shared `isExpiredForRelease` + `orders.expiryReleaseGraceSeconds` grace
+      // every other cancel sweep uses, so the release predicate can't drift.
+      !isExpiredForRelease(r.expiryUnixSec, wallNow, grace),
   );
 
   const report: CancelStaleReport = {
@@ -304,7 +319,7 @@ export async function runCancelStale(opts: CancelStaleOpts, deps: CancelStaleDep
     runId,
   };
   if (stale.length === 0) {
-    log(`[cancel-stale] nothing to do — no tracked commitments older than orders.staleAfterSeconds (${staleAfter}s).`);
+    log(`[cancel-stale] nothing to do — no still-matchable tracked commitments older than orders.staleAfterSeconds (${staleAfter}s).`);
     // Conditional flush: only flush if the state was loaded (i.e. there was
     // a prior `maker-state.json`). A `fresh` state means there's no file on
     // disk — flushing an empty one would erase the state-loss signal a
@@ -510,9 +525,11 @@ export async function runCancelStale(opts: CancelStaleOpts, deps: CancelStaleDep
 
 /**
  * Exit code policy. `0` on a clean cleanup; `1` if any per-record write
- * errored (`errored > 0`) or a gas-budget verdict denied an on-chain cancel
- * (`gasDenied > 0`). Operators wiring this into automation can rely on the
- * exit code to detect an incomplete sweep without parsing the JSON envelope.
+ * errored (`errored > 0`), a gas-budget verdict denied an on-chain cancel
+ * (`gasDenied > 0`), or a legacy book-hidden record's authoritative cancel was
+ * blocked for a missing signed payload (`blockedMissingPayload > 0`). Operators
+ * wiring this into automation can rely on the exit code to detect an incomplete
+ * sweep without parsing the JSON envelope.
  */
 export function cancelStaleExitCode(report: CancelStaleReport): number {
   // `blockedMissingPayload` (M6/A) is also an incomplete sweep — the operator

@@ -106,10 +106,11 @@ Aggregates the NDJSON event logs into the §2.3 run metrics: ticks, the candidat
 
 ## 8. Going live (the two-key model)
 
-Live requires **both**: `mode.dryRun: false` in your config **and** the `--live` flag on the command. `--live` without the config flag is refused; `--dry-run` always forces dry-run. If you ran dry-run with a blank `wallet.keystorePath`, set it now — the **absolute** path to your keystore file (no `~` expansion), or the `OSPEX_KEYSTORE_PATH` env var. The keystore passphrase comes from `OSPEX_KEYSTORE_PASSPHRASE` (preferred for non-interactive runs), else a no-echo TTY prompt; `--address` with `--live` is refused (the signer determines the maker wallet). Use a *fresh* `state.dir` for live — a directory polluted with prior dry-run synthetic commitments is refused at boot.
+Live requires **both**: `mode.dryRun: false` in your config **and** the `--live` flag on the command. `--live` without the config flag is refused; `--dry-run` always forces dry-run. If you ran dry-run with a blank `wallet.keystorePath`, set it now — the **absolute** path to your keystore file (no `~` expansion), or the `OSPEX_KEYSTORE_PATH` env var. The keystore passphrase comes from `OSPEX_KEYSTORE_PASSPHRASE` (preferred for non-interactive runs), else a no-echo TTY prompt; `--address` with `--live` is refused (the signer determines the maker wallet). Use a *fresh* `state.dir` for live — a directory polluted with prior dry-run synthetic commitments is refused at boot. **Point `state.dir` at an absolute path *outside* this repo working tree** (e.g. `/var/lib/ospex-mm/state` — an absolute path outside the clone). `maker-state.json` holds signed EIP-712 commitment payloads — bearer credentials a taker can use to fill your still-matchable quotes — so it must never be committed. Only the literal `./state/` (plus `./telemetry/`, `./KILL`) are git-ignored; a `state.dir` under any *other* in-repo name (`./live-state/`, `./canary-state/`, …) is **not** ignored and would make those credentials git-visible. See [`OPERATOR_SAFETY.md`](OPERATOR_SAFETY.md#sensitive-local-state).
 
 ```bash
-# after setting mode.dryRun: false in ospex-mm.yaml, with a fresh state.dir:
+# after setting mode.dryRun: false in ospex-mm.yaml, with a fresh state.dir
+# (absolute path OUTSIDE this repo — see the note above; an in-repo dir not named "state" is git-visible):
 OSPEX_KEYSTORE_PASSPHRASE='…' yarn mm run --live
 # or, on a TTY, omit the env var and you'll be prompted (no-echo)
 ```

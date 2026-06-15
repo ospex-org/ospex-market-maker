@@ -401,6 +401,33 @@ describe('runCancelStale — off-chain leg (default, no --authoritative)', () =>
     expect(report).toMatchObject({ inspected: 0, offchainCancelled: 0, errored: 0 });
     expect(captured!.cancelCommitmentOffchain).not.toHaveBeenCalled();
   });
+
+  it('a non-terminal record already past expiry + grace is excluded from the stale set (dead on chain — nothing matchable to invalidate); a still-live stale record on the same run is still swept', async () => {
+    // 0xexp: visibleOpen, posted T0-700 → expiry (postedAt+600) = T0-100, which is past
+    //   now (T0) + the default orders.expiryReleaseGraceSeconds (60): isExpiredForRelease(T0-100, T0, 60)
+    //   === true → excluded from the sweep (the runner's ageOut reclassifies it `expired` next tick).
+    // 0xlive: visibleOpen, posted T0-200 → expiry T0+400, still in the future → swept as usual.
+    seedState([
+      rec('0xexp', T0 - 700),
+      rec('0xlive', T0 - 200),
+    ]);
+    let captured: OspexAdapter | null = null;
+    const createLiveAdapter = (cfg: Config, signer: Signer): OspexAdapter => {
+      captured = liveAdapter(cfg, signer);
+      return captured;
+    };
+    const report = await runCancelStale(
+      { config: liveConfig(), authoritative: false, ignoreMissingState: false },
+      { ...baseDeps(), createLiveAdapter },
+    );
+    // Only the still-live record is inspected + cancelled; the already-expired one never enters the set.
+    expect(report).toMatchObject({ inspected: 1, offchainCancelled: 1, errored: 0, blockedMissingPayload: 0 });
+    expect(captured!.cancelCommitmentOffchain).toHaveBeenCalledTimes(1);
+    expect(captured!.cancelCommitmentOffchain).toHaveBeenCalledWith('0xlive');
+    const state = StateStore.at(stateDir).load().state;
+    expect(state.commitments['0xexp']!.lifecycle).toBe('visibleOpen'); // untouched — no off-chain DELETE / gas spent
+    expect(state.commitments['0xlive']!.lifecycle).toBe('softCancelled');
+  });
 });
 
 // ── --authoritative — on-chain leg ───────────────────────────────────────────

@@ -179,6 +179,25 @@ describe('runRun — live mode wiring', () => {
     expect(existsSync(join(logDir, 'run-live-run.ndjson'))).toBe(true); // the runner ran
   });
 
+  it('--live stamps the resolved signer address into the state lock (updateMaker) once the keystore is unlocked', async () => {
+    const updateMaker = vi.fn();
+    const acquireStateLock = vi.fn((_dir: string, _id: StateLockIdentity): StateLock => ({ path: 'p', release: () => {}, updateMaker }));
+    await runRun(
+      { config: liveConfig(), mode: 'live', ignoreMissingState: false, confirmUnlimited: false },
+      {
+        createLiveAdapter: vi.fn(liveDiscoveryFindsNothing),
+        unlockSigner: vi.fn((_p: string, _pw: string) => Promise.resolve(fakeSigner())),
+        acquireStateLock,
+        env: { OSPEX_KEYSTORE_PASSPHRASE: 'pw' },
+        makeRunId: () => 'r', runnerDeps: noopRunnerDeps, maxTicks: 1, log: () => {},
+      },
+    );
+    // The lock was acquired with a null maker (a live keystore omits the address), then
+    // stamped with the signer's address once unlocked.
+    expect(acquireStateLock.mock.calls[0]?.[1]).toMatchObject({ maker: null });
+    expect(updateMaker).toHaveBeenCalledWith(SIGNER_ADDRESS);
+  });
+
   it('--live with env unset → prompts for the passphrase', async () => {
     const unlockSigner = vi.fn((_path: string, _pw: string) => Promise.resolve(fakeSigner()));
     const promptPassphrase = vi.fn(() => Promise.resolve('pw-from-prompt'));
@@ -276,7 +295,7 @@ describe('runRun — live mode wiring', () => {
 describe('runRun — state.dir lock', () => {
   it('acquires the lock for config.state.dir with the maker/config/run identity and releases it after the loop', async () => {
     const release = vi.fn();
-    const acquireStateLock = vi.fn((_dir: string, _identity: StateLockIdentity): StateLock => ({ path: join(stateDir, STATE_LOCK_FILE), release }));
+    const acquireStateLock = vi.fn((_dir: string, _identity: StateLockIdentity): StateLock => ({ path: join(stateDir, STATE_LOCK_FILE), release, updateMaker: () => {} }));
     await runRun(
       { config: cfg(), configPath: '/etc/ospex-mm.yaml', mode: 'dry-run', ignoreMissingState: false, confirmUnlimited: false },
       { createAdapter: discoveryFindsNothing, makeRunId: () => 'run-x', acquireStateLock, runnerDeps: noopRunnerDeps, maxTicks: 1, log: () => {} },
@@ -290,7 +309,7 @@ describe('runRun — state.dir lock', () => {
     // boot resolves it best-effort for the lock identity.
     const keystorePath = join(stateDir, 'keystore.json');
     writeFileSync(keystorePath, JSON.stringify({ address: 'ABC0000000000000000000000000000000000ABC', crypto: {} }), 'utf8');
-    const acquireStateLock = vi.fn((_dir: string, _identity: StateLockIdentity): StateLock => ({ path: 'p', release: () => {} }));
+    const acquireStateLock = vi.fn((_dir: string, _identity: StateLockIdentity): StateLock => ({ path: 'p', release: () => {}, updateMaker: () => {} }));
     await runRun(
       { config: cfg({ wallet: { keystorePath } }), mode: 'dry-run', ignoreMissingState: false, confirmUnlimited: false },
       { createAdapter: discoveryFindsNothing, makeRunId: () => 'r', acquireStateLock, runnerDeps: noopRunnerDeps, maxTicks: 1, log: () => {} },

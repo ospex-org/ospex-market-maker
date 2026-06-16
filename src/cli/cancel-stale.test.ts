@@ -217,7 +217,7 @@ describe('runCancelStale — state.dir lock', () => {
   it('acquires the lock with the config/run identity (process label reflects --authoritative) and releases it', async () => {
     seedState([]); // a loaded-but-empty state so the command runs to completion
     const release = vi.fn();
-    const acquireStateLock = vi.fn((_dir: string, _identity: StateLockIdentity): StateLock => ({ path: join(stateDir, STATE_LOCK_FILE), release }));
+    const acquireStateLock = vi.fn((_dir: string, _identity: StateLockIdentity): StateLock => ({ path: join(stateDir, STATE_LOCK_FILE), release, updateMaker: () => {} }));
     await runCancelStale(
       { config: liveConfig(), configPath: '/etc/ospex-mm.yaml', authoritative: true, ignoreMissingState: false },
       { ...baseDeps(), acquireStateLock },

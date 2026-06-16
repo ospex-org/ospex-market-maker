@@ -242,6 +242,10 @@ export async function runRun(opts: RunOpts, deps: RunDeps = {}): Promise<void> {
       const signer = await unlockSigner(config.wallet.keystorePath, passphrase); // a bad passphrase / malformed keystore throws a plain Error — the CLI surfaces it as "run failed: …"
       liveMakerAddress = await signer.getAddress();
       bootAddress = liveMakerAddress;
+      // The lock's maker was resolved best-effort before unlock (commonly null for a
+      // Foundry keystore); now the signer's address is known, stamp it so the lock's
+      // diagnostics + fail-closed refusal name the real wallet.
+      lock.updateMaker(liveMakerAddress);
       adapter = (deps.createLiveAdapter ?? createLiveOspexAdapter)(config, signer);
     } else {
       adapter = (deps.createAdapter ?? createOspexAdapter)(config);

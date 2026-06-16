@@ -14,6 +14,14 @@ Read this before running the market maker against real funds. It is the safe-ope
 - Use a wallet that holds only what you're willing to put at risk. Don't point this at your main wallet.
 - Keep the keystore file and its passphrase secure. Anyone with both can sign as you.
 
+## One wallet per instance
+
+**Run at most one MM instance per wallet.** The `state.dir` lock stops two instances from sharing a *state directory*, but it does **not** stop two instances from sharing a *wallet* (different `state.dir`s, same keystore). Don't do it: both instances quote the same markets on the same maker address, so each sees the other's fills as commitments it never posted — which triggers repeated cursor-freeze + cold-restart churn — and they cancel and replace each other's quotes in a tight loop. There is no on-chain harm (your own commitments can't fill each other), but the MMs spend gas and make no orderly market.
+
+- This is **not enforced** (cross-process mutual exclusion on a wallet would need shared coordination the MM deliberately doesn't have). Instead, a **live boot warns**: it reads the wallet's open commitments and, if any weren't posted by this instance, logs `WARNING: … another MM may be running on the same wallet` and emits a `foreign-maker-commitments` telemetry event.
+- The warning is **advisory** — open commitments on your wallet that this instance didn't post can also be harmless **prior-run residue** (a previous run on this wallet whose quotes haven't expired) or a **hand-posted quote**. If you know that's the case, it's safe to ignore; the residue expires on its own. If you did *not* expect them, stop the other instance.
+- Running several MMs on one host? Give each **its own wallet** (and its own `state.dir` / `telemetry.logDir` / `killSwitchFile`).
+
 ## Funding
 
 - The MM needs **USDC** (for stakes) and **POL/MATIC** (for gas: approvals, on-chain cancels, settle, claim). It does **not** need LINK.

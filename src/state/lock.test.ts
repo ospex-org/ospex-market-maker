@@ -83,6 +83,39 @@ describe('acquireStateLock — happy path', () => {
   });
 });
 
+// ── updateMaker — stamp the resolved wallet post-unlock ────────────────────────
+
+describe('StateLock.updateMaker', () => {
+  const LIVE_MAKER = '0x1234000000000000000000000000000000001234';
+
+  it('stamps a maker onto a lock acquired with a null maker, preserving every other field (the live Foundry-keystore case)', () => {
+    const lock = acquireStateLock(dir, { maker: null, configPath: '/c.yaml', runId: 'run-1', process: 'run --live' }, deps());
+    expect(readLockFile().maker).toBeNull();
+    lock.updateMaker(LIVE_MAKER);
+    expect(readLockFile()).toEqual({
+      v: 1, pid: 4242, hostname: 'host-a', acquiredAt: '2026-06-15T00:00:00.000Z',
+      maker: LIVE_MAKER, configPath: '/c.yaml', runId: 'run-1', process: 'run --live',
+    });
+  });
+
+  it('does NOT rewrite a lock another instance reclaimed after us (pid/host/runId no longer ours)', () => {
+    const lock = acquireStateLock(dir, IDENTITY, deps());
+    // Simulate a different instance reclaiming the lock file.
+    seedLock({ v: 1, pid: 9999, hostname: 'host-a', acquiredAt: 't', maker: '0xsibling', configPath: null, runId: 'other-run', process: 'run --live' });
+    lock.updateMaker(LIVE_MAKER);
+    expect(readLockFile().maker).toBe('0xsibling'); // untouched
+    expect(readLockFile().runId).toBe('other-run');
+  });
+
+  it('is a no-op after release', () => {
+    const lock = acquireStateLock(dir, IDENTITY, deps());
+    lock.release();
+    expect(existsSync(lockPath)).toBe(false);
+    lock.updateMaker(LIVE_MAKER); // must not recreate or throw
+    expect(existsSync(lockPath)).toBe(false);
+  });
+});
+
 // ── acquire — fail closed on a live holder ─────────────────────────────────────
 
 describe('acquireStateLock — fails closed on a live duplicate', () => {

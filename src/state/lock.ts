@@ -78,6 +78,16 @@ export interface StateLock {
    * shutdown path).
    */
   release(): void;
+  /**
+   * Rewrite the recorded `maker` wallet **iff the lock is still ours** (same
+   * pid + hostname + runId). The maker is resolved best-effort at acquire time
+   * (commonly `null` for a live Foundry keystore, whose plaintext address is
+   * omitted); once the signer is unlocked and the address is known, the boot
+   * path calls this so the lock's diagnostic identity (and its fail-closed
+   * refusal message) names the real wallet. Best-effort + never throws — it's a
+   * diagnostic field, not part of the mutual-exclusion mechanism.
+   */
+  updateMaker(maker: string): void;
 }
 
 /** Injectable seams so the lock can be unit-tested without real processes / hosts / clocks. */
@@ -237,6 +247,7 @@ export function acquireStateLock(dir: string, identity: StateLockIdentity, deps:
 /** Build the {@link StateLock} handle returned on a successful acquire. */
 function makeLock(lockPath: string, pid: number, host: string, runId: string): StateLock {
   let released = false;
+  const isStillOurs = (p: LockFilePayload): boolean => p.pid === pid && p.hostname === host && p.runId === runId;
   return {
     path: lockPath,
     release(): void {
@@ -245,7 +256,7 @@ function makeLock(lockPath: string, pid: number, host: string, runId: string): S
       // Remove the lock only if it's still OURS — a different instance may have
       // legitimately reclaimed it (e.g. if this process was wrongly judged dead).
       const current = readLock(lockPath);
-      if (current.ok && current.payload.pid === pid && current.payload.hostname === host && current.payload.runId === runId) {
+      if (current.ok && isStillOurs(current.payload)) {
         try {
           unlinkSync(lockPath);
         } catch {
@@ -253,6 +264,18 @@ function makeLock(lockPath: string, pid: number, host: string, runId: string): S
         }
       }
       // else: not ours / already gone — leave it.
+    },
+    updateMaker(maker: string): void {
+      if (released) return;
+      const current = readLock(lockPath);
+      // Only rewrite a lock that is still ours and whose maker actually changed —
+      // never clobber a lock another instance reclaimed after us.
+      if (!current.ok || !isStillOurs(current.payload) || current.payload.maker === maker) return;
+      try {
+        writeFileSync(lockPath, `${JSON.stringify({ ...current.payload, maker }, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+      } catch {
+        // Best-effort — a failed diagnostic rewrite must not block the boot path.
+      }
     },
   };
 }

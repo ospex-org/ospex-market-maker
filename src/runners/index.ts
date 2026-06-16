@@ -1379,6 +1379,45 @@ export class Runner {
    * interval; a *signal* aborts the in-flight sleep, so it's acted on after
    * the current tick.
    */
+  /**
+   * One-time live-boot diagnostic for the one-wallet-per-instance rule (MM#6,
+   * DESIGN §12). Reads the maker's currently-open commitments from the API and
+   * compares them against THIS instance's loaded state: open commitments on this
+   * wallet that this instance did NOT post (absent from local state) are a likely
+   * sign that a SECOND MM is running on the same wallet — which causes mutual
+   * quote-cancellation and `unknown-own-fill` cold-restart churn (each instance
+   * treats the other's fills as orphans). WARN-only (never refuses): a foreign open
+   * commitment can also be benign (a not-yet-reloaded prior-run residue, or a
+   * hand-posted quote), so the message says "may be". Best-effort — a read failure
+   * is swallowed (the dangerous case also surfaces later as `unknown-own-fill`).
+   *
+   * MUST run BEFORE the own-state subscription re-baselines this instance's book:
+   * the snapshot returns the wallet's WHOLE book (including a sibling's rows), which
+   * would then read as "known" and mask the collision. `known` is captured up front
+   * from the pre-stream disk state for the same reason. Dry-run no-ops (no real
+   * wallet / on-chain commitments — and `listOpenCommitments` would be a needless read).
+   */
+  private async warnOnForeignMakerCommitments(): Promise<void> {
+    if (this.config.mode.dryRun || this.makerAddress === null) return; // live only — only live has real on-chain commitments to collide on
+    const known = new Set(Object.keys(this.state.commitments));
+    const listLimit = Math.max(this.config.risk.maxOpenCommitments * 2, 50);
+    let open: Commitment[];
+    try {
+      open = await this.adapter.listOpenCommitments(this.makerAddress, listLimit);
+    } catch {
+      return; // best-effort — a transient read failure must not block or noise the boot
+    }
+    const foreign = open.filter((c) => !known.has(c.commitmentHash));
+    if (foreign.length === 0) return;
+    this.eventLog.emit('foreign-maker-commitments', {
+      count: foreign.length,
+      commitmentHashes: foreign.slice(0, 20).map((c) => c.commitmentHash),
+    });
+    this.deps.log(
+      `[runner] WARNING: ${foreign.length} open commitment(s) on this wallet were not posted by this instance — another MM may be running on the same wallet. Run ONE MM per wallet (DESIGN §12 / OPERATOR_SAFETY "One wallet per instance"). If this is residue from a prior run on this wallet, it is harmless and expires on its own.`,
+    );
+  }
+
   async run(): Promise<void> {
     const unregister = this.deps.registerShutdownSignals(() => this.requestShutdown('signal'));
     let ticks = 0;
@@ -1393,6 +1432,10 @@ export class Runner {
       // unsubscribes on every shutdown path. INSIDE the `try` so a synchronous
       // throw from the SDK (auth misconfiguration, network init failure) still
       // runs `unregister()` + cleanup (Hermes #68 review blocker 3).
+      // One-time live-boot collision diagnostic (MM#6) — BEFORE the own-state
+      // subscription re-baselines this instance's book (which would mask a sibling's
+      // commitments as "known"). Best-effort + WARN-only; never blocks the boot.
+      await this.warnOnForeignMakerCommitments();
       if (this.makerAddress !== null) {
         this.openOwnStateSubscription();
       }

@@ -723,6 +723,51 @@ describe('Runner — state-loss hold durability', () => {
   });
 });
 
+describe('Runner — one-wallet-per-instance collision diagnostic (MM#6)', () => {
+  it('WARNs + emits foreign-maker-commitments when the wallet has open commitments this instance did not post', async () => {
+    StateStore.at(stateDir).flush(emptyMakerState()); // fresh — this instance posted nothing
+    const lines: string[] = [];
+    const config = cfg({ mode: { dryRun: false } });
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([]), undefined, undefined, undefined, {
+      listOpenCommitments: () => Promise.resolve([orderbookEntry({ commitmentHash: '0xforeign' })]),
+    });
+    await makeRunner({ config, adapter, maxTicks: 1, deps: { log: (l) => lines.push(l) } }).run();
+    expect(lines.some((l) => /another MM may be running on the same wallet/.test(l))).toBe(true);
+    expect(readEvents().find((e) => e.kind === 'foreign-maker-commitments')).toMatchObject({ count: 1, commitmentHashes: ['0xforeign'] });
+  });
+
+  it('does NOT WARN when every open commitment on the wallet is in local state', async () => {
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xmine': commitmentRecord({ hash: '0xmine' }) } });
+    const lines: string[] = [];
+    const config = cfg({ mode: { dryRun: false } });
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([]), undefined, undefined, undefined, {
+      listOpenCommitments: () => Promise.resolve([orderbookEntry({ commitmentHash: '0xmine' })]),
+    });
+    await makeRunner({ config, adapter, maxTicks: 1, deps: { log: (l) => lines.push(l) } }).run();
+    expect(lines.some((l) => /another MM may be running/.test(l))).toBe(false);
+    expect(readEvents().some((e) => e.kind === 'foreign-maker-commitments')).toBe(false);
+  });
+
+  it('is best-effort — a listOpenCommitments failure neither throws nor WARNs', async () => {
+    StateStore.at(stateDir).flush(emptyMakerState());
+    const config = cfg({ mode: { dryRun: false } });
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([]), undefined, undefined, undefined, {
+      listOpenCommitments: () => Promise.reject(new Error('api down')),
+    });
+    await expect(makeRunner({ config, adapter, maxTicks: 1 }).run()).resolves.toBeUndefined();
+    expect(readEvents().some((e) => e.kind === 'foreign-maker-commitments')).toBe(false);
+  });
+
+  it('dry-run never runs the check (no wallet)', async () => {
+    StateStore.at(stateDir).flush(emptyMakerState());
+    const failIfCalled = vi.fn(() => Promise.reject(new Error('listOpenCommitments must not be called in dry-run boot check')));
+    const adapter = spiedAdapter(cfg(), () => Promise.resolve([]));
+    vi.spyOn(adapter, 'listOpenCommitments').mockImplementation(failIfCalled as unknown as OspexAdapter['listOpenCommitments']);
+    await makeRunner({ config: cfg(), adapter, maxTicks: 1 }).run();
+    expect(readEvents().some((e) => e.kind === 'foreign-maker-commitments')).toBe(false);
+  });
+});
+
 // ── the tick loop ────────────────────────────────────────────────────────────
 
 describe('Runner — tick loop', () => {

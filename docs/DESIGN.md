@@ -143,9 +143,16 @@ A channel error / unrecoverable disconnect on an odds subscription marks that ma
 
 The MM holds open SSE connections to `ospex-core-api`: **one reference-odds stream per tracked market** (capped at `odds.maxRealtimeChannels`, default 5) **plus exactly one composite owner-auth own-state stream** (commitments + fills + positions on a single connection). So a single live instance uses **`maxRealtimeChannels + 1`** connections — 6 at the defaults.
 
-core-api bounds concurrent streams with a **per-IP cap** (`MAX_STREAM_CONNECTIONS_PER_IP`, default 16); a connection past the cap is refused with **HTTP 429**. The crucial subtlety: **the cap is per egress IP / host, not per process** — every MM instance running on the same host (and anything else streaming from that IP) shares one budget. The boot-time guardrail can only see *this* process, so it logs the per-instance count and the per-host math; it cannot detect siblings.
+core-api bounds concurrent streams with a **per-IP cap** (`MAX_STREAM_CONNECTIONS_PER_IP`, default 16); a connection past the cap is refused with **HTTP 429**. Two subtleties matter:
 
-**Running more than one instance on one host:** raise `MAX_STREAM_CONNECTIONS_PER_IP` on your core-api to at least `N × (maxRealtimeChannels + 1)` for N co-located instances, **or** give each instance its own egress IP. core-api also reserves a slice of the per-IP budget for owner-auth own-state streams (`RESERVED_STREAM_CONNECTIONS_PER_IP_OWNER`), so anonymous odds saturation can't 429 a maker's own-state reconnect — but that reserve does not remove the need to size the per-IP cap for the odds channels.
+1. **The cap is per egress IP / host, not per process** — every MM instance on the same host (and anything else streaming from that IP) shares one budget. The boot-time guardrail can only see *this* process, so it logs the per-instance count + the per-host math; it cannot detect siblings.
+2. **The per-IP cap is split.** core-api reserves `RESERVED_STREAM_CONNECTIONS_PER_IP_OWNER` (default 3) of it for the owner-auth own-state stream, so **anonymous** streams — the odds subscriptions — may use only `MAX_STREAM_CONNECTIONS_PER_IP − RESERVED_STREAM_CONNECTIONS_PER_IP_OWNER` (default `16 − 3 = 13`). The reserve keeps anonymous odds saturation from 429-ing a maker's safety-critical own-state reconnect. So the **binding** budget for odds channels is the *anonymous* one (13), **tighter** than the total cap (16): `maxRealtimeChannels = 14` fits the total (`14 + 1 = 15 ≤ 16`) but is refused on the 14th odds stream (`14 > 13`). The own-state stream itself always fits — it draws from the reserve.
+
+**Running more than one instance on one host** — both constraints must hold for N co-located instances:
+- **Odds (anonymous):** `N × maxRealtimeChannels ≤ MAX_STREAM_CONNECTIONS_PER_IP − RESERVED_STREAM_CONNECTIONS_PER_IP_OWNER` — usually the binding one.
+- **Total:** `N × (maxRealtimeChannels + 1) ≤ MAX_STREAM_CONNECTIONS_PER_IP`.
+
+To make room, raise `MAX_STREAM_CONNECTIONS_PER_IP` and/or lower `RESERVED_STREAM_CONNECTIONS_PER_IP_OWNER` on your core-api, **or** give each instance its own egress IP.
 
 **Lowering the per-instance footprint now (no protocol change):** reduce `odds.maxRealtimeChannels` and let the tail of tracked markets fall back to bounded polling — set `odds.subscribe: false` to poll *every* tracked market each tick (one `getOddsSnapshot` per market, no streams) when stream budget is the binding constraint. This trades freshness for connections.
 

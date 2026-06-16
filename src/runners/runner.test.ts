@@ -765,25 +765,46 @@ describe('Runner — tick loop', () => {
     expect(sleepMsCalls).toEqual([45000, 45000]);
   });
 
-  it('warns at boot when one instance’s own stream budget (odds channels + 1 own-state) would exceed the core-api per-IP cap', () => {
+  it('warns on the ANONYMOUS-odds per-IP budget (cap − owner reserve) before the total cap is hit', () => {
     const lines: string[] = [];
-    // 16 odds channels + 1 own-state = 17 > the per-IP cap of 16.
-    makeRunner({ config: cfg({ odds: { maxRealtimeChannels: 16 } }), deps: { log: (l) => lines.push(l) } });
-    expect(lines.filter((l) => /exceeding the core-api per-IP cap/.test(l))).toHaveLength(1);
-  });
-
-  it('does not emit the over-cap warning at the default stream caps (a single instance fits under the per-IP cap)', () => {
-    const lines: string[] = [];
-    makeRunner({ config: cfg(), deps: { log: (l) => lines.push(l) } });
+    // 14 odds channels: under the total cap (14 + 1 = 15 ≤ 16) BUT over the anonymous
+    // budget (14 > 16 − 3 = 13), so core-api 429s the 14th odds stream. The total-cap
+    // warning must NOT fire here; the anonymous-budget warning must.
+    makeRunner({ config: cfg({ odds: { maxRealtimeChannels: 14 } }), deps: { log: (l) => lines.push(l) } });
+    expect(lines.filter((l) => /ANONYMOUS per-IP SSE budget/.test(l))).toHaveLength(1);
     expect(lines.filter((l) => /exceeding the core-api per-IP cap/.test(l))).toHaveLength(0);
   });
 
-  it('always logs the per-host SSE-budget reminder when streaming (the cap is shared across co-located instances)', () => {
+  it('warns on the total per-IP cap (and the anonymous budget) when even own-state pushes it over', () => {
+    const lines: string[] = [];
+    // 16 odds + 1 own-state = 17 > the per-IP cap of 16 — AND 16 > the anonymous budget 13.
+    makeRunner({ config: cfg({ odds: { maxRealtimeChannels: 16 } }), deps: { log: (l) => lines.push(l) } });
+    expect(lines.filter((l) => /exceeding the core-api per-IP cap/.test(l))).toHaveLength(1);
+    expect(lines.filter((l) => /ANONYMOUS per-IP SSE budget/.test(l))).toHaveLength(1);
+  });
+
+  it('does not emit any over-budget warning at the default stream caps (5 odds fits both the anonymous budget and the cap)', () => {
+    const lines: string[] = [];
+    makeRunner({ config: cfg(), deps: { log: (l) => lines.push(l) } });
+    expect(lines.filter((l) => /exceeding the core-api per-IP cap/.test(l))).toHaveLength(0);
+    expect(lines.filter((l) => /ANONYMOUS per-IP SSE budget/.test(l))).toHaveLength(0);
+  });
+
+  it('does not warn at the anonymous-budget boundary (maxRealtimeChannels === cap − reserve)', () => {
+    const lines: string[] = [];
+    // 13 odds == the anonymous budget (16 − 3) → fits exactly; no warning.
+    makeRunner({ config: cfg({ odds: { maxRealtimeChannels: 13 } }), deps: { log: (l) => lines.push(l) } });
+    expect(lines.filter((l) => /ANONYMOUS per-IP SSE budget/.test(l))).toHaveLength(0);
+    expect(lines.filter((l) => /exceeding the core-api per-IP cap/.test(l))).toHaveLength(0);
+  });
+
+  it('always logs the per-host SSE-budget reminder when streaming (the cap is shared + split for owner-auth)', () => {
     const lines: string[] = [];
     makeRunner({ config: cfg(), deps: { log: (l) => lines.push(l) } });
     const reminder = lines.filter((l) => /SSE budget:/.test(l) && /per HOST/.test(l));
     expect(reminder).toHaveLength(1);
-    expect(reminder[0]).toMatch(/this instance uses 6 connections \(5 odds \+ 1 own-state\)/); // default maxRealtimeChannels=5
+    expect(reminder[0]).toMatch(/this instance uses 6 connections \(5 anonymous odds \+ 1 owner-auth own-state\)/); // default maxRealtimeChannels=5
+    expect(reminder[0]).toMatch(/odds share 13 anonymous slots/); // the anonymous budget = cap(16) − reserve(3)
   });
 
   it('does not log the SSE-budget reminder when odds.subscribe is false (no streams opened)', () => {

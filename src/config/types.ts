@@ -56,12 +56,27 @@ export type LogLevel = (typeof LOG_LEVELS)[number];
 export const DEFAULT_PER_IP_STREAM_CAP = 16;
 
 /**
- * SSE connections one MM instance holds open for own-state: exactly ONE
- * composite owner-auth stream (commitments + fills + positions in a single
- * connection — not three). So one live instance opens
- * `odds.maxRealtimeChannels` (default 5) + 1 = 6 streams, well within
- * {@link DEFAULT_PER_IP_STREAM_CAP}. The per-IP cap is per host, so co-locating
- * N instances needs `MAX_STREAM_CONNECTIONS_PER_IP >= N * (maxRealtimeChannels + 1)`.
+ * Of {@link DEFAULT_PER_IP_STREAM_CAP}, the per-IP slots `ospex-core-api` reserves
+ * for the owner-authenticated own-state stream (its default
+ * `RESERVED_STREAM_CONNECTIONS_PER_IP_OWNER`). **Anonymous** streams — the odds
+ * subscriptions — may use at most `DEFAULT_PER_IP_STREAM_CAP - this` per IP; the
+ * reserve keeps the safety-critical own-state stream from being 429'd by anonymous
+ * saturation. So the binding budget for odds channels is the *anonymous* one
+ * (16 - 3 = 13), tighter than the total cap. Mirrors the core-api default (keep in
+ * lockstep); used only for the boot-time guardrail warning.
+ */
+export const DEFAULT_PER_IP_OWNER_RESERVE = 3;
+
+/**
+ * SSE connections one MM instance holds open for own-state: exactly ONE composite
+ * **owner-auth** stream (commitments + fills + positions in a single connection —
+ * not three). It draws from core-api's per-IP owner reserve ({@link
+ * DEFAULT_PER_IP_OWNER_RESERVE}), NOT the anonymous odds budget. Distinct from that
+ * reserve: this is how many own-state streams a SINGLE instance opens (the "+1" in
+ * its total footprint); the reserve is how many per-IP slots core-api sets aside
+ * for owner-auth across the host. So one live instance opens
+ * `odds.maxRealtimeChannels` (default 5) anonymous odds streams + 1 owner-auth
+ * own-state stream = 6, well within {@link DEFAULT_PER_IP_STREAM_CAP}.
  */
 export const RESERVED_OWN_STATE_STREAMS = 1;
 

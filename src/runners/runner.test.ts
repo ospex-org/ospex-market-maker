@@ -1201,6 +1201,78 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
     await runPromise;
   });
 
+  it('onStatus(\'reconnecting\') with an in-flight TRUNCATED baseline drops the partial accumulation so the next cold snapshot REPLACES it (no phantom rows)', async () => {
+    const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
+
+    // Cold connect, page 1 (truncated) — still accumulating. '0xstale' is a row that
+    // will be filled/cancelled by the time of the next snapshot.
+    recorder.fire('onSnapshot', { cursor: 'c1', commitments: [mappableOwnerCommitment('0xstale')], positions: [], truncated: true, positionsTruncated: false });
+    expect(Object.keys(runner.ownStateSessionView().pendingBaseline!.commitments)).toEqual(['0xstale']);
+
+    // Paging failed mid-flight → the pinned SDK clears its cursor + cold-restarts,
+    // emitting 'reconnecting' (NOT 'resync'). The truncated baseline guarantees a cold
+    // restart (the SDK never advances its cursor on a truncated page), so the stopgap
+    // discards the partial accumulation.
+    recorder.fire('onStatus', 'reconnecting');
+    const mid = runner.ownStateSessionView();
+    expect(mid.pendingBaseline).toBeNull(); // in-flight accumulation discarded
+    expect(mid.ready).toBe(false);
+    expect(mid.lastStatus).toBe('reconnecting');
+
+    // The fresh cold snapshot ('0xstale' now gone) is treated as a NEW first page, not a continuation.
+    recorder.fire('onSnapshot', { cursor: 'c2', commitments: [mappableOwnerCommitment('0xfresh')], positions: [], truncated: false, positionsTruncated: false });
+    recorder.fire('onReady');
+
+    // Canonical book holds ONLY the fresh snapshot — '0xstale' did NOT merge in as a phantom row.
+    expect(Object.keys(runner.stateForTest().commitments)).toEqual(['0xfresh']);
+
+    triggerKill();
+    await runPromise;
+  });
+
+  it('onStatus(\'reconnecting\') after a COMPLETE (non-truncated) baseline, BEFORE onReady, KEEPS it — the SDK resumes and the resume-ready swaps the held baseline (Hermes review-PR98)', async () => {
+    const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
+
+    // A complete single-page snapshot (truncated:false). The SDK advances its running
+    // cursor on a non-truncated snapshot, so a drop here reconnects as a RESUME and the
+    // following onReady arrives with NO fresh snapshot.
+    recorder.fire('onSnapshot', { cursor: 'c1', commitments: [mappableOwnerCommitment('0xcomplete')], positions: [], truncated: false, positionsTruncated: false });
+    expect(Object.keys(runner.ownStateSessionView().pendingBaseline!.commitments)).toEqual(['0xcomplete']);
+
+    // Transport drops before onReady. The baseline is COMPLETE → it must be KEPT (discarding
+    // it would leave handleOwnerReady nothing to swap → ready over empty/stale state).
+    recorder.fire('onStatus', 'reconnecting');
+    const mid = runner.ownStateSessionView();
+    expect(mid.pendingBaseline).not.toBeNull(); // KEPT — not a truncated/paging-failure discard
+    expect(Object.keys(mid.pendingBaseline!.commitments)).toEqual(['0xcomplete']);
+    expect(mid.ready).toBe(false); // not ready until the resume's onReady — nothing posts against un-swapped state
+
+    // Resume-ready: no fresh snapshot, so handleOwnerReady swaps the held baseline.
+    recorder.fire('onReady');
+    expect(Object.keys(runner.stateForTest().commitments)).toEqual(['0xcomplete']); // ready WITH the snapshot it received
+
+    triggerKill();
+    await runPromise;
+  });
+
+  it('onStatus(\'reconnecting\') after a completed baseline ALREADY swapped (post-onReady) is a no-op — a normal mid-stream resume keeps the canonical book', async () => {
+    const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
+
+    recorder.fire('onSnapshot', { cursor: 'c1', commitments: [mappableOwnerCommitment('0xlive')], positions: [], truncated: false, positionsTruncated: false });
+    recorder.fire('onReady');
+    expect(Object.keys(runner.stateForTest().commitments)).toEqual(['0xlive']);
+    expect(runner.ownStateSessionView().pendingBaseline).toBeNull(); // nulled at the swap
+
+    // A transport drop mid-LIVE-stream emits 'reconnecting' with pendingBaseline already
+    // null → the rebaseline branch must NOT fire (a resume re-grounds via catchup, not a
+    // fresh snapshot, so the canonical book must be preserved).
+    recorder.fire('onStatus', 'reconnecting');
+    expect(Object.keys(runner.stateForTest().commitments)).toEqual(['0xlive']);
+
+    triggerKill();
+    await runPromise;
+  });
+
   it('onError(fatal) sets healthy=false; pre-existing canonical state PRESERVED (comparator suppression is PR5\'s job)', async () => {
     const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
 

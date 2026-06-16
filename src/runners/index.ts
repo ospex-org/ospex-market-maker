@@ -651,16 +651,23 @@ export class Runner {
 
     this.deps.log(`[runner] starting run ${opts.runId} — chain ${this.adapter.chainId}, api ${this.adapter.apiUrl}, mode ${this.config.mode.dryRun ? 'dry-run' : 'live'}`);
 
-    // Stream-budget guardrail: each odds subscription is one core-api SSE connection,
-    // counted against the per-IP cap shared with the (deferred) own-state streams. Warn
-    // (don't clamp) if the configured cap + reserved own-state streams would exceed the
-    // conservative default — the operator may have raised MAX_STREAM_CONNECTIONS_PER_IP.
-    if (
-      this.config.odds.subscribe &&
-      this.config.odds.maxRealtimeChannels + RESERVED_OWN_STATE_STREAMS > DEFAULT_PER_IP_STREAM_CAP
-    ) {
+    // Stream-budget guardrail. Each odds subscription is one core-api SSE
+    // connection; one instance also opens exactly one composite own-state stream
+    // — so a single instance needs maxRealtimeChannels + 1 connections. The
+    // core-api per-IP cap is per egress IP/HOST, SHARED across every MM instance
+    // on that host, and this process can't see its siblings. So: (a) warn if even
+    // ONE instance's own budget exceeds the conservative default cap, and (b)
+    // always remind the operator of the per-host math when streaming. Warn only
+    // (never clamp) — the operator may have raised MAX_STREAM_CONNECTIONS_PER_IP.
+    if (this.config.odds.subscribe) {
+      const perInstance = this.config.odds.maxRealtimeChannels + RESERVED_OWN_STATE_STREAMS;
+      if (perInstance > DEFAULT_PER_IP_STREAM_CAP) {
+        this.deps.log(
+          `[runner] one instance needs ${perInstance} SSE connections (odds.maxRealtimeChannels=${this.config.odds.maxRealtimeChannels} + 1 own-state), exceeding the core-api per-IP cap of ${DEFAULT_PER_IP_STREAM_CAP} — connections past the cap are refused (HTTP 429). Lower odds.maxRealtimeChannels (and marketSelection.maxTrackedContests), or raise MAX_STREAM_CONNECTIONS_PER_IP on your core-api.`,
+        );
+      }
       this.deps.log(
-        `[runner] odds.maxRealtimeChannels=${this.config.odds.maxRealtimeChannels} + ${RESERVED_OWN_STATE_STREAMS} reserved own-state streams exceeds the core-api per-IP cap of ${DEFAULT_PER_IP_STREAM_CAP} — odds subscriptions past the cap are refused (HTTP 429). Lower odds.maxRealtimeChannels (and marketSelection.maxTrackedContests), or raise MAX_STREAM_CONNECTIONS_PER_IP on your core-api.`,
+        `[runner] SSE budget: this instance uses ${perInstance} connections (${this.config.odds.maxRealtimeChannels} odds + 1 own-state). The core-api per-IP cap is per HOST — co-locating N instances needs MAX_STREAM_CONNECTIONS_PER_IP >= N*${perInstance} (or run each on its own egress IP). See DESIGN "SSE connection budget".`,
       );
     }
 

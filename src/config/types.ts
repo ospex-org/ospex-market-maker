@@ -43,22 +43,27 @@ export const LOG_LEVELS = ['fatal', 'error', 'warn', 'info', 'debug', 'trace', '
 export type LogLevel = (typeof LOG_LEVELS)[number];
 
 /**
- * The conservative per-IP SSE-connection cap on `ospex-core-api` (its default
- * `MAX_STREAM_CONNECTIONS_PER_IP`). Every open odds subscription — and, once they
- * land, every own-state stream — is one connection counted against this from a
- * single host; exceeding it gets the connection refused with HTTP 429. Operators
- * running their own core-api can raise the server-side cap. Used only for a
- * boot-time guardrail warning — the MM never silently rewrites the operator's caps.
+ * The per-IP SSE-connection cap on `ospex-core-api` (its default
+ * `MAX_STREAM_CONNECTIONS_PER_IP`). Every open odds subscription AND the
+ * owner-auth own-state stream is one connection counted against this — and the
+ * cap is per **egress IP / host**, so it is SHARED across every MM instance
+ * running on that host, not per process. Exceeding it gets the connection
+ * refused with HTTP 429. Operators running their own core-api can raise the
+ * server-side cap. Used only for a boot-time guardrail warning — the MM never
+ * silently rewrites the operator's caps. Mirrors the core-api default (keep in
+ * lockstep if that default changes).
  */
-export const DEFAULT_PER_IP_STREAM_CAP = 10;
+export const DEFAULT_PER_IP_STREAM_CAP = 16;
 
 /**
- * Connections to hold in reserve out of {@link DEFAULT_PER_IP_STREAM_CAP} for the
- * runner's own-state streams (fills + commitments + positions) — a deferred
- * push-architecture item. Reserving them now keeps the default odds-channel cap
- * compatible with the per-IP budget once they're wired (5 odds + 3 = 8 ≤ 10).
+ * SSE connections one MM instance holds open for own-state: exactly ONE
+ * composite owner-auth stream (commitments + fills + positions in a single
+ * connection — not three). So one live instance opens
+ * `odds.maxRealtimeChannels` (default 5) + 1 = 6 streams, well within
+ * {@link DEFAULT_PER_IP_STREAM_CAP}. The per-IP cap is per host, so co-locating
+ * N instances needs `MAX_STREAM_CONNECTIONS_PER_IP >= N * (maxRealtimeChannels + 1)`.
  */
-export const RESERVED_OWN_STATE_STREAMS = 3;
+export const RESERVED_OWN_STATE_STREAMS = 1;
 
 export interface WalletConfig {
   /** Path to a Foundry v3 keystore. May be omitted — then `OSPEX_KEYSTORE_PATH` or the SDK default applies. */

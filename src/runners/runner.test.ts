@@ -765,17 +765,31 @@ describe('Runner — tick loop', () => {
     expect(sleepMsCalls).toEqual([45000, 45000]);
   });
 
-  it('warns at boot when odds.maxRealtimeChannels + reserved own-state streams would exceed the core-api per-IP cap', () => {
+  it('warns at boot when one instance’s own stream budget (odds channels + 1 own-state) would exceed the core-api per-IP cap', () => {
     const lines: string[] = [];
-    // 8 odds channels + 3 reserved own-state = 11 > the per-IP cap of 10.
-    makeRunner({ config: cfg({ odds: { maxRealtimeChannels: 8 } }), deps: { log: (l) => lines.push(l) } });
-    expect(lines.filter((l) => /per-IP cap/.test(l))).toHaveLength(1);
+    // 16 odds channels + 1 own-state = 17 > the per-IP cap of 16.
+    makeRunner({ config: cfg({ odds: { maxRealtimeChannels: 16 } }), deps: { log: (l) => lines.push(l) } });
+    expect(lines.filter((l) => /exceeding the core-api per-IP cap/.test(l))).toHaveLength(1);
   });
 
-  it('does not warn at the default stream caps (fits under the per-IP cap with own-state headroom)', () => {
+  it('does not emit the over-cap warning at the default stream caps (a single instance fits under the per-IP cap)', () => {
     const lines: string[] = [];
     makeRunner({ config: cfg(), deps: { log: (l) => lines.push(l) } });
-    expect(lines.filter((l) => /per-IP cap/.test(l))).toHaveLength(0);
+    expect(lines.filter((l) => /exceeding the core-api per-IP cap/.test(l))).toHaveLength(0);
+  });
+
+  it('always logs the per-host SSE-budget reminder when streaming (the cap is shared across co-located instances)', () => {
+    const lines: string[] = [];
+    makeRunner({ config: cfg(), deps: { log: (l) => lines.push(l) } });
+    const reminder = lines.filter((l) => /SSE budget:/.test(l) && /per HOST/.test(l));
+    expect(reminder).toHaveLength(1);
+    expect(reminder[0]).toMatch(/this instance uses 6 connections \(5 odds \+ 1 own-state\)/); // default maxRealtimeChannels=5
+  });
+
+  it('does not log the SSE-budget reminder when odds.subscribe is false (no streams opened)', () => {
+    const lines: string[] = [];
+    makeRunner({ config: cfg({ odds: { subscribe: false } }), deps: { log: (l) => lines.push(l) } });
+    expect(lines.filter((l) => /SSE budget:/.test(l))).toHaveLength(0);
   });
 
   it('a state-flush failure propagates (the runner must not keep ticking on an un-persistable state)', async () => {

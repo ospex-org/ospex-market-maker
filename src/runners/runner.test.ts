@@ -3068,6 +3068,54 @@ describe('Runner — discovery', () => {
     expect(runner.trackedContestIds()).toEqual(['A']); // B departed on the 2nd cycle
   });
 
+  it('pulls a departing contest’s visible quotes off the book on untrack (would-soft-cancel side-not-quoted) — not left stranded until expiry', async () => {
+    StateStore.at(stateDir).flush(emptyMakerState());
+    let listCount = 0;
+    const config = cfg({ discovery: { everyNTicks: 1 } });
+    // tick 1: A listed → tracked, seeded, and quoted (2 synthetic visibleOpen records).
+    // tick 2: A gone from the listing → untrack pulls its visible quotes before deleting it.
+    const adapter = spiedAdapter(config, () => { listCount += 1; return Promise.resolve(listCount === 1 ? [contestView({ contestId: 'A' })] : []); });
+    const runner = makeRunner({ config, adapter, maxTicks: 2 });
+    await runner.run();
+
+    expect(runner.trackedContestIds()).toEqual([]); // A untracked on cycle 2
+    const events = readEvents();
+    expect(events.filter((e) => e.kind === 'would-submit')).toHaveLength(2); // tick 1 quoted both sides
+    const pulls = events.filter((e) => e.kind === 'would-soft-cancel');
+    expect(pulls).toHaveLength(2); // tick 2 untrack pulled both
+    expect(pulls.every((e) => e.contestId === 'A' && e.reason === 'side-not-quoted')).toBe(true);
+    const records = Object.values(StateStore.at(stateDir).load().state.commitments);
+    expect(records).toHaveLength(2);
+    expect(records.every((r) => r.lifecycle === 'softCancelled')).toBe(true);
+  });
+
+  it('refreshes a tracked market’s matchTimeSec from the latest listing (a rescheduled — esp. earlier — start reaches the gates)', async () => {
+    const LATER = '2099-02-01T00:00:00Z';
+    const EARLIER = '2099-01-01T00:00:00Z';
+    let listCount = 0;
+    const config = cfg({ discovery: { everyNTicks: 1 } });
+    // cycle 1: A starts LATER → tracked at that time. cycle 2: the start moved EARLIER → the refresh updates matchTimeSec.
+    const adapter = spiedAdapter(config, () => { listCount += 1; return Promise.resolve([contestView({ contestId: 'A', matchTime: listCount === 1 ? LATER : EARLIER })]); });
+    const runner = makeRunner({ config, adapter, maxTicks: 2 });
+    await runner.run();
+
+    expect(runner.trackedContestIds()).toEqual(['A']);
+    expect(runner.trackedMarketView('A')?.matchTimeSec).toBe(Math.floor(Date.parse(EARLIER) / 1000)); // refreshed to the moved-earlier start, not frozen at cycle 1's LATER
+  });
+
+  it('refreshes a tracked market’s speculationId when the contest re-opens a different moneyline speculation', async () => {
+    let listCount = 0;
+    const config = cfg({ discovery: { everyNTicks: 1 } });
+    const adapter = spiedAdapter(config, () => {
+      listCount += 1;
+      return Promise.resolve([contestView({ contestId: 'A', speculations: [{ speculationId: listCount === 1 ? 'spec-A' : 'spec-A-v2', contestId: 'A', marketType: 'moneyline', lineTicks: null, line: null, open: true }] })]);
+    });
+    const runner = makeRunner({ config, adapter, maxTicks: 2 });
+    await runner.run();
+
+    expect(runner.trackedMarketView('A')?.speculationId).toBe('spec-A-v2'); // refreshed from cycle 2's listing
+  });
+
   it('a listContests failure aborts the cycle (emits an error event, keeps the existing tracked set)', async () => {
     let listCount = 0;
     const config = cfg({ discovery: { everyNTicks: 1 } });

@@ -261,9 +261,9 @@ interface TrackedMarket {
   sport: string;
   awayTeam: string;
   homeTeam: string;
-  /** The contest's open moneyline speculation, as last seen at discovery. */
+  /** The contest's open moneyline speculation — refreshed from the latest listing on every discovery cycle. */
   speculationId: string;
-  /** Contest match time, unix seconds. */
+  /** Contest match time, unix seconds — refreshed from the latest listing on every discovery cycle (a reschedule moves it). */
   matchTimeSec: number;
   /**
    * The live SSE odds stream for this market's reference odds, or `null` — not
@@ -1594,7 +1594,10 @@ export class Runner {
    * The discovery cycle (DESIGN §10): list the verified contests starting within
    * `marketSelection.maxStartsWithinHours` (filtered to the configured sports + the
    * allow/deny lists); drop tracked contests no longer in that set (started / scored
-   * / out of window — tearing down each one's odds channel); for each *new* candidate
+   * / out of window — pulling each one's visible quotes off the book and tearing down
+   * its odds channel); refresh the still-tracked markets' `matchTimeSec` /
+   * `speculationId` from the latest listing (so a rescheduled start reaches the gates);
+   * for each *new* candidate
    * (soonest game first) — confirm it has an open moneyline speculation (else
    * `candidate` `no-open-speculation`), isn't already started (else `start-too-soon`),
    * and there's room under `marketSelection.maxTrackedContests` (else
@@ -1630,9 +1633,40 @@ export class Runner {
     for (const id of [...this.trackedMarkets.keys()]) {
       if (!byId.has(id)) {
         const departed = this.trackedMarkets.get(id);
+        // Take this contest's visible quotes off the book BEFORE we stop tracking it.
+        // Once untracked, `reconcileMarkets` never revisits it (it iterates only the
+        // tracked set), so any `visibleOpen` quote would otherwise strand on the relay
+        // book — unpriced and still matchable — until expiry. The visible book must
+        // never carry a quote the MM is no longer pricing (DESIGN §2.2 / §3); this
+        // mirrors what every unquoteable gate already does. Best-effort: a failed pull
+        // isn't retried at this site (the market is gone), so the quote rides to expiry
+        // (a later funding / stream-health cancel sweep, which scans all commitments,
+        // also re-pulls it).
+        if (departed !== undefined) await this.pullVisibleQuotes(departed, now);
         this.trackedMarkets.delete(id);
         if (departed?.subscription) void this.dropChannel(departed.subscription, departed.contestId);
       }
+    }
+
+    // Refresh already-tracked markets from the latest listing (the list row is in hand,
+    // so this needs no extra read). `matchTimeSec` / `speculationId` are otherwise frozen
+    // at first-tracking, so a rescheduled start — especially one moved EARLIER — would
+    // never reach the `start-too-soon` / `match-time` expiry gates: the odds stream keeps
+    // `lastOddsAt` fresh, so the `stale-reference` gate doesn't bound it (DESIGN §10).
+    for (const [id, m] of this.trackedMarkets) {
+      const c = byId.get(id);
+      if (c === undefined) continue; // departed contests were already removed by the untrack loop above
+      const refreshedMatchTimeSec = Math.floor(Date.parse(c.matchTime) / 1000);
+      if (Number.isFinite(refreshedMatchTimeSec) && refreshedMatchTimeSec !== m.matchTimeSec) {
+        if (refreshedMatchTimeSec < m.matchTimeSec) m.dirty = true; // moved earlier — re-evaluate the gates next tick, not at the staleAfter cadence
+        m.matchTimeSec = refreshedMatchTimeSec;
+      }
+      // A contest that re-opened a different moneyline speculation: track the new id.
+      // If the moneyline speculation closed (`spec === undefined`) leave the id as-is —
+      // reconcileMarket's open-speculation re-check pulls quotes + emits
+      // `no-open-speculation` that same tick.
+      const spec = c.speculations.find((s) => s.marketType === 'moneyline' && s.open);
+      if (spec !== undefined && spec.speculationId !== m.speculationId) m.speculationId = spec.speculationId;
     }
 
     const newCandidates = [...byId.values()]

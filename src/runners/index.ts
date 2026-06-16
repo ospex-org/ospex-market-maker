@@ -3295,9 +3295,9 @@ export class Runner {
    * `ready: false` so the next snapshot fully replaces shadow state.
    * `degraded` sets `healthy: false` — the PR5 comparator's precondition
    * `healthy && ready` suppresses divergence telemetry until the transport
-   * recovers (`connected` clears it). `reconnecting` with an in-flight baseline
-   * also re-baselines (see below) — a stopgap until the pinned SDK emits
-   * `resync` on a truncated-snapshot paging failure.
+   * recovers (`connected` clears it). `reconnecting` with an in-flight
+   * TRUNCATED baseline also re-baselines (see below) — a stopgap until the
+   * pinned SDK emits `resync` on a truncated-snapshot paging failure.
    */
   private handleOwnerStatus(status: OwnStateTransportStatus): void {
     this.ownStateSession.lastStatus = status;
@@ -3308,28 +3308,38 @@ export class Runner {
       // resync path and the mapping-degraded cold-restart path clear the SAME set
       // ([[feedback_enforce_invariant_every_site]] + [[feedback_reset_event_clears_dependent_buffers]]).
       this.resetOwnStateForRebaseline();
-    } else if (status === 'reconnecting' && this.ownStateSession.pendingBaseline !== null) {
-      // A non-null pendingBaseline means a cold-connect snapshot was still
-      // accumulating (it is nulled at every onReady swap), and the SDK's reconnect
-      // loop emits `reconnecting` ONLY after a connection ended/failed. The
-      // combination is therefore an INTERRUPTED cold start — most commonly a
-      // truncated-snapshot REST paging failure, which the pinned SDK (v0.6.2)
-      // recovers by clearing its cursor and cold-restarting while emitting
-      // `reconnecting`, NOT `resync`. Without this, the next cold snapshot's first
-      // page is merged onto the stale partial accumulation (handleOwnerSnapshot
-      // treats a non-null pendingBaseline as a continuation page), so rows already
-      // filled/cancelled by snapshot time would swap in as PHANTOM canonical
-      // quotes. Discard the in-flight baseline so the incoming snapshot REPLACES
-      // it. Safe with no data loss: a non-null baseline implies the cold start
-      // never reached `ready`, so the cursor is still unset and the reconnect is
-      // necessarily a fresh cold-start that fully rebuilds the book.
+    } else if (status === 'reconnecting' && this.ownStateSession.pendingBaseline?.truncated === true) {
+      // An in-flight baseline whose LATEST page was `truncated: true` means a
+      // cold-connect snapshot was still paging when the transport dropped — and the
+      // SDK pins to v0.6.2, whose reconnect loop recovers a truncated-snapshot REST
+      // paging failure by CLEARING its cursor and cold-restarting while emitting
+      // `reconnecting`, NOT `resync`. The discriminator is exact: the SDK never
+      // advances its running cursor on a truncated snapshot frame (it can't resume
+      // from a `page-*` cursor — subscribe.ts), so a truncated baseline guarantees
+      // the reconnect is a fresh cold-start that brings a NEW snapshot. Without this
+      // discard, that new snapshot's first page would be merged onto the stale
+      // partial accumulation (handleOwnerSnapshot treats a non-null pendingBaseline
+      // as a continuation page) → rows already filled/cancelled by snapshot time
+      // swap in as PHANTOM canonical quotes. Discarding it makes the incoming
+      // snapshot REPLACE the partial.
+      //
+      // CRITICAL — only when `truncated === true`. A COMPLETE (`truncated: false`)
+      // baseline must NOT be discarded: the SDK advanced its running cursor on the
+      // non-truncated snapshot, so a drop-before-`ready` reconnect RESUMES from that
+      // cursor and the following `onReady` arrives with NO fresh snapshot. Discarding
+      // the complete baseline there would leave `handleOwnerReady` with nothing to
+      // swap (`baseline === null`) and mark the session `ready` over empty/stale
+      // canonical state — under-counting owned exposure (Hermes review-PR98). Keeping
+      // it is correct: the resume's `onReady` swaps the held baseline (then catch-up
+      // deltas apply on top); `ready` stays false until that swap, so nothing posts
+      // against the un-swapped state in between.
       //
       // Deliberately NOT triggered on `degraded`: that status is overloaded — the
       // server emits `event: degraded` for `positionsTruncated` DURING a healthy
       // snapshot delivery, so resetting on it could discard a valid in-flight
-      // baseline (→ missing rows → under-counted exposure, the worse error). Once
-      // the SDK emits `resync` on paging failure the resync branch above covers
-      // this and this branch becomes belt-and-braces.
+      // baseline (→ missing rows → under-counted exposure). Once the SDK emits
+      // `resync` on paging failure the resync branch above covers this and this
+      // branch becomes belt-and-braces.
       this.resetOwnStateForRebaseline();
     } else if (status === 'connected') {
       // Transport recovered — clear any prior transport-level error mark

@@ -97,6 +97,7 @@ export const CANDIDATE_SKIP_REASONS = [
   'would-create-lazy-speculation',
   'stale-reference',
   'start-too-soon',
+  'untracked', //                      the contest left the discovery listing and is being DRAINED — its visible quotes are pulled (never re-quoted) each tick until the pull succeeds, after which the next discovery cycle untracks it. Emitted while a `departing` market is retried after an untrack-time pull failed transiently.
   'cap-hit',
   'refused-pricing',
   'tracking-cap-reached',

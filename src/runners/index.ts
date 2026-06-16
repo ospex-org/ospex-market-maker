@@ -93,7 +93,7 @@
 
 import { existsSync } from 'node:fs';
 
-import { DEFAULT_PER_IP_STREAM_CAP, RESERVED_OWN_STATE_STREAMS, type Config } from '../config/index.js';
+import { DEFAULT_PER_IP_OWNER_RESERVE, DEFAULT_PER_IP_STREAM_CAP, RESERVED_OWN_STATE_STREAMS, type Config } from '../config/index.js';
 import { buildDesiredQuote, inventoryFromState, isExpiredForRelease, matchableCommitmentRiskWei6, reconcileBook, type BookReconciliation, type DesiredQuote, type RetainedPartial, type RetainedPartialReason, type SoftCancelReason } from '../orders/index.js';
 import { OspexStreamError } from '../ospex/index.js';
 import type {
@@ -261,9 +261,9 @@ interface TrackedMarket {
   sport: string;
   awayTeam: string;
   homeTeam: string;
-  /** The contest's open moneyline speculation, as last seen at discovery. */
+  /** The contest's open moneyline speculation — refreshed from the latest listing on every discovery cycle. */
   speculationId: string;
-  /** Contest match time, unix seconds. */
+  /** Contest match time, unix seconds — refreshed from the latest listing on every discovery cycle (a reschedule moves it). */
   matchTimeSec: number;
   /**
    * The live SSE odds stream for this market's reference odds, or `null` — not
@@ -281,6 +281,16 @@ interface TrackedMarket {
   dirty: boolean;
   /** Unix seconds — when the per-market reconcile last processed this market (a quote computed, or a gate hit), or `null` if never. Throttles the "we have no fresh standing quote" re-reconcile (a `dirty` event always triggers an immediate reconcile regardless). */
   lastReconciledAt: number | null;
+  /**
+   * The contest has left the discovery listing and we're DRAINING it — its visible
+   * quotes must come off the book, but it must NOT be re-quoted. Set when the
+   * untrack-time quote-pull fails transiently (so the market is retained for retry
+   * instead of stranding a still-matchable quote); `reconcileMarket` then pulls-only
+   * (never quotes) a departing market each tick until the pull succeeds, after which
+   * the next discovery cycle untracks it. Cleared if the contest reappears in the
+   * listing (it came back — resume normal tracking).
+   */
+  departing: boolean;
 }
 
 /**
@@ -306,6 +316,8 @@ export interface TrackedMarketView {
   dirty: boolean;
   /** Unix seconds — when the per-market reconcile last processed this market, or `null` if never. */
   lastReconciledAt: number | null;
+  /** Is this market being DRAINED (left the listing, pull-only, never re-quoted) after an untrack-time pull failed transiently? */
+  departing: boolean;
 }
 
 /** Reasons a tracked market is in a `degraded` (no live odds channel) state — carried on the `degraded` telemetry event. */
@@ -654,16 +666,33 @@ export class Runner {
 
     this.deps.log(`[runner] starting run ${opts.runId} — chain ${this.adapter.chainId}, api ${this.adapter.apiUrl}, mode ${this.config.mode.dryRun ? 'dry-run' : 'live'}`);
 
-    // Stream-budget guardrail: each odds subscription is one core-api SSE connection,
-    // counted against the per-IP cap shared with the (deferred) own-state streams. Warn
-    // (don't clamp) if the configured cap + reserved own-state streams would exceed the
-    // conservative default — the operator may have raised MAX_STREAM_CONNECTIONS_PER_IP.
-    if (
-      this.config.odds.subscribe &&
-      this.config.odds.maxRealtimeChannels + RESERVED_OWN_STATE_STREAMS > DEFAULT_PER_IP_STREAM_CAP
-    ) {
+    // Stream-budget guardrail. Each odds subscription is one ANONYMOUS core-api
+    // SSE connection; one instance also opens exactly one OWNER-AUTH own-state
+    // stream — so a single instance needs maxRealtimeChannels + 1 connections.
+    // core-api splits its per-IP cap: anonymous streams may use only
+    // (cap - ownerReserve), the reserve being kept for owner-auth. So the BINDING
+    // budget for odds channels is the anonymous one (default 16 - 3 = 13), tighter
+    // than the total cap. The cap is per egress IP/HOST, SHARED across every MM
+    // instance on the host, and this process can't see its siblings. Warn (never
+    // clamp — the operator may have tuned the server caps) on BOTH constraints
+    // independently, since they 429 differently and have different remedies; then
+    // always remind the operator of the per-host math.
+    if (this.config.odds.subscribe) {
+      const channels = this.config.odds.maxRealtimeChannels;
+      const perInstance = channels + RESERVED_OWN_STATE_STREAMS;
+      const anonOddsBudget = DEFAULT_PER_IP_STREAM_CAP - DEFAULT_PER_IP_OWNER_RESERVE;
+      if (channels > anonOddsBudget) {
+        this.deps.log(
+          `[runner] odds.maxRealtimeChannels=${channels} exceeds the ANONYMOUS per-IP SSE budget of ${anonOddsBudget} (the core-api per-IP cap ${DEFAULT_PER_IP_STREAM_CAP} minus its ${DEFAULT_PER_IP_OWNER_RESERVE} owner-auth-reserved slots) — odds subscriptions past it are refused (HTTP 429), even though the own-state stream uses the reserve. Lower odds.maxRealtimeChannels (and marketSelection.maxTrackedContests), or on your core-api raise MAX_STREAM_CONNECTIONS_PER_IP and/or lower RESERVED_STREAM_CONNECTIONS_PER_IP_OWNER.`,
+        );
+      }
+      if (perInstance > DEFAULT_PER_IP_STREAM_CAP) {
+        this.deps.log(
+          `[runner] one instance needs ${perInstance} SSE connections (odds.maxRealtimeChannels=${channels} + 1 own-state), exceeding the core-api per-IP cap of ${DEFAULT_PER_IP_STREAM_CAP} — connections past the cap are refused (HTTP 429). Lower odds.maxRealtimeChannels (and marketSelection.maxTrackedContests), or raise MAX_STREAM_CONNECTIONS_PER_IP on your core-api.`,
+        );
+      }
       this.deps.log(
-        `[runner] odds.maxRealtimeChannels=${this.config.odds.maxRealtimeChannels} + ${RESERVED_OWN_STATE_STREAMS} reserved own-state streams exceeds the core-api per-IP cap of ${DEFAULT_PER_IP_STREAM_CAP} — odds subscriptions past the cap are refused (HTTP 429). Lower odds.maxRealtimeChannels (and marketSelection.maxTrackedContests), or raise MAX_STREAM_CONNECTIONS_PER_IP on your core-api.`,
+        `[runner] SSE budget: this instance uses ${perInstance} connections (${channels} anonymous odds + 1 owner-auth own-state). The core-api per-IP cap is per HOST and split — odds share ${anonOddsBudget} anonymous slots, own-state uses the owner reserve. Co-locating N instances needs N*${channels} <= MAX_STREAM_CONNECTIONS_PER_IP - RESERVED_STREAM_CONNECTIONS_PER_IP_OWNER for the odds streams (and N*${perInstance} <= MAX_STREAM_CONNECTIONS_PER_IP overall), or run each on its own egress IP. See DESIGN "SSE connection budget".`,
       );
     }
 
@@ -1597,7 +1626,10 @@ export class Runner {
    * The discovery cycle (DESIGN §10): list the verified contests starting within
    * `marketSelection.maxStartsWithinHours` (filtered to the configured sports + the
    * allow/deny lists); drop tracked contests no longer in that set (started / scored
-   * / out of window — tearing down each one's odds channel); for each *new* candidate
+   * / out of window — pulling each one's visible quotes off the book and tearing down
+   * its odds channel); refresh the still-tracked markets' `matchTimeSec` /
+   * `speculationId` from the latest listing (so a rescheduled start reaches the gates);
+   * for each *new* candidate
    * (soonest game first) — confirm it has an open moneyline speculation (else
    * `candidate` `no-open-speculation`), isn't already started (else `start-too-soon`),
    * and there's room under `marketSelection.maxTrackedContests` (else
@@ -1631,11 +1663,51 @@ export class Runner {
     }
 
     for (const id of [...this.trackedMarkets.keys()]) {
-      if (!byId.has(id)) {
-        const departed = this.trackedMarkets.get(id);
-        this.trackedMarkets.delete(id);
-        if (departed?.subscription) void this.dropChannel(departed.subscription, departed.contestId);
+      if (byId.has(id)) continue; // still listed — refreshed/quoted below
+      const departed = this.trackedMarkets.get(id);
+      if (departed === undefined) continue;
+      // Take this contest's visible quotes off the book BEFORE we stop tracking it.
+      // Once untracked, `reconcileMarkets` never revisits it (it iterates only the
+      // tracked set), so any `visibleOpen` quote would otherwise strand on the relay
+      // book — unpriced and still matchable — until expiry. The visible book must
+      // never carry a quote the MM is no longer pricing (DESIGN §2.2 / §3).
+      const outcome = await this.pullVisibleQuotes(departed, now);
+      if (outcome === 'transient-failure') {
+        // The off-chain (or cancelMode:onchain) cancel threw. Deleting now would
+        // strand a still-matchable quote with nothing tracking it to retry —
+        // dangerous under match-time expiry. Instead RETAIN the market, flagged
+        // `departing`, and re-arm `dirty`: `reconcileMarket` then pulls-only (never
+        // re-quotes) a departing market every tick until the pull succeeds, after
+        // which the next discovery cycle untracks it cleanly. Mirrors the
+        // re-arm-and-retry invariant the unquoteable reconcile gates already use.
+        departed.departing = true;
+        departed.dirty = true;
+        continue; // keep it tracked + keep its odds channel until the retry drains it
       }
+      this.trackedMarkets.delete(id);
+      if (departed.subscription) void this.dropChannel(departed.subscription, departed.contestId);
+    }
+
+    // Refresh already-tracked markets from the latest listing (the list row is in hand,
+    // so this needs no extra read). `matchTimeSec` / `speculationId` are otherwise frozen
+    // at first-tracking, so a rescheduled start — especially one moved EARLIER — would
+    // never reach the `start-too-soon` / `match-time` expiry gates: the odds stream keeps
+    // `lastOddsAt` fresh, so the `stale-reference` gate doesn't bound it (DESIGN §10).
+    for (const [id, m] of this.trackedMarkets) {
+      const c = byId.get(id);
+      if (c === undefined) continue; // departed (untracked above) or still draining (`departing`) — not in the listing
+      m.departing = false; // present in the listing again — resume normal tracking (a no-op when it was never draining)
+      const refreshedMatchTimeSec = Math.floor(Date.parse(c.matchTime) / 1000);
+      if (Number.isFinite(refreshedMatchTimeSec) && refreshedMatchTimeSec !== m.matchTimeSec) {
+        if (refreshedMatchTimeSec < m.matchTimeSec) m.dirty = true; // moved earlier — re-evaluate the gates next tick, not at the staleAfter cadence
+        m.matchTimeSec = refreshedMatchTimeSec;
+      }
+      // A contest that re-opened a different moneyline speculation: track the new id.
+      // If the moneyline speculation closed (`spec === undefined`) leave the id as-is —
+      // reconcileMarket's open-speculation re-check pulls quotes + emits
+      // `no-open-speculation` that same tick.
+      const spec = c.speculations.find((s) => s.marketType === 'moneyline' && s.open);
+      if (spec !== undefined && spec.speculationId !== m.speculationId) m.speculationId = spec.speculationId;
     }
 
     const newCandidates = [...byId.values()]
@@ -1686,6 +1758,7 @@ export class Runner {
         lastOddsAt: null,
         dirty: false,
         lastReconciledAt: null,
+        departing: false,
       });
       this.eventLog.emit('candidate', { contestId: c.contestId, sport: full.sport, matchTime: full.matchTime, speculationId: confirmedSpec.speculationId });
     }
@@ -2031,6 +2104,18 @@ export class Runner {
    * `lastReconciledAt` so the market re-reconciles next tick and retries the failed bit.
    */
   private async reconcileMarket(m: TrackedMarket, now: number): Promise<'applied' | 'transient-failure'> {
+    // Gate (first, unconditional): the contest has left the discovery listing and we're
+    // DRAINING it — pull whatever's still up and NEVER re-quote a market we've stopped
+    // tracking. `departing` is set by discover() when the untrack-time pull failed
+    // transiently; the read-and-clear `dirty` re-arm in reconcileMarkets retries this
+    // every tick until the pull succeeds, after which the next discovery cycle untracks
+    // it. (A successful drain leaves no `visibleOpen` quote, so this becomes a no-op pull
+    // until that deletion.)
+    if (m.departing) {
+      const outcome = await this.pullVisibleQuotes(m, now);
+      this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'untracked' });
+      return outcome;
+    }
     // Gate: the game starts within one expiry window — stop quoting it (a fresh quote would still be matchable at game time / outlive the pre-game window), and pull whatever's still up.
     if (m.matchTimeSec - now <= this.config.orders.expirySeconds) {
       const outcome = await this.pullVisibleQuotes(m, now);
@@ -3230,7 +3315,9 @@ export class Runner {
    * `ready: false` so the next snapshot fully replaces shadow state.
    * `degraded` sets `healthy: false` — the PR5 comparator's precondition
    * `healthy && ready` suppresses divergence telemetry until the transport
-   * recovers (`connected` clears it).
+   * recovers (`connected` clears it). `reconnecting` with an in-flight
+   * TRUNCATED baseline also re-baselines (see below) — a stopgap until the
+   * pinned SDK emits `resync` on a truncated-snapshot paging failure.
    */
   private handleOwnerStatus(status: OwnStateTransportStatus): void {
     this.ownStateSession.lastStatus = status;
@@ -3240,6 +3327,39 @@ export class Runner {
       // prior baseline seeded. Centralized in `resetOwnStateForRebaseline` so the
       // resync path and the mapping-degraded cold-restart path clear the SAME set
       // ([[feedback_enforce_invariant_every_site]] + [[feedback_reset_event_clears_dependent_buffers]]).
+      this.resetOwnStateForRebaseline();
+    } else if (status === 'reconnecting' && this.ownStateSession.pendingBaseline?.truncated === true) {
+      // An in-flight baseline whose LATEST page was `truncated: true` means a
+      // cold-connect snapshot was still paging when the transport dropped — and the
+      // SDK pins to v0.6.2, whose reconnect loop recovers a truncated-snapshot REST
+      // paging failure by CLEARING its cursor and cold-restarting while emitting
+      // `reconnecting`, NOT `resync`. The discriminator is exact: the SDK never
+      // advances its running cursor on a truncated snapshot frame (it can't resume
+      // from a `page-*` cursor — subscribe.ts), so a truncated baseline guarantees
+      // the reconnect is a fresh cold-start that brings a NEW snapshot. Without this
+      // discard, that new snapshot's first page would be merged onto the stale
+      // partial accumulation (handleOwnerSnapshot treats a non-null pendingBaseline
+      // as a continuation page) → rows already filled/cancelled by snapshot time
+      // swap in as PHANTOM canonical quotes. Discarding it makes the incoming
+      // snapshot REPLACE the partial.
+      //
+      // CRITICAL — only when `truncated === true`. A COMPLETE (`truncated: false`)
+      // baseline must NOT be discarded: the SDK advanced its running cursor on the
+      // non-truncated snapshot, so a drop-before-`ready` reconnect RESUMES from that
+      // cursor and the following `onReady` arrives with NO fresh snapshot. Discarding
+      // the complete baseline there would leave `handleOwnerReady` with nothing to
+      // swap (`baseline === null`) and mark the session `ready` over empty/stale
+      // canonical state — under-counting owned exposure (Hermes review-PR98). Keeping
+      // it is correct: the resume's `onReady` swaps the held baseline (then catch-up
+      // deltas apply on top); `ready` stays false until that swap, so nothing posts
+      // against the un-swapped state in between.
+      //
+      // Deliberately NOT triggered on `degraded`: that status is overloaded — the
+      // server emits `event: degraded` for `positionsTruncated` DURING a healthy
+      // snapshot delivery, so resetting on it could discard a valid in-flight
+      // baseline (→ missing rows → under-counted exposure). Once the SDK emits
+      // `resync` on paging failure the resync branch above covers this and this
+      // branch becomes belt-and-braces.
       this.resetOwnStateForRebaseline();
     } else if (status === 'connected') {
       // Transport recovered — clear any prior transport-level error mark
@@ -4682,6 +4802,7 @@ export class Runner {
       lastOddsAt: m.lastOddsAt,
       dirty: m.dirty,
       lastReconciledAt: m.lastReconciledAt,
+      departing: m.departing,
     };
   }
 }

@@ -3113,6 +3113,54 @@ describe('Runner — discovery', () => {
     expect(runner.trackedContestIds()).toEqual(['A']); // B departed on the 2nd cycle
   });
 
+  it('pulls a departing contest’s visible quotes off the book on untrack (would-soft-cancel side-not-quoted) — not left stranded until expiry', async () => {
+    StateStore.at(stateDir).flush(emptyMakerState());
+    let listCount = 0;
+    const config = cfg({ discovery: { everyNTicks: 1 } });
+    // tick 1: A listed → tracked, seeded, and quoted (2 synthetic visibleOpen records).
+    // tick 2: A gone from the listing → untrack pulls its visible quotes before deleting it.
+    const adapter = spiedAdapter(config, () => { listCount += 1; return Promise.resolve(listCount === 1 ? [contestView({ contestId: 'A' })] : []); });
+    const runner = makeRunner({ config, adapter, maxTicks: 2 });
+    await runner.run();
+
+    expect(runner.trackedContestIds()).toEqual([]); // A untracked on cycle 2
+    const events = readEvents();
+    expect(events.filter((e) => e.kind === 'would-submit')).toHaveLength(2); // tick 1 quoted both sides
+    const pulls = events.filter((e) => e.kind === 'would-soft-cancel');
+    expect(pulls).toHaveLength(2); // tick 2 untrack pulled both
+    expect(pulls.every((e) => e.contestId === 'A' && e.reason === 'side-not-quoted')).toBe(true);
+    const records = Object.values(StateStore.at(stateDir).load().state.commitments);
+    expect(records).toHaveLength(2);
+    expect(records.every((r) => r.lifecycle === 'softCancelled')).toBe(true);
+  });
+
+  it('refreshes a tracked market’s matchTimeSec from the latest listing (a rescheduled — esp. earlier — start reaches the gates)', async () => {
+    const LATER = '2099-02-01T00:00:00Z';
+    const EARLIER = '2099-01-01T00:00:00Z';
+    let listCount = 0;
+    const config = cfg({ discovery: { everyNTicks: 1 } });
+    // cycle 1: A starts LATER → tracked at that time. cycle 2: the start moved EARLIER → the refresh updates matchTimeSec.
+    const adapter = spiedAdapter(config, () => { listCount += 1; return Promise.resolve([contestView({ contestId: 'A', matchTime: listCount === 1 ? LATER : EARLIER })]); });
+    const runner = makeRunner({ config, adapter, maxTicks: 2 });
+    await runner.run();
+
+    expect(runner.trackedContestIds()).toEqual(['A']);
+    expect(runner.trackedMarketView('A')?.matchTimeSec).toBe(Math.floor(Date.parse(EARLIER) / 1000)); // refreshed to the moved-earlier start, not frozen at cycle 1's LATER
+  });
+
+  it('refreshes a tracked market’s speculationId when the contest re-opens a different moneyline speculation', async () => {
+    let listCount = 0;
+    const config = cfg({ discovery: { everyNTicks: 1 } });
+    const adapter = spiedAdapter(config, () => {
+      listCount += 1;
+      return Promise.resolve([contestView({ contestId: 'A', speculations: [{ speculationId: listCount === 1 ? 'spec-A' : 'spec-A-v2', contestId: 'A', marketType: 'moneyline', lineTicks: null, line: null, open: true }] })]);
+    });
+    const runner = makeRunner({ config, adapter, maxTicks: 2 });
+    await runner.run();
+
+    expect(runner.trackedMarketView('A')?.speculationId).toBe('spec-A-v2'); // refreshed from cycle 2's listing
+  });
+
   it('a listContests failure aborts the cycle (emits an error event, keeps the existing tracked set)', async () => {
     let listCount = 0;
     const config = cfg({ discovery: { everyNTicks: 1 } });
@@ -4058,6 +4106,70 @@ describe('Runner — live execution', () => {
     expect(events.find((e) => e.kind === 'error' && e.phase === 'cancel')).toMatchObject({ contestId: '1234', commitmentHash: '0xvisible', detail: 'relay 500' });
     expect(events.some((e) => e.kind === 'soft-cancel' || e.kind === 'would-soft-cancel')).toBe(false);
     expect(StateStore.at(stateDir).load().state.commitments['0xvisible']?.lifecycle).toBe('visibleOpen'); // still up — next pass retries the pull
+  });
+
+  it('an untrack-time off-chain-cancel failure RETAINS the market (departing) for retry instead of stranding the quote (Hermes review-PR97 §1)', async () => {
+    const visible = commitmentRecord({ hash: '0xstrand', speculationId: 'spec-1234', contestId: '1234', makerSide: 'away', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 5, updatedAtUnixSec: T0 - 5 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xstrand': visible } });
+    const config = cfg({ mode: { dryRun: false }, discovery: { everyNTicks: 1 } });
+    let listCount = 0;
+    const adapter = liveSpiedAdapter(
+      config,
+      () => { listCount += 1; return Promise.resolve(listCount === 1 ? [contestView({ contestId: '1234' })] : []); },
+      { cancelCommitmentOffchain: () => Promise.reject(new Error('relay 500')) }, // every cancel fails
+      undefined,
+      { snapshot: (id) => Promise.resolve(oddsSnapshotView(id, null)) }, // no moneyline row → unquoteable (pull-only)
+    );
+    const runner = makeRunner({ config, adapter, maxTicks: 2 });
+    await runner.run();
+
+    // tick 1: 1234 tracked. tick 2: 1234 leaves the listing → untrack pull → cancel fails.
+    expect(runner.trackedContestIds()).toEqual(['1234']); // RETAINED for retry, not stranded
+    expect(runner.trackedMarketView('1234')?.departing).toBe(true);
+    const events = readEvents();
+    expect(events.some((e) => e.kind === 'candidate' && e.skipReason === 'untracked')).toBe(true); // on the pull-only departing path (gate is first, so 'untracked' wins over 'no-reference-odds')
+    expect(events.some((e) => e.kind === 'submit')).toBe(false); // never re-quoted while departing
+    expect(StateStore.at(stateDir).load().state.commitments['0xstrand']?.lifecycle).toBe('visibleOpen'); // still up — the pull keeps retrying
+  });
+
+  it('a departing market drains and untracks once the retried pull succeeds', async () => {
+    const visible = commitmentRecord({ hash: '0xdrain', speculationId: 'spec-1234', contestId: '1234', makerSide: 'away', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 5, updatedAtUnixSec: T0 - 5 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xdrain': visible } });
+    const config = cfg({ mode: { dryRun: false }, discovery: { everyNTicks: 1 } });
+    let listCount = 0;
+    let cancelCalls = 0;
+    const adapter = liveSpiedAdapter(
+      config,
+      () => { listCount += 1; return Promise.resolve(listCount === 1 ? [contestView({ contestId: '1234' })] : []); },
+      { cancelCommitmentOffchain: () => { cancelCalls += 1; return cancelCalls <= 2 ? Promise.reject(new Error('relay 500')) : Promise.resolve(); } }, // first 2 cancels fail, then succeed
+      undefined,
+      { snapshot: (id) => Promise.resolve(oddsSnapshotView(id, null)) },
+    );
+    const runner = makeRunner({ config, adapter, maxTicks: 4 });
+    await runner.run();
+
+    expect(runner.trackedContestIds()).toEqual([]); // pull eventually succeeded → drained → untracked on a later discovery cycle
+    expect(StateStore.at(stateDir).load().state.commitments['0xdrain']?.lifecycle).toBe('softCancelled');
+  });
+
+  it('a departing market that reappears in the listing resumes normal tracking (departing cleared)', async () => {
+    const visible = commitmentRecord({ hash: '0xreappear', speculationId: 'spec-1234', contestId: '1234', makerSide: 'away', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 5, updatedAtUnixSec: T0 - 5 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xreappear': visible } });
+    const config = cfg({ mode: { dryRun: false }, discovery: { everyNTicks: 1 } });
+    let listCount = 0;
+    const adapter = liveSpiedAdapter(
+      config,
+      () => { listCount += 1; return Promise.resolve(listCount === 2 ? [] : [contestView({ contestId: '1234' })]); }, // present, gone, present
+      { cancelCommitmentOffchain: () => Promise.reject(new Error('relay 500')) },
+      undefined,
+      { snapshot: (id) => Promise.resolve(oddsSnapshotView(id, null)) },
+    );
+    const runner = makeRunner({ config, adapter, maxTicks: 3 });
+    await runner.run();
+
+    // tick 2: 1234 gone → cancel fails → departing. tick 3: 1234 back in the listing → departing cleared.
+    expect(runner.trackedContestIds()).toEqual(['1234']);
+    expect(runner.trackedMarketView('1234')?.departing).toBe(false);
   });
 
   it('a dry-run state directory reused for live is rejected at construction (a `dry:` synthetic commitment)', () => {

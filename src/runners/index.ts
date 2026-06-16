@@ -93,7 +93,7 @@
 
 import { existsSync } from 'node:fs';
 
-import { DEFAULT_PER_IP_STREAM_CAP, RESERVED_OWN_STATE_STREAMS, type Config } from '../config/index.js';
+import { DEFAULT_PER_IP_OWNER_RESERVE, DEFAULT_PER_IP_STREAM_CAP, RESERVED_OWN_STATE_STREAMS, type Config } from '../config/index.js';
 import { buildDesiredQuote, inventoryFromState, isExpiredForRelease, matchableCommitmentRiskWei6, reconcileBook, type BookReconciliation, type DesiredQuote, type RetainedPartial, type RetainedPartialReason, type SoftCancelReason } from '../orders/index.js';
 import { OspexStreamError } from '../ospex/index.js';
 import type {
@@ -663,16 +663,33 @@ export class Runner {
 
     this.deps.log(`[runner] starting run ${opts.runId} — chain ${this.adapter.chainId}, api ${this.adapter.apiUrl}, mode ${this.config.mode.dryRun ? 'dry-run' : 'live'}`);
 
-    // Stream-budget guardrail: each odds subscription is one core-api SSE connection,
-    // counted against the per-IP cap shared with the (deferred) own-state streams. Warn
-    // (don't clamp) if the configured cap + reserved own-state streams would exceed the
-    // conservative default — the operator may have raised MAX_STREAM_CONNECTIONS_PER_IP.
-    if (
-      this.config.odds.subscribe &&
-      this.config.odds.maxRealtimeChannels + RESERVED_OWN_STATE_STREAMS > DEFAULT_PER_IP_STREAM_CAP
-    ) {
+    // Stream-budget guardrail. Each odds subscription is one ANONYMOUS core-api
+    // SSE connection; one instance also opens exactly one OWNER-AUTH own-state
+    // stream — so a single instance needs maxRealtimeChannels + 1 connections.
+    // core-api splits its per-IP cap: anonymous streams may use only
+    // (cap - ownerReserve), the reserve being kept for owner-auth. So the BINDING
+    // budget for odds channels is the anonymous one (default 16 - 3 = 13), tighter
+    // than the total cap. The cap is per egress IP/HOST, SHARED across every MM
+    // instance on the host, and this process can't see its siblings. Warn (never
+    // clamp — the operator may have tuned the server caps) on BOTH constraints
+    // independently, since they 429 differently and have different remedies; then
+    // always remind the operator of the per-host math.
+    if (this.config.odds.subscribe) {
+      const channels = this.config.odds.maxRealtimeChannels;
+      const perInstance = channels + RESERVED_OWN_STATE_STREAMS;
+      const anonOddsBudget = DEFAULT_PER_IP_STREAM_CAP - DEFAULT_PER_IP_OWNER_RESERVE;
+      if (channels > anonOddsBudget) {
+        this.deps.log(
+          `[runner] odds.maxRealtimeChannels=${channels} exceeds the ANONYMOUS per-IP SSE budget of ${anonOddsBudget} (the core-api per-IP cap ${DEFAULT_PER_IP_STREAM_CAP} minus its ${DEFAULT_PER_IP_OWNER_RESERVE} owner-auth-reserved slots) — odds subscriptions past it are refused (HTTP 429), even though the own-state stream uses the reserve. Lower odds.maxRealtimeChannels (and marketSelection.maxTrackedContests), or on your core-api raise MAX_STREAM_CONNECTIONS_PER_IP and/or lower RESERVED_STREAM_CONNECTIONS_PER_IP_OWNER.`,
+        );
+      }
+      if (perInstance > DEFAULT_PER_IP_STREAM_CAP) {
+        this.deps.log(
+          `[runner] one instance needs ${perInstance} SSE connections (odds.maxRealtimeChannels=${channels} + 1 own-state), exceeding the core-api per-IP cap of ${DEFAULT_PER_IP_STREAM_CAP} — connections past the cap are refused (HTTP 429). Lower odds.maxRealtimeChannels (and marketSelection.maxTrackedContests), or raise MAX_STREAM_CONNECTIONS_PER_IP on your core-api.`,
+        );
+      }
       this.deps.log(
-        `[runner] odds.maxRealtimeChannels=${this.config.odds.maxRealtimeChannels} + ${RESERVED_OWN_STATE_STREAMS} reserved own-state streams exceeds the core-api per-IP cap of ${DEFAULT_PER_IP_STREAM_CAP} — odds subscriptions past the cap are refused (HTTP 429). Lower odds.maxRealtimeChannels (and marketSelection.maxTrackedContests), or raise MAX_STREAM_CONNECTIONS_PER_IP on your core-api.`,
+        `[runner] SSE budget: this instance uses ${perInstance} connections (${channels} anonymous odds + 1 owner-auth own-state). The core-api per-IP cap is per HOST and split — odds share ${anonOddsBudget} anonymous slots, own-state uses the owner reserve. Co-locating N instances needs N*${channels} <= MAX_STREAM_CONNECTIONS_PER_IP - RESERVED_STREAM_CONNECTIONS_PER_IP_OWNER for the odds streams (and N*${perInstance} <= MAX_STREAM_CONNECTIONS_PER_IP overall), or run each on its own egress IP. See DESIGN "SSE connection budget".`,
       );
     }
 

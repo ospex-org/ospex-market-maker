@@ -70,9 +70,11 @@
  * erase the state-loss signal for a subsequent `run --live` boot. Otherwise
  * flush as usual (the lifecycle changes need to persist).
  *
- * Single-writer caveat: the JSON state file isn't multi-process safe (DESIGN §12).
- * **Stop a running `ospex-mm run --live` first** — running both concurrently
- * against the same `state.dir` races on the flush. The command help and
+ * Single-writer caveat: the JSON state file isn't multi-process safe (DESIGN §12),
+ * now **enforced** — this command acquires the same single-process `state.dir` lock
+ * a `run` loop holds (`src/state/lock.ts`), so a concurrent `run --live` (or another
+ * cancel-stale) is refused rather than racing on the flush. **Stop a running
+ * `ospex-mm run --live` first** to avoid that refusal. The command help and
  * `OPERATOR_SAFETY.md` say so explicitly.
  *
  * Emits its events to a fresh `run-<runId>.ndjson` log under `telemetry.logDir`,
@@ -93,6 +95,7 @@ import type { Config } from '../config/index.js';
 import { isExpiredForRelease } from '../orders/index.js';
 import {
   createLiveOspexAdapter,
+  readKeystoreAddress,
   unlockKeystoreSigner,
   type Hex,
   type OspexAdapter,
@@ -100,13 +103,15 @@ import {
 } from '../ospex/index.js';
 import { canSpendGas } from '../risk/index.js';
 import { polFloatToWei18, softCancelEventPayload, todayUTCDateString } from '../runners/index.js';
-import { assessStateLoss, dispatchCancel, StateStore, type MakerState } from '../state/index.js';
+import { acquireStateLock, assessStateLoss, dispatchCancel, StateLockError, StateStore, type MakerState, type StateLock, type StateLockIdentity } from '../state/index.js';
 import { EventLog, eventLogsExist, newRunId } from '../telemetry/index.js';
 
 // ── opts + deps ──────────────────────────────────────────────────────────────
 
 export interface CancelStaleOpts {
   config: Config;
+  /** Path the config was loaded from — recorded in the `state.dir` lock identity (diagnostics only). Optional: tests omit it. */
+  configPath?: string;
   /** `--authoritative` — also issue on-chain `cancelCommitment` per record (costs POL gas, gas-gated with `mayUseReserve: true`). Default `false` — off-chain DELETE only (gasless). */
   authoritative: boolean;
   /** `--ignore-missing-state` — the operator attests no prior run left an open / soft-cancelled commitment that could still match on chain. Lifts the state-loss refusal (same semantics as the runner — DESIGN §12). */
@@ -125,6 +130,8 @@ export interface CancelStaleDeps {
   env?: Record<string, string | undefined>;
   /** Mint this command's run id. Default: {@link newRunId}. */
   makeRunId?: () => string;
+  /** Acquire the single-process `state.dir` lock (DESIGN §12) — refuses if a `run` loop (or another cancel-stale) holds it. Default: {@link acquireStateLock}. */
+  acquireStateLock?: (dir: string, identity: StateLockIdentity) => StateLock;
   /** Open the state store for `state.dir`. Default: `StateStore.at`. */
   makeStateStore?: (dir: string) => StateStore;
   /** Does `telemetry.logDir` hold any prior `run-*.ndjson` files? Default: {@link eventLogsExist}. Captured **before** this command opens its own event log so the prior-telemetry signal is sound (DESIGN §12). */
@@ -191,9 +198,6 @@ export interface CancelStaleReport {
  * `'onchain-cancel'`).
  */
 export async function runCancelStale(opts: CancelStaleOpts, deps: CancelStaleDeps = {}): Promise<CancelStaleReport> {
-  const log = deps.log ?? ((line: string): void => void process.stderr.write(`${line}\n`));
-  const now = deps.now ?? ((): number => Math.floor(Date.now() / 1000));
-
   // ── 1. Two-key gate (config posture) ─────────────────────────────────────
   // The same principle as `run --live`'s DESIGN §8: a real cancel-stale
   // invocation writes (off-chain DELETE is a signed action; `--authoritative`
@@ -210,6 +214,47 @@ export async function runCancelStale(opts: CancelStaleOpts, deps: CancelStaleDep
       'cancel-stale requires wallet.keystorePath in the config (or the OSPEX_KEYSTORE_PATH env, or --keystore on the command line). Set it before running.',
     );
   }
+
+  // ── 1.5 Single-process state.dir lock (DESIGN §12) ───────────────────────
+  // cancel-stale writes the same `maker-state.json` a `run --live` loop owns, so
+  // it must hold the SAME single-process lock: a concurrent `run` (or another
+  // cancel-stale) is refused rather than racing the flush (the command's own
+  // "STOP run --live FIRST" guidance, now enforced). Acquire BEFORE the state
+  // load / signer unlock so a refused command pays no scrypt cost. A stale
+  // dead-PID lock from a crashed prior run is reclaimed (src/state/lock.ts).
+  const runId = (deps.makeRunId ?? newRunId)();
+  const lockMaker = readKeystoreAddress(opts.config.wallet.keystorePath);
+  let lock: StateLock;
+  try {
+    lock = (deps.acquireStateLock ?? acquireStateLock)(opts.config.state.dir, {
+      maker: lockMaker,
+      configPath: opts.configPath ?? null,
+      runId,
+      process: opts.authoritative ? 'cancel-stale --authoritative' : 'cancel-stale',
+    });
+  } catch (err) {
+    if (err instanceof StateLockError) throw new CancelStaleRefused(err.message);
+    throw err;
+  }
+  try {
+    // `keystorePath` is narrowed to `string` by the gate above — thread it in so the
+    // inner body needs no re-narrowing.
+    return await runCancelStaleLocked(opts, deps, runId, opts.config.wallet.keystorePath);
+  } finally {
+    // Release on every exit path (clean return, a thrown CancelStaleRefused/Error).
+    lock.release();
+  }
+}
+
+/**
+ * The locked body of {@link runCancelStale} — runs only while this process holds
+ * the single-process `state.dir` lock. `runId` + `keystorePath` are resolved (and
+ * the lock acquired) by the wrapper; everything that reads or writes `state.dir`
+ * lives here.
+ */
+async function runCancelStaleLocked(opts: CancelStaleOpts, deps: CancelStaleDeps, runId: string, keystorePath: string): Promise<CancelStaleReport> {
+  const log = deps.log ?? ((line: string): void => void process.stderr.write(`${line}\n`));
+  const now = deps.now ?? ((): number => Math.floor(Date.now() / 1000));
 
   // ── 2. State load + boot-time fail-safe (DESIGN §12) ─────────────────────
   // BEFORE opening this command's own event log: capture `hasPriorTelemetry`,
@@ -272,7 +317,7 @@ export async function runCancelStale(opts: CancelStaleOpts, deps: CancelStaleDep
     }
   }
   const unlockSigner = deps.unlockSigner ?? unlockKeystoreSigner;
-  const signer = await unlockSigner(opts.config.wallet.keystorePath, passphrase); // bad passphrase / malformed keystore → plain Error (CLI surfaces "cancel-stale failed: …")
+  const signer = await unlockSigner(keystorePath, passphrase); // bad passphrase / malformed keystore → plain Error (CLI surfaces "cancel-stale failed: …")
   const makerAddress = await signer.getAddress();
   log(`[cancel-stale] maker wallet: ${makerAddress}`);
 
@@ -287,7 +332,7 @@ export async function runCancelStale(opts: CancelStaleOpts, deps: CancelStaleDep
   // (`filled` / `expired` / `authoritativelyInvalidated`) are excluded —
   // there's nothing matchable left to invalidate.
   const adapter = (deps.createLiveAdapter ?? createLiveOspexAdapter)(opts.config, signer);
-  const runId = (deps.makeRunId ?? newRunId)();
+  // `runId` is minted by the wrapper (it also stamps the state.dir lock identity).
   const eventLog = EventLog.open(opts.config.telemetry.logDir, runId);
 
   const wallNow = now();

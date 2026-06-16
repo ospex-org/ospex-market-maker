@@ -363,6 +363,8 @@ ReplaceReason:   'stale' | 'mispriced'
 
 Path: `<state.dir>/maker-state.json`. Atomic write (temp + rename). Single-writer; not multi-process safe. Loaded at boot via `StateStore.load()` which returns `{state, status: {kind: 'loaded' | 'fresh' | 'lost', reason?}}` — `lost` means the file exists but failed validation.
 
+> **Single-process enforcement.** The single-writer rule is enforced by a lock file `<state.dir>/maker.lock` (`O_EXCL`, written by `run` and `cancel-stale` at boot; `src/state/lock.ts`). A second instance against the same `state.dir` is refused (a stale lock from a crashed run is reclaimed only when its recorded pid is verifiably dead on the same host). The lock file is NOT sensitive (pid / hostname / maker wallet / config path / run id — no signing material); read-only commands (`status` / `doctor`) don't create it. Agents listing `state.dir` should expect `maker.lock` alongside `maker-state.json`.
+
 > ⚠️ **Sensitive bearer-credential state (own-state SSE plan §M6).** Post-M6/A, each commitment record persists the SDK's canonical signed bundle (`signedPayload` — EIP-712 signature + the inner typed-data struct). That bundle is exactly what `MatchingModule.matchCommitment` needs to fill the commitment, so anyone with read access to this file can fill the maker's still-matchable commitments until they expire / fill / are cancelled. Agents and scripts parsing this file:
 >
 > - **Must NEVER paste the file (or any record's `signedPayload` / `signature` / `commitment` subtree) into issues, PRs, chat, logs, or any artifact channel.** It's a bearer credential.
@@ -645,7 +647,7 @@ ospex-mm summary --json | jq '.summary.liveMetrics.realizedPnl.alreadyClaimedCou
 **"How do I sweep stale quotes? On-chain?"**
 - Off-chain only (gasless, signed DELETE): `ospex-mm cancel-stale`. Records → `softCancelled`. Still matchable on chain until expiry.
 - On-chain authoritative (costs POL gas, mayUseReserve): `ospex-mm cancel-stale --authoritative`. Records → `authoritativelyInvalidated`. `MatchingModule.cancelCommitment` flips `s_cancelledCommitments[hash]`.
-- **Stop `run --live` first** — the JSON state file is not multi-process safe.
+- **Stop `run --live` first** — the JSON state file is not multi-process safe. This is now enforced: `cancel-stale` shares `run`'s single-process `state.dir` lock, so it refuses (rather than racing the flush) while a `run` loop is live.
 
 **"What lifecycle is commitment H in?"**
 ```bash

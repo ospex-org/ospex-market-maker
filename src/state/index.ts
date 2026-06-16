@@ -29,6 +29,18 @@ import { platform } from 'node:process';
 
 import type { SignedCommitmentPayload, Hex } from '@ospex/sdk';
 
+// The single-process `state.dir` lock (DESIGN §12) lives in its own module; re-export
+// its surface here so callers import it from the same `../state/index.js` barrel as
+// `StateStore`.
+export {
+  acquireStateLock,
+  StateLockError,
+  STATE_LOCK_FILE,
+  type StateLock,
+  type StateLockDeps,
+  type StateLockIdentity,
+} from './lock.js';
+
 // ── commitment lifecycle (DESIGN §9) ─────────────────────────────────────────
 
 /**
@@ -549,8 +561,9 @@ export class StateStore {
     // `flag: 'wx'` = O_WRONLY|O_CREAT|O_EXCL → throw on exists. Paired with
     // the unlink above, this races safely: if the unlink succeeded the
     // create is fresh; if someone else creates the temp between our unlink
-    // and write (multi-MM-per-dir, which is already forbidden by DESIGN
-    // §12), we fail loudly rather than truncating their file.
+    // and write (multi-MM-per-dir, which the boot-time `state.dir` lock in
+    // `lock.ts` now refuses — DESIGN §12), we fail loudly rather than
+    // truncating their file.
     writeFileSync(tmp, `${JSON.stringify(out, null, 2)}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
 
     // POSIX-only sanity check. On a filesystem that supports POSIX modes,

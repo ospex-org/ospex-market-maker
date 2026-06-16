@@ -5,7 +5,7 @@ import { join } from 'node:path';
 
 import { parseConfig, type Config } from '../config/index.js';
 import { createLiveOspexAdapter, type CancelOnchainResult, type Hex, type OspexAdapter, type Signer } from '../ospex/index.js';
-import { StateStore, emptyMakerState, type MakerCommitmentRecord, type MakerSignedPayload, type MakerState } from '../state/index.js';
+import { STATE_LOCK_FILE, StateLockError, StateStore, emptyMakerState, type MakerCommitmentRecord, type MakerSignedPayload, type MakerState, type StateLock, type StateLockIdentity } from '../state/index.js';
 import { CancelStaleRefused, cancelStaleExitCode, runCancelStale, type CancelStaleReport } from './cancel-stale.js';
 
 // ── harness ──────────────────────────────────────────────────────────────────
@@ -199,6 +199,43 @@ describe('runCancelStale — refusals', () => {
     expect(err).not.toBeNull();
     expect(err).not.toBeInstanceOf(CancelStaleRefused);
     expect(err!.message).toMatch(/invalid password/);
+  });
+});
+
+// ── state.dir single-process lock (DESIGN §12 — shares run --live's lock) ─────
+
+describe('runCancelStale — state.dir lock', () => {
+  it('acquires the lock with the config/run identity (process label reflects --authoritative) and releases it', async () => {
+    seedState([]); // a loaded-but-empty state so the command runs to completion
+    const release = vi.fn();
+    const acquireStateLock = vi.fn((_dir: string, _identity: StateLockIdentity): StateLock => ({ path: join(stateDir, STATE_LOCK_FILE), release }));
+    await runCancelStale(
+      { config: liveConfig(), configPath: '/etc/ospex-mm.yaml', authoritative: true, ignoreMissingState: false },
+      { ...baseDeps(), acquireStateLock },
+    );
+    expect(acquireStateLock).toHaveBeenCalledWith(stateDir, { maker: null, configPath: '/etc/ospex-mm.yaml', runId: 'cs-run', process: 'cancel-stale --authoritative' });
+    expect(release).toHaveBeenCalledTimes(1);
+  });
+
+  it('a held lock (StateLockError) is surfaced as CancelStaleRefused — before the signer unlock, with no event log opened', async () => {
+    const unlockSigner = vi.fn(() => Promise.resolve(fakeSigner()));
+    const acquireStateLock = vi.fn(() => {
+      throw new StateLockError('refusing to start: an MM is already running against this state.dir (pid 7 …).');
+    });
+    await expect(runCancelStale(
+      { config: liveConfig(), authoritative: false, ignoreMissingState: false },
+      { ...baseDeps(), unlockSigner, acquireStateLock },
+    )).rejects.toMatchObject({ name: 'CancelStaleRefused', message: expect.stringMatching(/already running against this state\.dir/) as unknown });
+    expect(unlockSigner).not.toHaveBeenCalled(); // refused before the (expensive) scrypt unlock
+    expect(existsSync(join(logDir, 'run-cs-run.ndjson'))).toBe(false); // never opened the log / touched state
+  });
+
+  it('the real lock is taken + released across a run — a second cancel-stale succeeds, no lock left behind', async () => {
+    seedState([]);
+    await runCancelStale({ config: liveConfig(), authoritative: false, ignoreMissingState: false }, baseDeps());
+    expect(existsSync(join(stateDir, STATE_LOCK_FILE))).toBe(false); // released
+    await runCancelStale({ config: liveConfig(), authoritative: false, ignoreMissingState: false }, { ...baseDeps(), makeRunId: () => 'cs-run-2' });
+    expect(existsSync(join(stateDir, STATE_LOCK_FILE))).toBe(false);
   });
 });
 

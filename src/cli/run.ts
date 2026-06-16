@@ -50,7 +50,7 @@ import {
   type Signer,
 } from '../ospex/index.js';
 import { Runner, type RunnerDeps } from '../runners/index.js';
-import { StateStore } from '../state/index.js';
+import { acquireStateLock, StateLockError, StateStore, type StateLock, type StateLockIdentity } from '../state/index.js';
 import { newRunId } from '../telemetry/index.js';
 
 // ── opts + deps ──────────────────────────────────────────────────────────────
@@ -60,6 +60,8 @@ export type RunMode = 'dry-run' | 'live';
 
 export interface RunOpts {
   config: Config;
+  /** Path the config was loaded from — recorded in the `state.dir` lock identity (diagnostics only). Optional: tests omit it. */
+  configPath?: string;
   /** `'dry-run'` runs the shadow loop; `'live'` posts on chain (gated by the two-key model — also requires `config.mode.dryRun: false`). */
   mode: RunMode;
   /**
@@ -87,6 +89,8 @@ export interface RunDeps {
   env?: Record<string, string | undefined>;
   /** Mint this run's id. Default: {@link newRunId}. */
   makeRunId?: () => string;
+  /** Acquire the single-process `state.dir` lock (DESIGN §12). Default: {@link acquireStateLock}. */
+  acquireStateLock?: (dir: string, identity: StateLockIdentity) => StateLock;
   /** Open the state store for `state.dir`. Default: `StateStore.at`. */
   makeStateStore?: (dir: string) => StateStore;
   /** Forwarded to the `Runner` (clock / sleep / kill-probe / signal registration / log / random). */
@@ -169,66 +173,107 @@ export async function runRun(opts: RunOpts, deps: RunDeps = {}): Promise<void> {
   const effectiveDryRun = opts.mode === 'dry-run';
   const config: Config = opts.config.mode.dryRun === effectiveDryRun ? opts.config : { ...opts.config, mode: { ...opts.config.mode, dryRun: effectiveDryRun } };
 
-  // Live mode: unlock the signer first (passphrase from env, else a TTY prompt),
-  // build the signed adapter, resolve the maker address from the signer for the
-  // boot banner. Anything that throws below is either a `RunRefused` (a clean
-  // refusal) or a plain `Error` (e.g. wrong passphrase, malformed keystore — the
-  // CLI prints it under "run failed: …").
-  let adapter: OspexAdapter;
-  let bootAddress: string;
-  let liveMakerAddress: Hex | null = null; // set in live mode (from `signer.getAddress()`) — passed to the Runner for fill detection + competitiveness self-exclusion
-  if (opts.mode === 'live') {
-    if (config.wallet.keystorePath === undefined) {
-      throw new RunRefused(
-        'live mode requires wallet.keystorePath in the config (or the OSPEX_KEYSTORE_PATH env, or --keystore on the command line). Set it before running with --live.',
-      );
-    }
-    const env = deps.env ?? process.env;
-    const promptPassphrase = deps.promptPassphrase ?? defaultPromptPassphrase;
-    let passphrase: string;
-    const envPassphrase = env.OSPEX_KEYSTORE_PASSPHRASE;
-    if (envPassphrase !== undefined && envPassphrase.length > 0) {
-      passphrase = envPassphrase;
-    } else {
-      try {
-        passphrase = await promptPassphrase();
-      } catch (err) {
+  // Mint the run id up front so the same id stamps both the runner and the
+  // `state.dir` lock identity below.
+  const runId = (deps.makeRunId ?? newRunId)();
+
+  // ── Single-process state.dir lock (DESIGN §12) ─────────────────────────────
+  // The JSON state under `state.dir` is not multi-process safe: a second MM
+  // (`run`, or a concurrent `cancel-stale`) silently last-writer-wins-corrupts
+  // it, and the corrupted blob still validates as "loaded" so the state-loss
+  // fail-safe never fires. Acquire the lock BEFORE the (expensive, possibly
+  // interactive) signer unlock so a duplicate instance is refused immediately —
+  // before it prompts for a passphrase — and before any state read/write. A
+  // duplicate / cross-host / corrupt lock fails closed; a stale dead-PID lock is
+  // reclaimed (src/state/lock.ts).
+  //
+  // Best-effort maker identity for the lock payload (the finding asks it to
+  // carry maker/config/run identity): `--address` (dry-run) ▸ the keystore's
+  // optional plaintext `address` ▸ null. In live mode `--address` is already
+  // refused above and a Foundry keystore omits the address, so this is commonly
+  // null for live — mutual exclusion doesn't depend on it; it's diagnostic.
+  const lockMaker: string | null = opts.address ?? (config.wallet.keystorePath !== undefined ? readKeystoreAddress(config.wallet.keystorePath) : null);
+  let lock: StateLock;
+  try {
+    lock = (deps.acquireStateLock ?? acquireStateLock)(config.state.dir, {
+      maker: lockMaker,
+      configPath: opts.configPath ?? null,
+      runId,
+      process: `run --${opts.mode}`,
+    });
+  } catch (err) {
+    // A held / unverifiable lock is a clean refusal (printed verbatim, exit 1) —
+    // surface it as RunRefused, like the other boot-time gates above.
+    if (err instanceof StateLockError) throw new RunRefused(err.message);
+    throw err;
+  }
+
+  try {
+    // Live mode: unlock the signer first (passphrase from env, else a TTY prompt),
+    // build the signed adapter, resolve the maker address from the signer for the
+    // boot banner. Anything that throws below is either a `RunRefused` (a clean
+    // refusal) or a plain `Error` (e.g. wrong passphrase, malformed keystore — the
+    // CLI prints it under "run failed: …"). Either way the `finally` releases the lock.
+    let adapter: OspexAdapter;
+    let bootAddress: string;
+    let liveMakerAddress: Hex | null = null; // set in live mode (from `signer.getAddress()`) — passed to the Runner for fill detection + competitiveness self-exclusion
+    if (opts.mode === 'live') {
+      if (config.wallet.keystorePath === undefined) {
         throw new RunRefused(
-          `live mode needs the keystore passphrase: ${(err as Error).message}. Set OSPEX_KEYSTORE_PASSPHRASE in the environment to unlock non-interactively.`,
+          'live mode requires wallet.keystorePath in the config (or the OSPEX_KEYSTORE_PATH env, or --keystore on the command line). Set it before running with --live.',
         );
       }
+      const env = deps.env ?? process.env;
+      const promptPassphrase = deps.promptPassphrase ?? defaultPromptPassphrase;
+      let passphrase: string;
+      const envPassphrase = env.OSPEX_KEYSTORE_PASSPHRASE;
+      if (envPassphrase !== undefined && envPassphrase.length > 0) {
+        passphrase = envPassphrase;
+      } else {
+        try {
+          passphrase = await promptPassphrase();
+        } catch (err) {
+          throw new RunRefused(
+            `live mode needs the keystore passphrase: ${(err as Error).message}. Set OSPEX_KEYSTORE_PASSPHRASE in the environment to unlock non-interactively.`,
+          );
+        }
+      }
+      const unlockSigner = deps.unlockSigner ?? unlockKeystoreSigner;
+      const signer = await unlockSigner(config.wallet.keystorePath, passphrase); // a bad passphrase / malformed keystore throws a plain Error — the CLI surfaces it as "run failed: …"
+      liveMakerAddress = await signer.getAddress();
+      bootAddress = liveMakerAddress;
+      adapter = (deps.createLiveAdapter ?? createLiveOspexAdapter)(config, signer);
+    } else {
+      adapter = (deps.createAdapter ?? createOspexAdapter)(config);
+      // Resolve the maker wallet best-effort, for the boot banner only. Dry-run
+      // posts nothing, so an unresolved address is fine here; `--address` ▸ the
+      // keystore's (optional) `address` field ▸ unknown (Foundry-style keystores
+      // omit it for privacy).
+      const resolved: Hex | null = opts.address ?? (config.wallet.keystorePath !== undefined ? readKeystoreAddress(config.wallet.keystorePath) : null);
+      bootAddress = resolved ?? '(unresolved — dry-run does not need it; pass --address or use an ethers-style keystore)';
     }
-    const unlockSigner = deps.unlockSigner ?? unlockKeystoreSigner;
-    const signer = await unlockSigner(config.wallet.keystorePath, passphrase); // a bad passphrase / malformed keystore throws a plain Error — the CLI surfaces it as "run failed: …"
-    liveMakerAddress = await signer.getAddress();
-    bootAddress = liveMakerAddress;
-    adapter = (deps.createLiveAdapter ?? createLiveOspexAdapter)(config, signer);
-  } else {
-    adapter = (deps.createAdapter ?? createOspexAdapter)(config);
-    // Resolve the maker wallet best-effort, for the boot banner only. Dry-run
-    // posts nothing, so an unresolved address is fine here; `--address` ▸ the
-    // keystore's (optional) `address` field ▸ unknown (Foundry-style keystores
-    // omit it for privacy).
-    const resolved: Hex | null = opts.address ?? (config.wallet.keystorePath !== undefined ? readKeystoreAddress(config.wallet.keystorePath) : null);
-    bootAddress = resolved ?? '(unresolved — dry-run does not need it; pass --address or use an ethers-style keystore)';
+    log(`[run] maker wallet: ${bootAddress}`);
+
+    const stateStore = (deps.makeStateStore ?? ((dir: string): StateStore => StateStore.at(dir)))(config.state.dir);
+
+    const runner = new Runner({
+      config,
+      adapter,
+      stateStore,
+      runId,
+      ignoreMissingState: opts.ignoreMissingState,
+      ...(liveMakerAddress !== null ? { makerAddress: liveMakerAddress } : {}),
+      ...(deps.maxTicks !== undefined ? { maxTicks: deps.maxTicks } : {}),
+      ...(deps.runnerDeps !== undefined ? { deps: deps.runnerDeps } : {}),
+    });
+
+    await runner.run();
+  } finally {
+    // Release on EVERY exit path (graceful shutdown, a thrown RunRefused/Error,
+    // signal-driven stop). The runner's own `finally` has already done the last
+    // state flush by the time `run()` resolves, so the lock outlives all writes.
+    lock.release();
   }
-  log(`[run] maker wallet: ${bootAddress}`);
-
-  const runId = (deps.makeRunId ?? newRunId)();
-  const stateStore = (deps.makeStateStore ?? ((dir: string): StateStore => StateStore.at(dir)))(config.state.dir);
-
-  const runner = new Runner({
-    config,
-    adapter,
-    stateStore,
-    runId,
-    ignoreMissingState: opts.ignoreMissingState,
-    ...(liveMakerAddress !== null ? { makerAddress: liveMakerAddress } : {}),
-    ...(deps.maxTicks !== undefined ? { maxTicks: deps.maxTicks } : {}),
-    ...(deps.runnerDeps !== undefined ? { deps: deps.runnerDeps } : {}),
-  });
-
-  await runner.run();
 }
 
 // ── default passphrase prompt ────────────────────────────────────────────────

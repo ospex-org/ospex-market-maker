@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { parseConfig, type Config } from '../config/index.js';
 import { createLiveOspexAdapter, createOspexAdapter, type Hex, type OspexAdapter, type Signer } from '../ospex/index.js';
 import type { RunnerDeps } from '../runners/index.js';
+import { STATE_LOCK_FILE, StateLockError, type StateLock, type StateLockIdentity } from '../state/index.js';
 import { RunRefused, runRun } from './run.js';
 
 // ── harness ──────────────────────────────────────────────────────────────────
@@ -267,5 +268,74 @@ describe('runRun — live mode wiring', () => {
       { createLiveAdapter: liveDiscoveryFindsNothing, unlockSigner, env: { OSPEX_KEYSTORE_PASSPHRASE: 'pw' }, makeRunId: () => 'r', runnerDeps: noopRunnerDeps, maxTicks: 1, log: () => {} },
     );
     expect(unlockSigner).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ── state.dir single-process lock (DESIGN §12 — the HIGH finding) ─────────────
+
+describe('runRun — state.dir lock', () => {
+  it('acquires the lock for config.state.dir with the maker/config/run identity and releases it after the loop', async () => {
+    const release = vi.fn();
+    const acquireStateLock = vi.fn((_dir: string, _identity: StateLockIdentity): StateLock => ({ path: join(stateDir, STATE_LOCK_FILE), release }));
+    await runRun(
+      { config: cfg(), configPath: '/etc/ospex-mm.yaml', mode: 'dry-run', ignoreMissingState: false, confirmUnlimited: false },
+      { createAdapter: discoveryFindsNothing, makeRunId: () => 'run-x', acquireStateLock, runnerDeps: noopRunnerDeps, maxTicks: 1, log: () => {} },
+    );
+    expect(acquireStateLock).toHaveBeenCalledWith(stateDir, { maker: null, configPath: '/etc/ospex-mm.yaml', runId: 'run-x', process: 'run --dry-run' });
+    expect(release).toHaveBeenCalledTimes(1);
+  });
+
+  it('stamps the resolved maker address in the lock identity when the keystore exposes it', async () => {
+    // An ethers-style keystore exposes the address without a passphrase, so the dry-run
+    // boot resolves it best-effort for the lock identity.
+    const keystorePath = join(stateDir, 'keystore.json');
+    writeFileSync(keystorePath, JSON.stringify({ address: 'ABC0000000000000000000000000000000000ABC', crypto: {} }), 'utf8');
+    const acquireStateLock = vi.fn((_dir: string, _identity: StateLockIdentity): StateLock => ({ path: 'p', release: () => {} }));
+    await runRun(
+      { config: cfg({ wallet: { keystorePath } }), mode: 'dry-run', ignoreMissingState: false, confirmUnlimited: false },
+      { createAdapter: discoveryFindsNothing, makeRunId: () => 'r', acquireStateLock, runnerDeps: noopRunnerDeps, maxTicks: 1, log: () => {} },
+    );
+    expect(acquireStateLock.mock.calls[0]?.[1]).toMatchObject({ maker: '0xabc0000000000000000000000000000000000abc' });
+  });
+
+  it('a held lock (StateLockError) is surfaced as RunRefused, verbatim, and the runner never starts', async () => {
+    const acquireStateLock = vi.fn(() => {
+      throw new StateLockError('refusing to start: an MM is already running against this state.dir (pid 999 …).');
+    });
+    await expect(
+      runRun(
+        { config: cfg(), mode: 'dry-run', ignoreMissingState: false, confirmUnlimited: false },
+        { createAdapter: discoveryFindsNothing, makeRunId: () => 'blocked', acquireStateLock, runnerDeps: noopRunnerDeps, maxTicks: 1, log: () => {} },
+      ),
+    ).rejects.toMatchObject({ name: 'RunRefused', message: expect.stringMatching(/already running against this state\.dir/) as unknown });
+    // The loop never ran — no event log was opened.
+    expect(existsSync(join(logDir, 'run-blocked.ndjson'))).toBe(false);
+  });
+
+  it('the real lock is taken + released across a normal run — a second run against the same state.dir succeeds and leaves no lock behind', async () => {
+    const opts = { config: cfg(), mode: 'dry-run' as const, ignoreMissingState: false, confirmUnlimited: false };
+    const deps = { createAdapter: discoveryFindsNothing, makeRunId: () => 'first', runnerDeps: noopRunnerDeps, maxTicks: 1, log: () => {} };
+    await runRun(opts, deps);
+    expect(existsSync(join(stateDir, STATE_LOCK_FILE))).toBe(false); // released
+    // A second run re-acquires cleanly (release worked).
+    await runRun(opts, { ...deps, makeRunId: () => 'second' });
+    expect(existsSync(join(stateDir, STATE_LOCK_FILE))).toBe(false);
+  });
+
+  it('releases the real lock even when boot throws (bad passphrase) — a subsequent run succeeds', async () => {
+    // Minimal live config (mode.dryRun:false + a keystore path); unlockSigner throws
+    // *after* the lock is acquired, so the finally must release it.
+    const keystorePath = join(stateDir, 'ks.json');
+    writeFileSync(keystorePath, '{}', 'utf8');
+    const liveCfg = cfg({ mode: { dryRun: false }, wallet: { keystorePath } });
+    const unlockSigner = vi.fn(() => Promise.reject(new Error('invalid password')));
+    await expect(
+      runRun(
+        { config: liveCfg, mode: 'live', ignoreMissingState: false, confirmUnlimited: false },
+        { unlockSigner, env: { OSPEX_KEYSTORE_PASSPHRASE: 'wrong' }, makeRunId: () => 'r', log: () => {} },
+      ),
+    ).rejects.toThrow(/invalid password/);
+    // The finally released the lock despite the throw.
+    expect(existsSync(join(stateDir, STATE_LOCK_FILE))).toBe(false);
   });
 });

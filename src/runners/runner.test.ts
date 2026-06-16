@@ -723,6 +723,44 @@ describe('Runner — state-loss hold durability', () => {
   });
 });
 
+describe('Runner — state-loss hold per-instance scoping (live, MM#8 shared-telemetry false-trip)', () => {
+  const FOREIGN_MAKER = '0x8888888888888888888888888888888888888888';
+  function liveRunner(): Runner {
+    const config = cfg({ mode: { dryRun: false } });
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([]));
+    return makeRunner({ config, adapter, maxTicks: 1 }); // makerAddress defaults to DEFAULT_FAKE_MAKER_ADDRESS
+  }
+
+  it('a SIBLING instance’s prior log (a different maker) does NOT trip the hold — fresh state + no own-maker telemetry = first run for this instance', () => {
+    // Instance B boots fresh into a telemetry dir holding instance A's (foreign-maker) logs.
+    writeFileSync(join(logDir, 'run-prior.ndjson'), `{"ts":"x","runId":"prior","maker":"${FOREIGN_MAKER}","kind":"tick-start","tick":1}\n`, 'utf8');
+    const runner = liveRunner();
+    expect(runner.bootAssessment.holdQuoting).toBe(false); // not starved into the hold by a sibling
+  });
+
+  it('this instance’s OWN prior log (matching maker) STILL trips the hold — the genuine state-loss fail-safe is not weakened', () => {
+    // Same maker as the live runner (DEFAULT_FAKE_MAKER_ADDRESS) → a real prior run of THIS instance whose state vanished.
+    writeFileSync(join(logDir, 'run-prior.ndjson'), `{"ts":"x","runId":"prior","maker":"${DEFAULT_FAKE_MAKER_ADDRESS}","kind":"tick-start","tick":1}\n`, 'utf8');
+    const runner = liveRunner();
+    expect(runner.bootAssessment.holdQuoting).toBe(true);
+  });
+
+  it('a maker-less prior log (legacy / dry-run sibling) does NOT trip a live instance’s hold (the documented one-time migration trade-off)', () => {
+    writeFileSync(join(logDir, 'run-prior.ndjson'), '{"ts":"x","runId":"prior","kind":"tick-start","tick":1}\n', 'utf8');
+    const runner = liveRunner();
+    expect(runner.bootAssessment.holdQuoting).toBe(false); // unattributable → not this instance's
+  });
+
+  it('a live run stamps its maker on every telemetry line (a shared log dir is attributable per instance)', async () => {
+    const config = cfg({ mode: { dryRun: false } });
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([]));
+    await makeRunner({ config, adapter, runId: 'stamp-run', maxTicks: 1 }).run();
+    const lines = readFileSync(join(logDir, 'run-stamp-run.ndjson'), 'utf8').trim().split('\n').filter(Boolean);
+    expect(lines.length).toBeGreaterThan(0);
+    expect(lines.every((l) => (JSON.parse(l) as { maker?: string }).maker === DEFAULT_FAKE_MAKER_ADDRESS)).toBe(true);
+  });
+});
+
 // ── the tick loop ────────────────────────────────────────────────────────────
 
 describe('Runner — tick loop', () => {
@@ -5369,8 +5407,10 @@ describe('Runner — boot-time auto-approve (Phase 3 d-i)', () => {
   });
 
   it('live + autoApprove=true + boot-time state-loss hold ACTIVE → auto-approve is deferred (no readApprovals, no approveUSDC) — raising the allowance would risk re-activating latent soft-cancelled commitments (Hermes review-PR25 §1)', async () => {
-    // Seed prior telemetry but no state file → constructor's boot fail-safe holds quoting.
-    writeFileSync(join(logDir, 'run-prior.ndjson'), '{"ts":"x","runId":"prior","kind":"tick-start","tick":1}\n', 'utf8');
+    // Seed prior telemetry stamped with THIS instance's maker but no state file →
+    // constructor's boot fail-safe holds quoting (the live state-loss check is
+    // scoped to the maker, so the prior log must carry it to count).
+    writeFileSync(join(logDir, 'run-prior.ndjson'), `{"ts":"x","runId":"prior","maker":"${DEFAULT_FAKE_MAKER_ADDRESS}","kind":"tick-start","tick":1}\n`, 'utf8');
     const readApprovals = vi.fn(() => Promise.resolve(approvalsSnapshotWith(0n)));
     const readBalances = vi.fn(() => Promise.resolve({ owner: '0xowner' as Hex, chainId: 137, native: 10n ** 18n, usdc: 2n ** 255n, link: 0n, usdcAddress: '0xusdc' as Hex, linkAddress: '0xlink' as Hex }));
     const approve = approveRecorder();

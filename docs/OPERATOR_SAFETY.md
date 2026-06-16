@@ -87,6 +87,18 @@ So a pulled quote is *latent* exposure, not gone. The MM tracks this and counts 
   - **Stale lock after a crash.** If a run is killed hard (SIGKILL, power loss) it can leave the lock file behind. The next `run` / `cancel-stale` reclaims it automatically **only** when the recorded process is verifiably dead on the same host. If the lock was created on a *different* host (a shared `state.dir` across machines — unsupported) or is unparseable, the command fails closed; once you've confirmed no MM is running against that directory, remove `state.dir/maker.lock` by hand and retry. The lock file is not sensitive (it carries no signing material — only a wallet address, hostname, and config path).
   - If the state file is lost or corrupted between runs, the MM will not resume quoting on a blank slate (it would under-count latent exposure) — it reconstructs from telemetry, or waits one `expirySeconds` window, or you pass an explicit override.
 
+## Running more than one MM (on one host)
+
+If you run more than one MM instance on the same machine, **give each instance its own `state.dir`, its own `telemetry.logDir`, and its own `killSwitchFile`** — plus its own wallet (see "One wallet per instance" if present, or simply: never point two instances at the same keystore). The `state.dir` lock enforces the first of these; the others are operator discipline.
+
+- **`state.dir`** — lock-enforced (a second instance on the same `state.dir` is refused). Already covered above.
+- **`telemetry.logDir`** — give each instance its own. A live run now stamps its **maker wallet on every telemetry line**, so even a shared log dir is attributable per instance, and the boot-time state-loss fail-safe scopes its "a prior run happened" check to *this* instance's maker — a sibling's logs in a shared dir no longer false-trip the hold (which used to push operators toward `--ignore-missing-state`, the exact override that defeats the real fail-safe). Separate dirs are still cleaner for reading/scorecards. (Note: a live run upgraded from a pre-this-release version whose old logs carry no maker field won't have those legacy logs counted — rely on the `state.dir` lock / state file across that one-time boundary.)
+- **`killSwitchFile`** — this is the subtle one at N>1:
+  - A **shared** kill file (the default `./KILL`, when every instance is launched from the same working directory) is a **fleet kill**: dropping `./KILL` stops *every* instance polling that path. There is no separate per-instance switch in that layout.
+  - A **per-instance** kill file (a distinct `killSwitchFile` per instance) is a **per-instance switch** — and then there is **no single fleet-wide file** to stop them all at once (you drop each instance's file, or signal each process).
+  - **Latency:** the kill file is polled once per tick, so a dropped file takes effect within up to one `ownState.auditPollIntervalMs` (default ~60 s). For an immediate stop, send **SIGINT/SIGTERM** — always per-process and acted on at the next safe point (it triggers the same graceful cancel-sweep).
+- **SSE connection budget** — the core-api per-IP stream cap is per **host**, shared across all co-located instances. Size it for the fleet: `MAX_STREAM_CONNECTIONS_PER_IP ≥ N·(odds.maxRealtimeChannels + 1)`. See DESIGN §3 "SSE connection budget".
+
 ## Sensitive local state
 
 The state file under `state.dir/maker-state.json` is **sensitive operator state**. Each commitment record persists the SDK's signed EIP-712 payload — the same input a taker uses to fill that commitment on chain. Anyone with read access to this file can fill your still-matchable commitments until they expire / fill / are cancelled. Treat `state.dir` like a wallet directory, not a log directory.

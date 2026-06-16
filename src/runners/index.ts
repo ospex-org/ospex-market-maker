@@ -261,9 +261,9 @@ interface TrackedMarket {
   sport: string;
   awayTeam: string;
   homeTeam: string;
-  /** The contest's open moneyline speculation, as last seen at discovery. */
+  /** The contest's open moneyline speculation — refreshed from the latest listing on every discovery cycle. */
   speculationId: string;
-  /** Contest match time, unix seconds. */
+  /** Contest match time, unix seconds — refreshed from the latest listing on every discovery cycle (a reschedule moves it). */
   matchTimeSec: number;
   /**
    * The live SSE odds stream for this market's reference odds, or `null` — not
@@ -281,6 +281,16 @@ interface TrackedMarket {
   dirty: boolean;
   /** Unix seconds — when the per-market reconcile last processed this market (a quote computed, or a gate hit), or `null` if never. Throttles the "we have no fresh standing quote" re-reconcile (a `dirty` event always triggers an immediate reconcile regardless). */
   lastReconciledAt: number | null;
+  /**
+   * The contest has left the discovery listing and we're DRAINING it — its visible
+   * quotes must come off the book, but it must NOT be re-quoted. Set when the
+   * untrack-time quote-pull fails transiently (so the market is retained for retry
+   * instead of stranding a still-matchable quote); `reconcileMarket` then pulls-only
+   * (never quotes) a departing market each tick until the pull succeeds, after which
+   * the next discovery cycle untracks it. Cleared if the contest reappears in the
+   * listing (it came back — resume normal tracking).
+   */
+  departing: boolean;
 }
 
 /**
@@ -306,6 +316,8 @@ export interface TrackedMarketView {
   dirty: boolean;
   /** Unix seconds — when the per-market reconcile last processed this market, or `null` if never. */
   lastReconciledAt: number | null;
+  /** Is this market being DRAINED (left the listing, pull-only, never re-quoted) after an untrack-time pull failed transiently? */
+  departing: boolean;
 }
 
 /** Reasons a tracked market is in a `degraded` (no live odds channel) state — carried on the `degraded` telemetry event. */
@@ -1594,7 +1606,10 @@ export class Runner {
    * The discovery cycle (DESIGN §10): list the verified contests starting within
    * `marketSelection.maxStartsWithinHours` (filtered to the configured sports + the
    * allow/deny lists); drop tracked contests no longer in that set (started / scored
-   * / out of window — tearing down each one's odds channel); for each *new* candidate
+   * / out of window — pulling each one's visible quotes off the book and tearing down
+   * its odds channel); refresh the still-tracked markets' `matchTimeSec` /
+   * `speculationId` from the latest listing (so a rescheduled start reaches the gates);
+   * for each *new* candidate
    * (soonest game first) — confirm it has an open moneyline speculation (else
    * `candidate` `no-open-speculation`), isn't already started (else `start-too-soon`),
    * and there's room under `marketSelection.maxTrackedContests` (else
@@ -1628,11 +1643,51 @@ export class Runner {
     }
 
     for (const id of [...this.trackedMarkets.keys()]) {
-      if (!byId.has(id)) {
-        const departed = this.trackedMarkets.get(id);
-        this.trackedMarkets.delete(id);
-        if (departed?.subscription) void this.dropChannel(departed.subscription, departed.contestId);
+      if (byId.has(id)) continue; // still listed — refreshed/quoted below
+      const departed = this.trackedMarkets.get(id);
+      if (departed === undefined) continue;
+      // Take this contest's visible quotes off the book BEFORE we stop tracking it.
+      // Once untracked, `reconcileMarkets` never revisits it (it iterates only the
+      // tracked set), so any `visibleOpen` quote would otherwise strand on the relay
+      // book — unpriced and still matchable — until expiry. The visible book must
+      // never carry a quote the MM is no longer pricing (DESIGN §2.2 / §3).
+      const outcome = await this.pullVisibleQuotes(departed, now);
+      if (outcome === 'transient-failure') {
+        // The off-chain (or cancelMode:onchain) cancel threw. Deleting now would
+        // strand a still-matchable quote with nothing tracking it to retry —
+        // dangerous under match-time expiry. Instead RETAIN the market, flagged
+        // `departing`, and re-arm `dirty`: `reconcileMarket` then pulls-only (never
+        // re-quotes) a departing market every tick until the pull succeeds, after
+        // which the next discovery cycle untracks it cleanly. Mirrors the
+        // re-arm-and-retry invariant the unquoteable reconcile gates already use.
+        departed.departing = true;
+        departed.dirty = true;
+        continue; // keep it tracked + keep its odds channel until the retry drains it
       }
+      this.trackedMarkets.delete(id);
+      if (departed.subscription) void this.dropChannel(departed.subscription, departed.contestId);
+    }
+
+    // Refresh already-tracked markets from the latest listing (the list row is in hand,
+    // so this needs no extra read). `matchTimeSec` / `speculationId` are otherwise frozen
+    // at first-tracking, so a rescheduled start — especially one moved EARLIER — would
+    // never reach the `start-too-soon` / `match-time` expiry gates: the odds stream keeps
+    // `lastOddsAt` fresh, so the `stale-reference` gate doesn't bound it (DESIGN §10).
+    for (const [id, m] of this.trackedMarkets) {
+      const c = byId.get(id);
+      if (c === undefined) continue; // departed (untracked above) or still draining (`departing`) — not in the listing
+      m.departing = false; // present in the listing again — resume normal tracking (a no-op when it was never draining)
+      const refreshedMatchTimeSec = Math.floor(Date.parse(c.matchTime) / 1000);
+      if (Number.isFinite(refreshedMatchTimeSec) && refreshedMatchTimeSec !== m.matchTimeSec) {
+        if (refreshedMatchTimeSec < m.matchTimeSec) m.dirty = true; // moved earlier — re-evaluate the gates next tick, not at the staleAfter cadence
+        m.matchTimeSec = refreshedMatchTimeSec;
+      }
+      // A contest that re-opened a different moneyline speculation: track the new id.
+      // If the moneyline speculation closed (`spec === undefined`) leave the id as-is —
+      // reconcileMarket's open-speculation re-check pulls quotes + emits
+      // `no-open-speculation` that same tick.
+      const spec = c.speculations.find((s) => s.marketType === 'moneyline' && s.open);
+      if (spec !== undefined && spec.speculationId !== m.speculationId) m.speculationId = spec.speculationId;
     }
 
     const newCandidates = [...byId.values()]
@@ -1683,6 +1738,7 @@ export class Runner {
         lastOddsAt: null,
         dirty: false,
         lastReconciledAt: null,
+        departing: false,
       });
       this.eventLog.emit('candidate', { contestId: c.contestId, sport: full.sport, matchTime: full.matchTime, speculationId: confirmedSpec.speculationId });
     }
@@ -2028,6 +2084,18 @@ export class Runner {
    * `lastReconciledAt` so the market re-reconciles next tick and retries the failed bit.
    */
   private async reconcileMarket(m: TrackedMarket, now: number): Promise<'applied' | 'transient-failure'> {
+    // Gate (first, unconditional): the contest has left the discovery listing and we're
+    // DRAINING it — pull whatever's still up and NEVER re-quote a market we've stopped
+    // tracking. `departing` is set by discover() when the untrack-time pull failed
+    // transiently; the read-and-clear `dirty` re-arm in reconcileMarkets retries this
+    // every tick until the pull succeeds, after which the next discovery cycle untracks
+    // it. (A successful drain leaves no `visibleOpen` quote, so this becomes a no-op pull
+    // until that deletion.)
+    if (m.departing) {
+      const outcome = await this.pullVisibleQuotes(m, now);
+      this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'untracked' });
+      return outcome;
+    }
     // Gate: the game starts within one expiry window — stop quoting it (a fresh quote would still be matchable at game time / outlive the pre-game window), and pull whatever's still up.
     if (m.matchTimeSec - now <= this.config.orders.expirySeconds) {
       const outcome = await this.pullVisibleQuotes(m, now);
@@ -4679,6 +4747,7 @@ export class Runner {
       lastOddsAt: m.lastOddsAt,
       dirty: m.dirty,
       lastReconciledAt: m.lastReconciledAt,
+      departing: m.departing,
     };
   }
 }

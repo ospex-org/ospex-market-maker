@@ -768,6 +768,44 @@ describe('Runner — one-wallet-per-instance collision diagnostic (MM#6)', () =>
   });
 });
 
+describe('Runner — state-loss hold per-instance scoping (live, MM#8 shared-telemetry false-trip)', () => {
+  const FOREIGN_MAKER = '0x8888888888888888888888888888888888888888';
+  function liveRunner(): Runner {
+    const config = cfg({ mode: { dryRun: false } });
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([]));
+    return makeRunner({ config, adapter, maxTicks: 1 }); // makerAddress defaults to DEFAULT_FAKE_MAKER_ADDRESS
+  }
+
+  it('a SIBLING instance’s prior log (a different maker) does NOT trip the hold — fresh state + no own-maker telemetry = first run for this instance', () => {
+    // Instance B boots fresh into a telemetry dir holding instance A's (foreign-maker) logs.
+    writeFileSync(join(logDir, 'run-prior.ndjson'), `{"ts":"x","runId":"prior","maker":"${FOREIGN_MAKER}","kind":"tick-start","tick":1}\n`, 'utf8');
+    const runner = liveRunner();
+    expect(runner.bootAssessment.holdQuoting).toBe(false); // not starved into the hold by a sibling
+  });
+
+  it('this instance’s OWN prior log (matching maker) STILL trips the hold — the genuine state-loss fail-safe is not weakened', () => {
+    // Same maker as the live runner (DEFAULT_FAKE_MAKER_ADDRESS) → a real prior run of THIS instance whose state vanished.
+    writeFileSync(join(logDir, 'run-prior.ndjson'), `{"ts":"x","runId":"prior","maker":"${DEFAULT_FAKE_MAKER_ADDRESS}","kind":"tick-start","tick":1}\n`, 'utf8');
+    const runner = liveRunner();
+    expect(runner.bootAssessment.holdQuoting).toBe(true);
+  });
+
+  it('a maker-less prior log (legacy / dry-run sibling) does NOT trip a live instance’s hold (the documented one-time migration trade-off)', () => {
+    writeFileSync(join(logDir, 'run-prior.ndjson'), '{"ts":"x","runId":"prior","kind":"tick-start","tick":1}\n', 'utf8');
+    const runner = liveRunner();
+    expect(runner.bootAssessment.holdQuoting).toBe(false); // unattributable → not this instance's
+  });
+
+  it('a live run stamps its maker on every telemetry line (a shared log dir is attributable per instance)', async () => {
+    const config = cfg({ mode: { dryRun: false } });
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([]));
+    await makeRunner({ config, adapter, runId: 'stamp-run', maxTicks: 1 }).run();
+    const lines = readFileSync(join(logDir, 'run-stamp-run.ndjson'), 'utf8').trim().split('\n').filter(Boolean);
+    expect(lines.length).toBeGreaterThan(0);
+    expect(lines.every((l) => (JSON.parse(l) as { maker?: string }).maker === DEFAULT_FAKE_MAKER_ADDRESS)).toBe(true);
+  });
+});
+
 // ── the tick loop ────────────────────────────────────────────────────────────
 
 describe('Runner — tick loop', () => {
@@ -810,17 +848,52 @@ describe('Runner — tick loop', () => {
     expect(sleepMsCalls).toEqual([45000, 45000]);
   });
 
-  it('warns at boot when odds.maxRealtimeChannels + reserved own-state streams would exceed the core-api per-IP cap', () => {
+  it('warns on the ANONYMOUS-odds per-IP budget (cap − owner reserve) before the total cap is hit', () => {
     const lines: string[] = [];
-    // 8 odds channels + 3 reserved own-state = 11 > the per-IP cap of 10.
-    makeRunner({ config: cfg({ odds: { maxRealtimeChannels: 8 } }), deps: { log: (l) => lines.push(l) } });
-    expect(lines.filter((l) => /per-IP cap/.test(l))).toHaveLength(1);
+    // 14 odds channels: under the total cap (14 + 1 = 15 ≤ 16) BUT over the anonymous
+    // budget (14 > 16 − 3 = 13), so core-api 429s the 14th odds stream. The total-cap
+    // warning must NOT fire here; the anonymous-budget warning must.
+    makeRunner({ config: cfg({ odds: { maxRealtimeChannels: 14 } }), deps: { log: (l) => lines.push(l) } });
+    expect(lines.filter((l) => /ANONYMOUS per-IP SSE budget/.test(l))).toHaveLength(1);
+    expect(lines.filter((l) => /exceeding the core-api per-IP cap/.test(l))).toHaveLength(0);
   });
 
-  it('does not warn at the default stream caps (fits under the per-IP cap with own-state headroom)', () => {
+  it('warns on the total per-IP cap (and the anonymous budget) when even own-state pushes it over', () => {
+    const lines: string[] = [];
+    // 16 odds + 1 own-state = 17 > the per-IP cap of 16 — AND 16 > the anonymous budget 13.
+    makeRunner({ config: cfg({ odds: { maxRealtimeChannels: 16 } }), deps: { log: (l) => lines.push(l) } });
+    expect(lines.filter((l) => /exceeding the core-api per-IP cap/.test(l))).toHaveLength(1);
+    expect(lines.filter((l) => /ANONYMOUS per-IP SSE budget/.test(l))).toHaveLength(1);
+  });
+
+  it('does not emit any over-budget warning at the default stream caps (5 odds fits both the anonymous budget and the cap)', () => {
     const lines: string[] = [];
     makeRunner({ config: cfg(), deps: { log: (l) => lines.push(l) } });
-    expect(lines.filter((l) => /per-IP cap/.test(l))).toHaveLength(0);
+    expect(lines.filter((l) => /exceeding the core-api per-IP cap/.test(l))).toHaveLength(0);
+    expect(lines.filter((l) => /ANONYMOUS per-IP SSE budget/.test(l))).toHaveLength(0);
+  });
+
+  it('does not warn at the anonymous-budget boundary (maxRealtimeChannels === cap − reserve)', () => {
+    const lines: string[] = [];
+    // 13 odds == the anonymous budget (16 − 3) → fits exactly; no warning.
+    makeRunner({ config: cfg({ odds: { maxRealtimeChannels: 13 } }), deps: { log: (l) => lines.push(l) } });
+    expect(lines.filter((l) => /ANONYMOUS per-IP SSE budget/.test(l))).toHaveLength(0);
+    expect(lines.filter((l) => /exceeding the core-api per-IP cap/.test(l))).toHaveLength(0);
+  });
+
+  it('always logs the per-host SSE-budget reminder when streaming (the cap is shared + split for owner-auth)', () => {
+    const lines: string[] = [];
+    makeRunner({ config: cfg(), deps: { log: (l) => lines.push(l) } });
+    const reminder = lines.filter((l) => /SSE budget:/.test(l) && /per HOST/.test(l));
+    expect(reminder).toHaveLength(1);
+    expect(reminder[0]).toMatch(/this instance uses 6 connections \(5 anonymous odds \+ 1 owner-auth own-state\)/); // default maxRealtimeChannels=5
+    expect(reminder[0]).toMatch(/odds share 13 anonymous slots/); // the anonymous budget = cap(16) − reserve(3)
+  });
+
+  it('does not log the SSE-budget reminder when odds.subscribe is false (no streams opened)', () => {
+    const lines: string[] = [];
+    makeRunner({ config: cfg({ odds: { subscribe: false } }), deps: { log: (l) => lines.push(l) } });
+    expect(lines.filter((l) => /SSE budget:/.test(l))).toHaveLength(0);
   });
 
   it('a state-flush failure propagates (the runner must not keep ticking on an un-persistable state)', async () => {
@@ -1241,6 +1314,78 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
     expect(session.lastStatus).toBe('resync');
     // Pre-resync canonical state.commitments PRESERVED — comparator suppresses via `ready` precondition.
     expect(Object.keys(runner.stateForTest().commitments)).toEqual(['0xpre']);
+
+    triggerKill();
+    await runPromise;
+  });
+
+  it('onStatus(\'reconnecting\') with an in-flight TRUNCATED baseline drops the partial accumulation so the next cold snapshot REPLACES it (no phantom rows)', async () => {
+    const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
+
+    // Cold connect, page 1 (truncated) — still accumulating. '0xstale' is a row that
+    // will be filled/cancelled by the time of the next snapshot.
+    recorder.fire('onSnapshot', { cursor: 'c1', commitments: [mappableOwnerCommitment('0xstale')], positions: [], truncated: true, positionsTruncated: false });
+    expect(Object.keys(runner.ownStateSessionView().pendingBaseline!.commitments)).toEqual(['0xstale']);
+
+    // Paging failed mid-flight → the pinned SDK clears its cursor + cold-restarts,
+    // emitting 'reconnecting' (NOT 'resync'). The truncated baseline guarantees a cold
+    // restart (the SDK never advances its cursor on a truncated page), so the stopgap
+    // discards the partial accumulation.
+    recorder.fire('onStatus', 'reconnecting');
+    const mid = runner.ownStateSessionView();
+    expect(mid.pendingBaseline).toBeNull(); // in-flight accumulation discarded
+    expect(mid.ready).toBe(false);
+    expect(mid.lastStatus).toBe('reconnecting');
+
+    // The fresh cold snapshot ('0xstale' now gone) is treated as a NEW first page, not a continuation.
+    recorder.fire('onSnapshot', { cursor: 'c2', commitments: [mappableOwnerCommitment('0xfresh')], positions: [], truncated: false, positionsTruncated: false });
+    recorder.fire('onReady');
+
+    // Canonical book holds ONLY the fresh snapshot — '0xstale' did NOT merge in as a phantom row.
+    expect(Object.keys(runner.stateForTest().commitments)).toEqual(['0xfresh']);
+
+    triggerKill();
+    await runPromise;
+  });
+
+  it('onStatus(\'reconnecting\') after a COMPLETE (non-truncated) baseline, BEFORE onReady, KEEPS it — the SDK resumes and the resume-ready swaps the held baseline (Hermes review-PR98)', async () => {
+    const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
+
+    // A complete single-page snapshot (truncated:false). The SDK advances its running
+    // cursor on a non-truncated snapshot, so a drop here reconnects as a RESUME and the
+    // following onReady arrives with NO fresh snapshot.
+    recorder.fire('onSnapshot', { cursor: 'c1', commitments: [mappableOwnerCommitment('0xcomplete')], positions: [], truncated: false, positionsTruncated: false });
+    expect(Object.keys(runner.ownStateSessionView().pendingBaseline!.commitments)).toEqual(['0xcomplete']);
+
+    // Transport drops before onReady. The baseline is COMPLETE → it must be KEPT (discarding
+    // it would leave handleOwnerReady nothing to swap → ready over empty/stale state).
+    recorder.fire('onStatus', 'reconnecting');
+    const mid = runner.ownStateSessionView();
+    expect(mid.pendingBaseline).not.toBeNull(); // KEPT — not a truncated/paging-failure discard
+    expect(Object.keys(mid.pendingBaseline!.commitments)).toEqual(['0xcomplete']);
+    expect(mid.ready).toBe(false); // not ready until the resume's onReady — nothing posts against un-swapped state
+
+    // Resume-ready: no fresh snapshot, so handleOwnerReady swaps the held baseline.
+    recorder.fire('onReady');
+    expect(Object.keys(runner.stateForTest().commitments)).toEqual(['0xcomplete']); // ready WITH the snapshot it received
+
+    triggerKill();
+    await runPromise;
+  });
+
+  it('onStatus(\'reconnecting\') after a completed baseline ALREADY swapped (post-onReady) is a no-op — a normal mid-stream resume keeps the canonical book', async () => {
+    const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
+
+    recorder.fire('onSnapshot', { cursor: 'c1', commitments: [mappableOwnerCommitment('0xlive')], positions: [], truncated: false, positionsTruncated: false });
+    recorder.fire('onReady');
+    expect(Object.keys(runner.stateForTest().commitments)).toEqual(['0xlive']);
+    expect(runner.ownStateSessionView().pendingBaseline).toBeNull(); // nulled at the swap
+
+    // A transport drop mid-LIVE-stream emits 'reconnecting' with pendingBaseline already
+    // null → the rebaseline branch must NOT fire (a resume re-grounds via catchup, not a
+    // fresh snapshot, so the canonical book must be preserved).
+    recorder.fire('onStatus', 'reconnecting');
+    expect(Object.keys(runner.stateForTest().commitments)).toEqual(['0xlive']);
 
     triggerKill();
     await runPromise;
@@ -3113,6 +3258,54 @@ describe('Runner — discovery', () => {
     expect(runner.trackedContestIds()).toEqual(['A']); // B departed on the 2nd cycle
   });
 
+  it('pulls a departing contest’s visible quotes off the book on untrack (would-soft-cancel side-not-quoted) — not left stranded until expiry', async () => {
+    StateStore.at(stateDir).flush(emptyMakerState());
+    let listCount = 0;
+    const config = cfg({ discovery: { everyNTicks: 1 } });
+    // tick 1: A listed → tracked, seeded, and quoted (2 synthetic visibleOpen records).
+    // tick 2: A gone from the listing → untrack pulls its visible quotes before deleting it.
+    const adapter = spiedAdapter(config, () => { listCount += 1; return Promise.resolve(listCount === 1 ? [contestView({ contestId: 'A' })] : []); });
+    const runner = makeRunner({ config, adapter, maxTicks: 2 });
+    await runner.run();
+
+    expect(runner.trackedContestIds()).toEqual([]); // A untracked on cycle 2
+    const events = readEvents();
+    expect(events.filter((e) => e.kind === 'would-submit')).toHaveLength(2); // tick 1 quoted both sides
+    const pulls = events.filter((e) => e.kind === 'would-soft-cancel');
+    expect(pulls).toHaveLength(2); // tick 2 untrack pulled both
+    expect(pulls.every((e) => e.contestId === 'A' && e.reason === 'side-not-quoted')).toBe(true);
+    const records = Object.values(StateStore.at(stateDir).load().state.commitments);
+    expect(records).toHaveLength(2);
+    expect(records.every((r) => r.lifecycle === 'softCancelled')).toBe(true);
+  });
+
+  it('refreshes a tracked market’s matchTimeSec from the latest listing (a rescheduled — esp. earlier — start reaches the gates)', async () => {
+    const LATER = '2099-02-01T00:00:00Z';
+    const EARLIER = '2099-01-01T00:00:00Z';
+    let listCount = 0;
+    const config = cfg({ discovery: { everyNTicks: 1 } });
+    // cycle 1: A starts LATER → tracked at that time. cycle 2: the start moved EARLIER → the refresh updates matchTimeSec.
+    const adapter = spiedAdapter(config, () => { listCount += 1; return Promise.resolve([contestView({ contestId: 'A', matchTime: listCount === 1 ? LATER : EARLIER })]); });
+    const runner = makeRunner({ config, adapter, maxTicks: 2 });
+    await runner.run();
+
+    expect(runner.trackedContestIds()).toEqual(['A']);
+    expect(runner.trackedMarketView('A')?.matchTimeSec).toBe(Math.floor(Date.parse(EARLIER) / 1000)); // refreshed to the moved-earlier start, not frozen at cycle 1's LATER
+  });
+
+  it('refreshes a tracked market’s speculationId when the contest re-opens a different moneyline speculation', async () => {
+    let listCount = 0;
+    const config = cfg({ discovery: { everyNTicks: 1 } });
+    const adapter = spiedAdapter(config, () => {
+      listCount += 1;
+      return Promise.resolve([contestView({ contestId: 'A', speculations: [{ speculationId: listCount === 1 ? 'spec-A' : 'spec-A-v2', contestId: 'A', marketType: 'moneyline', lineTicks: null, line: null, open: true }] })]);
+    });
+    const runner = makeRunner({ config, adapter, maxTicks: 2 });
+    await runner.run();
+
+    expect(runner.trackedMarketView('A')?.speculationId).toBe('spec-A-v2'); // refreshed from cycle 2's listing
+  });
+
   it('a listContests failure aborts the cycle (emits an error event, keeps the existing tracked set)', async () => {
     let listCount = 0;
     const config = cfg({ discovery: { everyNTicks: 1 } });
@@ -4058,6 +4251,70 @@ describe('Runner — live execution', () => {
     expect(events.find((e) => e.kind === 'error' && e.phase === 'cancel')).toMatchObject({ contestId: '1234', commitmentHash: '0xvisible', detail: 'relay 500' });
     expect(events.some((e) => e.kind === 'soft-cancel' || e.kind === 'would-soft-cancel')).toBe(false);
     expect(StateStore.at(stateDir).load().state.commitments['0xvisible']?.lifecycle).toBe('visibleOpen'); // still up — next pass retries the pull
+  });
+
+  it('an untrack-time off-chain-cancel failure RETAINS the market (departing) for retry instead of stranding the quote (Hermes review-PR97 §1)', async () => {
+    const visible = commitmentRecord({ hash: '0xstrand', speculationId: 'spec-1234', contestId: '1234', makerSide: 'away', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 5, updatedAtUnixSec: T0 - 5 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xstrand': visible } });
+    const config = cfg({ mode: { dryRun: false }, discovery: { everyNTicks: 1 } });
+    let listCount = 0;
+    const adapter = liveSpiedAdapter(
+      config,
+      () => { listCount += 1; return Promise.resolve(listCount === 1 ? [contestView({ contestId: '1234' })] : []); },
+      { cancelCommitmentOffchain: () => Promise.reject(new Error('relay 500')) }, // every cancel fails
+      undefined,
+      { snapshot: (id) => Promise.resolve(oddsSnapshotView(id, null)) }, // no moneyline row → unquoteable (pull-only)
+    );
+    const runner = makeRunner({ config, adapter, maxTicks: 2 });
+    await runner.run();
+
+    // tick 1: 1234 tracked. tick 2: 1234 leaves the listing → untrack pull → cancel fails.
+    expect(runner.trackedContestIds()).toEqual(['1234']); // RETAINED for retry, not stranded
+    expect(runner.trackedMarketView('1234')?.departing).toBe(true);
+    const events = readEvents();
+    expect(events.some((e) => e.kind === 'candidate' && e.skipReason === 'untracked')).toBe(true); // on the pull-only departing path (gate is first, so 'untracked' wins over 'no-reference-odds')
+    expect(events.some((e) => e.kind === 'submit')).toBe(false); // never re-quoted while departing
+    expect(StateStore.at(stateDir).load().state.commitments['0xstrand']?.lifecycle).toBe('visibleOpen'); // still up — the pull keeps retrying
+  });
+
+  it('a departing market drains and untracks once the retried pull succeeds', async () => {
+    const visible = commitmentRecord({ hash: '0xdrain', speculationId: 'spec-1234', contestId: '1234', makerSide: 'away', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 5, updatedAtUnixSec: T0 - 5 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xdrain': visible } });
+    const config = cfg({ mode: { dryRun: false }, discovery: { everyNTicks: 1 } });
+    let listCount = 0;
+    let cancelCalls = 0;
+    const adapter = liveSpiedAdapter(
+      config,
+      () => { listCount += 1; return Promise.resolve(listCount === 1 ? [contestView({ contestId: '1234' })] : []); },
+      { cancelCommitmentOffchain: () => { cancelCalls += 1; return cancelCalls <= 2 ? Promise.reject(new Error('relay 500')) : Promise.resolve(); } }, // first 2 cancels fail, then succeed
+      undefined,
+      { snapshot: (id) => Promise.resolve(oddsSnapshotView(id, null)) },
+    );
+    const runner = makeRunner({ config, adapter, maxTicks: 4 });
+    await runner.run();
+
+    expect(runner.trackedContestIds()).toEqual([]); // pull eventually succeeded → drained → untracked on a later discovery cycle
+    expect(StateStore.at(stateDir).load().state.commitments['0xdrain']?.lifecycle).toBe('softCancelled');
+  });
+
+  it('a departing market that reappears in the listing resumes normal tracking (departing cleared)', async () => {
+    const visible = commitmentRecord({ hash: '0xreappear', speculationId: 'spec-1234', contestId: '1234', makerSide: 'away', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 5, updatedAtUnixSec: T0 - 5 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xreappear': visible } });
+    const config = cfg({ mode: { dryRun: false }, discovery: { everyNTicks: 1 } });
+    let listCount = 0;
+    const adapter = liveSpiedAdapter(
+      config,
+      () => { listCount += 1; return Promise.resolve(listCount === 2 ? [] : [contestView({ contestId: '1234' })]); }, // present, gone, present
+      { cancelCommitmentOffchain: () => Promise.reject(new Error('relay 500')) },
+      undefined,
+      { snapshot: (id) => Promise.resolve(oddsSnapshotView(id, null)) },
+    );
+    const runner = makeRunner({ config, adapter, maxTicks: 3 });
+    await runner.run();
+
+    // tick 2: 1234 gone → cancel fails → departing. tick 3: 1234 back in the listing → departing cleared.
+    expect(runner.trackedContestIds()).toEqual(['1234']);
+    expect(runner.trackedMarketView('1234')?.departing).toBe(false);
   });
 
   it('a dry-run state directory reused for live is rejected at construction (a `dry:` synthetic commitment)', () => {
@@ -5414,8 +5671,10 @@ describe('Runner — boot-time auto-approve (Phase 3 d-i)', () => {
   });
 
   it('live + autoApprove=true + boot-time state-loss hold ACTIVE → auto-approve is deferred (no readApprovals, no approveUSDC) — raising the allowance would risk re-activating latent soft-cancelled commitments (Hermes review-PR25 §1)', async () => {
-    // Seed prior telemetry but no state file → constructor's boot fail-safe holds quoting.
-    writeFileSync(join(logDir, 'run-prior.ndjson'), '{"ts":"x","runId":"prior","kind":"tick-start","tick":1}\n', 'utf8');
+    // Seed prior telemetry stamped with THIS instance's maker but no state file →
+    // constructor's boot fail-safe holds quoting (the live state-loss check is
+    // scoped to the maker, so the prior log must carry it to count).
+    writeFileSync(join(logDir, 'run-prior.ndjson'), `{"ts":"x","runId":"prior","maker":"${DEFAULT_FAKE_MAKER_ADDRESS}","kind":"tick-start","tick":1}\n`, 'utf8');
     const readApprovals = vi.fn(() => Promise.resolve(approvalsSnapshotWith(0n)));
     const readBalances = vi.fn(() => Promise.resolve({ owner: '0xowner' as Hex, chainId: 137, native: 10n ** 18n, usdc: 2n ** 255n, link: 0n, usdcAddress: '0xusdc' as Hex, linkAddress: '0xlink' as Hex }));
     const approve = approveRecorder();

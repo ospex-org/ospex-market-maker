@@ -42,28 +42,36 @@
  * sweep uses). Already-terminal records (`filled` / `expired` /
  * `authoritativelyInvalidated`) are excluded — there's nothing matchable left.
  *
- * Order of operations (`runCancelStale`): the cheap, no-passphrase checks run
- * first so a doomed invocation doesn't pay the scrypt cost or prompt the
- * operator:
+ * Order of operations (`runCancelStale`): the cheap, signer-free refusals run
+ * first so a doomed invocation pays no scrypt cost; the per-instance state-loss
+ * check follows the unlock because it needs the maker the unlock reveals:
  *   1. `mode.dryRun: true` → refuse (two-key gate, matches `run --live`).
  *   2. Missing `wallet.keystorePath` → refuse.
- *   3. **State load + boot-time fail-safe** (DESIGN §12 — *same model the runner
- *      uses*): if the state file is missing but prior telemetry exists, the
- *      `softCancelled` set from a prior run is gone; refuse unless
- *      `--ignore-missing-state`. A corrupt state file always refuses. This MUST
- *      run before opening this command's own event log (else `eventLogsExist`
- *      would see our just-created run-id file and miss the prior-telemetry
- *      signal). Catches the failure where a deleted `maker-state.json` followed
- *      by a cancel-stale run would have *erased* the state-loss signal — see
- *      `assessStateLoss`.
- *   4. **Dry-run synthetic-hash guard**: refuse if any loaded record has a
- *      `dry:<runId>:<n>` hash, mirroring `Runner`'s live-mode ctor refusal.
- *      Off-chain DELETE / on-chain cancel against a synthetic hash would
- *      corrupt the local state + spam the relay.
- *   5. *Only now*: unlock the signer (passphrase from `OSPEX_KEYSTORE_PASSPHRASE`
- *      or a TTY prompt) and build the live adapter.
- *   6. Open the event log, identify stale records, run the off-chain + on-chain
- *      legs, flush state (conditionally — see below).
+ *   3. **Corrupt-state + dry-run-synthetic-hash refusals** (cheap, no signer): a
+ *      corrupt state file always refuses (operating without an accurate
+ *      `softCancelled` set would be writing blind); a `dry:<runId>:<n>` synthetic
+ *      hash in a live state refuses, mirroring `Runner`'s live-mode ctor refusal
+ *      (an off-chain DELETE / on-chain cancel against a synthetic hash would
+ *      corrupt local state + spam the relay). Both run before the (expensive) unlock.
+ *   4. **Unlock the signer** (passphrase from `OSPEX_KEYSTORE_PASSPHRASE` or a TTY
+ *      prompt) and resolve the maker wallet (`signer.getAddress()`). The maker is
+ *      resolved here — not last — because it scopes the state-loss check below; a
+ *      Foundry keystore omits the plaintext `address`, so the maker is only knowable
+ *      after the scrypt unlock (the same model the runner uses: `run.ts` unlocks
+ *      before constructing the `Runner`, whose ctor runs the scoped check).
+ *   5. **Boot-time state-loss fail-safe** (DESIGN §12 — *same model the runner
+ *      uses*), **scoped to THIS maker**: if the state file is missing but prior
+ *      telemetry *for this maker* exists, the `softCancelled` set from a prior run
+ *      is gone; refuse unless `--ignore-missing-state`. Scoping to the maker means a
+ *      sibling instance sharing `telemetry.logDir` no longer false-trips the hold
+ *      (matches `src/runners/index.ts`). MUST run before opening this command's own
+ *      event log (else `eventLogsExist` would see our just-created run-id file and
+ *      miss the prior-telemetry signal). Catches the failure where a deleted
+ *      `maker-state.json` followed by a cancel-stale run would have *erased* the
+ *      state-loss signal — see `assessStateLoss`.
+ *   6. Build the live adapter, open the (maker-stamped) event log, identify stale
+ *      records, run the off-chain + on-chain legs, flush state (conditionally —
+ *      see below).
  *
  * **Flush policy**: if the state was `fresh` (no file on disk) AND no records
  * were touched, the command does **not** flush — flushing an empty file would
@@ -77,8 +85,10 @@
  * `ospex-mm run --live` first** to avoid that refusal. The command help and
  * `OPERATOR_SAFETY.md` say so explicitly.
  *
- * Emits its events to a fresh `run-<runId>.ndjson` log under `telemetry.logDir`,
- * so `ospex-mm summary` aggregates them alongside the runner's logs. Returns a
+ * Emits its events to a fresh `run-<runId>.ndjson` log under `telemetry.logDir`
+ * (each line stamped with the maker wallet, so a shared log dir is attributable
+ * per instance), so `ospex-mm summary` aggregates them alongside the runner's
+ * logs. Returns a
  * typed `CancelStaleReport` (counts of inspected / off-chain-cancelled /
  * on-chain-cancelled / gas-denied / errored records) so the CLI can render it
  * (`--json` envelope or human text), and so tests can assert on the outcome.
@@ -134,8 +144,8 @@ export interface CancelStaleDeps {
   acquireStateLock?: (dir: string, identity: StateLockIdentity) => StateLock;
   /** Open the state store for `state.dir`. Default: `StateStore.at`. */
   makeStateStore?: (dir: string) => StateStore;
-  /** Does `telemetry.logDir` hold any prior `run-*.ndjson` files? Default: {@link eventLogsExist}. Captured **before** this command opens its own event log so the prior-telemetry signal is sound (DESIGN §12). */
-  hasPriorTelemetry?: (logDir: string) => boolean;
+  /** Does `telemetry.logDir` hold a prior `run-*.ndjson` for THIS maker? Default: {@link eventLogsExist}. Scoped to the maker (resolved from the unlocked signer) so a sibling instance sharing the dir doesn't false-trip the state-loss hold; captured **before** this command opens its own event log so the prior-telemetry signal is sound (DESIGN §12). */
+  hasPriorTelemetry?: (logDir: string, maker?: string) => boolean;
   /** Wall clock — unix seconds. Default: `Math.floor(Date.now() / 1000)`. */
   now?: () => number;
   /** Human-readable diagnostics. Default: a line to `process.stderr`. */
@@ -256,41 +266,27 @@ async function runCancelStaleLocked(opts: CancelStaleOpts, deps: CancelStaleDeps
   const log = deps.log ?? ((line: string): void => void process.stderr.write(`${line}\n`));
   const now = deps.now ?? ((): number => Math.floor(Date.now() / 1000));
 
-  // ── 2. State load + boot-time fail-safe (DESIGN §12) ─────────────────────
-  // BEFORE opening this command's own event log: capture `hasPriorTelemetry`,
-  // load the state, run `assessStateLoss`. Refuse on:
-  //   - a corrupt state file (always — the operator should diagnose first);
-  //   - a missing state file PLUS prior telemetry (the prior `softCancelled`
-  //     set is gone — same posture as the runner; lifted only by
-  //     `--ignore-missing-state`).
-  // ALSO before the (expensive) signer unlock — a refused command shouldn't
-  // pay the scrypt cost or prompt the operator for a passphrase.
+  // ── 2. State load + corrupt-state refusal (cheap, no signer) ─────────────
+  // Load the state and refuse a corrupt file immediately — operating without an
+  // accurate `softCancelled` set is writing blind. Signer-free, so it runs before
+  // the (expensive) unlock. The MISSING-state half of the fail-safe is deferred to
+  // step 5: it must be scoped to this maker, which a Foundry keystore only reveals
+  // after the unlock.
   const stateStore = (deps.makeStateStore ?? ((dir: string): StateStore => StateStore.at(dir)))(opts.config.state.dir);
-  const hasPriorTelemetry = (deps.hasPriorTelemetry ?? eventLogsExist)(opts.config.telemetry.logDir);
   const loadResult = stateStore.load();
   if (loadResult.status.kind === 'lost') {
     throw new CancelStaleRefused(
       `cancel-stale refuses to run with a corrupt state file (${loadResult.status.reason}). Fix the state at ${stateStore.statePath} before invoking — operating without an accurate softCancelled set would be writing blind.`,
     );
   }
-  const assessment = assessStateLoss(loadResult.status, {
-    hasPriorTelemetry,
-    ignoreMissingStateOverride: opts.ignoreMissingState,
-    expirySeconds: opts.config.orders.expirySeconds,
-  });
-  if (assessment.holdQuoting) {
-    throw new CancelStaleRefused(
-      `cancel-stale refusing: ${assessment.reason} (writing an empty state here would erase the state-loss signal a subsequent run --live boot relies on). Pass --ignore-missing-state only after confirming no prior commitment is still matchable on chain, or manually restore the state file (e.g. from a backup, or by reconstructing it from prior telemetry under \`telemetry.logDir\`) before retrying.`,
-    );
-  }
   const state = loadResult.state;
 
-  // ── 3. Dry-run synthetic-hash guard ──────────────────────────────────────
-  // Mirrors the runner's live-mode ctor refusal (src/runners/index.ts:376-383):
+  // ── 3. Dry-run synthetic-hash guard (cheap, no signer) ───────────────────
+  // Mirrors the runner's live-mode ctor refusal (src/runners/index.ts):
   // a `dry:<runId>:<n>` synthetic hash can never be a real on-chain commitment
   // — off-chain DELETE / on-chain cancel against one corrupts local accounting
   // and spams the relay with bad hashes. Point `state.dir` at a fresh directory,
-  // or clear the dry-run state first.
+  // or clear the dry-run state first. Signer-free, so it runs before the unlock.
   const synthetic = Object.values(state.commitments).find((r) => r.hash.startsWith('dry:'));
   if (synthetic !== undefined) {
     throw new CancelStaleRefused(
@@ -298,9 +294,14 @@ async function runCancelStaleLocked(opts: CancelStaleOpts, deps: CancelStaleDeps
     );
   }
 
-  // ── 4. Signer unlock (only now) ──────────────────────────────────────────
+  // ── 4. Signer unlock + maker resolution ──────────────────────────────────
   // Mirrors `run --live`'s passphrase resolution (env wins; else TTY prompt).
   // A non-TTY / cancelled prompt → CancelStaleRefused with a clear hint.
+  // The maker (`signer.getAddress()`) is resolved here — not last — because it
+  // scopes the state-loss check below (step 5) and stamps this run's telemetry: a
+  // Foundry keystore omits the plaintext `address`, so the maker is only knowable
+  // after the unlock. Same model the runner uses (run.ts unlocks before building
+  // the Runner, whose ctor runs the scoped check).
   const env = deps.env ?? process.env;
   const promptPassphrase = deps.promptPassphrase ?? defaultPromptPassphrase;
   let passphrase: string;
@@ -321,7 +322,28 @@ async function runCancelStaleLocked(opts: CancelStaleOpts, deps: CancelStaleDeps
   const makerAddress = await signer.getAddress();
   log(`[cancel-stale] maker wallet: ${makerAddress}`);
 
-  // ── 5. Open event log + identify stale records ───────────────────────────
+  // ── 5. Boot-time state-loss fail-safe (DESIGN §12), scoped to THIS maker ──
+  // Now that the maker is known, run the missing-state half of the fail-safe: a
+  // missing state file PLUS prior telemetry FOR THIS MAKER means the prior
+  // `softCancelled` set is gone (lifted only by `--ignore-missing-state`). Scoping
+  // the prior-telemetry check to `makerAddress` means a sibling instance sharing
+  // `telemetry.logDir` no longer false-trips the hold — the same scope the runner
+  // applies (src/runners/index.ts). MUST run before opening this command's own
+  // event log (else `eventLogsExist` would see our just-created run-id file and miss
+  // the prior-telemetry signal), and before any state write — see `assessStateLoss`.
+  const hasPriorTelemetry = (deps.hasPriorTelemetry ?? eventLogsExist)(opts.config.telemetry.logDir, makerAddress);
+  const assessment = assessStateLoss(loadResult.status, {
+    hasPriorTelemetry,
+    ignoreMissingStateOverride: opts.ignoreMissingState,
+    expirySeconds: opts.config.orders.expirySeconds,
+  });
+  if (assessment.holdQuoting) {
+    throw new CancelStaleRefused(
+      `cancel-stale refusing: ${assessment.reason} (writing an empty state here would erase the state-loss signal a subsequent run --live boot relies on). Pass --ignore-missing-state only after confirming no prior commitment is still matchable on chain, or manually restore the state file (e.g. from a backup, or by reconstructing it from prior telemetry under \`telemetry.logDir\`) before retrying.`,
+    );
+  }
+
+  // ── 6. Open event log + identify stale records ───────────────────────────
   // Stale set: every still-matchable lifecycle whose age has crossed
   // `orders.staleAfterSeconds`. Includes `partiallyFilled` (the unfilled
   // remainder is still on the API book + matchable; the reconciler treats
@@ -332,8 +354,10 @@ async function runCancelStaleLocked(opts: CancelStaleOpts, deps: CancelStaleDeps
   // (`filled` / `expired` / `authoritativelyInvalidated`) are excluded —
   // there's nothing matchable left to invalidate.
   const adapter = (deps.createLiveAdapter ?? createLiveOspexAdapter)(opts.config, signer);
-  // `runId` is minted by the wrapper (it also stamps the state.dir lock identity).
-  const eventLog = EventLog.open(opts.config.telemetry.logDir, runId);
+  // `runId` is minted by the wrapper (it also stamps the state.dir lock identity);
+  // `makerAddress` stamps every line so a shared `telemetry.logDir` is attributable
+  // per instance and the state-loss check above scopes to this maker (matches the runner).
+  const eventLog = EventLog.open(opts.config.telemetry.logDir, runId, makerAddress);
 
   const wallNow = now();
   const staleAfter = opts.config.orders.staleAfterSeconds;

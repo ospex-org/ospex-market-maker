@@ -26,7 +26,11 @@ afterEach(() => {
 /** Fixed clock so `staleAfterSeconds` math is deterministic. */
 const T0 = 1_900_000_000;
 
-const SIGNER_ADDRESS = '0x9999999999999999999999999999999999999999' as Hex;
+// Deliberately MIXED-CASE (checksummed-style, as a real `signer.getAddress()` returns) so the
+// maker stamp + the maker-scoped state-loss match both exercise the telemetry layer's
+// lowercase-normalization — a live maker that didn't match its own lowercased logs would
+// silently break the scope.
+const SIGNER_ADDRESS = '0xaBcDeF0123456789AbCdEf0123456789aBcDeF01' as Hex;
 
 function fakeSigner(): Signer {
   return {
@@ -136,15 +140,20 @@ function readEvents(runId: string): { kind: string; [k: string]: unknown }[] {
   return readFileSync(path, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l) as { kind: string });
 }
 
-/** Common deps — fixed clock, fake signer unlock, silenced log, no prior telemetry by default. */
-const baseDeps = (): Parameters<typeof runCancelStale>[1] => ({
+/** Common deps WITHOUT `hasPriorTelemetry` — so the real maker-scoped `eventLogsExist` runs against the temp `logDir` (the field is omitted, not set to `undefined`, per `exactOptionalPropertyTypes`). */
+const baseDepsRealTelemetry = (): Parameters<typeof runCancelStale>[1] => ({
   unlockSigner: () => Promise.resolve(fakeSigner()),
   createLiveAdapter: liveAdapter,
   env: { OSPEX_KEYSTORE_PASSPHRASE: 'pw' },
   now: () => T0,
   makeRunId: () => 'cs-run',
-  hasPriorTelemetry: () => false,
   log: () => {},
+});
+
+/** Common deps — fixed clock, fake signer unlock, silenced log, no prior telemetry by default (injected fake). */
+const baseDeps = (): Parameters<typeof runCancelStale>[1] => ({
+  ...baseDepsRealTelemetry(),
+  hasPriorTelemetry: () => false,
 });
 
 // ── refusals (preconditions) ─────────────────────────────────────────────────
@@ -242,13 +251,16 @@ describe('runCancelStale — state.dir lock', () => {
 // ── boot-time state-loss fail-safe (DESIGN §12 / Hermes review-PR30 blocker #2) ─
 
 describe('runCancelStale — state-loss fail-safe', () => {
-  it('fresh state + prior telemetry exists → CancelStaleRefused (the prior softCancelled set is gone — refusing protects the state-loss signal a subsequent run --live boot needs); no signer unlock attempted; no state file written', async () => {
+  it('fresh state + prior telemetry exists → CancelStaleRefused (the prior softCancelled set is gone — refusing protects the state-loss signal a subsequent run --live boot needs); unlocks once to resolve the maker for the scoped check; no state file written', async () => {
     const unlockSigner = vi.fn(() => Promise.resolve(fakeSigner()));
     await expect(runCancelStale(
       { config: liveConfig(), authoritative: false, ignoreMissingState: false },
       { ...baseDeps(), unlockSigner, hasPriorTelemetry: () => true },
     )).rejects.toMatchObject({ name: 'CancelStaleRefused', message: expect.stringMatching(/--ignore-missing-state/) as unknown });
-    expect(unlockSigner).not.toHaveBeenCalled();
+    // The state-loss check is scoped to THIS maker (so a sibling sharing telemetry.logDir
+    // doesn't false-trip it), and a Foundry keystore only reveals the maker after the
+    // unlock — so the signer IS unlocked once before the scoped check (matches the runner).
+    expect(unlockSigner).toHaveBeenCalledTimes(1);
     // Crucial — must NOT have written an empty state file (that would erase the state-loss signal for the next runner boot).
     expect(existsSync(join(stateDir, 'maker-state.json'))).toBe(false);
   });
@@ -294,6 +306,54 @@ describe('runCancelStale — state-loss fail-safe', () => {
       { ...baseDeps(), unlockSigner },
     )).rejects.toMatchObject({ name: 'CancelStaleRefused', message: expect.stringMatching(/dry-run synthetic commitment/) as unknown });
     expect(unlockSigner).not.toHaveBeenCalled();
+  });
+
+  it('fresh state + a SIBLING maker\'s run log in a shared telemetry.logDir → does NOT trip the hold (per-instance scope, via the REAL eventLogsExist); proceeds as a genuine first run', async () => {
+    // The core of the Hermes blocker: a DIFFERENT maker's prior run log sharing this
+    // telemetry.logDir must not force THIS fresh instance into the state-loss hold (that
+    // would train operators to reach for --ignore-missing-state, defeating the fail-safe).
+    // `hasPriorTelemetry: undefined` drops the injected fake so the real maker-scoped
+    // eventLogsExist runs against the temp logDir; the fake signer's maker is SIGNER_ADDRESS.
+    writeFileSync(
+      join(logDir, 'run-sibling.ndjson'),
+      `${JSON.stringify({ ts: '2026-01-01T00:00:00.000Z', runId: 'sibling', maker: '0x1111111111111111111111111111111111111111', kind: 'tick-start' })}\n`,
+      'utf8',
+    );
+    const report = await runCancelStale(
+      { config: liveConfig(), authoritative: false, ignoreMissingState: false },
+      baseDepsRealTelemetry(),
+    );
+    expect(report).toMatchObject({ inspected: 0, runId: 'cs-run' });
+    expect(existsSync(join(stateDir, 'maker-state.json'))).toBe(false);
+  });
+
+  it('fresh state + THIS maker\'s own prior run log in telemetry.logDir → trips the hold (a genuine state loss for this wallet still holds)', async () => {
+    // The other side of the scope: a prior run log for the SAME wallet, with the state
+    // file gone, IS a real state loss (the prior softCancelled set is lost) → must hold.
+    writeFileSync(
+      join(logDir, 'run-prior.ndjson'),
+      `${JSON.stringify({ ts: '2026-01-01T00:00:00.000Z', runId: 'prior', maker: SIGNER_ADDRESS, kind: 'tick-start' })}\n`,
+      'utf8',
+    );
+    await expect(runCancelStale(
+      { config: liveConfig(), authoritative: false, ignoreMissingState: false },
+      baseDepsRealTelemetry(),
+    )).rejects.toMatchObject({ name: 'CancelStaleRefused', message: expect.stringMatching(/--ignore-missing-state/) as unknown });
+    expect(existsSync(join(stateDir, 'maker-state.json'))).toBe(false);
+  });
+
+  it('stamps every emitted telemetry line with the maker wallet (a shared telemetry.logDir is attributable per instance)', async () => {
+    seedState([rec('0xstale', T0 - 200)]); // stale visibleOpen → off-chain cancelled → emits a soft-cancel line
+    const report = await runCancelStale(
+      { config: liveConfig(), authoritative: false, ignoreMissingState: false },
+      baseDeps(),
+    );
+    expect(report.offchainCancelled).toBe(1);
+    const lines = readEvents('cs-run');
+    expect(lines.length).toBeGreaterThan(0);
+    for (const line of lines) {
+      expect(line.maker).toBe(SIGNER_ADDRESS.toLowerCase());
+    }
   });
 });
 

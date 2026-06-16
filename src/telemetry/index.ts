@@ -4,12 +4,16 @@
  * fees / settlement outcomes / realized P&L — see {@link LiveMetrics}; only
  * unrealized P&L over still-active positions remains as a follow-up).
  *
- * Every line of the event log is `{ ts, runId, kind, ...payload }`. **This NDJSON
- * shape is a stable contract** — a future external scorecard consumes it unchanged
- * (DESIGN §11, §16), so this module is treated as a wire boundary and fails closed:
- * `kind` must be a known kind; the `runId` must be filename-safe (it names the
- * file); the payload must be a plain object with none of the reserved keys (`ts` /
- * `runId` / `kind`); and every payload value must be JSON-safe and deterministic —
+ * Every line of the event log is `{ ts, runId, [maker,] kind, ...payload }` — the
+ * `maker` field (the instance's lowercased wallet address) is present on a live run
+ * and absent in dry-run, so a shared `telemetry.logDir` is attributable per instance
+ * and the state-loss fail-safe can scope its "prior run" check to THIS maker (see
+ * `eventLogsExist`). **This NDJSON shape is a stable contract** — a future external
+ * scorecard consumes it unchanged (DESIGN §11, §16), so this module is treated as a
+ * wire boundary and fails closed: `kind` must be a known kind; the `runId` must be
+ * filename-safe (it names the file); the payload must be a plain object with none of
+ * the reserved keys (`ts` / `runId` / `kind` / `maker`); and every payload value
+ * must be JSON-safe and deterministic —
  * `bigint`s, non-finite / unsafe-integer numbers, `undefined`, functions, symbols,
  * and non-plain objects (`Map`, `Date`, class instances, …) all throw rather than
  * being silently dropped or mangled by `JSON.stringify`. Anything that can exceed
@@ -109,7 +113,7 @@ export type CandidateSkipReason = (typeof CANDIDATE_SKIP_REASONS)[number];
 /** Free-form payload for an event-log line — merged into `{ ts, runId, kind }`. See the bigint / reserved-key rules. */
 export type TelemetryPayload = Record<string, unknown>;
 
-const RESERVED_KEYS = ['ts', 'runId', 'kind'] as const;
+const RESERVED_KEYS = ['ts', 'runId', 'kind', 'maker'] as const;
 const KNOWN_KINDS: ReadonlySet<string> = new Set(TELEMETRY_KINDS);
 
 /**
@@ -228,10 +232,13 @@ export function newRunId(): string {
 export class EventLog {
   readonly runId: string;
   readonly path: string;
+  /** The instance's lowercased maker wallet, or `null` (dry-run). Stamped on every emitted line so a shared log dir is attributable per instance. */
+  readonly maker: string | null;
 
-  private constructor(runId: string, path: string) {
+  private constructor(runId: string, path: string, maker: string | null) {
     this.runId = runId;
     this.path = path;
+    this.maker = maker;
   }
 
   /**
@@ -239,13 +246,25 @@ export class EventLog {
    * itself is created on the first `emit`. `runId` must be filename-safe — only
    * letters, digits, `_` and `-` (no path separators, no `..`) — since it becomes
    * part of the file name; use `newRunId()` for a safe one.
+   *
+   * `maker` (optional — the live wallet address) is stamped on every line so a
+   * shared `telemetry.logDir` is attributable per instance and `eventLogsExist`
+   * can scope the state-loss "prior run" check to THIS maker. It is a public
+   * on-chain address (not signing material). Omit it for dry-run.
    */
-  static open(logDir: string, runId: string): EventLog {
+  static open(logDir: string, runId: string, maker?: string): EventLog {
     if (!/^[A-Za-z0-9_-]+$/.test(runId)) {
       throw new Error(`telemetry: runId "${runId}" is not filename-safe — use only letters, digits, "_" and "-" (it becomes part of the log file name); call newRunId() for a safe one`);
     }
+    let normalizedMaker: string | null = null;
+    if (maker !== undefined) {
+      if (!/^0x[0-9a-fA-F]{40}$/.test(maker)) {
+        throw new Error(`telemetry: maker "${maker}" is not a 0x-prefixed 40-hex address`);
+      }
+      normalizedMaker = maker.toLowerCase();
+    }
     mkdirSync(logDir, { recursive: true });
-    return new EventLog(runId, join(logDir, `run-${runId}.ndjson`));
+    return new EventLog(runId, join(logDir, `run-${runId}.ndjson`), normalizedMaker);
   }
 
   /**
@@ -277,7 +296,7 @@ export class EventLog {
     }
     for (const k of RESERVED_KEYS) {
       if (Object.prototype.hasOwnProperty.call(payload, k)) {
-        throw new Error(`telemetry: payload must not set the reserved key "${k}" (the writer owns ts / runId / kind)`);
+        throw new Error(`telemetry: payload must not set the reserved key "${k}" (the writer owns ts / runId / kind / maker)`);
       }
     }
     for (const [key, value] of Object.entries(payload)) {
@@ -295,25 +314,69 @@ export class EventLog {
     // serialization (Hermes PR #64 round 1). The walker returns a fresh
     // sanitized structure so the caller's `payload` object is not mutated.
     const sanitizedPayload = sanitizePayloadValues(payload) as Record<string, unknown>;
-    const line = JSON.stringify({ ts: new Date().toISOString(), runId: this.runId, kind, ...sanitizedPayload });
+    const line = JSON.stringify({
+      ts: new Date().toISOString(),
+      runId: this.runId,
+      ...(this.maker !== null ? { maker: this.maker } : {}),
+      kind,
+      ...sanitizedPayload,
+    });
     appendFileSync(this.path, `${line}\n`, 'utf8');
   }
 }
 
 /**
- * Is there evidence of a prior run under `logDir` — at least one event-log file
- * (`run-*.ndjson`)? The boot path feeds this to `assessStateLoss`'s
- * `hasPriorTelemetry`: a missing state file plus prior telemetry = state loss, not
- * a first run (DESIGN §12). A missing `logDir` means no prior run (`false`); an
- * unreadable one is treated conservatively as a prior run (`true`).
+ * Is there evidence of a prior run under `logDir`? The boot path feeds this to
+ * `assessStateLoss`'s `hasPriorTelemetry`: a missing state file plus prior
+ * telemetry = state loss, not a first run (DESIGN §12). A missing `logDir` means
+ * no prior run (`false`); an unreadable one is treated conservatively as a prior
+ * run (`true`).
+ *
+ * When `maker` is given (a live boot), the check is **scoped to THIS instance**:
+ * only a prior run-log whose lines carry the same `maker` counts. This is the fix
+ * for the shared-`telemetry.logDir` false-trip — a sibling instance's logs (a
+ * different maker) no longer force this fresh-state instance into the state-loss
+ * hold (which would otherwise train operators to reach for `--ignore-missing-state`,
+ * defeating the real fail-safe). A maker-less line (a dry-run sibling, or a log
+ * written before this field existed) is NOT attributable to this instance and is
+ * skipped — so a pre-upgrade run's own legacy logs won't trip the hold; rely on
+ * the `state.dir` lock / `--ignore-missing-state` across that one-time boundary.
+ * A file that can't be read/parsed is counted conservatively (errs toward holding).
+ *
+ * Without `maker` (dry-run, no signer) the check is the original dir-wide
+ * "any `run-*.ndjson`" — dry-run carries no on-chain exposure, so an over-broad
+ * hold there is harmless.
  */
-export function eventLogsExist(logDir: string): boolean {
+export function eventLogsExist(logDir: string, maker?: string): boolean {
+  let names: string[];
   try {
-    return readdirSync(logDir).some((name) => /^run-.+\.ndjson$/.test(name));
+    names = readdirSync(logDir);
   } catch (err) {
     if ((err as { code?: string }).code === 'ENOENT') return false;
-    return true;
+    return true; // unreadable dir — conservative
   }
+  const runLogs = names.filter((name) => /^run-.+\.ndjson$/.test(name));
+  if (maker === undefined) return runLogs.length > 0;
+
+  const wanted = maker.toLowerCase();
+  for (const name of runLogs) {
+    let firstLine: string;
+    try {
+      const text = readFileSync(join(logDir, name), 'utf8');
+      firstLine = text.slice(0, text.indexOf('\n') === -1 ? text.length : text.indexOf('\n'));
+    } catch {
+      return true; // can't read a run log — conservative (a prior run we can't rule out)
+    }
+    if (firstLine.trim() === '') continue;
+    try {
+      const parsed = JSON.parse(firstLine) as { maker?: unknown };
+      if (typeof parsed.maker === 'string' && parsed.maker.toLowerCase() === wanted) return true;
+    } catch {
+      return true; // unparseable run log — conservative
+    }
+    // parsed but maker absent / different → not this instance's prior run; keep scanning.
+  }
+  return false;
 }
 
 /**

@@ -657,9 +657,12 @@ export class Runner {
     };
 
     // Read hasPriorTelemetry BEFORE this run's own (empty) event-log file would be
-    // counted — so check first, then open the log.
-    const hasPriorTelemetry = eventLogsExist(this.config.telemetry.logDir);
-    this.eventLog = EventLog.open(this.config.telemetry.logDir, opts.runId);
+    // counted — so check first, then open the log. In live mode scope the check to
+    // THIS maker so a sibling instance sharing `telemetry.logDir` doesn't false-trip
+    // the state-loss hold (MM#8); the same maker stamps this run's lines.
+    const instanceMaker = this.makerAddress ?? undefined;
+    const hasPriorTelemetry = eventLogsExist(this.config.telemetry.logDir, instanceMaker);
+    this.eventLog = EventLog.open(this.config.telemetry.logDir, opts.runId, instanceMaker);
 
     this.deps.log(`[runner] starting run ${opts.runId} — chain ${this.adapter.chainId}, api ${this.adapter.apiUrl}, mode ${this.config.mode.dryRun ? 'dry-run' : 'live'}`);
 

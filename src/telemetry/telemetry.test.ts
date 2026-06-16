@@ -57,11 +57,29 @@ describe('EventLog', () => {
     expect(() => log.emit('not-a-kind' as TelemetryKind)).toThrow(/unknown event kind/);
   });
 
-  it('rejects a payload that shadows a reserved key (ts / runId / kind)', () => {
+  it('rejects a payload that shadows a reserved key (ts / runId / kind / maker)', () => {
     const log = EventLog.open(dir, 'r');
     expect(() => log.emit('error', { ts: 'spoofed' })).toThrow(/reserved key "ts"/);
     expect(() => log.emit('error', { runId: 'spoofed' })).toThrow(/reserved key "runId"/);
     expect(() => log.emit('error', { kind: 'spoofed' })).toThrow(/reserved key "kind"/);
+    expect(() => log.emit('error', { maker: 'spoofed' })).toThrow(/reserved key "maker"/);
+  });
+
+  it('stamps the maker on every line when opened with one (lowercased); omits it otherwise', () => {
+    const withMaker = EventLog.open(dir, 'live', '0xABCDEF0123456789abcdef0123456789ABCDEF01');
+    withMaker.emit('tick-start');
+    const line = JSON.parse(readFileSync(withMaker.path, 'utf8').trim()) as { maker?: string; kind: string };
+    expect(line.maker).toBe('0xabcdef0123456789abcdef0123456789abcdef01'); // lowercased
+    expect(line.kind).toBe('tick-start');
+
+    const noMaker = EventLog.open(dir, 'dry');
+    noMaker.emit('tick-start');
+    expect('maker' in (JSON.parse(readFileSync(noMaker.path, 'utf8').trim()) as object)).toBe(false);
+  });
+
+  it('rejects a maker that is not a 0x-prefixed 40-hex address', () => {
+    expect(() => EventLog.open(dir, 'r', 'not-an-address')).toThrow(/40-hex address/);
+    expect(() => EventLog.open(dir, 'r', '0x123')).toThrow(/40-hex address/);
   });
 
   it('rejects payload values JSON.stringify would drop / mangle / lose precision on (fail closed — stable wire contract)', () => {
@@ -322,6 +340,29 @@ describe('eventLogsExist', () => {
     const log = EventLog.open(dir, 'somerun');
     log.emit('tick-start');
     expect(eventLogsExist(dir)).toBe(true);
+  });
+
+  describe('maker-scoped (live state-loss check)', () => {
+    const MINE = '0x1111111111111111111111111111111111111111';
+    const THEIRS = '0x2222222222222222222222222222222222222222';
+
+    it('matches only this maker’s prior logs — a sibling maker’s logs do NOT count', () => {
+      EventLog.open(dir, 'theirs', THEIRS).emit('tick-start');
+      expect(eventLogsExist(dir, MINE)).toBe(false); // only a foreign maker present
+      EventLog.open(dir, 'mine', MINE).emit('tick-start');
+      expect(eventLogsExist(dir, MINE)).toBe(true); // now this maker has a prior log
+    });
+
+    it('ignores a maker-less (legacy / dry-run) log when scoped to a maker, but counts it dir-wide', () => {
+      writeFileSync(join(dir, 'run-legacy.ndjson'), '{"ts":"x","runId":"legacy","kind":"tick-start"}\n', 'utf8');
+      expect(eventLogsExist(dir, MINE)).toBe(false); // unattributable → not this instance's
+      expect(eventLogsExist(dir)).toBe(true); // dir-wide (dry-run) still sees it
+    });
+
+    it('counts an unparseable run log conservatively (errs toward the hold)', () => {
+      writeFileSync(join(dir, 'run-corrupt.ndjson'), 'not json\n', 'utf8');
+      expect(eventLogsExist(dir, MINE)).toBe(true);
+    });
   });
 });
 

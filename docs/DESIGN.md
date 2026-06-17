@@ -288,7 +288,7 @@ Mechanism: the presence of a file at `killSwitchFile` (config; default `./KILL`)
 
 ## 7. Config schema
 
-A YAML file (`--config <path>`, default `./ospex-mm.yaml`), validated at boot — invalid or missing required values → exit `1` with a message naming the problem. Env vars override individual fields (`OSPEX_KEYSTORE_PATH`, `OSPEX_RPC_URL`, `OSPEX_API_URL`, `OSPEX_CHAIN_ID`, plus `OSPEX_MM_*`). The repo ships `ospex-mm.example.yaml` — the MLB + moneyline starter config below, conservative caps, `dryRun: true`, short `fixed-seconds` expiry — which doubles as the onboarding doc. A novice typically touches only `rpcUrl`, `pricing.economics`, and maybe `risk` — plus `wallet` when going live.
+A YAML file (`--config <path>`, default `./ospex-mm.yaml`), validated at boot — invalid or missing required values → exit `1` with a message naming the problem. Env vars override individual fields (`OSPEX_KEYSTORE_PATH`, `OSPEX_RPC_URL`, `OSPEX_API_URL`, `OSPEX_CHAIN_ID`). The repo ships `ospex-mm.example.yaml` — the MLB + moneyline starter config below, conservative caps, `dryRun: true`, short `fixed-seconds` expiry — which doubles as the onboarding doc. A novice typically touches only `rpcUrl`, `pricing.economics`, and maybe `risk` — plus `wallet` when going live.
 
 ```yaml
 # ospex-mm.example.yaml — annotated reference config (v0)

@@ -4,9 +4,10 @@
  * tracking → per-market reconcile → age-out → terminal-record prune → state flush;
  * posts nothing). `--live` (Phase 3) is the same loop with the reconcile's writes
  * wired through the SDK — submits via `commitments.submitRaw`, off-chain cancels
- * via `commitments.cancel` — plus fill detection (the per-tick
- * `listOpenCommitments` diff), the position-status poll (mirrors API buckets into
- * the local `MakerPositionStatus`), boot-time auto-approve of the `PositionModule`
+ * via `commitments.cancel` — plus own-state tracking over the owner-auth own-state
+ * SSE stream (canonical since OS-Phase 4: fills + position-status transitions write
+ * `MakerState` directly, with the per-tick `listOpenCommitments` / position-status
+ * probes demoted to a 60s audit cross-check), boot-time auto-approve of the `PositionModule`
  * USDC allowance (`mode: exact` raises to `min(risk-cap ceiling, current wallet
  * USDC)`, deferred while the state-loss hold is active), the daily POL
  * gas-budget verdict (`canSpendGas` gates every on-chain write, denials emit

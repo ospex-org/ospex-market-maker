@@ -7,11 +7,15 @@
  * `0` — a summary is a report, not a check; operational failures (an unreadable log
  * directory or file, a malformed `--since`) throw, and the CLI maps those to exit 1.
  *
- * In dry-run logs (all there are in v0) it computes the would-be-stale rate, the
+ * It computes the dry-run metrics — the would-be-stale rate, the
  * quote-competitiveness numbers, the latent-exposure peak, the quote-age
- * distribution, the candidate-skip histogram, and the error counts. The live-mode
- * metrics — fill rate, P&L, gas, fees, settlement outcomes — are Phase 3 (the live
- * events and their payloads don't exist yet; they show up in `eventCounts`).
+ * distribution, the candidate-skip histogram, and the error counts — from the
+ * dry-run `would-*` events, so on a pure LIVE run those read 0 / empty. It ALSO
+ * aggregates dedicated **live-mode metrics** (`RunSummary.liveMetrics`, rendered
+ * under "Live-mode metrics"): fill rate, settlements, realized P&L, gas, and
+ * fees — from the real submit / fill / settle / claim events. Only unrealized
+ * P&L (active positions marked to current fair) remains future work — the
+ * Phase-3 slice flagged in the rendered output.
  *
  * The `listRunLogs` / `summarize` calls are injectable so the wiring is testable
  * without touching the filesystem.
@@ -103,7 +107,7 @@ export function renderSummaryReportText(summary: RunSummary, logDir: string, out
   } else {
     out.write(`Quote age: no completed quotes\n`);
   }
-  out.write(`Latent-exposure peak: ${formatUsdcWei6(summary.latentExposurePeakWei6)} USDC (${summary.latentExposurePeakWei6} wei6)\n`);
+  out.write(`Latent-exposure peak: ${formatUsdcWei6(summary.latentExposurePeakWei6)} USDC (${summary.latentExposurePeakWei6} wei6) — from dry-run would-* events; reads 0 on a live run\n`);
 
   out.write(`Degraded events: ${histogramText(summary.degradedByReason) || 'none'}\n`);
   out.write(`Errors: ${summary.errors.total}${summary.errors.total > 0 ? ` — by phase: ${histogramText(summary.errors.byPhase)}` : ''}\n`);

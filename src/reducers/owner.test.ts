@@ -1,8 +1,15 @@
 import { describe, expect, it } from 'vitest';
 
-import type { Fill, OwnerCommitment, PositionStatusEvent } from '../ospex/index.js';
+import type {
+  Fill,
+  Hex,
+  OwnerCommitment,
+  PositionStatusEvent,
+  SignedCommitmentPayload,
+} from '../ospex/index.js';
 import {
   emptyMakerState,
+  toMakerSignedPayload,
   type MakerPositionRecord,
   type MakerPositionStatus,
 } from '../state/index.js';
@@ -115,6 +122,23 @@ function makerPosition(status: MakerPositionStatus): MakerPositionRecord {
   };
 }
 
+/** A canonical signed payload for the default `0xabc` commitment (hash must match the record key). */
+const SIGNED_PAYLOAD: SignedCommitmentPayload = {
+  commitmentHash: '0xabc' as Hex,
+  commitment: {
+    maker: OUR_ADDR as Hex,
+    contestId: 1n,
+    scorer: '0xscorer' as Hex,
+    lineTicks: 0,
+    positionType: 0,
+    oddsTick: 250,
+    riskAmount: 250000n,
+    nonce: 1n,
+    expiry: 4070908800n,
+  },
+  signature: '0xsig' as Hex,
+};
+
 // ── reduceOwnerCommitmentObservation (canonical: writes MakerState.commitments) ─
 
 describe('reduceOwnerCommitmentObservation', () => {
@@ -162,6 +186,44 @@ describe('reduceOwnerCommitmentObservation', () => {
     expect(() => reduceOwnerCommitmentObservation(state, ownerCommitment({ speculationId: null }))).toThrow();
     // state untouched on a throw
     expect(state.commitments).toEqual({});
+  });
+
+  it('PRESERVES a previously-captured signedPayload when a later delta arrives WITHOUT one (M#5)', () => {
+    const state = emptyMakerState();
+    // First observation carries the signed bundle → status 'present'.
+    reduceOwnerCommitmentObservation(state, ownerCommitment({ signedPayload: SIGNED_PAYLOAD }));
+    expect(state.commitments['0xabc']?.signedPayloadStatus).toBe('present');
+    expect(state.commitments['0xabc']?.signedPayload).toEqual(toMakerSignedPayload(SIGNED_PAYLOAD));
+    // A later delta (e.g. a fill bump) arrives with signedPayload:null. The
+    // captured bundle is the only handle for an authoritative on-chain cancel —
+    // the wholesale replace must NOT downgrade it to 'missing-legacy'.
+    reduceOwnerCommitmentObservation(
+      state,
+      ownerCommitment({ signedPayload: null, filledRiskAmount: '100000' }),
+    );
+    expect(state.commitments['0xabc']?.filledRiskWei6).toBe('100000'); // the delta still applied
+    expect(state.commitments['0xabc']?.signedPayloadStatus).toBe('present'); // NOT downgraded
+    expect(state.commitments['0xabc']?.signedPayload).toEqual(toMakerSignedPayload(SIGNED_PAYLOAD));
+  });
+
+  it('does NOT fabricate a payload for a commitment that never carried one (stays missing-legacy)', () => {
+    const state = emptyMakerState();
+    reduceOwnerCommitmentObservation(state, ownerCommitment({ signedPayload: null }));
+    reduceOwnerCommitmentObservation(
+      state,
+      ownerCommitment({ signedPayload: null, filledRiskAmount: '100000' }),
+    );
+    expect(state.commitments['0xabc']?.signedPayloadStatus).toBe('missing-legacy');
+    expect(state.commitments['0xabc']?.signedPayload).toBeUndefined();
+  });
+
+  it('UPGRADES missing-legacy → present when a later delta DOES carry the payload', () => {
+    const state = emptyMakerState();
+    reduceOwnerCommitmentObservation(state, ownerCommitment({ signedPayload: null }));
+    expect(state.commitments['0xabc']?.signedPayloadStatus).toBe('missing-legacy');
+    reduceOwnerCommitmentObservation(state, ownerCommitment({ signedPayload: SIGNED_PAYLOAD }));
+    expect(state.commitments['0xabc']?.signedPayloadStatus).toBe('present');
+    expect(state.commitments['0xabc']?.signedPayload).toEqual(toMakerSignedPayload(SIGNED_PAYLOAD));
   });
 });
 

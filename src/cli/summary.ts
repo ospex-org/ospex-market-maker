@@ -7,14 +7,15 @@
  * `0` — a summary is a report, not a check; operational failures (an unreadable log
  * directory or file, a malformed `--since`) throw, and the CLI maps those to exit 1.
  *
- * It computes the would-be-stale rate, the quote-competitiveness numbers, the
- * latent-exposure peak, the quote-age distribution, the candidate-skip histogram,
- * and the error counts — all derived from the dry-run `would-*` events, so on a
- * LIVE run (which emits real submit / fill / settlement events instead) those
- * metrics read 0 / empty. Live-mode metrics — fill rate, P&L, gas, fees,
- * settlement outcomes — are not yet aggregated into dedicated figures; the live
- * events currently surface only in `eventCounts` (dedicated live-metric
- * aggregation is future work).
+ * It computes the dry-run metrics — the would-be-stale rate, the
+ * quote-competitiveness numbers, the latent-exposure peak, the quote-age
+ * distribution, the candidate-skip histogram, and the error counts — from the
+ * dry-run `would-*` events, so on a pure LIVE run those read 0 / empty. It ALSO
+ * aggregates dedicated **live-mode metrics** (`RunSummary.liveMetrics`, rendered
+ * under "Live-mode metrics"): fill rate, settlements, realized P&L, gas, and
+ * fees — from the real submit / fill / settle / claim events. Only unrealized
+ * P&L (active positions marked to current fair) remains future work — the
+ * Phase-3 slice flagged in the rendered output.
  *
  * The `listRunLogs` / `summarize` calls are injectable so the wiring is testable
  * without touching the filesystem.

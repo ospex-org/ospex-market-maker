@@ -847,7 +847,8 @@ describe('OspexAdapter — write surface', () => {
       address: '0x9999999999999999999999999999999999999999',
       success: true,
       entries: [],
-      totals: { claimed: 0, failed: 0, claimedFresh: 0, alreadyClaimed: 0, recoveredAlreadyClaimed: 0, totalPayoutWei6: '0', totalPayoutUSDC: 0 },
+      // settle-leg counts mirror the claim-leg ones (added to ClaimAllResult.totals in @ospex/sdk v0.7.0; additive).
+      totals: { claimed: 0, failed: 0, claimedFresh: 0, alreadyClaimed: 0, recoveredAlreadyClaimed: 0, settledFresh: 0, alreadySettled: 0, recoveredAlreadySettled: 0, totalPayoutWei6: '0', totalPayoutUSDC: 0 },
     };
     const adapter = liveAdapterWith({
       positions: {

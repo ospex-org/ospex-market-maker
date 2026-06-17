@@ -7,11 +7,14 @@
  * `0` — a summary is a report, not a check; operational failures (an unreadable log
  * directory or file, a malformed `--since`) throw, and the CLI maps those to exit 1.
  *
- * In dry-run logs (all there are in v0) it computes the would-be-stale rate, the
- * quote-competitiveness numbers, the latent-exposure peak, the quote-age
- * distribution, the candidate-skip histogram, and the error counts. The live-mode
- * metrics — fill rate, P&L, gas, fees, settlement outcomes — are Phase 3 (the live
- * events and their payloads don't exist yet; they show up in `eventCounts`).
+ * It computes the would-be-stale rate, the quote-competitiveness numbers, the
+ * latent-exposure peak, the quote-age distribution, the candidate-skip histogram,
+ * and the error counts — all derived from the dry-run `would-*` events, so on a
+ * LIVE run (which emits real submit / fill / settlement events instead) those
+ * metrics read 0 / empty. Live-mode metrics — fill rate, P&L, gas, fees,
+ * settlement outcomes — are not yet aggregated into dedicated figures; the live
+ * events currently surface only in `eventCounts` (dedicated live-metric
+ * aggregation is future work).
  *
  * The `listRunLogs` / `summarize` calls are injectable so the wiring is testable
  * without touching the filesystem.
@@ -103,7 +106,7 @@ export function renderSummaryReportText(summary: RunSummary, logDir: string, out
   } else {
     out.write(`Quote age: no completed quotes\n`);
   }
-  out.write(`Latent-exposure peak: ${formatUsdcWei6(summary.latentExposurePeakWei6)} USDC (${summary.latentExposurePeakWei6} wei6)\n`);
+  out.write(`Latent-exposure peak: ${formatUsdcWei6(summary.latentExposurePeakWei6)} USDC (${summary.latentExposurePeakWei6} wei6) — from dry-run would-* events; reads 0 on a live run\n`);
 
   out.write(`Degraded events: ${histogramText(summary.degradedByReason) || 'none'}\n`);
   out.write(`Errors: ${summary.errors.total}${summary.errors.total > 0 ? ` — by phase: ${histogramText(summary.errors.byPhase)}` : ''}\n`);

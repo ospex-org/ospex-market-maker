@@ -25,7 +25,7 @@ The market maker is built on [`@ospex/sdk`](https://github.com/ospex-org/ospex-s
 - **The MM never calls the Ospex contracts directly.** Everything goes through `@ospex/sdk`, and only `src/ospex/` imports it.
 - **No upstream odds-provider names in committed files** — docs, README, code comments, CLI output, telemetry payloads, configs, examples. The SDK's provider-specific wire-field names are confined to `src/ospex/` and mapped to neutral terms (`referenceGameId` / `upstreamGameId`) everywhere else. See `docs/DESIGN.md §16`.
 - **No flow / taker / observer / scorecard code here.** Those exist to exercise a market maker and prove the platform — they belong in a separate test harness, not in this repo. See `docs/DESIGN.md §16`.
-- **No live write paths in Phase 1.** `submit` / cancel / approve are not implemented (not even behind a flag) until Phase 2+; the risk engine's latent-exposure and aggregate-allowance logic is implemented and unit-tested in Phase 1 anyway. See `docs/DESIGN.md §14`.
+- **Live write paths stay gated behind the two-key live model.** `submit` / cancel / approve ARE implemented, but every write is reachable only when BOTH `mode.dryRun: false` in the config AND the `--live` flag are set — either alone runs the shadow (dry-run) loop. Don't add a new write path that can fire without that two-key gate or that bypasses the `dryRun` default. See `docs/DESIGN.md §8` (two-key model) / §14.
 - **Safety defaults stay safe.** Don't loosen `mode.dryRun: true`, the two-key live model, the conservative caps, or the short-expiry default in the example config without a very good reason.
 
 ## Tests

@@ -148,6 +148,17 @@ function positionStatusRank(s: MakerPositionStatus): number {
  * must not wipe it. **Never mutates `state.positions`** (positions are owned by
  * the fill + position-status reducers — bumping them here would double-count).
  *
+ * **Also preserves a previously-captured `signedPayload`** across the replace:
+ * the payload is the MM's only handle for an authoritative on-chain cancel of a
+ * book-hidden row, and it is immutable for a given `commitmentHash` (the hash IS
+ * the EIP-712 digest of the signed struct). A later delta that arrives WITHOUT
+ * it (`signedPayload: null` → `signedPayloadStatus: 'missing-legacy'`, e.g. an
+ * indexer-sourced fill bump that omits the signature) must NOT erase the one the
+ * MM already holds — that would silently strand the row (no payload → no
+ * `cancelOnchain`). The preserve is upgrade-only (missing → present, never the
+ * reverse); a delta that DOES carry the payload uses the delta's (identical for
+ * the same hash).
+ *
  * Emits `mark-dirty` on a lifecycle change so the affected market re-reconciles
  * (e.g. a now-`filled` commitment frees the side to re-quote) — mirrors the
  * poll path's `applyFillToRecord`.
@@ -158,7 +169,16 @@ export function reduceOwnerCommitmentObservation(
 ): ReducerDescriptor[] {
   const mapped = mapOwnerCommitmentToMaker(body);
   const existing = state.commitments[body.commitmentHash];
-  if (existing !== undefined) mapped.fills = existing.fills;
+  if (existing !== undefined) {
+    mapped.fills = existing.fills;
+    // Never DROP a captured signed payload: if this delta lacks one but we
+    // already hold it for this hash, carry it (and its 'present' status)
+    // forward. Immutable per hash, so reusing the prior is always correct.
+    if (mapped.signedPayload === undefined && existing.signedPayload !== undefined) {
+      mapped.signedPayload = existing.signedPayload;
+      mapped.signedPayloadStatus = existing.signedPayloadStatus;
+    }
+  }
   const lifecycleChanged = existing === undefined || existing.lifecycle !== mapped.lifecycle;
   state.commitments[body.commitmentHash] = mapped;
   return lifecycleChanged ? [{ kind: 'mark-dirty', contestId: mapped.contestId }] : [];

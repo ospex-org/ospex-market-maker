@@ -94,7 +94,7 @@
 import { existsSync } from 'node:fs';
 
 import { DEFAULT_PER_IP_OWNER_RESERVE, DEFAULT_PER_IP_STREAM_CAP, RESERVED_OWN_STATE_STREAMS, type Config } from '../config/index.js';
-import { buildDesiredQuote, inventoryFromState, isExpiredForRelease, matchableCommitmentRiskWei6, reconcileBook, referenceOddsFromSdk, type BookReconciliation, type DesiredQuote, type ReferenceOdds, type RetainedPartial, type RetainedPartialReason, type SoftCancelReason } from '../orders/index.js';
+import { buildDesiredQuote, inventoryFromState, isExpiredForRelease, matchableCommitmentRiskWei6, reconcileBook, referenceOddsEqual, referenceOddsFromSdk, type BookReconciliation, type DesiredQuote, type ReferenceOdds, type RetainedPartial, type RetainedPartialReason, type SoftCancelReason } from '../orders/index.js';
 import { OspexStreamError } from '../ospex/index.js';
 import type {
   ApproveResult,
@@ -118,7 +118,9 @@ import type {
   PositionStatus,
   PositionStatusEvent,
   SpeculationView,
+  SpreadOdds,
   Subscription,
+  TotalOdds,
 } from '../ospex/index.js';
 import { decimalToTick, inverseOddsTick, isLineWithinSanityBand, isTickInRange, LineOutOfSanityBandError, oppositeSide, positionTypeForSide, toProtocolQuote, type ProtocolQuote, type QuoteSide } from '../pricing/index.js';
 import {
@@ -358,8 +360,8 @@ export class Runner {
   private readonly eventLog: EventLog;
   private readonly maxTicks: number | undefined;
   private readonly deps: RunnerDeps;
-  /** The chain's moneyline scorer module address — every commitment the MM posts (live) / would post (dry-run) points at it (v0 quotes moneyline only). Cached at boot from `adapter.addresses()`. */
-  private readonly moneylineScorer: Hex;
+  /** The chain's scorer module addresses by market (`moneyline` / `spread` / `total`) — a commitment points at the scorer for its market's type. Cached at boot from `adapter.addresses()`. Moneyline is the only market quoted today; the others are wired for when discovery widens. */
+  private readonly scorers: Record<MarketType, Hex>;
   /**
    * The maker wallet — lowercased `Hex`. Set in live mode (from `RunnerOptions.makerAddress`,
    * which `runRun` derives from `signer.getAddress()`); `null` in dry-run. Used by fill detection
@@ -653,7 +655,7 @@ export class Runner {
       );
     }
     this.makerAddress = opts.makerAddress === undefined ? null : (opts.makerAddress.toLowerCase() as Hex);
-    this.moneylineScorer = this.adapter.addresses().scorers.moneyline;
+    this.scorers = this.adapter.addresses().scorers;
     this.stateStore = opts.stateStore;
     this.maxTicks = opts.maxTicks;
     this.deps = {
@@ -1886,22 +1888,26 @@ export class Runner {
     }
   }
 
-  /** `odds.subscribe: false` mode: snapshot every tracked market's reference odds this tick. A market whose moneyline odds changed since last tick (or had none) is marked dirty (the per-market reconcile re-quotes it); an unchanged one just has its freshness bumped. A per-market failure is logged and skipped. */
+  /** `odds.subscribe: false` mode: snapshot every tracked market's reference odds this tick. A market whose reference odds changed since last tick (or had none) is marked dirty (the per-market reconcile re-quotes it); an unchanged one just has its freshness bumped. A per-market failure is logged and skipped. */
   private async pollTrackedOdds(): Promise<void> {
     for (const m of this.trackedMarkets.values()) {
       const snap = await this.snapshotOdds(m, 'odds-poll');
       if (snap === null) continue;
-      const ml = snap.odds.moneyline;
-      const storedML = m.lastReferenceOdds !== null && m.lastReferenceOdds.market === 'moneyline' ? m.lastReferenceOdds : null;
-      const changed = ml !== null && (storedML === null || storedML.awayOddsAmerican !== ml.awayOddsAmerican || storedML.homeOddsAmerican !== ml.homeOddsAmerican);
-      this.recordOdds(m, ml, { markDirty: changed });
+      const odds = snap.odds[m.marketType];
+      // Did the usable reference move since last tick? Compare the mapped reference odds
+      // market-aware (`referenceOddsEqual`) rather than raw per-side fields, so this is
+      // correct for any market. A partial / missing row maps to `null` (not a move);
+      // `recordOdds` still clears `lastReferenceOdds` + dirties if it had been usable.
+      const next = odds === null ? null : referenceOddsFromSdk(odds);
+      const changed = next !== null && (m.lastReferenceOdds === null || !referenceOddsEqual(m.lastReferenceOdds, next));
+      this.recordOdds(m, odds, { markDirty: changed });
     }
   }
 
   /** Seed a market's reference odds from a one-shot snapshot (DESIGN §10 — "snapshot-first"). A failure is logged (inside `snapshotOdds`) and ignored: the SSE odds stream will deliver odds on its first `onChange`. */
   private async seedOdds(m: TrackedMarket): Promise<void> {
     const snap = await this.snapshotOdds(m, 'odds-seed');
-    if (snap !== null) this.recordOdds(m, snap.odds.moneyline, { markDirty: true });
+    if (snap !== null) this.recordOdds(m, snap.odds[m.marketType], { markDirty: true });
   }
 
   /** One-shot reference-odds snapshot for a market; logs an `error` (with the given `phase`) and returns `null` on failure. */
@@ -1915,8 +1921,9 @@ export class Runner {
   }
 
   /**
-   * Open the core-api SSE odds stream for a market's reference moneyline odds and
-   * install it on the market (`m.subscription`), wiring all five handlers:
+   * Open the core-api SSE odds stream for a market's reference odds (the stream is
+   * opened for the market's own `marketType`) and install it on the market
+   * (`m.subscription`), wiring all five handlers:
    * `onSnapshot` (the baseline on connect / after a degraded recovery → store +
    * mark dirty), `onChange` (a price move → store, bump freshness, mark dirty),
    * `onRefresh` (a no-change re-poll → store, bump freshness), `onStatus` (surface
@@ -1937,7 +1944,10 @@ export class Runner {
    */
   private async subscribeMarketOdds(m: TrackedMarket): Promise<boolean> {
     let thisSub: Subscription | null = null;
-    const handlers: OddsSubscribeHandlers<MoneylineOdds> = {
+    // The stream delivers the subscribed market's shape; `recordOdds` maps any of the
+    // three via `referenceOddsFromSdk`. Moneyline is all that's tracked today, but the
+    // handlers are typed to the union so a spread / total stream needs no change here.
+    const handlers: OddsSubscribeHandlers<MoneylineOdds | SpreadOdds | TotalOdds> = {
       onSnapshot: (odds) => {
         if (thisSub === null || m.subscription !== thisSub) return; // a delivery from an already-replaced channel
         this.recordOdds(m, odds, { markDirty: true });
@@ -1973,7 +1983,7 @@ export class Runner {
       },
     };
     try {
-      const sub = await this.adapter.subscribeOdds({ contestId: m.contestId, market: 'moneyline' }, handlers);
+      const sub = await this.adapter.subscribeOdds<MarketType>({ contestId: m.contestId, market: m.marketType }, handlers);
       thisSub = sub;
       m.subscription = sub; // installed synchronously after the await resolves — no gap for a handler to race with
       return true;
@@ -1997,7 +2007,7 @@ export class Runner {
    * dead, it just has no usable odds). Otherwise store the new odds and set `dirty` if
    * `markDirty` (the caller's "the price moved / appeared" signal).
    */
-  private recordOdds(m: TrackedMarket, odds: MoneylineOdds | null, opts: { markDirty: boolean }): void {
+  private recordOdds(m: TrackedMarket, odds: MoneylineOdds | SpreadOdds | TotalOdds | null, opts: { markDirty: boolean }): void {
     m.lastOddsAt = this.deps.now();
     const ref = odds === null ? null : referenceOddsFromSdk(odds);
     if (ref === null) {
@@ -2712,7 +2722,7 @@ export class Runner {
       try {
         const result = await this.adapter.submitCommitment({
           contestId: BigInt(m.contestId),
-          scorer: this.moneylineScorer,
+          scorer: this.scorers[m.marketType],
           lineTicks,
           positionType: proto.positionType,
           oddsTick: proto.makerOddsTick,
@@ -2754,7 +2764,7 @@ export class Runner {
       sport: m.sport,
       awayTeam: m.awayTeam,
       homeTeam: m.homeTeam,
-      scorer: this.moneylineScorer,
+      scorer: this.scorers[m.marketType],
       makerSide: proto.makerSide,
       oddsTick: proto.makerOddsTick,
       riskAmountWei6: String(qs.sizeWei6),

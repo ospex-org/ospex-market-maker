@@ -4,12 +4,14 @@ import { parseConfig, type Config } from '../config/index.js';
 import { decimalToAmerican, decimalToImpliedProb, tickToDecimal, toProtocolQuote, type QuoteSide } from '../pricing/index.js';
 import type { ExposureItem, Inventory, Market } from '../risk/index.js';
 import { emptyMakerState, type MakerCommitmentRecord, type MakerPositionRecord, type MakerState } from '../state/index.js';
-import { breakdownReferenceOdds, buildDesiredQuote, inventoryFromState, isExpiredForRelease, matchableCommitmentRiskWei6, reconcileBook, toRiskCaps, type BookReconciliation, type DesiredQuote } from './index.js';
+import { breakdownReferenceOdds, buildDesiredQuote, inventoryFromState, isExpiredForRelease, matchableCommitmentRiskWei6, reconcileBook, toRiskCaps, type BookReconciliation, type DesiredQuote, type ReferenceOdds } from './index.js';
 
 const cfg = (overrides: Record<string, unknown> = {}): Config => parseConfig({ rpcUrl: 'http://localhost:8545', ...overrides });
 
 const MARKET: Market = { contestId: 'C1', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD' };
 const EMPTY: Inventory = { items: [], openCommitmentCount: 0 };
+/** A moneyline `ReferenceOdds` from a per-side American pair (the buildDesiredQuote default-market input). */
+const ml = (away: number, home: number): ReferenceOdds => ({ market: 'moneyline', awayOddsAmerican: away, homeOddsAmerican: home });
 function inventoryWith(items: ExposureItem[]): Inventory {
   return { items, openCommitmentCount: items.length };
 }
@@ -138,7 +140,7 @@ describe('toRiskCaps', () => {
 
 describe('buildDesiredQuote', () => {
   it('prices a two-sided quote against an empty inventory (default economics config)', () => {
-    const d = buildDesiredQuote(cfg(), MARKET, { away: 150, home: -180 }, EMPTY);
+    const d = buildDesiredQuote(cfg(), MARKET, ml(150, -180), EMPTY);
     expect(d.referenceOdds).not.toBeNull();
     expect(d.referenceOdds?.overround).toBeGreaterThan(0);
     // Empty inventory + default caps → headroom on each side is the per-commitment cap (0.25), the smallest.
@@ -159,7 +161,7 @@ describe('buildDesiredQuote', () => {
     // 1 - 0.9 ≈ 0.1, perTeam(LAD) 2 - 0.9, perSport 5 - 0.9, bankroll 25 - 0.9) ≈ 0.1. The home offer
     // (a maker-on-away commitment) is untouched: home-offer headroom = min(0.25, 1 - 0, 2 - 0, ...) = 0.25.
     const inv = inventoryWith([{ contestId: 'C1', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', makerSide: 'home', riskAmountUSDC: 0.9 }]);
-    const d = buildDesiredQuote(cfg(), MARKET, { away: 150, home: -180 }, inv);
+    const d = buildDesiredQuote(cfg(), MARKET, ml(150, -180), inv);
     expect(d.headroomUSDC.away).toBeCloseTo(0.1, 6);
     expect(d.headroomUSDC.home).toBeCloseTo(0.25, 9);
     // Both offers still quoted, but the away offer is the smaller one (its headroom ≈ 0.1 binds, vs the home offer's 0.25).
@@ -173,7 +175,7 @@ describe('buildDesiredQuote', () => {
     // 1.5 USDC of maker-on-home exposure on C1 → over the per-contest cap of 1 in the "away wins" bucket
     // → the away offer (a maker-on-home commitment) has 0 headroom and is pulled. The home offer is fine.
     const inv = inventoryWith([{ contestId: 'C1', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', makerSide: 'home', riskAmountUSDC: 1.5 }]);
-    const d = buildDesiredQuote(cfg(), MARKET, { away: 150, home: -180 }, inv);
+    const d = buildDesiredQuote(cfg(), MARKET, ml(150, -180), inv);
     expect(d.headroomUSDC.away).toBe(0);
     expect(d.result.away).toBeNull();
     // home offer still has headroom
@@ -181,14 +183,14 @@ describe('buildDesiredQuote', () => {
   });
 
   it('reports canQuote: false when the math refuses (direct spread far exceeds the consensus overround)', () => {
-    const d = buildDesiredQuote(cfg({ pricing: { mode: 'direct', direct: { spreadBps: 9000 } } }), MARKET, { away: 150, home: -180 }, EMPTY);
+    const d = buildDesiredQuote(cfg({ pricing: { mode: 'direct', direct: { spreadBps: 9000 } } }), MARKET, ml(150, -180), EMPTY);
     expect(d.result.canQuote).toBe(false);
     expect(d.result.notes.some((n) => n.startsWith('REFUSE:'))).toBe(true);
   });
 
   it('refuses (both sides null) when the open-commitment count cap is hit — even with positive exposure headroom', () => {
     // openCommitmentCount 1 / maxOpenCommitments 1 → verdictForMarket refuses, but headroomForSide over an empty `items` array is still the full per-commitment cap.
-    const d = buildDesiredQuote(cfg({ risk: { maxOpenCommitments: 1 } }), MARKET, { away: 150, home: -180 }, { items: [], openCommitmentCount: 1 });
+    const d = buildDesiredQuote(cfg({ risk: { maxOpenCommitments: 1 } }), MARKET, ml(150, -180), { items: [], openCommitmentCount: 1 });
     expect(d.result.canQuote).toBe(false);
     expect(d.result.away).toBeNull();
     expect(d.result.home).toBeNull();
@@ -199,7 +201,7 @@ describe('buildDesiredQuote', () => {
   });
 
   it('refuses (referenceOdds: null) when the upstream reference odds are out of range — does not throw', () => {
-    for (const bad of [{ away: 0, home: -180 }, { away: Number.NaN, home: -180 }, { away: Number.POSITIVE_INFINITY, home: -180 }] as const) {
+    for (const bad of [ml(0, -180), ml(Number.NaN, -180), ml(Number.POSITIVE_INFINITY, -180)]) {
       const d = buildDesiredQuote(cfg(), MARKET, bad, EMPTY);
       expect(d.referenceOdds).toBeNull();
       expect(d.result.canQuote).toBe(false);
@@ -212,9 +214,24 @@ describe('buildDesiredQuote', () => {
   });
 
   it('carries the spread mode through (economics vs direct)', () => {
-    expect(buildDesiredQuote(cfg(), MARKET, { away: 150, home: -180 }, EMPTY).result.targetMonthlyReturnUSDC).not.toBeNull(); // economics mode populates these
-    const direct = buildDesiredQuote(cfg({ pricing: { mode: 'direct', direct: { spreadBps: 200 } } }), MARKET, { away: 150, home: -180 }, EMPTY);
+    expect(buildDesiredQuote(cfg(), MARKET, ml(150, -180), EMPTY).result.targetMonthlyReturnUSDC).not.toBeNull(); // economics mode populates these
+    const direct = buildDesiredQuote(cfg({ pricing: { mode: 'direct', direct: { spreadBps: 200 } } }), MARKET, ml(150, -180), EMPTY);
     expect(direct.result.targetMonthlyReturnUSDC).toBeNull(); // direct mode has no economics diagnostics
+  });
+
+  it('dispatches a spread ReferenceOdds to the spread adapter — a two-sided cover quote', () => {
+    const d = buildDesiredQuote(cfg(), MARKET, { market: 'spread', awayLine: 1.5, homeLine: -1.5, awayOddsAmerican: 152, homeOddsAmerican: -176 }, EMPTY);
+    expect(d.result.canQuote).toBe(true);
+    expect(d.result.away).not.toBeNull();
+    expect(d.result.home).not.toBeNull();
+  });
+
+  it('dispatches a total ReferenceOdds to the total adapter, relabelling over→away / under→home (protocol-correct)', () => {
+    const d = buildDesiredQuote(cfg(), MARKET, { market: 'total', line: 7.5, overOddsAmerican: 104, underOddsAmerican: -123 }, EMPTY);
+    expect(d.result.canQuote).toBe(true);
+    // result.away is the OVER side; via toProtocolQuote the maker of an over offer is on under (home/Lower/1).
+    expect(toProtocolQuote({ side: d.result.away!.takerSide, oddsTick: d.result.away!.quoteTick })).toMatchObject({ makerSide: 'home', positionType: 1 });
+    expect(toProtocolQuote({ side: d.result.home!.takerSide, oddsTick: d.result.home!.quoteTick })).toMatchObject({ makerSide: 'away', positionType: 0 });
   });
 });
 
@@ -379,14 +396,14 @@ describe('expiry-release grace — interleaving G (sizing safety)', () => {
 
     // The away offer is served by a maker-on-home commitment, so it draws on the same outcome bucket as
     // the within-grace one. Per-contest cap 1.0; the within-grace 0.9 leaves only 0.1 of headroom.
-    const d = buildDesiredQuote(cfg(), MARKET, { away: 150, home: -180 }, graced);
+    const d = buildDesiredQuote(cfg(), MARKET, ml(150, -180), graced);
     expect(d.headroomUSDC.away).toBeCloseTo(0.1, 6); // 0.9 (old remaining) + 0.1 (max repost) = the 1.0 per-contest cap
 
     // Contrast: at grace 0 the commitment is released from the inventory and the headroom jumps back to
     // the per-commitment cap (0.25) — so 0.9 (still matchable on chain) + 0.25 would breach the 1.0 cap.
     const released = inventoryFromState(stateWith({ commitments: { g: within } }), NOW, 0);
     expect(released.openCommitmentCount).toBe(0);
-    const dReleased = buildDesiredQuote(cfg(), MARKET, { away: 150, home: -180 }, released);
+    const dReleased = buildDesiredQuote(cfg(), MARKET, ml(150, -180), released);
     expect(dReleased.headroomUSDC.away).toBeCloseTo(0.25, 6);
     expect(0.9 + dReleased.headroomUSDC.away).toBeGreaterThan(1.0); // the breach the grace prevents
   });

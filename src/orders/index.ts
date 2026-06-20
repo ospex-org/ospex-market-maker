@@ -37,18 +37,21 @@ import {
   decimalToImpliedProb,
   inverseOddsTick,
   oppositeSide,
+  priceSpread,
+  priceTotal,
   tickToDecimal,
   wei6ToUSDC,
-  type QuoteInputs,
   type QuoteResult,
   type QuoteSide,
+  type SpreadPricing,
 } from '../pricing/index.js';
 import { headroomForSide, verdictForMarket, type ExposureItem, type Inventory, type MakerSide, type Market, type RiskCaps } from '../risk/index.js';
 import { isTerminalPositionStatus, type CommitmentLifecycle, type MakerCommitmentRecord, type MakerState } from '../state/index.js';
+import type { ReferenceOdds } from './reference-odds.js';
 
 // Reference-odds ingestion: the SDK per-market odds shape → the MM's usable
-// `ReferenceOdds`. Re-exported so the (forthcoming) spread / total pricing
-// strategies and line-keyed discovery consume one entry point.
+// `ReferenceOdds`. Re-exported so the spread / total pricing adapters and
+// line-keyed discovery consume one entry point.
 export { referenceOddsFromSdk, type ReferenceOdds } from './reference-odds.js';
 
 // ── types ────────────────────────────────────────────────────────────────────
@@ -77,12 +80,6 @@ export interface DesiredQuote {
    */
   headroomUSDC: { away: number; home: number };
   result: QuoteResult;
-}
-
-/** Reference moneyline odds as the upstream surfaces them (American). `null` per side when not populated. */
-export interface ReferenceMoneylineAmerican {
-  away: number;
-  home: number;
 }
 
 /** Why the runner would replace a commitment: pull it off-chain → post a fresh one at the current price. */
@@ -176,18 +173,30 @@ export interface BookReconciliation {
 export function buildDesiredQuote(
   config: Config,
   market: Market,
-  refOdds: ReferenceMoneylineAmerican,
+  refOdds: ReferenceOdds,
   inventory: Inventory,
 ): DesiredQuote {
   const caps = toRiskCaps(config);
   // Headroom per *taker offer*: the away offer becomes a maker-on-home commitment
   // (it loses if away wins, counts toward the home-team cap), so it's sized by the
   // maker-on-home headroom — and vice versa. See `toProtocolQuote` / DESIGN §5–§6.
+  // Spread cover sides are away/home like moneyline; total over/under map to the
+  // away (Upper/over) and home (Lower/under) protocol sides — `priceTotal` is
+  // relabelled back to away/home below so the planning chain stays two-outcome.
+  // (The risk buckets are still moneyline-shaped here — per-market buckets land
+  // with the risk-engine generalization; spread/total aren't quoted live yet.)
   const headroomUSDC = {
     away: headroomForSide(inventory, market, 'home', caps),
     home: headroomForSide(inventory, market, 'away', caps),
   };
-  const referenceOdds = tryBreakdownReferenceOdds(refOdds);
+
+  // The two-way reference juice (for the breakdown + the refusal message), in
+  // protocol-side order: moneyline / spread away/home, total over/under.
+  const [side1American, side2American] =
+    refOdds.market === 'total'
+      ? [refOdds.overOddsAmerican, refOdds.underOddsAmerican]
+      : [refOdds.awayOddsAmerican, refOdds.homeOddsAmerican];
+  const referenceOdds = tryBreakdownReferenceOdds(side1American, side2American);
 
   const verdict = verdictForMarket(inventory, market, caps);
   if (!verdict.allowed) {
@@ -197,12 +206,39 @@ export function buildDesiredQuote(
     return {
       referenceOdds: null,
       headroomUSDC,
-      result: refusedResult([`REFUSE: reference moneyline odds are invalid / out of range (away=${refOdds.away}, home=${refOdds.home})`]),
+      result: refusedResult([`REFUSE: reference ${refOdds.market} odds are invalid / out of range (side1=${side1American}, side2=${side2American})`]),
     };
   }
 
-  const inputs = buildQuoteInputs(config, referenceOdds, headroomUSDC.away, headroomUSDC.home);
-  const result = computeQuote(inputs);
+  const pricing = buildMarketPricing(config, headroomUSDC.away, headroomUSDC.home);
+  let result: QuoteResult;
+  switch (refOdds.market) {
+    case 'moneyline':
+      result = computeQuote({ ...pricing, consensusAwayDecimal: referenceOdds.awayDecimal, consensusHomeDecimal: referenceOdds.homeDecimal });
+      break;
+    case 'spread':
+      result = priceSpread(
+        { awayLine: refOdds.awayLine, homeLine: refOdds.homeLine, awayOddsAmerican: refOdds.awayOddsAmerican, homeOddsAmerican: refOdds.homeOddsAmerican },
+        pricing,
+      ).result;
+      break;
+    case 'total': {
+      // Relabel the over/under quote back to the two-outcome away/home `QuoteResult`
+      // the planning chain (`reconcileBook`) expects: over = away/Upper, under = home/Lower.
+      const tq = priceTotal({ line: refOdds.line, overOddsAmerican: refOdds.overOddsAmerican, underOddsAmerican: refOdds.underOddsAmerican }, pricing);
+      result = {
+        canQuote: tq.canQuote,
+        away: tq.over,
+        home: tq.under,
+        fair: tq.fair,
+        spread: tq.spread,
+        targetMonthlyReturnUSDC: tq.targetMonthlyReturnUSDC,
+        expectedMonthlyFilledVolumeUSDC: tq.expectedMonthlyFilledVolumeUSDC,
+        notes: tq.notes,
+      };
+      break;
+    }
+  }
   return { referenceOdds, headroomUSDC, result };
 }
 
@@ -551,9 +587,9 @@ export function breakdownReferenceOdds(awayOddsAmerican: number, homeOddsAmerica
 }
 
 /** Like `breakdownReferenceOdds`, but returns `null` (instead of throwing) when the upstream odds are out of `americanToDecimal`'s acceptable range — the caller turns that into a refusal rather than crashing the tick (DESIGN §2.2 — refuse on bad reference data). */
-function tryBreakdownReferenceOdds(refOdds: ReferenceMoneylineAmerican): ReferenceOddsBreakdown | null {
+function tryBreakdownReferenceOdds(side1American: number, side2American: number): ReferenceOddsBreakdown | null {
   try {
-    return breakdownReferenceOdds(refOdds.away, refOdds.home);
+    return breakdownReferenceOdds(side1American, side2American);
   } catch {
     return null;
   }
@@ -586,16 +622,15 @@ export function toRiskCaps(config: Config): RiskCaps {
   };
 }
 
-function buildQuoteInputs(
-  config: Config,
-  refOdds: ReferenceOddsBreakdown,
-  awayHeadroomUSDC: number,
-  homeHeadroomUSDC: number,
-): QuoteInputs {
+/**
+ * The pricing scalars + spread-derivation mode shared by every market's quote
+ * construction (`computeQuote` for moneyline, `priceSpread` / `priceTotal` for the
+ * others) — everything `computeQuote` needs EXCEPT the reference odds, which each
+ * market sources from its own juice. Mirrors `SpreadPricing` / `TotalPricing`.
+ */
+function buildMarketPricing(config: Config, awayHeadroomUSDC: number, homeHeadroomUSDC: number): SpreadPricing {
   const { capitalUSDC, ...economicsRest } = config.pricing.economics;
   const common = {
-    consensusAwayDecimal: refOdds.awayDecimal,
-    consensusHomeDecimal: refOdds.homeDecimal,
     capitalUSDC,
     maxPerQuotePctOfCapital: config.pricing.maxPerQuotePctOfCapital,
     minEdgeBps: config.pricing.minEdgeBps,

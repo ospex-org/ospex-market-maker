@@ -2200,7 +2200,7 @@ export class Runner {
     // Price → plan → apply.
     const market: Market = { contestId: m.contestId, sport: m.sport, awayTeam: m.awayTeam, homeTeam: m.homeTeam };
     const inventory = inventoryFromState(this.state, now, this.config.orders.expiryReleaseGraceSeconds);
-    const desired = buildDesiredQuote(this.config, market, { away: ml.awayOddsAmerican, home: ml.homeOddsAmerican }, inventory);
+    const desired = buildDesiredQuote(this.config, market, { market: 'moneyline', awayOddsAmerican: ml.awayOddsAmerican, homeOddsAmerican: ml.homeOddsAmerican }, inventory);
     this.eventLog.emit('quote-intent', {
       contestId: m.contestId,
       speculationId: m.speculationId,

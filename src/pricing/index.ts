@@ -31,6 +31,13 @@ export {
 } from './markets/spread.js';
 
 export {
+  priceTotal,
+  type TotalReference,
+  type TotalPricing,
+  type TotalQuote,
+} from './markets/total.js';
+
+export {
   americanToDecimal,
   decimalToAmerican,
   decimalToImpliedProb,

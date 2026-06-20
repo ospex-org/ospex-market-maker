@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import type { MoneylineOdds, SpreadOdds, TotalOdds } from '../ospex/index.js';
-import { referenceOddsFromSdk, type ReferenceOdds } from './reference-odds.js';
+import { referenceOddsEqual, referenceOddsFromSdk, type ReferenceOdds } from './reference-odds.js';
 
 // Every SDK odds shape extends OddsTimestamps; a real delivery carries them. The
 // mapper must ignore them (they're liveness metadata, not pricing inputs).
@@ -88,5 +88,55 @@ describe('referenceOddsFromSdk', () => {
     expect(referenceOddsFromSdk(spread(0, 0, -110, -110))).toMatchObject({ market: 'spread', awayLine: 0, homeLine: 0 });
     // (total line is contract-bounded >= 0; a 0 total is degenerate but still "present")
     expect(referenceOddsFromSdk(total(0, -110, -110))).toMatchObject({ market: 'total', line: 0 });
+  });
+});
+
+// ── reference-odds change-detection (polling-fallback ingestion) ────────────────
+//
+// `referenceOddsEqual` decides whether the reference moved since last tick (and the
+// market must re-quote). It is market-aware: identical iff same market AND every
+// pricing-relevant field matches. Built from the real mapper so the test exercises
+// the shapes the runner actually compares.
+
+describe('referenceOddsEqual', () => {
+  const ref = (odds: Parameters<typeof referenceOddsFromSdk>[0]): ReferenceOdds => {
+    const r = referenceOddsFromSdk(odds);
+    if (r === null) throw new Error('test fixture must be fully priced');
+    return r;
+  };
+
+  it('a market is equal to itself, field-for-field (no spurious re-quote on an unchanged poll)', () => {
+    expect(referenceOddsEqual(ref(moneyline(-150, 130)), ref(moneyline(-150, 130)))).toBe(true);
+    expect(referenceOddsEqual(ref(spread(1.5, -1.5, 152, -176)), ref(spread(1.5, -1.5, 152, -176)))).toBe(true);
+    expect(referenceOddsEqual(ref(total(7.5, 104, -123)), ref(total(7.5, 104, -123)))).toBe(true);
+  });
+
+  it('moneyline: any side-price move is a change', () => {
+    expect(referenceOddsEqual(ref(moneyline(-150, 130)), ref(moneyline(-148, 130)))).toBe(false); // away juice moved
+    expect(referenceOddsEqual(ref(moneyline(-150, 130)), ref(moneyline(-150, 132)))).toBe(false); // home juice moved
+  });
+
+  it('spread: a line move OR a side-price move is a change (the line matters, not just juice)', () => {
+    const base = ref(spread(1.5, -1.5, 152, -176));
+    expect(referenceOddsEqual(base, ref(spread(2.5, -2.5, 152, -176)))).toBe(false); // both lines moved together
+    // Each line field is compared independently — move one in isolation (a synthetic
+    // shape; real run-lines mirror, but the equality check must not depend on that).
+    expect(referenceOddsEqual(base, ref(spread(2.5, -1.5, 152, -176)))).toBe(false); // away line only
+    expect(referenceOddsEqual(base, ref(spread(1.5, -2.5, 152, -176)))).toBe(false); // home line only
+    expect(referenceOddsEqual(base, ref(spread(1.5, -1.5, 150, -176)))).toBe(false); // away juice moved
+    expect(referenceOddsEqual(base, ref(spread(1.5, -1.5, 152, -174)))).toBe(false); // home juice moved
+  });
+
+  it('total: a line move OR an over/under-price move is a change', () => {
+    const base = ref(total(7.5, 104, -123));
+    expect(referenceOddsEqual(base, ref(total(8.5, 104, -123)))).toBe(false); // line moved
+    expect(referenceOddsEqual(base, ref(total(7.5, 106, -123)))).toBe(false); // over juice moved
+    expect(referenceOddsEqual(base, ref(total(7.5, 104, -125)))).toBe(false); // under juice moved
+  });
+
+  it('different markets are never equal (a contest can carry moneyline + spread + total at once)', () => {
+    expect(referenceOddsEqual(ref(moneyline(-150, 130)), ref(spread(1.5, -1.5, 152, -176)))).toBe(false);
+    expect(referenceOddsEqual(ref(spread(1.5, -1.5, 152, -176)), ref(total(7.5, 104, -123)))).toBe(false);
+    expect(referenceOddsEqual(ref(total(7.5, 104, -123)), ref(moneyline(-150, 130)))).toBe(false);
   });
 });

@@ -80,3 +80,31 @@ export function referenceOddsFromSdk(odds: MoneylineOdds | SpreadOdds | TotalOdd
     }
   }
 }
+
+/**
+ * True iff two {@link ReferenceOdds} carry the same market AND identical fields.
+ * The change-detector the polling-fallback ingestion (`odds.subscribe: false`) uses
+ * to decide whether the reference moved since last tick — and therefore whether the
+ * market must re-quote. Market-aware: it compares exactly the fields that define each
+ * market type (moneyline / spread side prices; spread lines + side prices; total line +
+ * over/under prices), so it is correct for all three without per-caller branching.
+ * (A re-quote *threshold* — re-quote only on a move beyond N ticks — is a later layer;
+ * this is exact equality, matching today's "any move re-quotes" moneyline behavior.)
+ */
+export function referenceOddsEqual(a: ReferenceOdds, b: ReferenceOdds): boolean {
+  if (a.market !== b.market) return false;
+  switch (a.market) {
+    case 'moneyline':
+      return b.market === 'moneyline' && a.awayOddsAmerican === b.awayOddsAmerican && a.homeOddsAmerican === b.homeOddsAmerican;
+    case 'spread':
+      return (
+        b.market === 'spread' &&
+        a.awayLine === b.awayLine &&
+        a.homeLine === b.homeLine &&
+        a.awayOddsAmerican === b.awayOddsAmerican &&
+        a.homeOddsAmerican === b.homeOddsAmerican
+      );
+    case 'total':
+      return b.market === 'total' && a.line === b.line && a.overOddsAmerican === b.overOddsAmerican && a.underOddsAmerican === b.underOddsAmerican;
+  }
+}

@@ -52,7 +52,7 @@ import type { ReferenceOdds } from './reference-odds.js';
 // Reference-odds ingestion: the SDK per-market odds shape → the MM's usable
 // `ReferenceOdds`. Re-exported so the spread / total pricing adapters and
 // line-keyed discovery consume one entry point.
-export { referenceOddsFromSdk, type ReferenceOdds } from './reference-odds.js';
+export { referenceOddsEqual, referenceOddsFromSdk, type ReferenceOdds } from './reference-odds.js';
 
 // ── types ────────────────────────────────────────────────────────────────────
 

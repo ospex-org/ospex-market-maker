@@ -3512,6 +3512,7 @@ describe('Runner — odds subscriptions', () => {
     expect(snapshotCalls).toBe(1); // seeded before subscribing
     expect(recorder.successfulCalls()).toEqual(['A']);
     expect(runner.trackedMarketView('A')).toMatchObject({
+      marketType: 'moneyline', // the tracked-market identity surfaces on the view (the map keys on contestId:marketType:lineTicks)
       subscribed: true,
       lastReferenceOdds: { awayOddsAmerican: -150, homeOddsAmerican: 130 },
       lastOddsAt: T0,

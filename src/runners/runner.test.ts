@@ -28,6 +28,8 @@ import {
   type PositionStatus,
   type Signer,
   type SpeculationView,
+  type SpreadOdds,
+  type TotalOdds,
   type SubmitCommitmentArgs,
   type SubmitCommitmentResult,
   type Subscription,
@@ -188,6 +190,14 @@ function moneylineOdds(awayOddsAmerican: number | null, homeOddsAmerican: number
 /** A one-shot odds snapshot for a contest — the moneyline defaults to `-110 / -110`; pass `null` for "no moneyline row yet". Provider-neutral (0.3.0): no referenceGameId on the odds surface. The live `onChange` / `onRefresh` payloads use `moneylineOdds(...)` directly (the per-market shape). */
 function oddsSnapshotView(contestId: string, moneyline: MoneylineOdds | null = moneylineOdds(-110, -110)): ContestOddsSnapshot {
   return { contestId, odds: { moneyline, spread: null, total: null } };
+}
+/** A spread odds row — `awayLine` is the away team's spread (the home line mirrors it); juice defaults to `-110 / -110`. */
+function spreadOdds(awayLine: number, awayOddsAmerican = -110, homeOddsAmerican = -110): SpreadOdds {
+  return { market: 'spread', awayLine, homeLine: -awayLine, awayOddsAmerican, homeOddsAmerican, upstreamLastUpdated: '2026-01-01T00:00:00Z', pollCapturedAt: '2026-01-01T00:00:00Z', changedAt: '2026-01-01T00:00:00Z' };
+}
+/** A total odds row — `line` is the over/under threshold; over/under juice default to `-110 / -110`. */
+function totalOdds(line: number, overOddsAmerican = -110, underOddsAmerican = -110): TotalOdds {
+  return { market: 'total', line, overOddsAmerican, underOddsAmerican, upstreamLastUpdated: '2026-01-01T00:00:00Z', pollCapturedAt: '2026-01-01T00:00:00Z', changedAt: '2026-01-01T00:00:00Z' };
 }
 /** A `getSpeculation` view for a moneyline speculation — `open` defaults to true (the realistic case the per-market reconcile expects); `orderbook` defaults to `[]` (the detail endpoint always populates it — pass entries to exercise the competitiveness check, or `{ ...speculationView(id) }` without an `orderbook` override for the degraded case). */
 function speculationView(speculationId: string, open = true, orderbook: Commitment[] = []): SpeculationView {
@@ -4193,6 +4203,65 @@ describe('Runner — live execution', () => {
     // The missing-open-spread market surfaced a `no-open-speculation` candidate.
     const noOpen = readEvents().filter((e) => e.kind === 'candidate' && e.skipReason === 'no-open-speculation');
     expect(noOpen).toHaveLength(1);
+  });
+
+  // ── line-consistency gate (spread/total: never quote a mispriced line) ──────────
+  //
+  // A spread/total commitment carries an on-chain line; the reference odds are priced
+  // for THEIR line. If the tracked speculation's line has diverged from the oracle
+  // line, quoting would post the reference price at a different line. The gate pulls +
+  // refuses (`reference-line-mismatch`) on a divergence. The comparison is pinned to
+  // the protocol's away-perspective convention (see oracleLineTicks's unit tests).
+
+  /** A contest carrying one open spread spec at the given away-perspective `lineTicks`. */
+  function spreadContest(contestId: string, lineTicks: number): { lean: ContestView; full: ContestView } {
+    const spec: SpeculationView = { speculationId: `sp-${contestId}`, contestId, marketType: 'spread', lineTicks, line: lineTicks / 10, open: true };
+    return {
+      lean: contestView({ contestId, speculations: [spec] }),
+      full: contestView({ contestId, referenceGameId: `GAME-${contestId}`, speculations: [spec] }),
+    };
+  }
+
+  it('line-consistency gate: a spread market whose tracked line MATCHES the oracle line passes the gate and is priced', async () => {
+    const config = withMarkets(cfg(), ['spread']);
+    const { lean, full } = spreadContest('1', -15); // tracked spec at away -1.5
+    // Oracle awayLine -1.5 → -15 == tracked -15 → the gate passes (no mismatch refusal).
+    const adapter = spiedAdapter(config, () => Promise.resolve([lean]), () => Promise.resolve(full), {
+      snapshot: (id) => Promise.resolve({ contestId: id, odds: { moneyline: null, spread: spreadOdds(-1.5), total: null } }),
+    });
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    const events = readEvents();
+    expect(events.filter((e) => e.kind === 'candidate' && e.skipReason === 'reference-line-mismatch')).toHaveLength(0);
+    // Non-vacuous: the market reconciled PAST the gate to pricing (a `quote-intent` is
+    // emitted only after the line gate + open-spec re-check pass), proving the gate
+    // was reached and let it through — not that reconcile bailed before the gate.
+    expect(events.some((e) => e.kind === 'quote-intent' && e.contestId === '1')).toBe(true);
+  });
+
+  it('line-consistency gate: a spread market whose oracle line has DIVERGED from the tracked line is pulled + refused', async () => {
+    const config = withMarkets(cfg(), ['spread']);
+    const { lean, full } = spreadContest('1', -15); // tracked spec at away -1.5
+    // Oracle awayLine -2.0 → -20 != tracked -15 → pull + reference-line-mismatch.
+    const adapter = spiedAdapter(config, () => Promise.resolve([lean]), () => Promise.resolve(full), {
+      snapshot: (id) => Promise.resolve({ contestId: id, odds: { moneyline: null, spread: spreadOdds(-2.0), total: null } }),
+    });
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    const mismatch = readEvents().filter((e) => e.kind === 'candidate' && e.skipReason === 'reference-line-mismatch');
+    expect(mismatch).toHaveLength(1);
+    expect(mismatch[0]?.contestId).toBe('1');
+  });
+
+  it('line-consistency gate: applies to total markets too (oracle threshold diverged from the tracked line → refused)', async () => {
+    const config = withMarkets(cfg(), ['total']);
+    const spec: SpeculationView = { speculationId: 'to-1', contestId: '1', marketType: 'total', lineTicks: 75, line: 7.5, open: true };
+    const lean = contestView({ contestId: '1', speculations: [spec] });
+    const full = contestView({ contestId: '1', referenceGameId: 'GAME-1', speculations: [spec] });
+    // Oracle total 8.5 → 85 != tracked 75 → pull + reference-line-mismatch.
+    const adapter = spiedAdapter(config, () => Promise.resolve([lean]), () => Promise.resolve(full), {
+      snapshot: (id) => Promise.resolve({ contestId: id, odds: { moneyline: null, spread: null, total: totalOdds(8.5) } }),
+    });
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    expect(readEvents().filter((e) => e.kind === 'candidate' && e.skipReason === 'reference-line-mismatch')).toHaveLength(1);
   });
 
   it('match-time expiry: submitCommitment is called with expiry = the contest match time', async () => {

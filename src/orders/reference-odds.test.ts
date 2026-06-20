@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import type { MoneylineOdds, SpreadOdds, TotalOdds } from '../ospex/index.js';
-import { referenceOddsEqual, referenceOddsFromSdk, type ReferenceOdds } from './reference-odds.js';
+import { oracleLineTicks, referenceOddsEqual, referenceOddsFromSdk, type ReferenceOdds } from './reference-odds.js';
 
 // Every SDK odds shape extends OddsTimestamps; a real delivery carries them. The
 // mapper must ignore them (they're liveness metadata, not pricing inputs).
@@ -138,5 +138,42 @@ describe('referenceOddsEqual', () => {
     expect(referenceOddsEqual(ref(moneyline(-150, 130)), ref(spread(1.5, -1.5, 152, -176)))).toBe(false);
     expect(referenceOddsEqual(ref(spread(1.5, -1.5, 152, -176)), ref(total(7.5, 104, -123)))).toBe(false);
     expect(referenceOddsEqual(ref(total(7.5, 104, -123)), ref(moneyline(-150, 130)))).toBe(false);
+  });
+});
+
+// ── oracle line → on-chain lineTicks (the line a tracked spec must carry) ────────
+//
+// PINS the side/sign convention: spread lineTicks is AWAY-perspective, 10×-scaled
+// (a spec at away -1.5 is -15); total lineTicks is the threshold, 10×-scaled. These
+// are the values a tracked speculation's `lineTicks` is compared against, so the
+// sign/perspective must match the protocol exactly — the runner refuses to quote on
+// a mismatch.
+
+describe('oracleLineTicks', () => {
+  const ref = (odds: Parameters<typeof referenceOddsFromSdk>[0]): ReferenceOdds => {
+    const r = referenceOddsFromSdk(odds);
+    if (r === null) throw new Error('test fixture must be fully priced');
+    return r;
+  };
+
+  it('moneyline has no line → null', () => {
+    expect(oracleLineTicks(ref(moneyline(-150, 130)))).toBeNull();
+  });
+
+  it('spread → round(awayLine × 10), away-perspective (matches the spec lineTicks convention)', () => {
+    // Away favored -1.5 (home +1.5): away-perspective ticks = -15.
+    expect(oracleLineTicks(ref(spread(-1.5, 1.5, -176, 152)))).toBe(-15);
+    // Away underdog +1.5 (home -1.5): away-perspective ticks = +15.
+    expect(oracleLineTicks(ref(spread(1.5, -1.5, 152, -176)))).toBe(15);
+    // A pick-em / 0 line is a real value.
+    expect(oracleLineTicks(ref(spread(0, 0, -110, -110)))).toBe(0);
+    // A larger run/point line preserves magnitude + sign.
+    expect(oracleLineTicks(ref(spread(-7.5, 7.5, -110, -110)))).toBe(-75);
+  });
+
+  it('total → round(line × 10), perspective-neutral', () => {
+    expect(oracleLineTicks(ref(total(7.5, 104, -123)))).toBe(75);
+    expect(oracleLineTicks(ref(total(220.5, -110, -110)))).toBe(2205); // NBA-scale total
+    expect(oracleLineTicks(ref(total(0, -110, -110)))).toBe(0);
   });
 });

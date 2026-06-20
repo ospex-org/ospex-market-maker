@@ -94,7 +94,7 @@
 import { existsSync } from 'node:fs';
 
 import { DEFAULT_PER_IP_OWNER_RESERVE, DEFAULT_PER_IP_STREAM_CAP, RESERVED_OWN_STATE_STREAMS, type Config } from '../config/index.js';
-import { buildDesiredQuote, inventoryFromState, isExpiredForRelease, matchableCommitmentRiskWei6, reconcileBook, referenceOddsEqual, referenceOddsFromSdk, type BookReconciliation, type DesiredQuote, type ReferenceOdds, type RetainedPartial, type RetainedPartialReason, type SoftCancelReason } from '../orders/index.js';
+import { buildDesiredQuote, inventoryFromState, isExpiredForRelease, matchableCommitmentRiskWei6, oracleLineTicks, reconcileBook, referenceOddsEqual, referenceOddsFromSdk, type BookReconciliation, type DesiredQuote, type ReferenceOdds, type RetainedPartial, type RetainedPartialReason, type SoftCancelReason } from '../orders/index.js';
 import { OspexStreamError } from '../ospex/index.js';
 import type {
   ApproveResult,
@@ -2245,6 +2245,20 @@ export class Runner {
       this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'stale-reference' });
       return outcome;
     }
+    // Gate (spread / total): the tracked speculation's ON-CHAIN line must match the line
+    // the reference odds are priced for. `m.lineTicks` is the spec's away-perspective,
+    // 10×-scaled line; `oracleLineTicks(ref)` derives the same from the reference odds
+    // (spread → awayLine, total → line). A divergence means the reference PRICE applies to
+    // a different line than the one we'd commit at — a mispriced commitment — so pull and
+    // refuse rather than misprice. Moneyline has no line (`oracleLineTicks` → null) and is
+    // unaffected. Following the oracle to the open spec at the new line (re-binding) is the
+    // next line-policy slice; until then a divergence refuses rather than chases.
+    const oracleTicks = oracleLineTicks(ref);
+    if (oracleTicks !== null && oracleTicks !== m.lineTicks) {
+      const outcome = await this.pullVisibleQuotes(m, now);
+      this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'reference-line-mismatch' });
+      return outcome;
+    }
     // Lazy-creation re-check (DESIGN §6/§9): the speculation we'd post to must still exist + be open — discovery confirmed it; re-confirm via the per-speculation detail read (PR 5's competitiveness check reuses the `getSpeculation` orderbook).
     let spec: SpeculationView;
     try {
@@ -2280,7 +2294,8 @@ export class Runner {
     // event focuses on the exposure-side reasoning that operators ask "why
     // didn't the MM post here?" about. Emitted only when the engine actually
     // runs — i.e. after the pre-engine gates (no-reference-odds /
-    // start-too-soon / stale-reference / no-open-speculation) have passed.
+    // start-too-soon / stale-reference / no-open-speculation /
+    // reference-line-mismatch) have passed.
     // For each side (`away` / `home` as the *taker offer* — the side a taker
     // would back), `allowed` mirrors `desired.result.{away,home} !== null`;
     // `sizeUSDC` is the engine-bound size when allowed (zero when refused);

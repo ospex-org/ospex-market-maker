@@ -96,6 +96,7 @@ export const CANDIDATE_SKIP_REASONS = [
   'no-reference-odds',
   'no-open-speculation',
   'would-create-lazy-speculation',
+  'reference-line-mismatch', //        spread/total only: the tracked speculation's on-chain line (away-perspective lineTicks) diverged from the line the reference odds are priced for, so quoting it would post the reference price at a different line (a mispriced commitment). The visible quotes are pulled and the market refuses until the lines agree. Moneyline has no line and never hits this. (Following the oracle to the spec at the new line is the line-policy slice; until then a divergence refuses rather than chases.)
   'stale-reference',
   'start-too-soon',
   'untracked', //                      the contest left the discovery listing and is being DRAINED — its visible quotes are pulled (never re-quoted) each tick until the pull succeeds, after which the next discovery cycle untracks it. Emitted while a `departing` market is retried after an untrack-time pull failed transiently.

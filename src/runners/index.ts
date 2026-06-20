@@ -1759,8 +1759,9 @@ export class Runner {
       // A contest that re-opened a different speculation for this market: track the new id.
       // If the speculation closed (`spec === undefined`) leave the id as-is —
       // reconcileMarket's open-speculation re-check pulls quotes + emits
-      // `no-open-speculation` that same tick. Matched on the market's own `marketType`
-      // (moneyline today); line-matching for spread/total arrives with line policy.
+      // `no-open-speculation` that same tick. Matched on the market's own `marketType`,
+      // so a multi-market contest re-points each market independently; line-matching for
+      // spread/total (which spec is the oracle-primary line) arrives with line policy.
       const spec = c.speculations.find((s) => s.marketType === m.marketType && s.open);
       if (spec !== undefined && spec.speculationId !== m.speculationId) {
         m.speculationId = spec.speculationId;
@@ -1771,19 +1772,26 @@ export class Runner {
       }
     }
 
-    // Contests whose moneyline market isn't tracked yet. Discovery is moneyline-gated,
-    // so "newcomer" == "no tracked moneyline market for this contest". `trackedMarkets`
-    // keys on `marketKey`, so a bare `.has(contestId)` would never match — collect the
-    // tracked moneyline contest ids explicitly. (Widens to per-desired-market once
-    // spread/total discovery lands.)
-    const trackedMoneylineContests = new Set<string>();
-    for (const m of this.trackedMarkets.values()) if (m.marketType === 'moneyline') trackedMoneylineContests.add(m.contestId);
+    // Newcomer discovery — track an open speculation for each CONFIGURED market the
+    // contest doesn't already carry. `marketSelection.markets` is the gate: the config
+    // schema rejects everything but moneyline today, so this reduces to the single
+    // moneyline-market-per-contest path; once the gate widens, a contest gains a tracked
+    // market per configured market (the `trackedMarkets` composite key already supports
+    // it). "Already tracked" is a (contest, market) test (any line), since a contest's
+    // markets key on `marketKey(contest, market, line)`.
+    const wantedMarkets = ms.markets;
+    const isMarketTracked = (contestId: string, market: MarketType): boolean =>
+      this.marketsForContest(contestId).some((m) => m.marketType === market);
+
     const newCandidates = [...byId.values()]
-      .filter((c) => !trackedMoneylineContests.has(c.contestId))
+      .filter((c) => wantedMarkets.some((mkt) => !isMarketTracked(c.contestId, mkt)))
       .sort((a, b) => Date.parse(a.matchTime) - Date.parse(b.matchTime));
     for (const c of newCandidates) {
-      const spec = c.speculations.find((s) => s.marketType === 'moneyline' && s.open);
-      if (spec === undefined) {
+      // The wanted, still-untracked markets with an open spec on the lean listing row —
+      // the contests worth paying `getContest` to confirm. If none, the contest has no
+      // open speculation we'd track (mirrors the single-market `no-open-speculation`).
+      const leanOpen = wantedMarkets.some((mkt) => !isMarketTracked(c.contestId, mkt) && c.speculations.some((s) => s.marketType === mkt && s.open));
+      if (!leanOpen) {
         this.eventLog.emit('candidate', { contestId: c.contestId, skipReason: 'no-open-speculation' });
         continue;
       }
@@ -1793,10 +1801,10 @@ export class Runner {
         this.eventLog.emit('candidate', { contestId: c.contestId, skipReason: 'start-too-soon' });
         continue;
       }
-      // One market per contest today (moneyline-gated), so map size == contest count and
-      // this bounds contests as the config name promises. NOTE: once a contest tracks
-      // several markets, `trackedMarkets.size` counts markets, not contests — the cap's
-      // per-contest-vs-per-market semantics must be revisited when multi-market discovery lands.
+      // The cap bounds total tracked markets. One market per contest today (moneyline-
+      // gated), so it still bounds contests as the config name promises; once a contest
+      // tracks several markets it bounds markets. Pre-check skips a full map before the
+      // `getContest` we couldn't use; the per-market create below stops adding mid-contest.
       if (this.trackedMarkets.size >= ms.maxTrackedContests) {
         this.eventLog.emit('candidate', { contestId: c.contestId, skipReason: 'tracking-cap-reached' });
         continue;
@@ -1812,30 +1820,40 @@ export class Runner {
         this.eventLog.emit('candidate', { contestId: c.contestId, skipReason: 'no-reference-odds' });
         continue;
       }
-      const confirmedSpec = full.speculations.find((s) => s.marketType === 'moneyline' && s.open);
-      if (confirmedSpec === undefined) {
-        this.eventLog.emit('candidate', { contestId: c.contestId, skipReason: 'no-open-speculation' });
-        continue;
+      // Track an open spec for each wanted, still-untracked market the FULL contest (the
+      // authoritative read) confirms. A wanted market with no open spec here emits
+      // `no-open-speculation` (mirrors the lean-row miss). Stop once the cap fills.
+      for (const mkt of wantedMarkets) {
+        if (isMarketTracked(c.contestId, mkt)) continue;
+        const confirmedSpec = full.speculations.find((s) => s.marketType === mkt && s.open);
+        if (confirmedSpec === undefined) {
+          this.eventLog.emit('candidate', { contestId: c.contestId, skipReason: 'no-open-speculation' });
+          continue;
+        }
+        if (this.trackedMarkets.size >= ms.maxTrackedContests) {
+          this.eventLog.emit('candidate', { contestId: c.contestId, skipReason: 'tracking-cap-reached' });
+          break; // map is full — no remaining market for this contest can fit either
+        }
+        const lineTicks = confirmedSpec.lineTicks ?? 0; // moneyline: the spec's lineTicks is null → 0
+        this.trackedMarkets.set(marketKey(c.contestId, confirmedSpec.marketType, lineTicks), {
+          contestId: c.contestId,
+          marketType: confirmedSpec.marketType,
+          referenceGameId: full.referenceGameId,
+          sport: full.sport,
+          awayTeam: full.awayTeam,
+          homeTeam: full.homeTeam,
+          speculationId: confirmedSpec.speculationId,
+          lineTicks,
+          matchTimeSec,
+          subscription: null,
+          lastReferenceOdds: null,
+          lastOddsAt: null,
+          dirty: false,
+          lastReconciledAt: null,
+          departing: false,
+        });
+        this.eventLog.emit('candidate', { contestId: c.contestId, sport: full.sport, matchTime: full.matchTime, speculationId: confirmedSpec.speculationId });
       }
-      const lineTicks = confirmedSpec.lineTicks ?? 0; // moneyline: the spec's lineTicks is null → 0
-      this.trackedMarkets.set(marketKey(c.contestId, confirmedSpec.marketType, lineTicks), {
-        contestId: c.contestId,
-        marketType: confirmedSpec.marketType, // moneyline-gated above, so always 'moneyline' today
-        referenceGameId: full.referenceGameId,
-        sport: full.sport,
-        awayTeam: full.awayTeam,
-        homeTeam: full.homeTeam,
-        speculationId: confirmedSpec.speculationId,
-        lineTicks,
-        matchTimeSec,
-        subscription: null,
-        lastReferenceOdds: null,
-        lastOddsAt: null,
-        dirty: false,
-        lastReconciledAt: null,
-        departing: false,
-      });
-      this.eventLog.emit('candidate', { contestId: c.contestId, sport: full.sport, matchTime: full.matchTime, speculationId: confirmedSpec.speculationId });
     }
   }
 
@@ -4898,13 +4916,14 @@ export class Runner {
   }
 
   /**
-   * A read-only snapshot of the contest's tracked **moneyline** market — for
-   * diagnostics / tests / (Phase 3) `ospex-mm status`. `undefined` if the contest
-   * isn't tracked. (Moneyline is the only market discovered today; a market-typed
-   * lookup arrives with multi-market discovery / the `status` surface.)
+   * A read-only snapshot of one of the contest's tracked markets — for diagnostics /
+   * tests / (Phase 3) `ospex-mm status`. Defaults to the `moneyline` market (the only
+   * one discovered under the default config); pass `marketType` to inspect a contest's
+   * `spread` / `total` market once those are configured. `undefined` if the contest has
+   * no tracked market of that type.
    */
-  trackedMarketView(contestId: string): TrackedMarketView | undefined {
-    const m = this.marketsForContest(contestId).find((mm) => mm.marketType === 'moneyline');
+  trackedMarketView(contestId: string, marketType: MarketType = 'moneyline'): TrackedMarketView | undefined {
+    const m = this.marketsForContest(contestId).find((mm) => mm.marketType === marketType);
     if (m === undefined) return undefined;
     return {
       contestId: m.contestId,

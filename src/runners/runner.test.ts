@@ -4126,6 +4126,75 @@ describe('Runner — live execution', () => {
     expect(runner.trackedMarketView('1234')?.lineTicks).toBe(5);
   });
 
+  // ── multi-market discovery (config-driven; gated dormant until the market gate widens) ──
+  //
+  // Discovery tracks an open speculation for EACH configured market, keyed by
+  // `marketKey(contest, market, line)` — so one contest can carry independent
+  // moneyline / spread / total markets. The production config schema rejects
+  // spread/total (SUPPORTED_MARKETS), so these tests widen the *parsed* market list
+  // directly to exercise the path before the gate flips — without enabling the markets
+  // in any real config.
+
+  /** TEST-ONLY gate bypass: widen a parsed config's market list past the SUPPORTED_MARKETS schema gate. */
+  function withMarkets(config: Config, markets: string[]): Config {
+    config.marketSelection.markets = markets as unknown as typeof config.marketSelection.markets;
+    return config;
+  }
+
+  it('multi-market discovery: a contest with open moneyline + spread + total specs tracks all three, one subscription each', async () => {
+    const config = withMarkets(cfg(), ['moneyline', 'spread', 'total']);
+    const specs: SpeculationView[] = [
+      { speculationId: 'spec-ml', contestId: '1', marketType: 'moneyline', lineTicks: null, line: null, open: true },
+      { speculationId: 'spec-sp', contestId: '1', marketType: 'spread', lineTicks: -15, line: -1.5, open: true },
+      { speculationId: 'spec-to', contestId: '1', marketType: 'total', lineTicks: 75, line: 7.5, open: true },
+    ];
+    const lean = contestView({ contestId: '1', speculations: specs });
+    const full = contestView({ contestId: '1', referenceGameId: 'GAME-1', speculations: specs });
+    const subCalls: Array<{ contestId: string; market: string }> = [];
+    const subscribe: OspexAdapter['subscribeOdds'] = (args, _h) => {
+      subCalls.push({ contestId: String(args.contestId), market: args.market });
+      return Promise.resolve(noopSubscription());
+    };
+    const adapter = spiedAdapter(config, () => Promise.resolve([lean]), () => Promise.resolve(full), { subscribe });
+    const runner = makeRunner({ config, adapter, maxTicks: 1 });
+    await runner.run();
+
+    // One contest, three independent tracked markets.
+    expect(runner.trackedContestIds()).toEqual(['1']); // deduped — the contest appears once despite three markets
+    expect(runner.trackedMarketView('1', 'moneyline')).toMatchObject({ marketType: 'moneyline', speculationId: 'spec-ml', lineTicks: 0 });
+    expect(runner.trackedMarketView('1', 'spread')).toMatchObject({ marketType: 'spread', speculationId: 'spec-sp', lineTicks: -15 });
+    expect(runner.trackedMarketView('1', 'total')).toMatchObject({ marketType: 'total', speculationId: 'spec-to', lineTicks: 75 });
+    // Each market opened its own odds stream, for its own market type.
+    expect(subCalls).toHaveLength(3);
+    expect(subCalls.map((s) => s.market).sort()).toEqual(['moneyline', 'spread', 'total']);
+    expect(subCalls.every((s) => s.contestId === '1')).toBe(true);
+    // A candidate event per tracked market (one per open spec).
+    const candidates = readEvents().filter((e) => e.kind === 'candidate' && e.speculationId !== undefined);
+    expect(candidates.map((e) => e.speculationId).sort()).toEqual(['spec-ml', 'spec-sp', 'spec-to']);
+  });
+
+  it('multi-market discovery: a configured market with no open spec is skipped (no-open-speculation), the others still track', async () => {
+    const config = withMarkets(cfg(), ['moneyline', 'spread', 'total']);
+    // Spread is CLOSED; moneyline + total are open → only those two track.
+    const specs: SpeculationView[] = [
+      { speculationId: 'spec-ml', contestId: '1', marketType: 'moneyline', lineTicks: null, line: null, open: true },
+      { speculationId: 'spec-sp', contestId: '1', marketType: 'spread', lineTicks: -15, line: -1.5, open: false },
+      { speculationId: 'spec-to', contestId: '1', marketType: 'total', lineTicks: 75, line: 7.5, open: true },
+    ];
+    const lean = contestView({ contestId: '1', speculations: specs });
+    const full = contestView({ contestId: '1', referenceGameId: 'GAME-1', speculations: specs });
+    const adapter = spiedAdapter(config, () => Promise.resolve([lean]), () => Promise.resolve(full));
+    const runner = makeRunner({ config, adapter, maxTicks: 1 });
+    await runner.run();
+
+    expect(runner.trackedMarketView('1', 'moneyline')?.speculationId).toBe('spec-ml');
+    expect(runner.trackedMarketView('1', 'total')?.speculationId).toBe('spec-to');
+    expect(runner.trackedMarketView('1', 'spread')).toBeUndefined(); // the closed spread spec was never tracked
+    // The missing-open-spread market surfaced a `no-open-speculation` candidate.
+    const noOpen = readEvents().filter((e) => e.kind === 'candidate' && e.skipReason === 'no-open-speculation');
+    expect(noOpen).toHaveLength(1);
+  });
+
   it('match-time expiry: submitCommitment is called with expiry = the contest match time', async () => {
     StateStore.at(stateDir).flush(emptyMakerState());
     const config = cfg({ mode: { dryRun: false }, orders: { expiryMode: 'match-time', expirySeconds: 120 } });

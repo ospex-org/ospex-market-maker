@@ -4264,6 +4264,63 @@ describe('Runner — live execution', () => {
     expect(readEvents().filter((e) => e.kind === 'candidate' && e.skipReason === 'reference-line-mismatch')).toHaveLength(1);
   });
 
+  // ── line-move re-key (the trackedMarkets map key follows the tracked line) ───────
+  //
+  // The map keys on `marketKey(contest, market, lineTicks)`. When the discovery refresh
+  // re-points a market to a different open speculation at a NEW line, the entry must
+  // re-key from the old line to the new one (else a `marketKey`-keyed lookup would miss
+  // it). Moneyline is always line 0, so it never re-keys.
+
+  it('line-move re-key: a tracked spread market re-keys its map entry when the open spec moves to a new line', async () => {
+    let listCount = 0;
+    const config = withMarkets(cfg({ discovery: { everyNTicks: 1 } }), ['spread']);
+    const specAt = (lineTicks: number, id: string): SpeculationView => ({ speculationId: id, contestId: '1', marketType: 'spread', lineTicks, line: lineTicks / 10, open: true });
+    // Cycle 1 tracks the open spread spec at -15; cycle 2's listing has a DIFFERENT open
+    // spread spec at -20 → the refresh re-point follows it and re-keys.
+    const adapter = spiedAdapter(
+      config,
+      () => { listCount += 1; return Promise.resolve([contestView({ contestId: '1', speculations: [listCount === 1 ? specAt(-15, 'sp-v1') : specAt(-20, 'sp-v2')] })]); },
+      (id) => Promise.resolve(contestView({ contestId: id, referenceGameId: 'GAME-1', speculations: [specAt(-15, 'sp-v1')] })), // newcomer confirm (cycle 1 only)
+    );
+    const runner = makeRunner({ config, adapter, maxTicks: 2 });
+    await runner.run();
+
+    // The market followed to the new spec + line…
+    expect(runner.trackedMarketView('1', 'spread')).toMatchObject({ speculationId: 'sp-v2', lineTicks: -20 });
+    // …and the map entry was re-keyed: it lives under the NEW line, not the old.
+    expect(runner.trackedMarketKeysForTest()).toEqual(['1:spread:-20']);
+  });
+
+  it('line-move re-key: a spread spec re-point at the SAME line updates the id but does NOT re-key', async () => {
+    let listCount = 0;
+    const config = withMarkets(cfg({ discovery: { everyNTicks: 1 } }), ['spread']);
+    const specAt = (lineTicks: number, id: string): SpeculationView => ({ speculationId: id, contestId: '1', marketType: 'spread', lineTicks, line: lineTicks / 10, open: true });
+    // Both cycles' open spread spec sits at -15, but cycle 2 re-IDs it (e.g. the writer
+    // recreated it). The re-point follows the new id; the line is unchanged → no re-key.
+    const adapter = spiedAdapter(
+      config,
+      () => { listCount += 1; return Promise.resolve([contestView({ contestId: '1', speculations: [listCount === 1 ? specAt(-15, 'sp-v1') : specAt(-15, 'sp-v2')] })]); },
+      (id) => Promise.resolve(contestView({ contestId: id, referenceGameId: 'GAME-1', speculations: [specAt(-15, 'sp-v1')] })),
+    );
+    const runner = makeRunner({ config, adapter, maxTicks: 2 });
+    await runner.run();
+    expect(runner.trackedMarketView('1', 'spread')).toMatchObject({ speculationId: 'sp-v2', lineTicks: -15 }); // re-pointed
+    expect(runner.trackedMarketKeysForTest()).toEqual(['1:spread:-15']); // line unchanged → key stable (the re-key is gated on the LINE, not the id)
+  });
+
+  it('line-move re-key: moneyline never re-keys (line always 0) even across a spec re-point', async () => {
+    let listCount = 0;
+    const config = cfg({ discovery: { everyNTicks: 1 } });
+    const adapter = spiedAdapter(config, () => {
+      listCount += 1;
+      return Promise.resolve([contestView({ contestId: '1', speculations: [{ speculationId: listCount === 1 ? 'ml-v1' : 'ml-v2', contestId: '1', marketType: 'moneyline', lineTicks: null, line: null, open: true }] })]);
+    });
+    const runner = makeRunner({ config, adapter, maxTicks: 2 });
+    await runner.run();
+    expect(runner.trackedMarketView('1')?.speculationId).toBe('ml-v2'); // re-pointed to the new spec
+    expect(runner.trackedMarketKeysForTest()).toEqual(['1:moneyline:0']); // key stable — moneyline never re-keys
+  });
+
   it('match-time expiry: submitCommitment is called with expiry = the contest match time', async () => {
     StateStore.at(stateDir).flush(emptyMakerState());
     const config = cfg({ mode: { dryRun: false }, orders: { expiryMode: 'match-time', expirySeconds: 120 } });

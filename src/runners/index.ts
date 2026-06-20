@@ -94,7 +94,7 @@
 import { existsSync } from 'node:fs';
 
 import { DEFAULT_PER_IP_OWNER_RESERVE, DEFAULT_PER_IP_STREAM_CAP, RESERVED_OWN_STATE_STREAMS, type Config } from '../config/index.js';
-import { buildDesiredQuote, inventoryFromState, isExpiredForRelease, matchableCommitmentRiskWei6, reconcileBook, type BookReconciliation, type DesiredQuote, type RetainedPartial, type RetainedPartialReason, type SoftCancelReason } from '../orders/index.js';
+import { buildDesiredQuote, inventoryFromState, isExpiredForRelease, matchableCommitmentRiskWei6, reconcileBook, referenceOddsFromSdk, type BookReconciliation, type DesiredQuote, type ReferenceOdds, type RetainedPartial, type RetainedPartialReason, type SoftCancelReason } from '../orders/index.js';
 import { OspexStreamError } from '../ospex/index.js';
 import type {
   ApproveResult,
@@ -238,17 +238,11 @@ export function interruptibleSleep(ms: number, signal: AbortSignal): Promise<voi
 
 type ShutdownReason = 'kill-file' | 'signal';
 
-/** The latest reference moneyline odds seen for a market (American; either side can be `null` if the upstream hasn't priced it). */
-interface MoneylineOddsPair {
-  awayOddsAmerican: number | null;
-  homeOddsAmerican: number | null;
-}
-
 /**
  * A contest the runner is tracking — its market metadata + the reference-odds
  * state. The (TODO) per-market reconcile reads `speculationId` (re-confirms it's
  * still open — the lazy-creation check), `matchTimeSec` (the `start-too-soon`
- * gate / the `match-time` expiry value), `lastMoneylineOdds` (the input to
+ * gate / the `match-time` expiry value), `lastReferenceOdds` (the input to
  * `buildDesiredQuote`), `lastOddsAt` (the `stale-reference` gate), and `dirty`
  * (whether to re-quote — read-and-cleared each pass, so a burst of odds moves
  * coalesces to one reconcile).
@@ -275,8 +269,8 @@ interface TrackedMarket {
    * the signal to (re)subscribe.
    */
   subscription: Subscription | null;
-  /** The latest reference moneyline odds, or `null` if none seen yet (the seed snapshot failed / the upstream has no moneyline row for the game). */
-  lastMoneylineOdds: MoneylineOddsPair | null;
+  /** The latest *usable* reference odds for the tracked market (every side priced), or `null` if none seen yet / the upstream has no row or only a partial one (`referenceOddsFromSdk` null-collapses partials). Moneyline today; spread / total once discovered. */
+  lastReferenceOdds: ReferenceOdds | null;
   /** Unix seconds — when the reference odds were last seen fresh (the seed snapshot, or an `onChange` / `onRefresh` from the channel, or a polling snapshot). `null` until the first reading. */
   lastOddsAt: number | null;
   /** An `onChange` (a genuine price move, or a polling snapshot that differed) arrived since the per-market reconcile last consumed this market. Newly-seeded markets start `true` (they need their first reconcile). */
@@ -312,8 +306,8 @@ export interface TrackedMarketView {
   matchTimeSec: number;
   /** Is an SSE odds stream live for this market right now? (`false` while degraded / over the channel cap / in `odds.subscribe: false` polling mode.) */
   subscribed: boolean;
-  /** The latest reference moneyline odds (American), or `null` if none seen yet. */
-  lastMoneylineOdds: MoneylineOddsPair | null;
+  /** The latest usable reference odds for this market, or `null` if none seen yet / only a partial row. */
+  lastReferenceOdds: ReferenceOdds | null;
   /** Unix seconds — when the reference odds were last seen fresh; `null` until the first reading. */
   lastOddsAt: number | null;
   /** Has the reference odds moved since the per-market reconcile last consumed this market? */
@@ -1805,7 +1799,7 @@ export class Runner {
         lineTicks: confirmedSpec.lineTicks ?? 0, // moneyline: the spec's lineTicks is null → 0
         matchTimeSec,
         subscription: null,
-        lastMoneylineOdds: null,
+        lastReferenceOdds: null,
         lastOddsAt: null,
         dirty: false,
         lastReconciledAt: null,
@@ -1870,7 +1864,8 @@ export class Runner {
       const snap = await this.snapshotOdds(m, 'odds-poll');
       if (snap === null) continue;
       const ml = snap.odds.moneyline;
-      const changed = ml !== null && (m.lastMoneylineOdds === null || m.lastMoneylineOdds.awayOddsAmerican !== ml.awayOddsAmerican || m.lastMoneylineOdds.homeOddsAmerican !== ml.homeOddsAmerican);
+      const storedML = m.lastReferenceOdds !== null && m.lastReferenceOdds.market === 'moneyline' ? m.lastReferenceOdds : null;
+      const changed = ml !== null && (storedML === null || storedML.awayOddsAmerican !== ml.awayOddsAmerican || storedML.homeOddsAmerican !== ml.homeOddsAmerican);
       this.recordOdds(m, ml, { markDirty: changed });
     }
   }
@@ -1966,21 +1961,23 @@ export class Runner {
    * or an `onChange` / `onRefresh` payload), so it always bumps `lastOddsAt` — that's
    * the "the feed is alive" signal that the `stale-reference` gate keys off (a
    * *failed* snapshot request never reaches here, so `lastOddsAt` then ages out).
-   * `odds === null` means the response had no moneyline row for this game — we have
-   * no usable reference odds *now*: clear `lastMoneylineOdds`, and if it had been
-   * usable, mark the market dirty so the next reconcile pulls our visible quotes via
-   * the `no-reference-odds` gate (distinct from the `stale-reference` gate — the feed
-   * isn't dead, it just has no moneyline). Otherwise store the new odds and set
-   * `dirty` if `markDirty` (the caller's "the price moved / appeared" signal).
+   * `referenceOddsFromSdk(odds)` collapses to `null` when the response had no row, or
+   * only a partial one (a side / line unpriced) — in either case we have no usable
+   * reference *now*: clear `lastReferenceOdds`, and if it had been usable, mark the
+   * market dirty so the next reconcile pulls our visible quotes via the
+   * `no-reference-odds` gate (distinct from the `stale-reference` gate — the feed isn't
+   * dead, it just has no usable odds). Otherwise store the new odds and set `dirty` if
+   * `markDirty` (the caller's "the price moved / appeared" signal).
    */
-  private recordOdds(m: TrackedMarket, odds: MoneylineOddsPair | null, opts: { markDirty: boolean }): void {
+  private recordOdds(m: TrackedMarket, odds: MoneylineOdds | null, opts: { markDirty: boolean }): void {
     m.lastOddsAt = this.deps.now();
-    if (odds === null) {
-      if (m.lastMoneylineOdds !== null) m.dirty = true; // it was usable a moment ago — the next reconcile must pull our quotes (no-reference-odds gate)
-      m.lastMoneylineOdds = null;
+    const ref = odds === null ? null : referenceOddsFromSdk(odds);
+    if (ref === null) {
+      if (m.lastReferenceOdds !== null) m.dirty = true; // it was usable a moment ago — the next reconcile must pull our quotes (no-reference-odds gate)
+      m.lastReferenceOdds = null;
       return;
     }
-    m.lastMoneylineOdds = { awayOddsAmerican: odds.awayOddsAmerican, homeOddsAmerican: odds.homeOddsAmerican };
+    m.lastReferenceOdds = ref;
     if (opts.markDirty) m.dirty = true;
   }
 
@@ -2095,8 +2092,7 @@ export class Runner {
    */
   private marketUnquoteable(m: TrackedMarket, now: number): boolean {
     if (m.matchTimeSec - now <= this.config.orders.expirySeconds) return true; // the game starts within one expiry window
-    const ml = m.lastMoneylineOdds;
-    if (ml === null || ml.awayOddsAmerican === null || ml.homeOddsAmerican === null) return true; // no usable reference moneyline odds — none seen yet, the latest response had no moneyline row, or a side isn't priced
+    if (m.lastReferenceOdds === null) return true; // no usable reference odds — none seen yet, the latest response had no row, or only a partial one
     if (m.lastOddsAt !== null && now - m.lastOddsAt > this.config.orders.staleReferenceAfterSeconds) return true; // the feed has stopped responding
     if (this.config.odds.subscribe && m.subscription === null) return true; // the SSE odds stream errored / never came up (re-subscribed on the next discovery cycle; in polling mode pollTrackedOdds re-snapshots every tick, so there's no "degraded" notion)
     return false;
@@ -2173,15 +2169,16 @@ export class Runner {
       this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'start-too-soon' });
       return outcome;
     }
-    // Gate: the reference odds have gone stale (the upstream feed stopped advancing). A never-seen-odds market (`lastOddsAt === null`) falls through to the `no-reference-odds` gate below — `lastOddsAt === null` iff `lastMoneylineOdds === null` (`recordOdds` sets both or neither).
+    // Gate: the reference odds have gone stale (the upstream feed stopped advancing). A never-seen-odds market (`lastOddsAt === null`) falls through to the `no-reference-odds` gate below — `lastOddsAt === null` iff `lastReferenceOdds === null` (`recordOdds` sets both or neither).
     if (m.lastOddsAt !== null && now - m.lastOddsAt > this.config.orders.staleReferenceAfterSeconds) {
       const outcome = await this.pullVisibleQuotes(m, now);
       this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'stale-reference' });
       return outcome;
     }
-    // Gate: no usable reference moneyline odds (both sides must be priced — `buildDesiredQuote` itself refuses out-of-range *values*, but it can't be handed a `null`).
-    const ml = m.lastMoneylineOdds;
-    if (ml === null || ml.awayOddsAmerican === null || ml.homeOddsAmerican === null) {
+    // Gate: no usable reference odds (`referenceOddsFromSdk` null-collapses a missing or
+    // partial row at `recordOdds`, so a non-null `lastReferenceOdds` is fully priced).
+    const ref = m.lastReferenceOdds;
+    if (ref === null) {
       const outcome = await this.pullVisibleQuotes(m, now);
       this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'no-reference-odds' });
       return outcome;
@@ -2208,7 +2205,7 @@ export class Runner {
     // Price → plan → apply.
     const market: Market = { contestId: m.contestId, sport: m.sport, awayTeam: m.awayTeam, homeTeam: m.homeTeam };
     const inventory = inventoryFromState(this.state, now, this.config.orders.expiryReleaseGraceSeconds);
-    const desired = buildDesiredQuote(this.config, market, { market: 'moneyline', awayOddsAmerican: ml.awayOddsAmerican, homeOddsAmerican: ml.homeOddsAmerican }, inventory);
+    const desired = buildDesiredQuote(this.config, market, ref, inventory);
     this.eventLog.emit('quote-intent', {
       contestId: m.contestId,
       speculationId: m.speculationId,
@@ -4865,7 +4862,7 @@ export class Runner {
       lineTicks: m.lineTicks,
       matchTimeSec: m.matchTimeSec,
       subscribed: m.subscription !== null,
-      lastMoneylineOdds: m.lastMoneylineOdds === null ? null : { ...m.lastMoneylineOdds },
+      lastReferenceOdds: m.lastReferenceOdds === null ? null : { ...m.lastReferenceOdds },
       lastOddsAt: m.lastOddsAt,
       dirty: m.dirty,
       lastReconciledAt: m.lastReconciledAt,

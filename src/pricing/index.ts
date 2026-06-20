@@ -2,8 +2,9 @@
  * Pricing: strip the consensus vig → fair value → quoting spread (economics or
  * direct mode) → two-sided quote prices → odds-tick conversion + bounds checks →
  * size each side by per-quote cap and exposure headroom. Pure functions, no SDK,
- * no chain. See DESIGN §5. (Per-market-type strategies under `strategies/` —
- * moneyline ships first; spread / total are future work.)
+ * no chain. See DESIGN §5. `computeQuote` is the shared two-way pricing core; spread
+ * / total reuse it through thin per-market adapters under `markets/` that source
+ * their per-side juice + line (moneyline uses `computeQuote` directly).
  */
 
 export {
@@ -21,6 +22,13 @@ export {
   assertLineWithinSanityBand,
   LineOutOfSanityBandError,
 } from './line.js';
+
+export {
+  priceSpread,
+  type SpreadReference,
+  type SpreadPricing,
+  type SpreadQuote,
+} from './markets/spread.js';
 
 export {
   americanToDecimal,

@@ -1747,6 +1747,11 @@ export class Runner {
     // at first-tracking, so a rescheduled start — especially one moved EARLIER — would
     // never reach the `start-too-soon` / `match-time` expiry gates: the odds stream keeps
     // `lastOddsAt` fresh, so the `stale-reference` gate doesn't bound it (DESIGN §10).
+    // A re-point that moves a market's `lineTicks` (spread / total only — moneyline is
+    // always 0) changes its `marketKey`, so the map entry must be re-keyed. Mutating the
+    // map mid-iteration over `.values()` is unsafe, so collect the moves here and apply
+    // them after the loop.
+    const reKeys: Array<{ from: string; to: string; market: TrackedMarket }> = [];
     for (const m of this.trackedMarkets.values()) {
       const c = byId.get(m.contestId);
       if (c === undefined) continue; // departed (untracked above) or still draining (`departing`) — not in the listing
@@ -1760,16 +1765,27 @@ export class Runner {
       // If the speculation closed (`spec === undefined`) leave the id as-is —
       // reconcileMarket's open-speculation re-check pulls quotes + emits
       // `no-open-speculation` that same tick. Matched on the market's own `marketType`,
-      // so a multi-market contest re-points each market independently; line-matching for
-      // spread/total (which spec is the oracle-primary line) arrives with line policy.
+      // so a multi-market contest re-points each market independently; selecting WHICH
+      // spread/total spec is the oracle-primary line is the follow-the-oracle slice.
       const spec = c.speculations.find((s) => s.marketType === m.marketType && s.open);
       if (spec !== undefined && spec.speculationId !== m.speculationId) {
+        const fromLineTicks = m.lineTicks;
+        const toLineTicks = spec.lineTicks ?? 0; // moneyline: null → 0 (never changes)
         m.speculationId = spec.speculationId;
-        // Moneyline has no line → stays 0, so `marketKey` is stable across the re-point.
-        // NOTE: for spread/total a line move would change `lineTicks` and orphan the map
-        // key under the old line — re-keying is owned by the line-policy slice.
-        m.lineTicks = spec.lineTicks ?? 0;
+        m.lineTicks = toLineTicks;
+        if (toLineTicks !== fromLineTicks) {
+          // The line moved (spread / total): the entry is keyed under the OLD line, so
+          // queue a re-key to the new line. Moneyline (line always 0) never reaches here.
+          reKeys.push({ from: marketKey(m.contestId, m.marketType, fromLineTicks), to: marketKey(m.contestId, m.marketType, toLineTicks), market: m });
+        }
       }
+    }
+    // Apply the queued re-keys now that the `.values()` iteration is done. Each is a
+    // distinct (contest, market) entry (one tracked market per pair), so no `to` key
+    // collides with another live entry and no `from`/`to` overlap across moves.
+    for (const { from, to, market } of reKeys) {
+      this.trackedMarkets.delete(from);
+      this.trackedMarkets.set(to, market);
     }
 
     // Newcomer discovery — track an open speculation for each CONFIGURED market the
@@ -4928,6 +4944,11 @@ export class Runner {
   /** The contest ids the runner is currently tracking, sorted — for diagnostics / tests. Deduplicated: a contest tracking multiple markets still appears once. */
   trackedContestIds(): readonly string[] {
     return [...new Set([...this.trackedMarkets.values()].map((m) => m.contestId))].sort();
+  }
+
+  /** The raw `trackedMarkets` map keys (`marketKey` = `contestId:marketType:lineTicks`), sorted — for tests asserting a market was re-keyed when its line moved. The composite-key format is an internal detail; tests are the only consumer. */
+  trackedMarketKeysForTest(): readonly string[] {
+    return [...this.trackedMarkets.keys()].sort();
   }
 
   /**

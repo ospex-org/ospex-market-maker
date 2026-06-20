@@ -263,6 +263,8 @@ interface TrackedMarket {
   homeTeam: string;
   /** The contest's open moneyline speculation — refreshed from the latest listing on every discovery cycle. */
   speculationId: string;
+  /** The tracked speculation's on-chain line, 10×-scaled int32 ticks (moneyline is always 0; spread / total carry the oracle line once those markets are discovered). Threaded to the commitment at submit, where the line-sanity rail guards it. */
+  lineTicks: number;
   /** Contest match time, unix seconds — refreshed from the latest listing on every discovery cycle (a reschedule moves it). */
   matchTimeSec: number;
   /**
@@ -305,6 +307,8 @@ export interface TrackedMarketView {
   awayTeam: string;
   homeTeam: string;
   speculationId: string;
+  /** The tracked speculation's on-chain line, 10×-scaled int32 ticks (moneyline 0). */
+  lineTicks: number;
   matchTimeSec: number;
   /** Is an SSE odds stream live for this market right now? (`false` while degraded / over the channel cap / in `odds.subscribe: false` polling mode.) */
   subscribed: boolean;
@@ -1750,7 +1754,10 @@ export class Runner {
       // reconcileMarket's open-speculation re-check pulls quotes + emits
       // `no-open-speculation` that same tick.
       const spec = c.speculations.find((s) => s.marketType === 'moneyline' && s.open);
-      if (spec !== undefined && spec.speculationId !== m.speculationId) m.speculationId = spec.speculationId;
+      if (spec !== undefined && spec.speculationId !== m.speculationId) {
+        m.speculationId = spec.speculationId;
+        m.lineTicks = spec.lineTicks ?? 0;
+      }
     }
 
     const newCandidates = [...byId.values()]
@@ -1795,6 +1802,7 @@ export class Runner {
         awayTeam: full.awayTeam,
         homeTeam: full.homeTeam,
         speculationId: confirmedSpec.speculationId,
+        lineTicks: confirmedSpec.lineTicks ?? 0, // moneyline: the spec's lineTicks is null → 0
         matchTimeSec,
         subscription: null,
         lastMoneylineOdds: null,
@@ -2645,15 +2653,15 @@ export class Runner {
     if (this.updateStreamHealthHold(this.deps.now())) return null;
     const proto = toProtocolQuote({ side: qs.takerSide, oddsTick: qs.quoteTick });
     // Line-sanity rail (DESIGN §5): the MM never signs — nor dry-run "would-submit"s —
-    // a commitment whose line falls outside its conservative band. Moneyline is always
-    // `lineTicks 0` (always in band); spread / total will source the contest's oracle
-    // line here when those markets land. Fail-closed backstop: a pathological spread line
+    // a commitment whose line falls outside its conservative band. The line is the tracked
+    // market's `lineTicks` (moneyline always 0 → in band; spread / total carry the oracle
+    // line once those markets are discovered). Fail-closed backstop: a pathological spread line
     // permanently reverts on-chain settlement and strands escrow (the SpreadScorerModule
     // adds lineTicks in checked int32 math with no on-chain magnitude bound, and the
     // protocol is non-upgradeable). On a refusal, skip the side this tick — never crash
     // the tick (DESIGN §9). A candidate-stage refusal (so an out-of-band market is never
     // even priced) arrives with spread / total discovery.
-    const lineTicks = 0;
+    const lineTicks = m.lineTicks;
     if (!isLineWithinSanityBand(lineTicks)) {
       const err = new LineOutOfSanityBandError(lineTicks);
       this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'submit', contestId: m.contestId, takerSide: qs.takerSide });
@@ -4854,6 +4862,7 @@ export class Runner {
       awayTeam: m.awayTeam,
       homeTeam: m.homeTeam,
       speculationId: m.speculationId,
+      lineTicks: m.lineTicks,
       matchTimeSec: m.matchTimeSec,
       subscribed: m.subscription !== null,
       lastMoneylineOdds: m.lastMoneylineOdds === null ? null : { ...m.lastMoneylineOdds },

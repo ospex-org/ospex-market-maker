@@ -4108,6 +4108,23 @@ describe('Runner — live execution', () => {
     expect(records.map((r) => r.makerSide).sort()).toEqual(['away', 'home']);
   });
 
+  it('threads the tracked speculation lineTicks through discovery → TrackedMarket → submitCommitment', async () => {
+    StateStore.at(stateDir).flush(emptyMakerState());
+    const config = cfg({ mode: { dryRun: false } });
+    const submit = submitRecorder();
+    // A synthetic non-zero lineTicks on the (moneyline) tracked speculation: real moneyline
+    // is always 0, but this proves the line flows discovery (getContest) → TrackedMarket →
+    // submitQuote → commitment — the wiring spread / total will rely on once discovered.
+    const withLine = (id: string) =>
+      contestView({ contestId: id, referenceGameId: `GAME-${id}`, speculations: [{ speculationId: `spec-${id}`, contestId: id, marketType: 'moneyline', lineTicks: 5, line: 0.5, open: true }] });
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([withLine('1234')]), { submitCommitment: submit.fn }, (id) => Promise.resolve(withLine(id)));
+    const runner = makeRunner({ config, adapter, maxTicks: 1 });
+    await runner.run();
+    expect(submit.calls).toHaveLength(2);
+    for (const a of submit.calls) expect(a.lineTicks).toBe(5);
+    expect(runner.trackedMarketView('1234')?.lineTicks).toBe(5);
+  });
+
   it('match-time expiry: submitCommitment is called with expiry = the contest match time', async () => {
     StateStore.at(stateDir).flush(emptyMakerState());
     const config = cfg({ mode: { dryRun: false }, orders: { expiryMode: 'match-time', expirySeconds: 120 } });

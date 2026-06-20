@@ -3513,7 +3513,7 @@ describe('Runner — odds subscriptions', () => {
     expect(recorder.successfulCalls()).toEqual(['A']);
     expect(runner.trackedMarketView('A')).toMatchObject({
       subscribed: true,
-      lastMoneylineOdds: { awayOddsAmerican: -150, homeOddsAmerican: 130 },
+      lastReferenceOdds: { awayOddsAmerican: -150, homeOddsAmerican: 130 },
       lastOddsAt: T0,
       dirty: false, // seeded dirty, but the same tick's per-market reconcile picked it up and cleared the flag
     });
@@ -3541,7 +3541,7 @@ describe('Runner — odds subscriptions', () => {
     expect(recorder.successfulCalls().filter((id) => id === 'A')).toHaveLength(1); // A subscribed cycle 1, then departed
   });
 
-  it('a channel onChange updates the odds + marks the market dirty; onRefresh updates without marking dirty; a seed with no moneyline row leaves lastMoneylineOdds null', async () => {
+  it('a channel onChange updates the odds + marks the market dirty; onRefresh updates without marking dirty; a seed with no moneyline row leaves lastReferenceOdds null', async () => {
     const config = cfg();
     const recorder = makeSubscribeRecorder();
     let t = T0;
@@ -3553,7 +3553,7 @@ describe('Runner — odds subscriptions', () => {
     await runner.run();
 
     // after the seed: subscribed, the feed responded (so lastOddsAt is set) but the response had no moneyline row, so no usable odds yet; not dirty (it had none before either).
-    expect(runner.trackedMarketView('A')).toMatchObject({ subscribed: true, lastMoneylineOdds: null, lastOddsAt: T0, dirty: false });
+    expect(runner.trackedMarketView('A')).toMatchObject({ subscribed: true, lastReferenceOdds: null, lastOddsAt: T0, dirty: false });
 
     const handlers = recorder.handlersFor('A');
     expect(handlers).toBeDefined();
@@ -3561,12 +3561,12 @@ describe('Runner — odds subscriptions', () => {
     // onRefresh: stores the odds + bumps freshness, but does NOT mark the market dirty.
     t = T0 + 5;
     handlers?.onRefresh?.(moneylineOdds(-120, 100));
-    expect(runner.trackedMarketView('A')).toMatchObject({ lastMoneylineOdds: { awayOddsAmerican: -120, homeOddsAmerican: 100 }, lastOddsAt: T0 + 5, dirty: false });
+    expect(runner.trackedMarketView('A')).toMatchObject({ lastReferenceOdds: { awayOddsAmerican: -120, homeOddsAmerican: 100 }, lastOddsAt: T0 + 5, dirty: false });
 
     // onChange: updates the odds, bumps freshness, marks the market dirty.
     t = T0 + 10;
     handlers?.onChange(moneylineOdds(150, -180));
-    expect(runner.trackedMarketView('A')).toMatchObject({ lastMoneylineOdds: { awayOddsAmerican: 150, homeOddsAmerican: -180 }, lastOddsAt: T0 + 10, dirty: true });
+    expect(runner.trackedMarketView('A')).toMatchObject({ lastReferenceOdds: { awayOddsAmerican: 150, homeOddsAmerican: -180 }, lastOddsAt: T0 + 10, dirty: true });
   });
 
   it('a fatal channel onError degrades the market (subscription cleared) + emits a degraded channel-error event; the next discovery cycle re-subscribes it', async () => {
@@ -3657,11 +3657,11 @@ describe('Runner — odds subscriptions', () => {
     const runner = makeRunner({ config, adapter, maxTicks: 1 });
     await runner.run();
 
-    expect(runner.trackedMarketView('A')).toMatchObject({ subscribed: true, lastMoneylineOdds: null }); // channel up despite the seed failure
+    expect(runner.trackedMarketView('A')).toMatchObject({ subscribed: true, lastReferenceOdds: null }); // channel up despite the seed failure
     expect(readEvents().find((e) => e.kind === 'error')).toMatchObject({ phase: 'odds-seed', contestId: 'A', detail: 'snapshot 503' });
 
     recorder.handlersFor('A')?.onChange(moneylineOdds(-200, 170));
-    expect(runner.trackedMarketView('A')?.lastMoneylineOdds).toEqual({ awayOddsAmerican: -200, homeOddsAmerican: 170 });
+    expect(runner.trackedMarketView('A')?.lastReferenceOdds).toEqual({ market: 'moneyline', awayOddsAmerican: -200, homeOddsAmerican: 170 });
   });
 
   it('a departed market has its odds channel unsubscribed', async () => {
@@ -3693,7 +3693,7 @@ describe('Runner — odds subscriptions', () => {
     expect(snapshotCalls).toBe(3); // one snapshot per tick for the one tracked market
     expect(runner.trackedMarketView('A')).toMatchObject({
       subscribed: false,
-      lastMoneylineOdds: { awayOddsAmerican: -130, homeOddsAmerican: 110 },
+      lastReferenceOdds: { awayOddsAmerican: -130, homeOddsAmerican: 110 },
       lastOddsAt: T0,
     });
   });

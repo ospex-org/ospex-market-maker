@@ -8,10 +8,12 @@
  * its `lineTicks`.
  *
  * Side semantics (DESIGN §5, `OspexTypes.sol`): the `QuoteResult`'s `away` /
- * `home` sides are the **away-cover** / **home-cover** taker offers, which map to
- * the protocol maker `positionType` via the existing `toProtocolQuote` (away →
- * Upper / 0, home → Lower / 1) — identical to moneyline, so no relabeling is
- * needed. (Total, by contrast, needs over/under relabeling — its own adapter.)
+ * `home` sides are the **away-cover** / **home-cover** taker offers. The existing
+ * `toProtocolQuote` converts each to the maker's *opposite* side — exactly as for
+ * moneyline, so no spread-specific relabeling is needed:
+ *   - away-cover taker offer → maker home / Lower / positionType 1
+ *   - home-cover taker offer → maker away / Upper / positionType 0
+ * (Total, by contrast, needs over/under relabeling — its own adapter.)
  *
  * Pure: no SDK, no chain. Moneyline keeps using `computeQuote` directly via the
  * orders layer; this is the spread sibling the orders layer will delegate to once

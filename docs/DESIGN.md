@@ -450,6 +450,8 @@ The MM is **subscription-first wherever the SDK supports it**, deliberately, to 
 
 - **Contest discovery — slow bounded poll, now; push, later.** `client.contests.list` (then `client.speculations.list` to confirm an open speculation exists) every `discovery.everyNTicks` ticks (~5 min) with jitter — new contests appear a few times a day. Could become push via the `contests` / `speculations` SSE streams (added in SDK 0.3.0), a lower-priority follow-up.
 
+- **Tracking identity — per market, not per contest.** A tracked entry is a `(contestId, marketType, lineTicks)` triple, not a bare contest: a single contest can carry independent moneyline / spread / total markets at distinct lines, each priced + quoted + reconciled on its own. The runner's tracked-market map keys on `contestId:marketType:lineTicks` (moneyline, which has no line, resolves to `…:moneyline:0`); untracking is per-contest (a contest leaving the listing drains every market it carried). Discovery is moneyline-gated today, so there is exactly one market per tracked contest and the key is a 1:1 relabeling of the old contest-id key — but the identity is in place so spread / total slot in without restructuring the tracking, untrack, and reconcile paths.
+
 ---
 
 ## 11. Telemetry & the run summary

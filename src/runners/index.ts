@@ -106,6 +106,7 @@ import type {
   ContestView,
   Fill,
   Hex,
+  MarketType,
   MoneylineOdds,
   OddsSubscribeHandlers,
   OspexAdapter,
@@ -249,6 +250,14 @@ type ShutdownReason = 'kill-file' | 'signal';
  */
 interface TrackedMarket {
   contestId: string;
+  /**
+   * Which market this entry tracks — `moneyline` today (discovery is gated to it),
+   * `spread` / `total` once those markets are discovered. Part of the tracking
+   * identity: a single contest can carry distinct moneyline / spread / total
+   * markets, so the `trackedMarkets` map keys on `marketKey(contestId, marketType,
+   * lineTicks)` rather than `contestId` alone (DESIGN §6).
+   */
+  marketType: MarketType;
   /** The neutral reference-game id — always set (a contest with no upstream linkage is skipped at discovery with `no-reference-odds`). Retained for the upstream-linkage gate and telemetry; the odds SSE stream itself is opened by `contestId`. */
   referenceGameId: string;
   /** Contest sport / teams — for the risk engine's `Market` (per-team / per-sport caps). */
@@ -296,6 +305,8 @@ interface TrackedMarket {
  */
 export interface TrackedMarketView {
   contestId: string;
+  /** Which market this entry tracks — `moneyline` today; `spread` / `total` once discovered. */
+  marketType: MarketType;
   referenceGameId: string;
   sport: string;
   awayTeam: string;
@@ -383,7 +394,7 @@ export class Runner {
   private readonly holdQuotingUntil: number | null;
   private shutdownReason: ShutdownReason | null = null;
   private readonly abortController = new AbortController();
-  /** The contests currently being tracked, keyed by `contestId`. Rebuilt each discovery cycle (add newcomers up to the cap; drop the departed). */
+  /** The markets currently being tracked, keyed by {@link marketKey} (`contestId:marketType:lineTicks`) — a contest can carry independent moneyline / spread / total markets. Rebuilt each discovery cycle (add newcomers up to the cap; drop the departed). Moneyline is the only market discovered today, so every key is `…:moneyline:0`. */
   private readonly trackedMarkets = new Map<string, TrackedMarket>();
   /** The tick number at/after which the next discovery cycle runs. `0` ⇒ the first tick (1) always discovers; bumped by `jitteredDiscoveryInterval()` after each cycle. */
   private nextDiscoveryAtTick = 0;
@@ -1703,10 +1714,10 @@ export class Runner {
       byId.set(c.contestId, c);
     }
 
-    for (const id of [...this.trackedMarkets.keys()]) {
-      if (byId.has(id)) continue; // still listed — refreshed/quoted below
-      const departed = this.trackedMarkets.get(id);
+    for (const key of [...this.trackedMarkets.keys()]) {
+      const departed = this.trackedMarkets.get(key);
       if (departed === undefined) continue;
+      if (byId.has(departed.contestId)) continue; // contest still listed — refreshed/quoted below (untracking is per-contest: a contest leaving the listing drains all its markets)
       // Take this contest's visible quotes off the book BEFORE we stop tracking it.
       // Once untracked, `reconcileMarkets` never revisits it (it iterates only the
       // tracked set), so any `visibleOpen` quote would otherwise strand on the relay
@@ -1725,7 +1736,7 @@ export class Runner {
         departed.dirty = true;
         continue; // keep it tracked + keep its odds channel until the retry drains it
       }
-      this.trackedMarkets.delete(id);
+      this.trackedMarkets.delete(key);
       if (departed.subscription) void this.dropChannel(departed.subscription, departed.contestId);
     }
 
@@ -1734,8 +1745,8 @@ export class Runner {
     // at first-tracking, so a rescheduled start — especially one moved EARLIER — would
     // never reach the `start-too-soon` / `match-time` expiry gates: the odds stream keeps
     // `lastOddsAt` fresh, so the `stale-reference` gate doesn't bound it (DESIGN §10).
-    for (const [id, m] of this.trackedMarkets) {
-      const c = byId.get(id);
+    for (const m of this.trackedMarkets.values()) {
+      const c = byId.get(m.contestId);
       if (c === undefined) continue; // departed (untracked above) or still draining (`departing`) — not in the listing
       m.departing = false; // present in the listing again — resume normal tracking (a no-op when it was never draining)
       const refreshedMatchTimeSec = Math.floor(Date.parse(c.matchTime) / 1000);
@@ -1743,19 +1754,30 @@ export class Runner {
         if (refreshedMatchTimeSec < m.matchTimeSec) m.dirty = true; // moved earlier — re-evaluate the gates next tick, not at the staleAfter cadence
         m.matchTimeSec = refreshedMatchTimeSec;
       }
-      // A contest that re-opened a different moneyline speculation: track the new id.
-      // If the moneyline speculation closed (`spec === undefined`) leave the id as-is —
+      // A contest that re-opened a different speculation for this market: track the new id.
+      // If the speculation closed (`spec === undefined`) leave the id as-is —
       // reconcileMarket's open-speculation re-check pulls quotes + emits
-      // `no-open-speculation` that same tick.
-      const spec = c.speculations.find((s) => s.marketType === 'moneyline' && s.open);
+      // `no-open-speculation` that same tick. Matched on the market's own `marketType`
+      // (moneyline today); line-matching for spread/total arrives with line policy.
+      const spec = c.speculations.find((s) => s.marketType === m.marketType && s.open);
       if (spec !== undefined && spec.speculationId !== m.speculationId) {
         m.speculationId = spec.speculationId;
+        // Moneyline has no line → stays 0, so `marketKey` is stable across the re-point.
+        // NOTE: for spread/total a line move would change `lineTicks` and orphan the map
+        // key under the old line — re-keying is owned by the line-policy slice.
         m.lineTicks = spec.lineTicks ?? 0;
       }
     }
 
+    // Contests whose moneyline market isn't tracked yet. Discovery is moneyline-gated,
+    // so "newcomer" == "no tracked moneyline market for this contest". `trackedMarkets`
+    // keys on `marketKey`, so a bare `.has(contestId)` would never match — collect the
+    // tracked moneyline contest ids explicitly. (Widens to per-desired-market once
+    // spread/total discovery lands.)
+    const trackedMoneylineContests = new Set<string>();
+    for (const m of this.trackedMarkets.values()) if (m.marketType === 'moneyline') trackedMoneylineContests.add(m.contestId);
     const newCandidates = [...byId.values()]
-      .filter((c) => !this.trackedMarkets.has(c.contestId))
+      .filter((c) => !trackedMoneylineContests.has(c.contestId))
       .sort((a, b) => Date.parse(a.matchTime) - Date.parse(b.matchTime));
     for (const c of newCandidates) {
       const spec = c.speculations.find((s) => s.marketType === 'moneyline' && s.open);
@@ -1769,6 +1791,10 @@ export class Runner {
         this.eventLog.emit('candidate', { contestId: c.contestId, skipReason: 'start-too-soon' });
         continue;
       }
+      // One market per contest today (moneyline-gated), so map size == contest count and
+      // this bounds contests as the config name promises. NOTE: once a contest tracks
+      // several markets, `trackedMarkets.size` counts markets, not contests — the cap's
+      // per-contest-vs-per-market semantics must be revisited when multi-market discovery lands.
       if (this.trackedMarkets.size >= ms.maxTrackedContests) {
         this.eventLog.emit('candidate', { contestId: c.contestId, skipReason: 'tracking-cap-reached' });
         continue;
@@ -1789,14 +1815,16 @@ export class Runner {
         this.eventLog.emit('candidate', { contestId: c.contestId, skipReason: 'no-open-speculation' });
         continue;
       }
-      this.trackedMarkets.set(c.contestId, {
+      const lineTicks = confirmedSpec.lineTicks ?? 0; // moneyline: the spec's lineTicks is null → 0
+      this.trackedMarkets.set(marketKey(c.contestId, confirmedSpec.marketType, lineTicks), {
         contestId: c.contestId,
+        marketType: confirmedSpec.marketType, // moneyline-gated above, so always 'moneyline' today
         referenceGameId: full.referenceGameId,
         sport: full.sport,
         awayTeam: full.awayTeam,
         homeTeam: full.homeTeam,
         speculationId: confirmedSpec.speculationId,
-        lineTicks: confirmedSpec.lineTicks ?? 0, // moneyline: the spec's lineTicks is null → 0
+        lineTicks,
         matchTimeSec,
         subscription: null,
         lastReferenceOdds: null,
@@ -2523,8 +2551,11 @@ export class Runner {
       txHash: result.txHash,
       gasPolWei: gasPolWei.toString(),
     });
-    const m = this.trackedMarkets.get(record.contestId);
-    if (m !== undefined) m.dirty = true; // re-quote the freed side next tick (never same-tick over a just-cancelled commitment)
+    // Re-quote the freed side next tick (never same-tick over a just-cancelled commitment).
+    // Dirty every tracked market on the contest — at most one today; over-broad but safe (a
+    // dirty market just re-reconciles, producing no churn if nothing changed) until records
+    // carry their market identity for a precise lookup.
+    for (const m of this.marketsForContest(record.contestId)) m.dirty = true;
     return 'cancelled';
   }
 
@@ -3062,8 +3093,9 @@ export class Runner {
           break;
         case 'mark-dirty': {
           if (audit) break; // the audit poll must never dirty markets / drive posting
-          const m = this.trackedMarkets.get(d.contestId);
-          if (m !== undefined) m.dirty = true;
+          // Dirty every tracked market on the contest — at most one today; over-broad but
+          // safe until descriptors carry market identity for a precise lookup.
+          for (const m of this.marketsForContest(d.contestId)) m.dirty = true;
           break;
         }
         case 'signal-past-expiry-lookup-failed':
@@ -4843,17 +4875,30 @@ export class Runner {
     return Math.max(1, Math.round(everyNTicks * factor));
   }
 
-  /** The contest ids the runner is currently tracking, sorted — for diagnostics / tests. */
-  trackedContestIds(): readonly string[] {
-    return [...this.trackedMarkets.keys()].sort();
+  /** Every tracked market belonging to `contestId` (the map keys on `marketKey`, not `contestId`, so a `.get` by contest id won't find them). At most one today — discovery is moneyline-gated — but a contest gains independent spread / total markets once those are discovered. */
+  private marketsForContest(contestId: string): TrackedMarket[] {
+    const out: TrackedMarket[] = [];
+    for (const m of this.trackedMarkets.values()) if (m.contestId === contestId) out.push(m);
+    return out;
   }
 
-  /** A read-only snapshot of one tracked market's state — for diagnostics / tests / (Phase 3) `ospex-mm status`. `undefined` if `contestId` isn't tracked. */
+  /** The contest ids the runner is currently tracking, sorted — for diagnostics / tests. Deduplicated: a contest tracking multiple markets still appears once. */
+  trackedContestIds(): readonly string[] {
+    return [...new Set([...this.trackedMarkets.values()].map((m) => m.contestId))].sort();
+  }
+
+  /**
+   * A read-only snapshot of the contest's tracked **moneyline** market — for
+   * diagnostics / tests / (Phase 3) `ospex-mm status`. `undefined` if the contest
+   * isn't tracked. (Moneyline is the only market discovered today; a market-typed
+   * lookup arrives with multi-market discovery / the `status` surface.)
+   */
   trackedMarketView(contestId: string): TrackedMarketView | undefined {
-    const m = this.trackedMarkets.get(contestId);
+    const m = this.marketsForContest(contestId).find((mm) => mm.marketType === 'moneyline');
     if (m === undefined) return undefined;
     return {
       contestId: m.contestId,
+      marketType: m.marketType,
       referenceGameId: m.referenceGameId,
       sport: m.sport,
       awayTeam: m.awayTeam,
@@ -4872,6 +4917,18 @@ export class Runner {
 }
 
 // ── small helpers ────────────────────────────────────────────────────────────
+
+/**
+ * The stable identity of a tracked market — `contestId:marketType:lineTicks`. A
+ * single contest can carry independent moneyline / spread / total markets (and,
+ * once line policy lands, distinct lines), so `trackedMarkets` keys on this rather
+ * than `contestId` alone. Moneyline always resolves to `…:moneyline:0` (no line),
+ * so this is a 1:1 relabeling of the old `contestId` key for the only market the
+ * runner discovers today (DESIGN §6).
+ */
+export function marketKey(contestId: string, marketType: MarketType, lineTicks: number): string {
+  return `${contestId}:${marketType}:${lineTicks}`;
+}
 
 /**
  * Sum the maker's currently-at-risk USDC across non-released commitments +

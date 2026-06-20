@@ -2294,7 +2294,8 @@ export class Runner {
     // event focuses on the exposure-side reasoning that operators ask "why
     // didn't the MM post here?" about. Emitted only when the engine actually
     // runs — i.e. after the pre-engine gates (no-reference-odds /
-    // start-too-soon / stale-reference / no-open-speculation) have passed.
+    // start-too-soon / stale-reference / no-open-speculation /
+    // reference-line-mismatch) have passed.
     // For each side (`away` / `home` as the *taker offer* — the side a taker
     // would back), `allowed` mirrors `desired.result.{away,home} !== null`;
     // `sizeUSDC` is the engine-bound size when allowed (zero when refused);

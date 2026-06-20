@@ -8,12 +8,12 @@
  * tighter than the SDK's catastrophic-overflow `MAX_LINE_TICKS` floor
  * (`±1,000,000` ticks = `±100,000.0`).
  *
- * Why a hard rail and not a cosmetic check: the *deployed* `SpreadScorerModule`
- * computes `adjustedAway = scaledAway + lineTicks` in CHECKED `int32` arithmetic
- * with NO on-chain magnitude bound, so a pathological spread line permanently
- * reverts settlement and locks the escrow of every position on that speculation
- * (the protocol is zero-admin / non-upgradeable; the contract fix is staged but
- * not yet deployed). The MM must never put its name on such a line. Real oracle
+ * Why a hard rail and not a cosmetic check: the `SpreadScorerModule` computes
+ * `adjustedAway = scaledAway + lineTicks` in CHECKED `int32` arithmetic with NO
+ * on-chain magnitude bound, so a pathological spread line permanently reverts
+ * settlement and strands the escrow of every position on that speculation — and the
+ * protocol is zero-admin / non-upgradeable, so there is no on-chain remediation once
+ * a speculation is created. The MM must never put its name on such a line. Real oracle
  * lines (run lines `±1.5`, totals `7`–`260`) sit two-to-three orders of magnitude
  * inside this band, so legitimate quoting is unaffected; moneyline — `lineTicks`
  * is always `0` — always passes.

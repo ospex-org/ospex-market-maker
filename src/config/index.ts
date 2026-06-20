@@ -239,7 +239,7 @@ const RISK_KEYS = [
 const GAS_KEYS = ['maxDailyGasPOL', 'emergencyReservePOL', 'reportInUSDC', 'nativeTokenUSDCPrice'] as const;
 const APPROVALS_KEYS = ['autoApprove', 'mode'] as const;
 const ORDERS_KEYS = [
-  'expiryMode', 'expirySeconds', 'expiryReleaseGraceSeconds', 'staleAfterSeconds', 'staleReferenceAfterSeconds', 'replaceOnOddsMoveBps', 'cancelMode',
+  'expiryMode', 'expirySeconds', 'expiryReleaseGraceSeconds', 'staleAfterSeconds', 'staleReferenceAfterSeconds', 'replaceOnOddsMoveBps', 'replaceOnLineMoveTicks', 'cancelMode',
 ] as const;
 const FUNDING_GUARD_KEYS = ['enabled', 'checkIntervalMs', 'underfundedCancelMode', 'failClosedOnReadError'] as const;
 const SETTLEMENT_KEYS = ['autoSettleOwn', 'autoClaimOwn', 'continueOnGasBudgetExhausted'] as const;
@@ -418,6 +418,7 @@ export function parseConfig(raw: unknown, env: EnvLike = {}): Config {
     staleAfterSeconds: def(ord.staleAfterSeconds, 90, (v) => asPositiveInt(v, 'orders.staleAfterSeconds')),
     staleReferenceAfterSeconds: def(ord.staleReferenceAfterSeconds, 300, (v) => asPositiveInt(v, 'orders.staleReferenceAfterSeconds')),
     replaceOnOddsMoveBps: def(ord.replaceOnOddsMoveBps, 50, (v) => asPositiveNumber(v, 'orders.replaceOnOddsMoveBps')),
+    replaceOnLineMoveTicks: def(ord.replaceOnLineMoveTicks, 0, (v) => asNonNegativeInt(v, 'orders.replaceOnLineMoveTicks')),
     cancelMode: def<CancelMode>(ord.cancelMode, 'offchain', (v) => asEnum(v, 'orders.cancelMode', CANCEL_MODES)),
   };
 

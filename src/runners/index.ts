@@ -1761,18 +1761,23 @@ export class Runner {
         if (refreshedMatchTimeSec < m.matchTimeSec) m.dirty = true; // moved earlier — re-evaluate the gates next tick, not at the staleAfter cadence
         m.matchTimeSec = refreshedMatchTimeSec;
       }
-      // A contest that re-opened a different speculation for this market: track the new id.
-      // If the speculation closed (`spec === undefined`) leave the id as-is —
-      // reconcileMarket's open-speculation re-check pulls quotes + emits
-      // `no-open-speculation` that same tick. Matched on the market's own `marketType`,
-      // so a multi-market contest re-points each market independently; selecting WHICH
-      // spread/total spec is the oracle-primary line is the follow-the-oracle slice.
-      const spec = c.speculations.find((s) => s.marketType === m.marketType && s.open);
+      // Re-bind this market to the open speculation it should track. Moneyline (and any
+      // market without usable reference odds yet) keeps the first open spec for its
+      // `marketType`; spread / total FOLLOW the oracle line (see `selectRefreshSpec`). If
+      // nothing is selected (`spec === undefined` — the spec closed, or no open spec exists
+      // at the chosen line) leave the id as-is: reconcileMarket's open-speculation re-check
+      // pulls quotes + emits `no-open-speculation` that same tick. Each market re-points
+      // independently (matched on its own `marketType`).
+      const spec = this.selectRefreshSpec(c, m);
       if (spec !== undefined && spec.speculationId !== m.speculationId) {
         const fromLineTicks = m.lineTicks;
         const toLineTicks = spec.lineTicks ?? 0; // moneyline: null → 0 (never changes)
         m.speculationId = spec.speculationId;
         m.lineTicks = toLineTicks;
+        // A re-point binds the market to a NEW on-chain speculation (any visible quotes were
+        // on the old one): re-quote it promptly rather than wait out the `staleAfterSeconds`
+        // throttle. Mirrors the match-time-moved-earlier dirty above.
+        m.dirty = true;
         if (toLineTicks !== fromLineTicks) {
           // The line moved (spread / total): the entry is keyed under the OLD line, so
           // queue a re-key to the new line. Moneyline (line always 0) never reaches here.
@@ -1871,6 +1876,43 @@ export class Runner {
         this.eventLog.emit('candidate', { contestId: c.contestId, sport: full.sport, matchTime: full.matchTime, speculationId: confirmedSpec.speculationId });
       }
     }
+  }
+
+  /**
+   * Pick the open speculation a tracked market should bind to on a discovery refresh.
+   *
+   * Moneyline has no line — it keeps the pre-follow behavior: the first open spec for the
+   * market type (`m.lineTicks` is always 0, so it never re-keys).
+   *
+   * Spread / total FOLLOW the oracle line. With a usable oracle the target line is the
+   * oracle line (`oracleLineTicks`) once it has moved MORE than `orders.replaceOnLineMoveTicks`
+   * ticks from the line we're quoting, else the current line (so a sub-threshold wobble is
+   * debounced); a same-line speculation re-ID is still followed because it binds to the open
+   * spec AT the target line. Two guards keep the binding sane:
+   * - With NO usable oracle yet (a newcomer's first cycle, or a transient null / partial odds
+   *   row) it holds the current line while its spec is open — it does NOT drift to an arbitrary
+   *   line via first-open, which would move `m.speculationId` off the spec our quotes sit on and
+   *   leave them un-pulled. It only re-points (first-open) once the held line's spec has closed.
+   * - If no open spec exists at the chosen (held or oracle) line, it falls back to the open spec
+   *   at the oracle line rather than strand on a closed/absent spec — otherwise a debounced move
+   *   whose held-line spec then closes would refuse forever.
+   *
+   * Returns undefined only when nothing suitable is open; the caller leaves the binding as-is
+   * and reconcileMarket refuses (`no-open-speculation`, or `reference-line-mismatch`).
+   */
+  private selectRefreshSpec(c: ContestView, m: TrackedMarket): SpeculationView | undefined {
+    const firstOpen = (): SpeculationView | undefined => c.speculations.find((s) => s.marketType === m.marketType && s.open);
+    if (m.marketType === 'moneyline') return firstOpen();
+    const openAtLine = (ticks: number): SpeculationView | undefined =>
+      c.speculations.find((s) => s.marketType === m.marketType && s.open && (s.lineTicks ?? 0) === ticks);
+    const oracleTicks = m.lastReferenceOdds === null ? null : oracleLineTicks(m.lastReferenceOdds);
+    // No usable oracle: hold the current line if its spec is still open; only re-point (first
+    // open) once that spec has closed — never drift off a live held line on a transient null.
+    if (oracleTicks === null) return openAtLine(m.lineTicks) ?? firstOpen();
+    // Follow the oracle past the threshold, else hold the current line (debounce). If no spec
+    // is open at the chosen line, follow the oracle line rather than strand on a closed one.
+    const targetTicks = Math.abs(oracleTicks - m.lineTicks) > this.config.orders.replaceOnLineMoveTicks ? oracleTicks : m.lineTicks;
+    return openAtLine(targetTicks) ?? openAtLine(oracleTicks);
   }
 
   /**
@@ -2267,8 +2309,11 @@ export class Runner {
     // (spread → awayLine, total → line). A divergence means the reference PRICE applies to
     // a different line than the one we'd commit at — a mispriced commitment — so pull and
     // refuse rather than misprice. Moneyline has no line (`oracleLineTicks` → null) and is
-    // unaffected. Following the oracle to the open spec at the new line (re-binding) is the
-    // next line-policy slice; until then a divergence refuses rather than chases.
+    // unaffected. The discovery refresh FOLLOWS the oracle (re-binds to the open spec at the
+    // new line — `selectRefreshSpec`), so a divergence reaching here is a residual one: a
+    // sub-`orders.replaceOnLineMoveTicks` move being debounced, or no open spec at the oracle
+    // line yet. We refuse until the next refresh resolves it (a move worth chasing with an
+    // open spec to chase, or the oracle returning to our line).
     const oracleTicks = oracleLineTicks(ref);
     if (oracleTicks !== null && oracleTicks !== m.lineTicks) {
       const outcome = await this.pullVisibleQuotes(m, now);

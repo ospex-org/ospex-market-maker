@@ -116,6 +116,14 @@ orders:
   staleAfterSeconds: 90             # pull-and-repost a quote this old (< expirySeconds, so it never just lapses)
   staleReferenceAfterSeconds: 300   # treat reference odds as stale (pull quotes, don't repost) if nothing heard this long
   replaceOnOddsMoveBps: 50          # pull-and-repost when fair value moves more than this since posting
+  replaceOnLineMoveTicks: 0         # spread/total only — re-bind a tracked market to the open speculation at the
+                                    #   oracle's new line (and re-quote there) when the line the reference odds imply
+                                    #   moves MORE than this many away-perspective ticks from the line we're quoting.
+                                    #   Ticks are 10x-scaled (a half-point move is 5 ticks, a full point 10), and the
+                                    #   comparison is strict — a value of N ignores moves of N ticks or fewer. 0 (the
+                                    #   default) follows every move (no debounce); a larger value debounces churn but the
+                                    #   line-consistency gate keeps refusing the residual mismatch until a move worth
+                                    #   chasing. Moneyline has no line and ignores this.
   cancelMode: offchain              # how to free a partially-filled remainder that's stale/mispriced/unwanted:
                                     #   "offchain" (default) — leave it; its off-chain cancel is rejected once matched (409),
                                     #     so it rides to expiry. Fine under short fixed-seconds expiry. (visibleOpen quotes are

@@ -143,7 +143,7 @@ export async function runQuote(opts: QuoteOpts): Promise<QuoteReport> {
   const desired = buildDesiredQuote(
     config,
     market,
-    { away: odds.awayOddsAmerican, home: odds.homeOddsAmerican },
+    { market: 'moneyline', awayOddsAmerican: odds.awayOddsAmerican, homeOddsAmerican: odds.homeOddsAmerican },
     { items: [], openCommitmentCount: 0 },
   );
   if (desired.referenceOdds === null) {

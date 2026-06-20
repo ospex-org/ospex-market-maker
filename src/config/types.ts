@@ -233,6 +233,19 @@ export interface OrdersConfig {
   staleReferenceAfterSeconds: number;
   replaceOnOddsMoveBps: number;
   /**
+   * Spread / total only — the minimum oracle line move (in away-perspective ticks, the
+   * protocol's 10×-scaled `lineTicks` unit) that makes the MM re-bind a tracked market to
+   * the open speculation at the new line and re-quote there. The discovery refresh FOLLOWS
+   * the oracle: when the line the reference odds imply (`oracleLineTicks` — `round(awayLine ×
+   * 10)` for spread, `round(line × 10)` for total) has moved MORE than this many ticks from
+   * the line we're quoting, the tracked market re-points to the open spec at the oracle line
+   * (the line-consistency gate then lets it quote). A smaller move is held (debounced): the
+   * gate keeps refusing the residual mismatch (`reference-line-mismatch`) until the move is
+   * worth chasing or the oracle returns to our line. `0` (default) follows every move — no
+   * debounce, the smallest refusal window. Moneyline has no line and ignores this entirely.
+   */
+  replaceOnLineMoveTicks: number;
+  /**
    * How the MM authoritatively cancels matchable commitments it no longer wants on chain.
    * `offchain` (default) pulls them off the relay (gasless, visibility-only — the signed
    * payload stays matchable until expiry); `onchain` ALSO sends an authoritative

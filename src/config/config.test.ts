@@ -36,6 +36,7 @@ describe('parseConfig', () => {
     expect(c.approvals.mode).toBe('exact');
     expect(c.orders.expiryMode).toBe('fixed-seconds');
     expect(c.orders.expiryReleaseGraceSeconds).toBe(60);
+    expect(c.orders.replaceOnLineMoveTicks).toBe(0); // follow every oracle line move by default (no debounce)
     expect(c.orders.cancelMode).toBe('offchain');
     expect(c.fundingGuard.enabled).toBe(true);
     expect(c.fundingGuard.checkIntervalMs).toBe(30_000);
@@ -109,6 +110,10 @@ describe('parseConfig', () => {
     expect(() => parseConfig({ rpcUrl: 'x', ownState: { indexerLagMaxSeconds: 301 } }, {})).toThrow(/indexerLagMaxSeconds/);
     expect(() => parseConfig({ rpcUrl: 'x', ownState: { staleMaxMs: 29999 } }, {})).toThrow(/staleMaxMs/); // floor is 30000 (above the ~20s server heartbeat)
     expect(() => parseConfig({ rpcUrl: 'x', ownState: { recoveryHoldMs: 300001 } }, {})).toThrow(/recoveryHoldMs/);
+    // orders.replaceOnLineMoveTicks — a non-negative integer (ticks); 0 is valid, negatives / fractions are not.
+    expect(() => parseConfig({ rpcUrl: 'x', orders: { replaceOnLineMoveTicks: -1 } }, {})).toThrow(/replaceOnLineMoveTicks/);
+    expect(() => parseConfig({ rpcUrl: 'x', orders: { replaceOnLineMoveTicks: 2.5 } }, {})).toThrow(/replaceOnLineMoveTicks/);
+    expect(parseConfig({ rpcUrl: 'x', orders: { replaceOnLineMoveTicks: 5 } }, {}).orders.replaceOnLineMoveTicks).toBe(5);
   });
 
   it('ownState PR2 health-gate knobs accept in-range values (and recoveryHoldMs accepts 0)', () => {

@@ -4321,6 +4321,169 @@ describe('Runner — live execution', () => {
     expect(runner.trackedMarketKeysForTest()).toEqual(['1:moneyline:0']); // key stable — moneyline never re-keys
   });
 
+  // ── follow-the-oracle line selection (spread/total: re-bind to the open spec at the oracle line) ──
+  //
+  // The discovery refresh binds a tracked spread/total market to the open speculation at
+  // the oracle line (`oracleLineTicks(lastReferenceOdds)`), debounced by
+  // `orders.replaceOnLineMoveTicks` — re-bind only when the line moves MORE than that many
+  // ticks from the quoted line. This RESOLVES a `reference-line-mismatch` by following the
+  // line instead of refusing forever. Moneyline has no line → it ignores all of this and
+  // keeps re-pointing via find-first. (The re-key mechanism itself is covered above.)
+
+  const specAtLine = (lineTicks: number, id: string): SpeculationView => ({ speculationId: id, contestId: '1', marketType: 'spread', lineTicks, line: lineTicks / 10, open: true });
+
+  it('follow-the-oracle: a spread market re-binds to the open spec at the oracle line when the line moves (default threshold 0 follows every move)', async () => {
+    let listCount = 0;
+    const config = withMarkets(cfg({ discovery: { everyNTicks: 1 } }), ['spread']);
+    // Cycle 1: only the -15 spec is open → the newcomer binds it (find-first; odds seed after). The
+    // oracle prices away -2.0 (→ -20). Cycle 2's listing carries BOTH the -15 spec (FIRST, so
+    // find-first would keep it) and a -20 spec → follow picks -20, proving follow ≠ find-first.
+    const adapter = spiedAdapter(
+      config,
+      () => { listCount += 1; return Promise.resolve([contestView({ contestId: '1', speculations: listCount === 1 ? [specAtLine(-15, 'sp-15')] : [specAtLine(-15, 'sp-15'), specAtLine(-20, 'sp-20')] })]); },
+      (id) => Promise.resolve(contestView({ contestId: id, referenceGameId: 'GAME-1', speculations: [specAtLine(-15, 'sp-15')] })),
+      { snapshot: (id) => Promise.resolve({ contestId: id, odds: { moneyline: null, spread: spreadOdds(-2.0), total: null } }) },
+    );
+    const runner = makeRunner({ config, adapter, maxTicks: 2 });
+    await runner.run();
+    // Followed to the oracle line's spec + re-keyed under the new line.
+    expect(runner.trackedMarketView('1', 'spread')).toMatchObject({ speculationId: 'sp-20', lineTicks: -20 });
+    expect(runner.trackedMarketKeysForTest()).toEqual(['1:spread:-20']);
+    // Non-vacuous: after following, the line gate is satisfied and the market reaches pricing.
+    expect(readEvents().some((e) => e.kind === 'quote-intent' && e.contestId === '1')).toBe(true);
+  });
+
+  it('follow-the-oracle: a TOTAL market re-binds to the open spec at the oracle line when the line moves (parity with spread)', async () => {
+    let listCount = 0;
+    const config = withMarkets(cfg({ discovery: { everyNTicks: 1 } }), ['total']);
+    const totalSpecAt = (lineTicks: number, id: string): SpeculationView => ({ speculationId: id, contestId: '1', marketType: 'total', lineTicks, line: lineTicks / 10, open: true });
+    // Cycle 1 binds the 75 (7.5) spec; the oracle prices total 8.5 (→ 85). Cycle 2 lists both the
+    // 75 spec (FIRST) and an 85 spec → follow picks 85 (round(line × 10), perspective-neutral).
+    const adapter = spiedAdapter(
+      config,
+      () => { listCount += 1; return Promise.resolve([contestView({ contestId: '1', speculations: listCount === 1 ? [totalSpecAt(75, 'to-75')] : [totalSpecAt(75, 'to-75'), totalSpecAt(85, 'to-85')] })]); },
+      (id) => Promise.resolve(contestView({ contestId: id, referenceGameId: 'GAME-1', speculations: [totalSpecAt(75, 'to-75')] })),
+      { snapshot: (id) => Promise.resolve({ contestId: id, odds: { moneyline: null, spread: null, total: totalOdds(8.5) } }) },
+    );
+    const runner = makeRunner({ config, adapter, maxTicks: 2 });
+    await runner.run();
+    expect(runner.trackedMarketView('1', 'total')).toMatchObject({ speculationId: 'to-85', lineTicks: 85 });
+    expect(runner.trackedMarketKeysForTest()).toEqual(['1:total:85']);
+    expect(readEvents().some((e) => e.kind === 'quote-intent' && e.contestId === '1')).toBe(true);
+  });
+
+  it('follow-the-oracle: a sub-threshold line move is debounced — the market holds its line and the gate keeps refusing', async () => {
+    let listCount = 0;
+    const config = withMarkets(cfg({ discovery: { everyNTicks: 1 }, orders: { replaceOnLineMoveTicks: 5 } }), ['spread']);
+    // Oracle away -2.0 (→ -20) is exactly 5 ticks from the tracked -15 — NOT > the threshold of 5,
+    // so the move is debounced even though a -20 spec is open. The market holds -15 and refuses.
+    const adapter = spiedAdapter(
+      config,
+      () => { listCount += 1; return Promise.resolve([contestView({ contestId: '1', speculations: listCount === 1 ? [specAtLine(-15, 'sp-15')] : [specAtLine(-15, 'sp-15'), specAtLine(-20, 'sp-20')] })]); },
+      (id) => Promise.resolve(contestView({ contestId: id, referenceGameId: 'GAME-1', speculations: [specAtLine(-15, 'sp-15')] })),
+      { snapshot: (id) => Promise.resolve({ contestId: id, odds: { moneyline: null, spread: spreadOdds(-2.0), total: null } }) },
+    );
+    const runner = makeRunner({ config, adapter, maxTicks: 2 });
+    await runner.run();
+    // Held its line — not re-bound to the -20 spec (the move was within the debounce threshold).
+    expect(runner.trackedMarketView('1', 'spread')).toMatchObject({ speculationId: 'sp-15', lineTicks: -15 });
+    expect(runner.trackedMarketKeysForTest()).toEqual(['1:spread:-15']);
+    // The residual mismatch is still refused.
+    expect(readEvents().some((e) => e.kind === 'candidate' && e.skipReason === 'reference-line-mismatch')).toBe(true);
+  });
+
+  it('follow-the-oracle: a move beyond the threshold IS followed (re-binds + re-keys)', async () => {
+    let listCount = 0;
+    const config = withMarkets(cfg({ discovery: { everyNTicks: 1 }, orders: { replaceOnLineMoveTicks: 5 } }), ['spread']);
+    // Oracle away -2.5 (→ -25) is 10 ticks from the tracked -15 — > the threshold of 5 → follow.
+    const adapter = spiedAdapter(
+      config,
+      () => { listCount += 1; return Promise.resolve([contestView({ contestId: '1', speculations: listCount === 1 ? [specAtLine(-15, 'sp-15')] : [specAtLine(-15, 'sp-15'), specAtLine(-25, 'sp-25')] })]); },
+      (id) => Promise.resolve(contestView({ contestId: id, referenceGameId: 'GAME-1', speculations: [specAtLine(-15, 'sp-15')] })),
+      { snapshot: (id) => Promise.resolve({ contestId: id, odds: { moneyline: null, spread: spreadOdds(-2.5), total: null } }) },
+    );
+    const runner = makeRunner({ config, adapter, maxTicks: 2 });
+    await runner.run();
+    expect(runner.trackedMarketView('1', 'spread')).toMatchObject({ speculationId: 'sp-25', lineTicks: -25 });
+    expect(runner.trackedMarketKeysForTest()).toEqual(['1:spread:-25']);
+  });
+
+  it('follow-the-oracle: a same-line speculation re-ID is followed (re-points the id, no re-key) even with odds present', async () => {
+    let listCount = 0;
+    const config = withMarkets(cfg({ discovery: { everyNTicks: 1 } }), ['spread']);
+    // Oracle away -1.5 (→ -15) stays aligned with the tracked line; cycle 2 re-IDs the -15 spec.
+    // The follow path binds to the open spec AT the held line, so the new id is picked up (no re-key).
+    const adapter = spiedAdapter(
+      config,
+      () => { listCount += 1; return Promise.resolve([contestView({ contestId: '1', speculations: [listCount === 1 ? specAtLine(-15, 'sp-v1') : specAtLine(-15, 'sp-v2')] })]); },
+      (id) => Promise.resolve(contestView({ contestId: id, referenceGameId: 'GAME-1', speculations: [specAtLine(-15, 'sp-v1')] })),
+      { snapshot: (id) => Promise.resolve({ contestId: id, odds: { moneyline: null, spread: spreadOdds(-1.5), total: null } }) },
+    );
+    const runner = makeRunner({ config, adapter, maxTicks: 2 });
+    await runner.run();
+    expect(runner.trackedMarketView('1', 'spread')).toMatchObject({ speculationId: 'sp-v2', lineTicks: -15 }); // followed the re-ID
+    expect(runner.trackedMarketKeysForTest()).toEqual(['1:spread:-15']); // same line → no re-key
+  });
+
+  it('follow-the-oracle: moneyline ignores replaceOnLineMoveTicks (re-points via find-first regardless, never re-keys)', async () => {
+    let listCount = 0;
+    const config = cfg({ discovery: { everyNTicks: 1 }, orders: { replaceOnLineMoveTicks: 100 } });
+    // Moneyline odds present, a large threshold set — yet moneyline has no line (`oracleLineTicks → null`),
+    // so it still re-points to the new open spec via find-first and never re-keys (line always 0).
+    const adapter = spiedAdapter(
+      config,
+      () => { listCount += 1; return Promise.resolve([contestView({ contestId: '1', speculations: [{ speculationId: listCount === 1 ? 'ml-v1' : 'ml-v2', contestId: '1', marketType: 'moneyline', lineTicks: null, line: null, open: true }] })]); },
+      undefined,
+      { snapshot: (id) => Promise.resolve(oddsSnapshotView(id, moneylineOdds(-150, 130))) },
+    );
+    const runner = makeRunner({ config, adapter, maxTicks: 2 });
+    await runner.run();
+    expect(runner.trackedMarketView('1')?.speculationId).toBe('ml-v2'); // re-pointed via find-first despite the large threshold
+    expect(runner.trackedMarketKeysForTest()).toEqual(['1:moneyline:0']);
+  });
+
+  it('follow-the-oracle: a transient null odds window holds the current line — it does NOT drift to another open line', async () => {
+    let listCount = 0;
+    const config = withMarkets(cfg({ discovery: { everyNTicks: 1 }, odds: { subscribe: false } }), ['spread']);
+    // Cycle 1 binds the -15 spec and seeds oracle -1.5; the snapshot then blinks null (a partial
+    // provider row). A -20 spec opens too, listed FIRST so first-open WOULD pick it. The market
+    // must HOLD -15 (the spec it quotes on) rather than drift to -20 while the oracle is unknown.
+    const adapter = spiedAdapter(
+      config,
+      () => {
+        listCount += 1;
+        const specs = listCount === 1 ? [specAtLine(-15, 'sp-15')] : [specAtLine(-20, 'sp-20'), specAtLine(-15, 'sp-15')];
+        return Promise.resolve([contestView({ contestId: '1', speculations: specs })]);
+      },
+      (id) => Promise.resolve(contestView({ contestId: id, referenceGameId: 'GAME-1', speculations: [specAtLine(-15, 'sp-15')] })),
+      { snapshot: (id) => Promise.resolve({ contestId: id, odds: { moneyline: null, spread: listCount <= 1 ? spreadOdds(-1.5) : null, total: null } }) },
+    );
+    const runner = makeRunner({ config, adapter, maxTicks: 3 });
+    await runner.run();
+    // Held its line across the null window — did not drift to the (first-listed) -20 spec.
+    expect(runner.trackedMarketView('1', 'spread')).toMatchObject({ speculationId: 'sp-15', lineTicks: -15 });
+    expect(runner.trackedMarketKeysForTest()).toEqual(['1:spread:-15']);
+  });
+
+  it('follow-the-oracle: a within-threshold market whose held-line spec closes follows the oracle line rather than stranding', async () => {
+    let listCount = 0;
+    const config = withMarkets(cfg({ discovery: { everyNTicks: 1 }, orders: { replaceOnLineMoveTicks: 5 } }), ['spread']);
+    // Tracked at -15; oracle away -2.0 (→ -20) is within the debounce threshold (move 5, not > 5),
+    // so it would normally HOLD -15. But cycle 2's listing drops the -15 spec (only -20 is open) —
+    // holding would strand it refusing forever, so it follows to the open oracle-line spec instead.
+    const adapter = spiedAdapter(
+      config,
+      () => { listCount += 1; return Promise.resolve([contestView({ contestId: '1', speculations: listCount === 1 ? [specAtLine(-15, 'sp-15')] : [specAtLine(-20, 'sp-20')] })]); },
+      (id) => Promise.resolve(contestView({ contestId: id, referenceGameId: 'GAME-1', speculations: [specAtLine(-15, 'sp-15')] })),
+      { snapshot: (id) => Promise.resolve({ contestId: id, odds: { moneyline: null, spread: spreadOdds(-2.0), total: null } }) },
+    );
+    const runner = makeRunner({ config, adapter, maxTicks: 2 });
+    await runner.run();
+    // Followed to the oracle line (the only open spec) instead of stranding on the closed -15.
+    expect(runner.trackedMarketView('1', 'spread')).toMatchObject({ speculationId: 'sp-20', lineTicks: -20 });
+    expect(runner.trackedMarketKeysForTest()).toEqual(['1:spread:-20']);
+  });
+
   it('match-time expiry: submitCommitment is called with expiry = the contest match time', async () => {
     StateStore.at(stateDir).flush(emptyMakerState());
     const config = cfg({ mode: { dryRun: false }, orders: { expiryMode: 'match-time', expirySeconds: 120 } });

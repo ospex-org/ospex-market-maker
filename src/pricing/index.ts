@@ -13,7 +13,14 @@ export {
   USDC_DECIMALS,
   USDC_UNIT_WEI6,
   RISK_LOT_WEI6,
+  MM_MAX_SANE_LINE_TICKS,
 } from './constants.js';
+
+export {
+  isLineWithinSanityBand,
+  assertLineWithinSanityBand,
+  LineOutOfSanityBandError,
+} from './line.js';
 
 export {
   americanToDecimal,

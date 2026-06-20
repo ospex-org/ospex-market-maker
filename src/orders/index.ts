@@ -19,6 +19,10 @@
  *     book-hygiene duplicate, or a stale/mispriced quote it can't yet afford to
  *     replace (those sides land in `deferredSides` for a retry next tick).
  *
+ * Upstream reference-odds ingestion — the SDK per-market odds shape (`MoneylineOdds`
+ * / `SpreadOdds` / `TotalOdds`) → the MM's usable `ReferenceOdds` — lives in
+ * `./reference-odds.ts` (the foundation the spread / total strategies build on).
+ *
  * The runner (a later step of the dry-run plan) wires these together; `run --live`
  * (Phase 3) adds the *execution* layer — the actual SDK write calls behind each
  * plan item, plus the authoritative on-chain cancel / nonce-floor paths. In
@@ -41,6 +45,11 @@ import {
 } from '../pricing/index.js';
 import { headroomForSide, verdictForMarket, type ExposureItem, type Inventory, type MakerSide, type Market, type RiskCaps } from '../risk/index.js';
 import { isTerminalPositionStatus, type CommitmentLifecycle, type MakerCommitmentRecord, type MakerState } from '../state/index.js';
+
+// Reference-odds ingestion: the SDK per-market odds shape → the MM's usable
+// `ReferenceOdds`. Re-exported so the (forthcoming) spread / total pricing
+// strategies and line-keyed discovery consume one entry point.
+export { referenceOddsFromSdk, type ReferenceOdds } from './reference-odds.js';
 
 // ── types ────────────────────────────────────────────────────────────────────
 

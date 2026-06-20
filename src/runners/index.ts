@@ -119,7 +119,7 @@ import type {
   SpeculationView,
   Subscription,
 } from '../ospex/index.js';
-import { decimalToTick, inverseOddsTick, isTickInRange, oppositeSide, positionTypeForSide, toProtocolQuote, type ProtocolQuote, type QuoteSide } from '../pricing/index.js';
+import { decimalToTick, inverseOddsTick, isLineWithinSanityBand, isTickInRange, LineOutOfSanityBandError, oppositeSide, positionTypeForSide, toProtocolQuote, type ProtocolQuote, type QuoteSide } from '../pricing/index.js';
 import {
   emptyOwnStateSession,
   mapOwnerCommitmentToMaker,
@@ -2644,6 +2644,21 @@ export class Runner {
     // so dry-run still prices + records its synthetic `would-submit`.
     if (this.updateStreamHealthHold(this.deps.now())) return null;
     const proto = toProtocolQuote({ side: qs.takerSide, oddsTick: qs.quoteTick });
+    // Line-sanity rail (locked decision #1, DESIGN §5): the MM never signs — nor
+    // dry-run "would-submit"s — a commitment whose line falls outside its conservative
+    // band. Moneyline is always `lineTicks 0` (always in band); spread / total will
+    // source the contest's oracle line here (PR-3+). Fail-closed backstop: a
+    // pathological spread line permanently reverts on-chain settlement and locks escrow
+    // (the deployed SpreadScorerModule adds lineTicks in checked int32 math with no
+    // magnitude bound; the contract fix is staged, not deployed). On a refusal, skip the
+    // side this tick — never crash the tick (DESIGN §9). The candidate-stage refusal
+    // (so an out-of-band market is never priced) lands with discovery in a later PR.
+    const lineTicks = 0;
+    if (!isLineWithinSanityBand(lineTicks)) {
+      const err = new LineOutOfSanityBandError(lineTicks);
+      this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'submit', contestId: m.contestId, takerSide: qs.takerSide });
+      return null;
+    }
     let hash: string;
     // The SDK's `submitRaw` returns `SubmitResult.signedPayload` (the canonical
     // EIP-712 bundle — own-state SSE plan §M6) on every live submit. We
@@ -2662,7 +2677,7 @@ export class Runner {
         const result = await this.adapter.submitCommitment({
           contestId: BigInt(m.contestId),
           scorer: this.moneylineScorer,
-          lineTicks: 0,
+          lineTicks,
           positionType: proto.positionType,
           oddsTick: proto.makerOddsTick,
           riskAmount: BigInt(qs.sizeWei6),

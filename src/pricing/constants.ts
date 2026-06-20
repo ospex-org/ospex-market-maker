@@ -24,3 +24,16 @@ export const USDC_UNIT_WEI6 = 1_000_000;
  * quotable risk increment is `100` wei6 = `0.0001` USDC.
  */
 export const RISK_LOT_WEI6 = ODDS_SCALE;
+
+/**
+ * Off-chain line-sanity bound (locked decision #1) — the maximum absolute
+ * `lineTicks` (int32, 10×-scaled) the market-maker will sign or quote: `±5_000`
+ * ticks = `±500.0` line points. A single conservative fat-finger / fund-lock rail,
+ * ~2× the most extreme real sports line (an NBA total ~260 ⇒ `2_600`) and `200×`
+ * tighter than the SDK's catastrophic-overflow `MAX_LINE_TICKS` floor (`±1_000_000`
+ * ticks = `±100,000.0`). Moneyline is always `lineTicks 0`, so it always passes.
+ * See `line.ts` for the rationale (the deployed `SpreadScorerModule` adds
+ * `lineTicks` in checked int32 math with no on-chain bound → a pathological spread
+ * line locks escrow forever; the contract fix is staged, not deployed).
+ */
+export const MM_MAX_SANE_LINE_TICKS = 5_000;

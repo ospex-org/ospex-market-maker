@@ -46,9 +46,11 @@ import {
 } from '../ospex/index.js';
 import {
   assessStateLoss,
+  MARKET_TYPES,
   type CommitmentLifecycle,
   type MakerPositionStatus,
   type MakerState,
+  type MarketType,
   type PnlSnapshot,
   type StateLoadResult,
   type StateLossAssessment,
@@ -58,15 +60,19 @@ import { eventLogsExist as eventLogsExistImpl } from '../telemetry/index.js';
 
 // ── report shape ─────────────────────────────────────────────────────────────
 
-/** Counts per `CommitmentLifecycle` bucket plus the distinct-contests-on-non-terminal cardinality (a proxy for "markets currently exposed"). */
+/** Counts per `CommitmentLifecycle` bucket, the non-terminal contest / speculation cardinalities, and a per-market count. */
 export interface CommitmentSummary {
   total: number;
   byLifecycle: Record<CommitmentLifecycle, number>;
-  /** Distinct `contestId`s across `visibleOpen` / `softCancelled` / `partiallyFilled` records — markets where the maker currently has matchable exposure. */
+  /** Distinct `contestId`s across `visibleOpen` / `softCancelled` / `partiallyFilled` records — distinct CONTESTS with matchable exposure. A contest may carry several markets (moneyline / spread / total), so this is NOT the count of markets exposed — see {@link distinctSpeculationsNonTerminal} for that. */
   distinctContestsNonTerminal: number;
+  /** Distinct `speculationId`s across `visibleOpen` / `softCancelled` / `partiallyFilled` records — the count of markets + lines with matchable exposure (a `speculationId` is 1:1 with a contest's market + line on chain). Equals {@link distinctContestsNonTerminal} for a moneyline-only maker. */
+  distinctSpeculationsNonTerminal: number;
+  /** Commitment count per market type (`moneyline` / `spread` / `total`) — zero-filled for all three. */
+  byMarket: Record<MarketType, number>;
 }
 
-/** Per-`MakerPositionStatus` count and own-risk USDC sum (wei6 decimal string). */
+/** A `{ count, own-risk USDC }` bucket — used per `MakerPositionStatus` and per market. */
 export interface PositionStatusBucket {
   count: number;
   /** Sum of `MakerPositionRecord.riskAmountWei6` across this bucket — own staked USDC (wei6 decimal string). */
@@ -76,6 +82,8 @@ export interface PositionStatusBucket {
 export interface PositionsSummary {
   total: number;
   byStatus: Record<MakerPositionStatus, PositionStatusBucket>;
+  /** Per-market count + own-risk USDC sum (`moneyline` / `spread` / `total`) — zero-filled for all three. The exposure-by-market view. */
+  byMarket: Record<MarketType, PositionStatusBucket>;
 }
 
 export interface DailyCountersSnapshot {
@@ -273,15 +281,23 @@ function summarizeCommitments(state: MakerState): CommitmentSummary {
   const byLifecycle: Record<CommitmentLifecycle, number> = {
     visibleOpen: 0, softCancelled: 0, partiallyFilled: 0, filled: 0, expired: 0, authoritativelyInvalidated: 0,
   };
+  const byMarket: Record<MarketType, number> = { moneyline: 0, spread: 0, total: 0 };
   const contestsNonTerminal = new Set<string>();
+  const speculationsNonTerminal = new Set<string>();
   for (const r of Object.values(state.commitments)) {
     byLifecycle[r.lifecycle] = (byLifecycle[r.lifecycle] ?? 0) + 1;
-    if (NON_TERMINAL_LIFECYCLES.has(r.lifecycle)) contestsNonTerminal.add(r.contestId);
+    byMarket[r.marketType] = (byMarket[r.marketType] ?? 0) + 1;
+    if (NON_TERMINAL_LIFECYCLES.has(r.lifecycle)) {
+      contestsNonTerminal.add(r.contestId);
+      speculationsNonTerminal.add(r.speculationId);
+    }
   }
   return {
     total: Object.keys(state.commitments).length,
     byLifecycle,
     distinctContestsNonTerminal: contestsNonTerminal.size,
+    distinctSpeculationsNonTerminal: speculationsNonTerminal.size,
+    byMarket,
   };
 }
 
@@ -297,14 +313,24 @@ function summarizePositions(state: MakerState): PositionsSummary {
   const sums: Record<MakerPositionStatus, bigint> = {
     active: 0n, pendingSettle: 0n, claimable: 0n, claimed: 0n, settledLost: 0n, void: 0n,
   };
+  const byMarket: Record<MarketType, PositionStatusBucket> = {
+    moneyline: { count: 0, ownRiskWei6: '0' },
+    spread: { count: 0, ownRiskWei6: '0' },
+    total: { count: 0, ownRiskWei6: '0' },
+  };
+  const marketSums: Record<MarketType, bigint> = { moneyline: 0n, spread: 0n, total: 0n };
   for (const p of Object.values(state.positions)) {
     byStatus[p.status].count += 1;
     sums[p.status] += BigInt(p.riskAmountWei6);
+    byMarket[p.marketType].count += 1;
+    marketSums[p.marketType] += BigInt(p.riskAmountWei6);
   }
   for (const s of POSITION_STATUSES) byStatus[s].ownRiskWei6 = sums[s].toString();
+  for (const m of MARKET_TYPES) byMarket[m].ownRiskWei6 = marketSums[m].toString();
   return {
     total: Object.keys(state.positions).length,
     byStatus,
+    byMarket,
   };
 }
 
@@ -357,17 +383,27 @@ export function renderStatusReportText(report: StatusReport, out: { write(s: str
   out.write(`last run id:      ${report.lastRunId ?? '(none)'}\n`);
   out.write(`wallet:           ${report.makerAddress ?? '(unresolved)'}${report.makerAddress !== null ? ` (${report.makerAddressSource})` : ''}\n\n`);
 
-  out.write(`Commitments:      ${report.commitments.total} tracked (${report.commitments.distinctContestsNonTerminal} distinct contest(s) with non-terminal exposure)\n`);
+  out.write(`Commitments:      ${report.commitments.total} tracked (${report.commitments.distinctContestsNonTerminal} distinct contest(s) / ${report.commitments.distinctSpeculationsNonTerminal} distinct market(s) with non-terminal exposure)\n`);
   for (const lc of COMMITMENT_LIFECYCLES) {
     const n = report.commitments.byLifecycle[lc];
     if (n > 0) out.write(`  ${lc.padEnd(28)} ${n}\n`);
   }
+  const commitmentsByMarket = MARKET_TYPES
+    .filter((m) => report.commitments.byMarket[m] > 0)
+    .map((m) => `${m} ${report.commitments.byMarket[m]}`)
+    .join('  ');
+  if (commitmentsByMarket !== '') out.write(`  by market: ${commitmentsByMarket}\n`);
 
   out.write(`\nPositions:        ${report.positions.total} tracked\n`);
   for (const s of POSITION_STATUSES) {
     const b = report.positions.byStatus[s];
     if (b.count > 0) out.write(`  ${s.padEnd(15)} ${b.count}  own-risk ${formatUsdcWei6(b.ownRiskWei6)} USDC\n`);
   }
+  const positionsByMarket = MARKET_TYPES
+    .filter((m) => report.positions.byMarket[m].count > 0)
+    .map((m) => `${m} ${report.positions.byMarket[m].count} (${formatUsdcWei6(report.positions.byMarket[m].ownRiskWei6)} USDC)`)
+    .join('  ');
+  if (positionsByMarket !== '') out.write(`  by market: ${positionsByMarket}\n`);
 
   out.write(`\nToday (${report.dailyCounters.today}):\n`);
   out.write(`  gas spent          ${formatPolWei18(report.dailyCounters.todayGasPolWei)} POL\n`);

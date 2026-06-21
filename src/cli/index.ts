@@ -226,7 +226,7 @@ program
 
 program
   .command('status')
-  .description('Read-only snapshot of the persisted state: commitments by lifecycle, positions by status (with USDC sums), today + lifetime gas / fees, the PnL snapshot, and the last run id — plus, when a maker address can be resolved without decrypting the keystore (--address, or a v3 keystore with a plaintext `address` field), the SDK\'s `positions.status(maker)` totals from the API. No keystore unlock; no writes; always exits 0.')
+  .description('Read-only snapshot of the persisted state: commitments by lifecycle, positions by status (with USDC sums), a per-market breakdown of both (moneyline / spread / total), today + lifetime gas / fees, the PnL snapshot, and the last run id — plus, when a maker address can be resolved without decrypting the keystore (--address, or a v3 keystore with a plaintext `address` field), the SDK\'s `positions.status(maker)` totals from the API. No keystore unlock; no writes; always exits 0.')
   .option('-c, --config <path>', 'path to the config YAML', DEFAULT_CONFIG_PATH)
   .option('-a, --address <addr>', 'maker wallet address (read-only override — keeps the call signer-free; lets the live position read run without an ethers-style keystore)')
   .option('--json', 'emit a JSON envelope { schemaVersion: 1, status: … } on stdout')

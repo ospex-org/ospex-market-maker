@@ -25,15 +25,23 @@ export interface ExposureItem {
   awayTeam: string;
   homeTeam: string;
   /**
-   * Which market + line this exposure belongs to. Exposure is keyed by the
-   * `(contestId, marketType, lineTicks)` *group*: moneyline / spread / total (and
-   * different spread/total lines) are **independent** events that can all lose at
-   * once, so each group is its own worst-case bucket (DESIGN §6). `lineTicks` is
-   * the on-chain away-perspective 10×-scaled line (`0` for moneyline).
+   * The on-chain speculation this exposure belongs to — the risk engine's **group
+   * key**. A speculation is exactly one `(contestId, scorer, lineTicks)` (the
+   * contract dedups creation per that tuple), so its id is 1:1 with a contest's
+   * market + line; moneyline / spread / total (and different spread/total lines)
+   * are independent speculations that can all lose at once, so each is its own
+   * worst-case bucket (DESIGN §6). It is always present on every commitment /
+   * position record and own-state body — unlike `lineTicks`, which the own-state
+   * position body omits — so grouping by it has no missing-line failure mode.
+   */
+  speculationId: string;
+  /**
+   * The market type, kept for the per-team cap rule only: a `total` (over/under)
+   * carries no team, so it is excluded from team exposure. The line itself is not
+   * needed here — the speculation id already identifies the market + line.
    */
   marketType: MarketType;
-  lineTicks: number;
-  /** Which side the maker is on within this group — if this side loses, the maker loses `riskAmountUSDC`. */
+  /** Which side the maker is on within this speculation — if this side loses, the maker loses `riskAmountUSDC`. */
   makerSide: MakerSide;
   /** The at-risk USDC: a position's stake, or a commitment's remaining risk. */
   riskAmountUSDC: number;
@@ -46,15 +54,16 @@ export interface Inventory {
   openCommitmentCount: number;
 }
 
-/** A market the maker is considering quoting — its contest, the two teams, and the `(marketType, lineTicks)` that pick its exposure group (DESIGN §6). */
+/** A market the maker is considering quoting — its contest, the two teams, the speculation id that picks its exposure group, and the market type (for the per-team cap rule) (DESIGN §6). */
 export interface Market {
   contestId: string;
   sport: string;
   awayTeam: string;
   homeTeam: string;
+  /** The speculation this quote's risk would land in — the exposure group key (1:1 with the contest's market + line). */
+  speculationId: string;
+  /** Market type — used only to exempt a `total` (over/under) market from the per-team cap. */
   marketType: MarketType;
-  /** Away-perspective 10×-scaled line; `0` for moneyline. With `marketType` it picks the exposure group this quote's risk lands in. */
-  lineTicks: number;
 }
 
 /**
@@ -73,9 +82,9 @@ export interface RiskCaps {
 }
 
 /**
- * The two mutually-exclusive sides of a single `(contestId, marketType, lineTicks)`
- * group, as worst-case USDC loss (DESIGN §6). For moneyline the names are literal
- * (loss if the away / home team wins); for spread they are the away-cover / home-cover
+ * The two mutually-exclusive sides of a single speculation (one exposure group),
+ * as worst-case USDC loss (DESIGN §6). For moneyline the names are literal (loss if
+ * the away / home team wins); for spread they are the away-cover / home-cover
  * outcomes; for total they are the over / under outcomes (over ↔ `ifAwayWins`,
  * under ↔ `ifHomeWins`, matching the protocol Upper/Lower side order). The two
  * sides can't both happen, so a group's worst case is `max(ifAwayWins, ifHomeWins)`.

@@ -134,15 +134,16 @@ export async function runQuote(opts: QuoteOpts): Promise<QuoteReport> {
   }
 
   // 3. Build the desired quote — config + reference odds + headroom over an empty inventory.
-  //    The `quote` CLI prices moneyline only (`extractMoneylineOdds`), so the market
-  //    identity is the moneyline group (`marketType: 'moneyline', lineTicks: 0`).
+  //    The `quote` CLI prices moneyline only (`extractMoneylineOdds`). It quotes against
+  //    an empty inventory, so the exposure-group key (`speculationId`) is never read —
+  //    `'0'` is the on-chain "no speculation" sentinel (a real id is a positive integer).
   const market = {
     contestId: contest.contestId,
     sport: contest.sport,
     awayTeam: contest.awayTeam,
     homeTeam: contest.homeTeam,
+    speculationId: '0',
     marketType: 'moneyline' as const,
-    lineTicks: 0,
   };
   const desired = buildDesiredQuote(
     config,

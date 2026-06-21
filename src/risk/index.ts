@@ -59,18 +59,19 @@ function validateMakerSide(side: MakerSide, name: string): void {
 
 const MARKET_TYPES: readonly MarketType[] = ['moneyline', 'spread', 'total'];
 
-// `marketType` + `lineTicks` drive the exposure grouping the per-contest / -team /
-// -sport / -bankroll caps bind, so they're money-critical inputs — validate them at
-// the boundary like every other numeric, never trusting the caller. (`lineTicks` is
-// a signed integer — spread lines are negative for an away favorite.)
+// `speculationId` is the exposure GROUP KEY and `marketType` drives the per-team cap
+// exemption, so both are money-critical inputs — validate them at the boundary like
+// every other input, never trusting the caller. `speculationId` must be a non-empty
+// string (a real on-chain id is a positive integer string; a blank one would silently
+// collapse distinct speculations into one group).
+function validateSpeculationId(v: unknown, name: string): void {
+  if (typeof v !== 'string' || v.length === 0) fail(`${name} must be a non-empty string, got ${describe(v)}`);
+}
+
 function validateMarketType(v: unknown, name: string): void {
   if (typeof v !== 'string' || !(MARKET_TYPES as readonly string[]).includes(v)) {
     fail(`${name} must be one of ${MARKET_TYPES.map((m) => `"${m}"`).join(' / ')}, got ${describe(v)}`);
   }
-}
-
-function requireInt(v: unknown, name: string): void {
-  if (typeof v !== 'number' || !Number.isInteger(v)) fail(`${name} must be an integer, got ${describe(v)}`);
 }
 
 function validateItems(items: readonly ExposureItem[]): void {
@@ -78,15 +79,15 @@ function validateItems(items: readonly ExposureItem[]): void {
   items.forEach((it, i) => {
     validateMakerSide(it.makerSide, `inventory.items[${i}].makerSide`);
     requireFiniteNonNeg(it.riskAmountUSDC, `inventory.items[${i}].riskAmountUSDC`);
+    validateSpeculationId(it.speculationId, `inventory.items[${i}].speculationId`);
     validateMarketType(it.marketType, `inventory.items[${i}].marketType`);
-    requireInt(it.lineTicks, `inventory.items[${i}].lineTicks`);
   });
 }
 
 /** Validate the `Market`'s exposure-group selectors (the fields that drive money grouping). */
 function validateMarket(market: Market): void {
+  validateSpeculationId(market.speculationId, 'market.speculationId');
   validateMarketType(market.marketType, 'market.marketType');
-  requireInt(market.lineTicks, 'market.lineTicks');
 }
 
 function validateInventory(inv: Inventory): void {
@@ -109,23 +110,19 @@ function validateCaps(caps: RiskCaps): void {
 
 // ── exposure accounting (the `*Unchecked` cores assume already-validated items) ──
 //
-// Exposure is grouped by `(contestId, marketType, lineTicks)`. Moneyline, spread,
-// and total — and distinct spread/total lines — are INDEPENDENT events that can all
-// lose at once, so each group is its own worst-case bucket. Within a group the two
-// maker sides are mutually exclusive outcomes, so the group's worst case is
-// `max(ifAwayWins, ifHomeWins)`; a contest's worst case SUMS its groups' worst cases
-// (conservative independence — never net one market's win against another's loss);
-// sport / bankroll worst cases sum across the relevant groups. A moneyline-only
-// contest has exactly one group, so every sum collapses to the prior per-contest
-// `max(...)` — moneyline accounting stays byte-identical.
-
-// `:` is collision-safe here: contestId is a numeric string, marketType is a fixed
-// enum, lineTicks is an integer — none contains a colon (mirrors the runner's `marketKey`).
-const GROUP_SEP = ':';
-
-function groupKey(contestId: string, marketType: MarketType, lineTicks: number): string {
-  return `${contestId}${GROUP_SEP}${marketType}${GROUP_SEP}${lineTicks}`;
-}
+// Exposure is grouped by SPECULATION (`speculationId`). A speculation is exactly one
+// `(contestId, scorer, lineTicks)` — moneyline, spread, and total (and distinct
+// spread/total lines) are independent speculations that can all lose at once, so each
+// is its own worst-case bucket. Within a speculation the two maker sides are mutually
+// exclusive outcomes, so its worst case is `max(ifAwayWins, ifHomeWins)`; a contest's
+// worst case SUMS its speculations' worst cases (conservative independence — never net
+// one market's win against another's loss); sport / bankroll worst cases sum across
+// the relevant speculations. A moneyline-only contest has exactly one speculation, so
+// every sum collapses to the prior per-contest `max(...)` — moneyline accounting stays
+// byte-identical. Grouping by the speculation id (always present on every record +
+// own-state body) rather than a reconstructed `(marketType, lineTicks)` tuple means a
+// position rehydrated from an own-state snapshot — whose body omits the line — still
+// keys to the right group, so there is no missing-line under-statement.
 
 interface GroupExposure {
   contestId: string;
@@ -133,15 +130,14 @@ interface GroupExposure {
   loss: OutcomeLoss;
 }
 
-/** Bucket every item into its `(contestId, marketType, lineTicks)` group, summing each maker side's at-risk USDC. */
+/** Bucket every item by its `speculationId`, summing each maker side's at-risk USDC. */
 function groupExposures(items: readonly ExposureItem[]): Map<string, GroupExposure> {
   const groups = new Map<string, GroupExposure>();
   for (const it of items) {
-    const key = groupKey(it.contestId, it.marketType, it.lineTicks);
-    let g = groups.get(key);
+    let g = groups.get(it.speculationId);
     if (g === undefined) {
       g = { contestId: it.contestId, sport: it.sport, loss: { ifAwayWins: 0, ifHomeWins: 0 } };
-      groups.set(key, g);
+      groups.set(it.speculationId, g);
     }
     // maker on this group's home/under side → loses on the away/over outcome, and vice versa:
     if (it.makerSide === 'home') g.loss.ifAwayWins += it.riskAmountUSDC;
@@ -194,7 +190,7 @@ function teamExposureUnchecked(items: readonly ExposureItem[], team: string): nu
  * maker side** — a moneyline-axis projection (away-side items vs home-side items),
  * NOT the per-cap contest worst case. For a moneyline-only contest the two coincide;
  * for a multi-market contest the cap-bound worst case is {@link contestWorstCaseUSDC}
- * (Σ over `(market, line)` groups of each group's `max(...)`), which this does not
+ * (Σ over the contest's speculations of each one's `max(...)`), which this does not
  * compute — spread cover / total over-under don't share moneyline's away-wins /
  * home-wins axis. Diagnostic accessor; the caps use the group-based helpers, not this.
  */
@@ -210,13 +206,13 @@ export function worstCaseByOutcome(items: readonly ExposureItem[], contestId: st
   return { ifAwayWins, ifHomeWins };
 }
 
-/** Worst-case USDC loss for one contest — Σ over its `(marketType, lineTicks)` groups of each group's `max(ifAwayWins, ifHomeWins)` (conservative independence across markets). This is what `maxRiskPerContestUSDC` binds. */
+/** Worst-case USDC loss for one contest — Σ over its speculations of each one's `max(ifAwayWins, ifHomeWins)` (conservative independence across markets). This is what `maxRiskPerContestUSDC` binds. */
 export function contestWorstCaseUSDC(items: readonly ExposureItem[], contestId: string): number {
   validateItems(items);
   return contestWorstCaseUnchecked(items, contestId);
 }
 
-/** Total worst-case USDC loss across everything (conservative — markets/contests are independent, so this sums every `(contest, market, line)` group's worst case). */
+/** Total worst-case USDC loss across everything (conservative — speculations are independent, so this sums every speculation's worst case). */
 export function totalWorstCaseUSDC(items: readonly ExposureItem[]): number {
   validateItems(items);
   return totalWorstCaseUnchecked(items);
@@ -238,11 +234,11 @@ const bankrollCeilingUSDC = (caps: RiskCaps): number => caps.bankrollUSDC * caps
  * cap and the per-contest / per-team / per-sport / bankroll headroom — never
  * over-estimates (fail closed). Always a finite number ≥ 0.
  *
- * The new risk lands in `market`'s `(marketType, lineTicks)` group. The per-contest
- * term reserves room for the OTHER groups' worst cases (independent markets that can
- * also lose) plus the target group's current bucket the new risk adds to:
- *   `maxRiskPerContest − (Σ other groups' max + target group's loss-on-this-side)`.
- * A moneyline-only contest has one group, so this collapses to the prior
+ * The new risk lands in `market`'s speculation. The per-contest term reserves room
+ * for the contest's OTHER speculations' worst cases (independent markets that can also
+ * lose) plus the target speculation's current bucket the new risk adds to:
+ *   `maxRiskPerContest − (Σ other speculations' max + target's loss-on-this-side)`.
+ * A moneyline-only contest has one speculation, so this collapses to the prior
  * `maxRiskPerContest − currentLossInThatBucket` — byte-identical. A `total` market
  * has no team, so the per-team cap doesn't bind it.
  */
@@ -253,15 +249,14 @@ export function headroomForSide(inventory: Inventory, market: Market, makerSide:
   validateMakerSide(makerSide, 'makerSide');
   const { items } = inventory;
 
-  // Split the contest's groups into the target group (the one this quote adds to)
-  // and the rest. Adding Δ to `makerSide` raises the target group's loss-bucket for
-  // the OTHER outcome (maker on away → loses if home wins → raises ifHomeWins).
-  const targetKey = groupKey(market.contestId, market.marketType, market.lineTicks);
+  // Split the contest's speculations into the target one (this quote's, by speculationId)
+  // and the rest. Adding Δ to `makerSide` raises the target's loss-bucket for the OTHER
+  // outcome (maker on away → loses if home wins → raises ifHomeWins).
   let otherGroupsWorstCase = 0;
   let targetLoss: OutcomeLoss = { ifAwayWins: 0, ifHomeWins: 0 };
-  for (const [key, g] of groupExposures(items)) {
+  for (const [speculationId, g] of groupExposures(items)) {
     if (g.contestId !== market.contestId) continue;
-    if (key === targetKey) targetLoss = g.loss;
+    if (speculationId === market.speculationId) targetLoss = g.loss;
     else otherGroupsWorstCase += groupWorstCase(g.loss);
   }
   const targetBucketLoss = makerSide === 'away' ? targetLoss.ifHomeWins : targetLoss.ifAwayWins;

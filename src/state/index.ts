@@ -711,6 +711,7 @@ function validateCommitmentRecord(
   if (typeof value.speculationId !== 'string' || typeof value.contestId !== 'string' || typeof value.scorer !== 'string') {
     return { ok: false, reason: 'speculationId / contestId / scorer must be strings' };
   }
+  if (value.speculationId.length === 0) return { ok: false, reason: 'speculationId must be non-empty (the risk-engine exposure group key)' };
   if (typeof value.sport !== 'string' || typeof value.awayTeam !== 'string' || typeof value.homeTeam !== 'string') {
     return { ok: false, reason: 'sport / awayTeam / homeTeam must be strings' };
   }
@@ -878,6 +879,7 @@ function validateMakerSignedPayload(
 function validatePositionRecord(value: unknown): { ok: true; record: MakerPositionRecord } | { ok: false; reason: string } {
   if (!isPlainObject(value)) return { ok: false, reason: 'not an object' };
   if (typeof value.speculationId !== 'string' || typeof value.contestId !== 'string') return { ok: false, reason: 'speculationId / contestId must be strings' };
+  if (value.speculationId.length === 0) return { ok: false, reason: 'speculationId must be non-empty (the risk-engine exposure group key)' };
   if (typeof value.sport !== 'string' || typeof value.awayTeam !== 'string' || typeof value.homeTeam !== 'string') {
     return { ok: false, reason: 'sport / awayTeam / homeTeam must be strings' };
   }

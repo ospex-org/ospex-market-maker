@@ -289,6 +289,7 @@ describe('mapOwnerCommitmentToMaker', () => {
   describe('fail-closed on missing required metadata', () => {
     const cases: ReadonlyArray<[string, Partial<OwnerCommitment>, string]> = [
       ['null speculationId', { speculationId: null }, 'speculationId'],
+      ['empty speculationId', { speculationId: '' }, 'speculationId'],
       ['null contestId', { contestId: null }, 'contestId'],
       ['null scorer', { scorer: null }, 'scorer'],
       ['null positionType', { positionType: null }, 'positionType'],
@@ -341,7 +342,7 @@ describe('mapOwnerPositionToMaker', () => {
 
   it('position marketType comes from the body `market`; lineTicks is 0 (the body carries no line)', () => {
     // A spread position body: marketType flows through, lineTicks stays 0 (the own-state position
-    // body has no line — sourcing spread/total lines from the commitment is a deferred follow-up).
+    // body has no line). Harmless for risk — the engine groups by speculationId, not the line.
     const r = mapOwnerPositionToMaker({ ...ACTIVE_POSITION, market: 'spread' } as OwnerPosition);
     expect(r).toMatchObject({ marketType: 'spread', lineTicks: 0 });
   });

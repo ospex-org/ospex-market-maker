@@ -186,6 +186,21 @@ describe('StateStore.load', () => {
     if (status.kind === 'lost') expect(status.reason).toMatch(/sport \/ awayTeam \/ homeTeam/);
   });
 
+  it('treats an empty speculationId (the risk-engine group key) as `lost` — commitment and position', () => {
+    const at = StateStore.at(dir);
+
+    const c = commitment();
+    writeFileSync(join(dir, STATE_FILE), JSON.stringify(stateWith({ commitments: { [c.hash]: { ...c, speculationId: '' } } })), 'utf8');
+    let status = at.load().status;
+    expect(status.kind).toBe('lost');
+    if (status.kind === 'lost') expect(status.reason).toMatch(/speculationId must be non-empty/);
+
+    writeFileSync(join(dir, STATE_FILE), JSON.stringify(stateWith({ positions: { 'spec-1:away': { ...position(), speculationId: '' } } })), 'utf8');
+    status = at.load().status;
+    expect(status.kind).toBe('lost');
+    if (status.kind === 'lost') expect(status.reason).toMatch(/speculationId must be non-empty/);
+  });
+
   it('a well-formed soft-cancelled commitment survives the round trip', () => {
     const store = StateStore.at(dir);
     const c = commitment({ lifecycle: 'softCancelled', riskAmountWei6: '100', filledRiskWei6: '0' });

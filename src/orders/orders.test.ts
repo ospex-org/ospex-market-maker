@@ -2,13 +2,13 @@ import { describe, expect, it } from 'vitest';
 
 import { parseConfig, type Config } from '../config/index.js';
 import { decimalToAmerican, decimalToImpliedProb, tickToDecimal, toProtocolQuote, type QuoteSide } from '../pricing/index.js';
-import type { ExposureItem, Inventory, Market } from '../risk/index.js';
+import { contestWorstCaseUSDC, type ExposureItem, type Inventory, type Market } from '../risk/index.js';
 import { emptyMakerState, type MakerCommitmentRecord, type MakerPositionRecord, type MakerState } from '../state/index.js';
 import { breakdownReferenceOdds, buildDesiredQuote, inventoryFromState, isExpiredForRelease, matchableCommitmentRiskWei6, reconcileBook, toRiskCaps, type BookReconciliation, type DesiredQuote, type ReferenceOdds } from './index.js';
 
 const cfg = (overrides: Record<string, unknown> = {}): Config => parseConfig({ rpcUrl: 'http://localhost:8545', ...overrides });
 
-const MARKET: Market = { contestId: 'C1', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', marketType: 'moneyline', lineTicks: 0 };
+const MARKET: Market = { contestId: 'C1', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', speculationId: 'spec-C1', marketType: 'moneyline' };
 const EMPTY: Inventory = { items: [], openCommitmentCount: 0 };
 /** A moneyline `ReferenceOdds` from a per-side American pair (the buildDesiredQuote default-market input). */
 const ml = (away: number, home: number): ReferenceOdds => ({ market: 'moneyline', awayOddsAmerican: away, homeOddsAmerican: home });
@@ -164,7 +164,7 @@ describe('buildDesiredQuote', () => {
     // (`headroomForSide(..., 'home', ...)`): away-offer headroom = min(perCommitment 0.25, perContest
     // 1 - 0.9 ≈ 0.1, perTeam(LAD) 2 - 0.9, perSport 5 - 0.9, bankroll 25 - 0.9) ≈ 0.1. The home offer
     // (a maker-on-away commitment) is untouched: home-offer headroom = min(0.25, 1 - 0, 2 - 0, ...) = 0.25.
-    const inv = inventoryWith([{ contestId: 'C1', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', marketType: 'moneyline', lineTicks: 0, makerSide: 'home', riskAmountUSDC: 0.9 }]);
+    const inv = inventoryWith([{ contestId: 'C1', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', speculationId: 'spec-C1', marketType: 'moneyline', makerSide: 'home', riskAmountUSDC: 0.9 }]);
     const d = buildDesiredQuote(cfg(), MARKET, ml(150, -180), inv);
     expect(d.headroomUSDC.away).toBeCloseTo(0.1, 6);
     expect(d.headroomUSDC.home).toBeCloseTo(0.25, 9);
@@ -178,7 +178,7 @@ describe('buildDesiredQuote', () => {
   it('pulls an offer whose headroom has been exhausted (clamps to 0)', () => {
     // 1.5 USDC of maker-on-home exposure on C1 → over the per-contest cap of 1 in the "away wins" bucket
     // → the away offer (a maker-on-home commitment) has 0 headroom and is pulled. The home offer is fine.
-    const inv = inventoryWith([{ contestId: 'C1', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', marketType: 'moneyline', lineTicks: 0, makerSide: 'home', riskAmountUSDC: 1.5 }]);
+    const inv = inventoryWith([{ contestId: 'C1', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', speculationId: 'spec-C1', marketType: 'moneyline', makerSide: 'home', riskAmountUSDC: 1.5 }]);
     const d = buildDesiredQuote(cfg(), MARKET, ml(150, -180), inv);
     expect(d.headroomUSDC.away).toBe(0);
     expect(d.result.away).toBeNull();
@@ -305,8 +305,8 @@ describe('inventoryFromState', () => {
     const inv = inventoryFromState(stateWith({ commitments: { '0x1': c }, positions: { 'spec-1:home': p } }), NOW, 0);
     expect(inv.openCommitmentCount).toBe(1);
     expect(inv.items).toEqual([
-      { contestId: 'contest-1', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', marketType: 'moneyline', lineTicks: 0, makerSide: 'away', riskAmountUSDC: 0.25 },
-      { contestId: 'contest-1', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', marketType: 'moneyline', lineTicks: 0, makerSide: 'home', riskAmountUSDC: 0.1 },
+      { contestId: 'contest-1', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', speculationId: 'spec-1', marketType: 'moneyline', makerSide: 'away', riskAmountUSDC: 0.25 },
+      { contestId: 'contest-1', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', speculationId: 'spec-1', marketType: 'moneyline', makerSide: 'home', riskAmountUSDC: 0.1 },
     ]);
   });
 
@@ -332,14 +332,26 @@ describe('inventoryFromState', () => {
     };
     const inv = inventoryFromState(stateWith({ commitments }), NOW, 0);
     expect(inv.openCommitmentCount).toBe(1);
-    expect(inv.items).toEqual([{ contestId: 'contest-1', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', marketType: 'moneyline', lineTicks: 0, makerSide: 'away', riskAmountUSDC: 0.25 }]);
+    expect(inv.items).toEqual([{ contestId: 'contest-1', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', speculationId: 'spec-1', marketType: 'moneyline', makerSide: 'away', riskAmountUSDC: 0.25 }]);
   });
 
   it('counts a partiallyFilled commitment at its remaining (unfilled) risk', () => {
     const partial = commitmentRecord({ hash: 'p', lifecycle: 'partiallyFilled', riskAmountWei6: '500000', filledRiskWei6: '200000' });
     const inv = inventoryFromState(stateWith({ commitments: { p: partial } }), NOW, 0);
     expect(inv.openCommitmentCount).toBe(1);
-    expect(inv.items).toEqual([{ contestId: 'contest-1', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', marketType: 'moneyline', lineTicks: 0, makerSide: 'away', riskAmountUSDC: 0.3 }]);
+    expect(inv.items).toEqual([{ contestId: 'contest-1', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', speculationId: 'spec-1', marketType: 'moneyline', makerSide: 'away', riskAmountUSDC: 0.3 }]);
+  });
+
+  it('inventoryFromState → contestWorstCaseUSDC: two same-contest positions on distinct speculations SUM (the snapshot-rehydration path)', () => {
+    // A cold-restart own-state snapshot maps positions with lineTicks 0 (the body omits the line)
+    // but their real, DISTINCT speculationIds. Two spread covers on the same contest at different
+    // lines therefore land in distinct exposure groups and must SUM, not net — the regression the
+    // speculationId key prevents (under the old line-based key both would key to lineTicks 0 and net).
+    const posA = positionRecord({ speculationId: 'spec-A', marketType: 'spread', lineTicks: 0, side: 'away', riskAmountWei6: '250000' }); // 0.25 USDC
+    const posB = positionRecord({ speculationId: 'spec-B', marketType: 'spread', lineTicks: 0, side: 'home', riskAmountWei6: '100000' }); // 0.10 USDC
+    const inv = inventoryFromState(stateWith({ positions: { 'spec-A:away': posA, 'spec-B:home': posB } }), NOW, 0);
+    // both on contest-1 (factory default) → 0.25 + 0.10, NOT max = 0.25
+    expect(contestWorstCaseUSDC(inv.items, 'contest-1')).toBeCloseTo(0.35, 9);
   });
 
   it('drops a fully-filled commitment (filled === risk — its filled portion is a position; no latent risk left here)', () => {

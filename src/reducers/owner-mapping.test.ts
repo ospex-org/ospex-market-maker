@@ -341,7 +341,7 @@ describe('mapOwnerPositionToMaker', () => {
 
   it('position marketType comes from the body `market`; lineTicks is 0 (the body carries no line)', () => {
     // A spread position body: marketType flows through, lineTicks stays 0 (the own-state position
-    // body has no line — the per-market risk re-key sources spread/total lines from the commitment).
+    // body has no line — sourcing spread/total lines from the commitment is a deferred follow-up).
     const r = mapOwnerPositionToMaker({ ...ACTIVE_POSITION, market: 'spread' } as OwnerPosition);
     expect(r).toMatchObject({ marketType: 'spread', lineTicks: 0 });
   });

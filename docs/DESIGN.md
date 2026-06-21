@@ -235,20 +235,22 @@ For moneyline, a *filled* position on side X loses the maker's stake (`riskAmoun
 - **Counting rule (no double-count).** Each *unit* of risk is counted exactly once, in whichever bucket it currently occupies: a fully-filled commitment is a *position*; a fully-open or soft-cancelled commitment counts its full `riskAmount`; a *partially-filled* commitment counts its filled portion as a position and only its `remaining_risk_amount` as the open contribution — never the original full amount *and* the resulting position. Open / latent / remaining risk is always counted as if matchable before the next tick (conservative). The maker can never lose more than its own stake on a single item.
 - **Off-chain cancel does not free headroom.** A `softCancelled` commitment stays in these buckets until it `expires` or is `authoritativelyInvalidated` (on-chain cancel / nonce-floor raise). `killCancelOnChain: false` pulls visible quotes only and is **not** a hard risk stop — the latent exposure persists until those quotes expire (≤ `expirySeconds` with the recommended mode; until game start with `match-time`).
 
-Caps then bind these outcome buckets:
+**Per market + line.** Exposure is grouped by `(contestId, marketType, lineTicks)`. Moneyline, spread, and total — and distinct spread/total lines — are **independent** events that can all lose at once, so each is its own worst-case bucket. Within a group the two maker sides are mutually exclusive, so the group's worst case is `max(lossIf(side1), lossIf(side2))`; a contest's worst case **sums** its groups' worst cases (conservative independence — never net one market's win against another's loss). A moneyline-only contest has exactly one group, so its contest worst case collapses to the `max(lossIf(homeWins), lossIf(awayWins))` of the bullets above — **moneyline accounting is byte-identical**. Spread cover sides map to the away/home teams like moneyline; total over/under map to the Upper/Lower protocol sides and carry **no team**, so total is excluded from the per-team cap.
+
+Caps then bind these outcome buckets (each "worst case" below is the per-group `max(...)` summed as just described):
 
 | Cap | Bounds |
 |---|---|
 | `maxRiskPerCommitmentUSDC` | the biggest single commitment's `riskAmount` |
-| `maxRiskPerContestUSDC` | `max(lossIf(homeWins), lossIf(awayWins))` for that contest |
-| `maxRiskPerTeamUSDC` | Σ over contests of the worst-case loss in the bucket where *that team* loses |
-| `maxRiskPerSportUSDC` | Σ over contests in that sport of `max(lossIf(homeWins), lossIf(awayWins))` |
-| `bankrollUSDC` × `maxBankrollUtilizationPct` | Σ over all contests of `max(lossIf(homeWins), lossIf(awayWins))` — the absolute exposure ceiling; stop quoting entirely above it |
+| `maxRiskPerContestUSDC` | Σ over the contest's `(market, line)` groups of `max(lossIf(side1), lossIf(side2))` (one group for a moneyline-only contest) |
+| `maxRiskPerTeamUSDC` | Σ of the at-risk USDC backing *that team* across moneyline + spread cover sides (total over/under carry no team and are excluded) |
+| `maxRiskPerSportUSDC` | Σ over the `(market, line)` groups in that sport of `max(lossIf(side1), lossIf(side2))` |
+| `bankrollUSDC` × `maxBankrollUtilizationPct` | Σ over all `(market, line)` groups of `max(lossIf(side1), lossIf(side2))` — the absolute exposure ceiling; stop quoting entirely above it |
 | `maxOpenCommitments` | count of `visibleOpen` + `softCancelled`-not-yet-expired commitments — don't pile up latent risk |
 | `gas.maxDailyGasPOL` | daily gas budget, in POL — see below |
 | `maxDailyFeeUSDC` (under `risk:`) | daily protocol-fee budget in USDC — genuinely zero in v0 (no lazy creation, see below), the knob exists for any future fee |
 
-When spread / total pricing lands, each market defines its own outcome-bucket loss function (the *position* still has a fixed worst-case loss = the staked `riskAmount`, so the bucket accounting generalizes). The **risk engine** is a pure function returning `{ allowed: true, sizeUSDC }` (clamped to headroom) or `{ allowed: false, reason }`; every refusal is a telemetry event; the loop cannot submit without an `allowed` verdict.
+Each market's outcome-bucket loss is the `(contestId, marketType, lineTicks)` grouping above (a *position* still has a fixed worst-case loss = the staked `riskAmount`, so the per-cap accounting just sums the independent groups). The **risk engine** is a pure function returning `{ allowed: true, sizeUSDC }` (clamped to headroom) or `{ allowed: false, reason }`; every refusal is a telemetry event; the loop cannot submit without an `allowed` verdict.
 
 ### Expiry bounds the latent-exposure window
 

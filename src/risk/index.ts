@@ -21,6 +21,7 @@ import type {
   Inventory,
   MakerSide,
   Market,
+  MarketType,
   OutcomeLoss,
   RiskCaps,
   RiskVerdict,
@@ -56,12 +57,36 @@ function validateMakerSide(side: MakerSide, name: string): void {
   if (side !== 'away' && side !== 'home') fail(`${name} must be "away" or "home", got ${describe(side)}`);
 }
 
+const MARKET_TYPES: readonly MarketType[] = ['moneyline', 'spread', 'total'];
+
+// `marketType` + `lineTicks` drive the exposure grouping the per-contest / -team /
+// -sport / -bankroll caps bind, so they're money-critical inputs — validate them at
+// the boundary like every other numeric, never trusting the caller. (`lineTicks` is
+// a signed integer — spread lines are negative for an away favorite.)
+function validateMarketType(v: unknown, name: string): void {
+  if (typeof v !== 'string' || !(MARKET_TYPES as readonly string[]).includes(v)) {
+    fail(`${name} must be one of ${MARKET_TYPES.map((m) => `"${m}"`).join(' / ')}, got ${describe(v)}`);
+  }
+}
+
+function requireInt(v: unknown, name: string): void {
+  if (typeof v !== 'number' || !Number.isInteger(v)) fail(`${name} must be an integer, got ${describe(v)}`);
+}
+
 function validateItems(items: readonly ExposureItem[]): void {
   if (!Array.isArray(items)) fail(`inventory.items must be an array, got ${describe(items)}`);
   items.forEach((it, i) => {
     validateMakerSide(it.makerSide, `inventory.items[${i}].makerSide`);
     requireFiniteNonNeg(it.riskAmountUSDC, `inventory.items[${i}].riskAmountUSDC`);
+    validateMarketType(it.marketType, `inventory.items[${i}].marketType`);
+    requireInt(it.lineTicks, `inventory.items[${i}].lineTicks`);
   });
+}
+
+/** Validate the `Market`'s exposure-group selectors (the fields that drive money grouping). */
+function validateMarket(market: Market): void {
+  validateMarketType(market.marketType, 'market.marketType');
+  requireInt(market.lineTicks, 'market.lineTicks');
 }
 
 function validateInventory(inv: Inventory): void {
@@ -83,8 +108,98 @@ function validateCaps(caps: RiskCaps): void {
 }
 
 // ── exposure accounting (the `*Unchecked` cores assume already-validated items) ──
+//
+// Exposure is grouped by `(contestId, marketType, lineTicks)`. Moneyline, spread,
+// and total — and distinct spread/total lines — are INDEPENDENT events that can all
+// lose at once, so each group is its own worst-case bucket. Within a group the two
+// maker sides are mutually exclusive outcomes, so the group's worst case is
+// `max(ifAwayWins, ifHomeWins)`; a contest's worst case SUMS its groups' worst cases
+// (conservative independence — never net one market's win against another's loss);
+// sport / bankroll worst cases sum across the relevant groups. A moneyline-only
+// contest has exactly one group, so every sum collapses to the prior per-contest
+// `max(...)` — moneyline accounting stays byte-identical.
 
-function outcomeLossUnchecked(items: readonly ExposureItem[], contestId: string): OutcomeLoss {
+// `:` is collision-safe here: contestId is a numeric string, marketType is a fixed
+// enum, lineTicks is an integer — none contains a colon (mirrors the runner's `marketKey`).
+const GROUP_SEP = ':';
+
+function groupKey(contestId: string, marketType: MarketType, lineTicks: number): string {
+  return `${contestId}${GROUP_SEP}${marketType}${GROUP_SEP}${lineTicks}`;
+}
+
+interface GroupExposure {
+  contestId: string;
+  sport: string;
+  loss: OutcomeLoss;
+}
+
+/** Bucket every item into its `(contestId, marketType, lineTicks)` group, summing each maker side's at-risk USDC. */
+function groupExposures(items: readonly ExposureItem[]): Map<string, GroupExposure> {
+  const groups = new Map<string, GroupExposure>();
+  for (const it of items) {
+    const key = groupKey(it.contestId, it.marketType, it.lineTicks);
+    let g = groups.get(key);
+    if (g === undefined) {
+      g = { contestId: it.contestId, sport: it.sport, loss: { ifAwayWins: 0, ifHomeWins: 0 } };
+      groups.set(key, g);
+    }
+    // maker on this group's home/under side → loses on the away/over outcome, and vice versa:
+    if (it.makerSide === 'home') g.loss.ifAwayWins += it.riskAmountUSDC;
+    else g.loss.ifHomeWins += it.riskAmountUSDC;
+  }
+  return groups;
+}
+
+const groupWorstCase = (loss: OutcomeLoss): number => Math.max(loss.ifAwayWins, loss.ifHomeWins);
+
+function contestWorstCaseUnchecked(items: readonly ExposureItem[], contestId: string): number {
+  let total = 0;
+  for (const g of groupExposures(items).values()) {
+    if (g.contestId === contestId) total += groupWorstCase(g.loss);
+  }
+  return total;
+}
+
+function totalWorstCaseUnchecked(items: readonly ExposureItem[]): number {
+  let total = 0;
+  for (const g of groupExposures(items).values()) total += groupWorstCase(g.loss);
+  return total;
+}
+
+function sportWorstCaseUnchecked(items: readonly ExposureItem[], sport: string): number {
+  let total = 0;
+  for (const g of groupExposures(items).values()) {
+    if (g.sport === sport) total += groupWorstCase(g.loss);
+  }
+  return total;
+}
+
+// Per-team directional exposure EXCLUDES total markets — over/under isn't a bet on a
+// team. Moneyline + spread cover sides count toward the team the maker is backing
+// (away side → away team, home side → home team).
+function teamExposureUnchecked(items: readonly ExposureItem[], team: string): number {
+  let total = 0;
+  for (const it of items) {
+    if (it.marketType === 'total') continue; // over/under carries no team
+    const makerSideTeam = it.makerSide === 'away' ? it.awayTeam : it.homeTeam;
+    if (makerSideTeam === team) total += it.riskAmountUSDC;
+  }
+  return total;
+}
+
+// ── public exposure accessors ────────────────────────────────────────────────
+
+/**
+ * The maker-side loss buckets for a contest, **summed across all its markets by
+ * maker side** — a moneyline-axis projection (away-side items vs home-side items),
+ * NOT the per-cap contest worst case. For a moneyline-only contest the two coincide;
+ * for a multi-market contest the cap-bound worst case is {@link contestWorstCaseUSDC}
+ * (Σ over `(market, line)` groups of each group's `max(...)`), which this does not
+ * compute — spread cover / total over-under don't share moneyline's away-wins /
+ * home-wins axis. Diagnostic accessor; the caps use the group-based helpers, not this.
+ */
+export function worstCaseByOutcome(items: readonly ExposureItem[], contestId: string): OutcomeLoss {
+  validateItems(items);
   let ifAwayWins = 0;
   let ifHomeWins = 0;
   for (const it of items) {
@@ -95,53 +210,19 @@ function outcomeLossUnchecked(items: readonly ExposureItem[], contestId: string)
   return { ifAwayWins, ifHomeWins };
 }
 
-function contestWorstCaseUnchecked(items: readonly ExposureItem[], contestId: string): number {
-  const { ifAwayWins, ifHomeWins } = outcomeLossUnchecked(items, contestId);
-  return Math.max(ifAwayWins, ifHomeWins);
-}
-
-function contestIds(items: readonly ExposureItem[]): Set<string> {
-  return new Set(items.map((it) => it.contestId));
-}
-
-function totalWorstCaseUnchecked(items: readonly ExposureItem[]): number {
-  let total = 0;
-  for (const id of contestIds(items)) total += contestWorstCaseUnchecked(items, id);
-  return total;
-}
-
-function sportWorstCaseUnchecked(items: readonly ExposureItem[], sport: string): number {
-  let total = 0;
-  for (const id of contestIds(items)) {
-    if (items.some((it) => it.contestId === id && it.sport === sport)) total += contestWorstCaseUnchecked(items, id);
-  }
-  return total;
-}
-
-function teamExposureUnchecked(items: readonly ExposureItem[], team: string): number {
-  let total = 0;
-  for (const it of items) {
-    const makerSideTeam = it.makerSide === 'away' ? it.awayTeam : it.homeTeam;
-    if (makerSideTeam === team) total += it.riskAmountUSDC;
-  }
-  return total;
-}
-
-// ── public exposure accessors ────────────────────────────────────────────────
-
-/** Worst-case loss for a contest, per outcome — sum the at-risk USDC of items on the *losing* side in each outcome. */
-export function worstCaseByOutcome(items: readonly ExposureItem[], contestId: string): OutcomeLoss {
+/** Worst-case USDC loss for one contest — Σ over its `(marketType, lineTicks)` groups of each group's `max(ifAwayWins, ifHomeWins)` (conservative independence across markets). This is what `maxRiskPerContestUSDC` binds. */
+export function contestWorstCaseUSDC(items: readonly ExposureItem[], contestId: string): number {
   validateItems(items);
-  return outcomeLossUnchecked(items, contestId);
+  return contestWorstCaseUnchecked(items, contestId);
 }
 
-/** Total worst-case USDC loss across all contests (conservative — contests are independent, so this sums their per-contest worst cases). */
+/** Total worst-case USDC loss across everything (conservative — markets/contests are independent, so this sums every `(contest, market, line)` group's worst case). */
 export function totalWorstCaseUSDC(items: readonly ExposureItem[]): number {
   validateItems(items);
   return totalWorstCaseUnchecked(items);
 }
 
-/** Current directional exposure to a team — the at-risk USDC the maker loses if that team loses (summed across all contests). */
+/** Current directional exposure to a team — the at-risk USDC the maker loses if that team loses (moneyline + spread cover sides backing the team; total over/under excluded — it carries no team). */
 export function teamExposureUSDC(items: readonly ExposureItem[], team: string): number {
   validateItems(items);
   return teamExposureUnchecked(items, team);
@@ -156,22 +237,48 @@ const bankrollCeilingUSDC = (caps: RiskCaps): number => caps.bankrollUSDC * caps
  * without breaching any exposure cap (DESIGN §6). Bounded by the per-commitment
  * cap and the per-contest / per-team / per-sport / bankroll headroom — never
  * over-estimates (fail closed). Always a finite number ≥ 0.
+ *
+ * The new risk lands in `market`'s `(marketType, lineTicks)` group. The per-contest
+ * term reserves room for the OTHER groups' worst cases (independent markets that can
+ * also lose) plus the target group's current bucket the new risk adds to:
+ *   `maxRiskPerContest − (Σ other groups' max + target group's loss-on-this-side)`.
+ * A moneyline-only contest has one group, so this collapses to the prior
+ * `maxRiskPerContest − currentLossInThatBucket` — byte-identical. A `total` market
+ * has no team, so the per-team cap doesn't bind it.
  */
 export function headroomForSide(inventory: Inventory, market: Market, makerSide: MakerSide, caps: RiskCaps): number {
   validateInventory(inventory);
   validateCaps(caps);
+  validateMarket(market);
   validateMakerSide(makerSide, 'makerSide');
   const { items } = inventory;
-  const loss = outcomeLossUnchecked(items, market.contestId);
-  // adding Δ to `makerSide` raises the outcome bucket where that side loses:
-  const currentLossInThatBucket = makerSide === 'away' ? loss.ifHomeWins : loss.ifAwayWins;
-  const team = makerSide === 'away' ? market.awayTeam : market.homeTeam;
+
+  // Split the contest's groups into the target group (the one this quote adds to)
+  // and the rest. Adding Δ to `makerSide` raises the target group's loss-bucket for
+  // the OTHER outcome (maker on away → loses if home wins → raises ifHomeWins).
+  const targetKey = groupKey(market.contestId, market.marketType, market.lineTicks);
+  let otherGroupsWorstCase = 0;
+  let targetLoss: OutcomeLoss = { ifAwayWins: 0, ifHomeWins: 0 };
+  for (const [key, g] of groupExposures(items)) {
+    if (g.contestId !== market.contestId) continue;
+    if (key === targetKey) targetLoss = g.loss;
+    else otherGroupsWorstCase += groupWorstCase(g.loss);
+  }
+  const targetBucketLoss = makerSide === 'away' ? targetLoss.ifHomeWins : targetLoss.ifAwayWins;
+
+  // A total (over/under) bet is on no team, so the per-team cap doesn't apply to it
+  // (and `teamExposureUnchecked` already excludes total items from any team's sum).
+  const teamHeadroom =
+    market.marketType === 'total'
+      ? Number.POSITIVE_INFINITY
+      : caps.maxRiskPerTeamUSDC - teamExposureUnchecked(items, makerSide === 'away' ? market.awayTeam : market.homeTeam);
+
   return Math.max(
     0,
     Math.min(
       caps.maxRiskPerCommitmentUSDC,
-      caps.maxRiskPerContestUSDC - currentLossInThatBucket,
-      caps.maxRiskPerTeamUSDC - teamExposureUnchecked(items, team),
+      caps.maxRiskPerContestUSDC - (otherGroupsWorstCase + targetBucketLoss),
+      teamHeadroom,
       caps.maxRiskPerSportUSDC - sportWorstCaseUnchecked(items, market.sport),
       bankrollCeilingUSDC(caps) - totalWorstCaseUnchecked(items),
     ),
@@ -182,6 +289,7 @@ export function headroomForSide(inventory: Inventory, market: Market, makerSide:
 export function verdictForMarket(inventory: Inventory, market: Market, caps: RiskCaps): RiskVerdict {
   validateInventory(inventory);
   validateCaps(caps);
+  validateMarket(market);
   if (inventory.openCommitmentCount >= caps.maxOpenCommitments) {
     return {
       allowed: false,

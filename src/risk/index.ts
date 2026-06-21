@@ -385,3 +385,49 @@ export function canSpendGas(args: {
   }
   return { allowed: true };
 }
+
+/**
+ * Verdict gate for incurring a speculation **creation fee** (DESIGN §6) — the
+ * USDC the protocol charges a SEED commitment's maker when its commitment first
+ * matches and lazily creates the speculation (`TreasuryModule.processSplitFee`,
+ * the maker's 0.25 USDC share). Unlike gas (tiny + not pre-estimated — see
+ * {@link canSpendGas}), a creation fee is a **known, fixed amount per seed**, so
+ * this verdict PRE-ACCOUNTS the requested fee: a seed is allowed only when today's
+ * realized creation-fee spend plus this seed's fee would not exceed the daily
+ * budget `maxDailyFeeUsdcWei6` (`risk.maxDailyFeeUSDC`).
+ *
+ * The default budget is **`0`** (`risk.maxDailyFeeUSDC` defaults to 0 — a
+ * non-seeding MM never pays a creation fee), so this refuses unless the operator
+ * set a real fee budget. The budget is thus an explicit *second* opt-in for
+ * seeding (alongside `marketSelection.seedSpeculations`): no fee budget ⇒ no seed
+ * can incur a fee ⇒ no seeding.
+ *
+ * All amounts are **USDC wei6**. The caller converts `risk.maxDailyFeeUSDC`
+ * (float USDC from config) via `BigInt(Math.round(u * 1e6))`. Exactly reaching
+ * the cap is allowed; exceeding it is refused.
+ *
+ * Returns `{allowed: false, reason}` when `todayFeeSpentUsdcWei6 < 0` or
+ * `requestedFeeUsdcWei6 < 0` (defense-in-depth — caller bug / state corruption),
+ * `maxDailyFeeUsdcWei6 <= 0` (budget disabled — the default), or the requested
+ * fee would push today's spend past the cap; otherwise `{allowed: true}`.
+ */
+export function canSpendFee(args: {
+  todayFeeSpentUsdcWei6: bigint;
+  requestedFeeUsdcWei6: bigint;
+  maxDailyFeeUsdcWei6: bigint;
+}): { allowed: true } | { allowed: false; reason: string } {
+  const { todayFeeSpentUsdcWei6, requestedFeeUsdcWei6, maxDailyFeeUsdcWei6 } = args;
+  if (todayFeeSpentUsdcWei6 < 0n) {
+    return { allowed: false, reason: `todayFeeSpentUsdcWei6 must be >= 0; got ${todayFeeSpentUsdcWei6.toString()} wei6 (state corruption?)` };
+  }
+  if (requestedFeeUsdcWei6 < 0n) {
+    return { allowed: false, reason: `requestedFeeUsdcWei6 must be >= 0; got ${requestedFeeUsdcWei6.toString()} wei6 (caller bug?)` };
+  }
+  if (maxDailyFeeUsdcWei6 <= 0n) {
+    return { allowed: false, reason: `risk.maxDailyFeeUSDC must be > 0 to incur a speculation creation fee (seeding); got ${maxDailyFeeUsdcWei6.toString()} wei6 — set a daily fee budget to enable seeding` };
+  }
+  if (todayFeeSpentUsdcWei6 + requestedFeeUsdcWei6 > maxDailyFeeUsdcWei6) {
+    return { allowed: false, reason: `creation fee ${requestedFeeUsdcWei6.toString()} wei6 + today's spend ${todayFeeSpentUsdcWei6.toString()} wei6 would exceed the daily fee cap ${maxDailyFeeUsdcWei6.toString()} wei6` };
+  }
+  return { allowed: true };
+}

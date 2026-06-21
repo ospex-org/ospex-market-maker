@@ -54,7 +54,7 @@ import { join } from 'node:path';
  */
 export const TELEMETRY_KINDS = [
   'tick-start',
-  'candidate', //                  a contest considered; carries `skipReason` (a CandidateSkipReason) if skipped
+  'candidate', //                  a contest considered; carries `skipReason` (a CandidateSkipReason) if skipped, and `market` ('spread' | 'total') on a per-market event — a reconcileMarket gate, a discovery confirm-loop refusal, or the tracked candidate (absent = moneyline, the default)
   'fair-value',
   'risk-verdict', //               { allowed, sizeUSDC } | { allowed: false, reason }
   'quote-intent',

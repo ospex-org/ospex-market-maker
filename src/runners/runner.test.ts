@@ -4484,6 +4484,60 @@ describe('Runner — live execution', () => {
     expect(runner.trackedMarketKeysForTest()).toEqual(['1:spread:-20']);
   });
 
+  // ── candidate `market` tag (per-market refusal attribution in telemetry) ─────────
+  //
+  // A `candidate` event keys on contestId, which a multi-market contest shares across its
+  // markets. Per-market events carry `market` ('spread' | 'total') so a refusal is
+  // attributable; moneyline omits it (the unmarked default) so its telemetry is byte-identical.
+
+  it('candidate market tag: discovery per-market refusal + tracked candidates carry `market` for spread/total, omit it for moneyline', async () => {
+    const config = withMarkets(cfg(), ['moneyline', 'spread', 'total']);
+    // moneyline + total open; spread CLOSED → spread emits no-open-speculation, the others track.
+    const specs: SpeculationView[] = [
+      { speculationId: 'spec-ml', contestId: '1', marketType: 'moneyline', lineTicks: null, line: null, open: true },
+      { speculationId: 'spec-sp', contestId: '1', marketType: 'spread', lineTicks: -15, line: -1.5, open: false },
+      { speculationId: 'spec-to', contestId: '1', marketType: 'total', lineTicks: 75, line: 7.5, open: true },
+    ];
+    const lean = contestView({ contestId: '1', speculations: specs });
+    const full = contestView({ contestId: '1', referenceGameId: 'GAME-1', speculations: specs });
+    const adapter = spiedAdapter(config, () => Promise.resolve([lean]), () => Promise.resolve(full));
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    const candidates = readEvents().filter((e) => e.kind === 'candidate');
+    // The closed spread market → no-open-speculation, attributed to spread.
+    expect(candidates.find((e) => e.skipReason === 'no-open-speculation')).toMatchObject({ contestId: '1', market: 'spread' });
+    // The tracked (success) candidate for total carries its market…
+    expect(candidates.find((e) => e.speculationId === 'spec-to')).toMatchObject({ market: 'total' });
+    // …and the moneyline tracked candidate omits `market` entirely (byte-identical telemetry).
+    const trackedMoneyline = candidates.find((e) => e.speculationId === 'spec-ml');
+    expect(trackedMoneyline).toBeDefined();
+    expect(trackedMoneyline).not.toHaveProperty('market');
+  });
+
+  it('candidate market tag: a reconcileMarket per-market gate (no-reference-odds) carries `market` for spread', async () => {
+    const config = withMarkets(cfg(), ['spread']);
+    const { lean, full } = spreadContest('1', -15);
+    // Spread tracked, but no spread odds → reconcile hits the no-reference-odds gate.
+    const adapter = spiedAdapter(config, () => Promise.resolve([lean]), () => Promise.resolve(full), {
+      snapshot: (id) => Promise.resolve({ contestId: id, odds: { moneyline: null, spread: null, total: null } }),
+    });
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    expect(readEvents().find((e) => e.kind === 'candidate' && e.skipReason === 'no-reference-odds')).toMatchObject({ contestId: '1', market: 'spread' });
+  });
+
+  it('candidate market tag: a contest-level no-open-speculation (no wanted market open on the lean row) omits `market`', async () => {
+    const config = withMarkets(cfg(), ['spread']);
+    // The only spread spec is CLOSED → leanOpen is false → the contest-level (pre-getContest)
+    // no-open-speculation fires; it spans all wanted markets, so it carries no `market`.
+    const spec: SpeculationView = { speculationId: 'sp-1', contestId: '1', marketType: 'spread', lineTicks: -15, line: -1.5, open: false };
+    const lean = contestView({ contestId: '1', speculations: [spec] });
+    const full = contestView({ contestId: '1', referenceGameId: 'GAME-1', speculations: [spec] });
+    const adapter = spiedAdapter(config, () => Promise.resolve([lean]), () => Promise.resolve(full));
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    const noOpen = readEvents().filter((e) => e.kind === 'candidate' && e.skipReason === 'no-open-speculation');
+    expect(noOpen).toHaveLength(1);
+    expect(noOpen[0]).not.toHaveProperty('market'); // contest-level (spans all wanted markets) → untagged
+  });
+
   it('match-time expiry: submitCommitment is called with expiry = the contest match time', async () => {
     StateStore.at(stateDir).flush(emptyMakerState());
     const config = cfg({ mode: { dryRun: false }, orders: { expiryMode: 'match-time', expirySeconds: 120 } });

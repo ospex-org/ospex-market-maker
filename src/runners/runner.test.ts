@@ -4081,9 +4081,29 @@ describe('Runner — live execution', () => {
     expect(() => makeRunner({ config: cfg({ mode: { dryRun: false } }) })).toThrow(/live mode .* requires a signed adapter/);
   });
 
-  it('refuses to boot when marketSelection.seedSpeculations is enabled — seeding is not yet implemented (the flag is staged ahead of its behavior)', () => {
+  it('boots with marketSelection.seedSpeculations enabled — the discovery seed branch tracks seed markets but reconcile refuses to post them in this slice (no boot guard)', () => {
     StateStore.at(stateDir).flush(emptyMakerState());
-    expect(() => makeRunner({ config: cfg({ marketSelection: { seedSpeculations: true } }) })).toThrow(/seeding is not yet implemented/);
+    expect(() => makeRunner({ config: cfg({ marketSelection: { seedSpeculations: true } }) })).not.toThrow();
+  });
+
+  it('LIVE mode + seeding: a seed market NEVER reaches submitCommitment — the reconcile gate refuses it (no post, no creation fee, no on-chain leg)', async () => {
+    StateStore.at(stateDir).flush(emptyMakerState());
+    const config = withMarkets(cfg({ mode: { dryRun: false }, marketSelection: { seedSpeculations: true } }), ['spread']);
+    const submit = submitRecorder();
+    // A verified contest with NO open spread speculation → discovery seeds it; reconcile refuses.
+    const lean = contestView({ contestId: '1', speculations: [] });
+    const full = contestView({ contestId: '1', referenceGameId: 'GAME-1', speculations: [] });
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([lean]), { submitCommitment: submit.fn }, () => Promise.resolve(full), {
+      snapshot: (id) => Promise.resolve({ contestId: id, odds: { moneyline: null, spread: spreadOdds(-1.5), total: null } }),
+    });
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    // The seed was tracked + reconciled (the gate fired) — but no post happened, in live mode.
+    const events = readEvents();
+    expect(events.filter((e) => e.kind === 'candidate' && e.skipReason === 'would-create-lazy-speculation')).toHaveLength(1);
+    expect(submit.calls).toHaveLength(0); // no submitCommitment — the money-safety property of this slice
+    expect(events.some((e) => e.kind === 'submit' || e.kind === 'would-submit')).toBe(false);
+    expect(Object.values(StateStore.at(stateDir).load().state.commitments)).toHaveLength(0); // nothing persisted
   });
 
   it('posts both sides via submitCommitment, records the real hashes, emits `submit` (not `would-submit`) — the protocol tuple flows through `toProtocolQuote`', async () => {
@@ -4209,6 +4229,137 @@ describe('Runner — live execution', () => {
     // The missing-open-spread market surfaced a `no-open-speculation` candidate.
     const noOpen = readEvents().filter((e) => e.kind === 'candidate' && e.skipReason === 'no-open-speculation');
     expect(noOpen).toHaveLength(1);
+  });
+
+  // ── seeding (marketSelection.seedSpeculations) — discovery + reconcile-refuse slice ──
+  //
+  // Default off: a wanted market with no open speculation is skipped (`no-open-speculation`).
+  // With seeding on, discovery instead tracks a SEED market at the oracle-primary line (read
+  // from a one-shot odds snapshot, since a newcomer has no streamed odds yet), carrying a
+  // placeholder `speculationId` (`seed:contest:market:line`). This slice tracks + REFUSES to
+  // post (the reconcile `would-create-lazy-speculation` gate, before pricing + before the
+  // `getSpeculation` read that would throw on a placeholder); the posting path ships later.
+
+  /** A market-selection config with seeding on and the given market list. */
+  function seedingCfg(markets: string[]): Config {
+    return withMarkets(cfg({ marketSelection: { seedSpeculations: true } }), markets);
+  }
+
+  it('seeding off (default): a spec-less contest with a wanted spread market is skipped (no-open-speculation), nothing tracked', async () => {
+    const config = withMarkets(cfg(), ['spread']); // seeding default off
+    const lean = contestView({ contestId: '1', speculations: [] });
+    const full = contestView({ contestId: '1', referenceGameId: 'GAME-1', speculations: [] });
+    const adapter = spiedAdapter(config, () => Promise.resolve([lean]), () => Promise.resolve(full), {
+      snapshot: (id) => Promise.resolve({ contestId: id, odds: { moneyline: null, spread: spreadOdds(-1.5), total: null } }),
+    });
+    const runner = makeRunner({ config, adapter, maxTicks: 1 });
+    await runner.run();
+
+    expect(runner.trackedMarketView('1', 'spread')).toBeUndefined(); // nothing seeded
+    const events = readEvents();
+    expect(events.filter((e) => e.kind === 'candidate' && e.skipReason === 'no-open-speculation')).toHaveLength(1);
+    expect(events.some((e) => e.kind === 'candidate' && e.skipReason === 'would-create-lazy-speculation')).toBe(false);
+  });
+
+  it('seeding on: a spec-less contest tracks a SEED spread market at the oracle line, and reconcile refuses to post (would-create-lazy-speculation)', async () => {
+    const config = seedingCfg(['spread']);
+    const lean = contestView({ contestId: '1', speculations: [] }); // NO spread speculation
+    const full = contestView({ contestId: '1', referenceGameId: 'GAME-1', speculations: [] });
+    const adapter = spiedAdapter(config, () => Promise.resolve([lean]), () => Promise.resolve(full), {
+      snapshot: (id) => Promise.resolve({ contestId: id, odds: { moneyline: null, spread: spreadOdds(-1.5), total: null } }),
+    });
+    const runner = makeRunner({ config, adapter, maxTicks: 1 });
+    await runner.run();
+
+    // Tracked as a seed at the oracle line (away -1.5 → -15) with a placeholder id.
+    const seed = runner.trackedMarketView('1', 'spread');
+    expect(seed).toMatchObject({ marketType: 'spread', lineTicks: -15 });
+    expect(seed?.speculationId).toBe('seed:1:spread:-15');
+
+    const events = readEvents();
+    // Discovery emitted a positive (tracked) candidate carrying the placeholder id.
+    expect(events.some((e) => e.kind === 'candidate' && e.speculationId === 'seed:1:spread:-15')).toBe(true);
+    // Reconcile recognized the seed and refused — exactly once, before pricing.
+    expect(events.filter((e) => e.kind === 'candidate' && e.skipReason === 'would-create-lazy-speculation')).toHaveLength(1);
+    expect(events.some((e) => e.kind === 'quote-intent' && e.contestId === '1')).toBe(false); // never reached pricing
+    expect(events.some((e) => e.kind === 'would-submit')).toBe(false); // dry-run: no post for a seed
+  });
+
+  it('seeding on: a total seed is tracked at the oracle threshold (8.5 → 85)', async () => {
+    const config = seedingCfg(['total']);
+    const lean = contestView({ contestId: '1', speculations: [] });
+    const full = contestView({ contestId: '1', referenceGameId: 'GAME-1', speculations: [] });
+    const adapter = spiedAdapter(config, () => Promise.resolve([lean]), () => Promise.resolve(full), {
+      snapshot: (id) => Promise.resolve({ contestId: id, odds: { moneyline: null, spread: null, total: totalOdds(8.5) } }),
+    });
+    const runner = makeRunner({ config, adapter, maxTicks: 1 });
+    await runner.run();
+
+    const seed = runner.trackedMarketView('1', 'total');
+    expect(seed).toMatchObject({ marketType: 'total', lineTicks: 85 });
+    expect(seed?.speculationId).toBe('seed:1:total:85');
+    expect(readEvents().filter((e) => e.kind === 'candidate' && e.skipReason === 'would-create-lazy-speculation' && e.market === 'total')).toHaveLength(1);
+  });
+
+  it('seeding on: a market with no usable reference odds is NOT seeded (no-reference-odds, nothing tracked)', async () => {
+    const config = seedingCfg(['spread']);
+    const lean = contestView({ contestId: '1', speculations: [] });
+    const full = contestView({ contestId: '1', referenceGameId: 'GAME-1', speculations: [] });
+    // The snapshot has no spread row (and a partial one would map to null too) → no oracle line → no seed.
+    const adapter = spiedAdapter(config, () => Promise.resolve([lean]), () => Promise.resolve(full), {
+      snapshot: (id) => Promise.resolve({ contestId: id, odds: { moneyline: null, spread: null, total: null } }),
+    });
+    const runner = makeRunner({ config, adapter, maxTicks: 1 });
+    await runner.run();
+
+    expect(runner.trackedMarketView('1', 'spread')).toBeUndefined();
+    const events = readEvents();
+    expect(events.filter((e) => e.kind === 'candidate' && e.skipReason === 'no-reference-odds')).toHaveLength(1);
+    expect(events.some((e) => e.kind === 'candidate' && e.skipReason === 'would-create-lazy-speculation')).toBe(false);
+  });
+
+  it('seeding on: a contest with an open moneyline spec AND a missing spread spec tracks moneyline normally + seeds spread', async () => {
+    const config = seedingCfg(['moneyline', 'spread']);
+    const specs: SpeculationView[] = [{ speculationId: 'spec-ml', contestId: '1', marketType: 'moneyline', lineTicks: null, line: null, open: true }];
+    const lean = contestView({ contestId: '1', speculations: specs });
+    const full = contestView({ contestId: '1', referenceGameId: 'GAME-1', speculations: specs });
+    const adapter = spiedAdapter(config, () => Promise.resolve([lean]), () => Promise.resolve(full), {
+      snapshot: (id) => Promise.resolve({ contestId: id, odds: { moneyline: moneylineOdds(-110, -110), spread: spreadOdds(-1.5), total: null } }),
+    });
+    const runner = makeRunner({ config, adapter, maxTicks: 1 });
+    await runner.run();
+
+    // Moneyline tracks its real open spec; spread is seeded at the oracle line.
+    expect(runner.trackedMarketView('1', 'moneyline')?.speculationId).toBe('spec-ml');
+    expect(runner.trackedMarketView('1', 'spread')?.speculationId).toBe('seed:1:spread:-15');
+    // Moneyline reconciled normally (reached pricing — only the moneyline market can, the
+    // seeded spread refuses before pricing); spread refused as a seed.
+    const events = readEvents();
+    expect(events.some((e) => e.kind === 'quote-intent' && e.contestId === '1' && e.speculationId === 'spec-ml')).toBe(true);
+    expect(events.filter((e) => e.kind === 'candidate' && e.skipReason === 'would-create-lazy-speculation' && e.market === 'spread')).toHaveLength(1);
+  });
+
+  it('seeding on: a seed already tracked is NOT re-created on the next discovery cycle (single tracked entry, one creation)', async () => {
+    const config = seedingCfg(['spread']);
+    config.discovery.everyNTicks = 1; // discover every tick → two discovery cycles over maxTicks:2
+    const lean = contestView({ contestId: '1', speculations: [] });
+    const full = contestView({ contestId: '1', referenceGameId: 'GAME-1', speculations: [] });
+    const adapter = spiedAdapter(config, () => Promise.resolve([lean]), () => Promise.resolve(full), {
+      snapshot: (id) => Promise.resolve({ contestId: id, odds: { moneyline: null, spread: spreadOdds(-1.5), total: null } }),
+    });
+    const runner = makeRunner({ config, adapter, maxTicks: 2 });
+    await runner.run();
+
+    // Exactly one seed tracked for the contest's spread market, across both cycles.
+    expect(runner.trackedContestIds()).toEqual(['1']);
+    expect(runner.trackedMarketView('1', 'spread')?.speculationId).toBe('seed:1:spread:-15');
+    // The seed-CREATION candidate (positive: a placeholder speculationId, no skipReason) is
+    // emitted only by the discovery seed branch — exactly once. The second cycle sees the seed
+    // already tracked (isMarketTracked) and skips it, so there is no second creation. (The
+    // reconcile refusal `would-create-lazy-speculation` may recur each tick — that's expected
+    // and is a distinct, skipReason-bearing event with no speculationId.)
+    const creations = readEvents().filter((e) => e.kind === 'candidate' && e.speculationId === 'seed:1:spread:-15' && e.skipReason === undefined);
+    expect(creations).toHaveLength(1);
   });
 
   // ── line-consistency gate (spread/total: never quote a mispriced line) ──────────

@@ -94,7 +94,7 @@
 import { existsSync } from 'node:fs';
 
 import { DEFAULT_PER_IP_OWNER_RESERVE, DEFAULT_PER_IP_STREAM_CAP, RESERVED_OWN_STATE_STREAMS, type Config } from '../config/index.js';
-import { buildDesiredQuote, inventoryFromState, isExpiredForRelease, matchableCommitmentRiskWei6, oracleLineTicks, reconcileBook, referenceOddsEqual, referenceOddsFromSdk, type BookReconciliation, type DesiredQuote, type ReferenceOdds, type RetainedPartial, type RetainedPartialReason, type SoftCancelReason } from '../orders/index.js';
+import { buildDesiredQuote, inventoryFromState, isExpiredForRelease, isSeedSpeculationId, matchableCommitmentRiskWei6, oracleLineTicks, reconcileBook, referenceOddsEqual, referenceOddsFromSdk, seedSpeculationId, type BookReconciliation, type DesiredQuote, type ReferenceOdds, type RetainedPartial, type RetainedPartialReason, type SoftCancelReason } from '../orders/index.js';
 import { OspexStreamError } from '../ospex/index.js';
 import type {
   ApproveResult,
@@ -652,18 +652,6 @@ export class Runner {
     if (!this.config.mode.dryRun && opts.makerAddress === undefined) {
       throw new Error(
         'Runner: live mode (config.mode.dryRun=false) requires `makerAddress` (the signer\'s wallet) — the own-state SSE stream is owner-authenticated, scoped to the signer\'s address. `runRun` passes it from `signer.getAddress()`.',
-      );
-    }
-    // Seeding (marketSelection.seedSpeculations) is the opt-in to lazily creating
-    // speculations — posting at the oracle-primary line where no speculation exists
-    // yet. The flag is staged ahead of its behavior: the seeding path (the discovery
-    // branch, the TreasuryModule creation-fee allowance + budget, the per-seed risk
-    // keying) ships in subsequent slices. Until then, refuse `true` at boot rather
-    // than silently no-op a money-consequential opt-in (it pays the protocol creation
-    // fee and widens the approval surface). Removed when the seeding path lands.
-    if (this.config.marketSelection.seedSpeculations) {
-      throw new Error(
-        'Runner: marketSelection.seedSpeculations is enabled, but speculation seeding is not yet implemented in this build — set it to false. Seeding lazily creates speculations (posting where none exists), pays the protocol creation fee, and approves the TreasuryModule; the path ships in a later release.',
       );
     }
     this.makerAddress = opts.makerAddress === undefined ? null : (opts.makerAddress.toLowerCase() as Hex);
@@ -1823,7 +1811,11 @@ export class Runner {
       // the contests worth paying `getContest` to confirm. If none, the contest has no
       // open speculation we'd track (mirrors the single-market `no-open-speculation`).
       const leanOpen = wantedMarkets.some((mkt) => !isMarketTracked(c.contestId, mkt) && c.speculations.some((s) => s.marketType === mkt && s.open));
-      if (!leanOpen) {
+      // With seeding on, a contest with NO open wanted speculation is still worth the
+      // `getContest`: a wanted market with no open spec is a SEED candidate (post at the
+      // oracle line to lazily create it), and every contest in `newCandidates` already has
+      // an untracked wanted market. Seeding off → unchanged (an open wanted spec is required).
+      if (!leanOpen && !ms.seedSpeculations) {
         this.eventLog.emit('candidate', { contestId: c.contestId, skipReason: 'no-open-speculation' });
         continue;
       }
@@ -1853,12 +1845,60 @@ export class Runner {
       }
       // Track an open spec for each wanted, still-untracked market the FULL contest (the
       // authoritative read) confirms. A wanted market with no open spec here emits
-      // `no-open-speculation` (mirrors the lean-row miss). Stop once the cap fills.
+      // `no-open-speculation` (mirrors the lean-row miss) — or, with seeding on, becomes a
+      // SEED candidate (below). Stop once the cap fills.
+      // A one-shot odds snapshot for this contest's seed candidates — fetched lazily (only
+      // when a wanted market needs seeding) and reused across the contest's seedable markets.
+      // `undefined` = not yet fetched; `null` = the fetch failed. A newcomer has no streamed
+      // odds yet (`lastReferenceOdds` populates only after it's tracked + subscribed), so a
+      // seed's oracle line MUST come from this snapshot at discovery time.
+      let seedSnap: ContestOddsSnapshot | null | undefined;
       for (const mkt of wantedMarkets) {
         if (isMarketTracked(c.contestId, mkt)) continue;
         const confirmedSpec = full.speculations.find((s) => s.marketType === mkt && s.open);
         if (confirmedSpec === undefined) {
-          this.eventLog.emit('candidate', { contestId: c.contestId, skipReason: 'no-open-speculation', ...marketTag(mkt) });
+          // No open speculation for this wanted market. Without seeding, that's the end of
+          // the line (`no-open-speculation`). With seeding on, it's a SEED candidate: track a
+          // placeholder-id market at the oracle-primary line so the MM can post there and
+          // lazily create the speculation (DESIGN §6). This slice tracks + refuses to post
+          // (`would-create-lazy-speculation` at reconcile); the posting path ships later.
+          if (!ms.seedSpeculations) {
+            this.eventLog.emit('candidate', { contestId: c.contestId, skipReason: 'no-open-speculation', ...marketTag(mkt) });
+            continue;
+          }
+          if (this.trackedMarkets.size >= ms.maxTrackedMarkets) {
+            this.eventLog.emit('candidate', { contestId: c.contestId, skipReason: 'tracking-cap-reached', ...marketTag(mkt) });
+            break; // map is full — no remaining market for this contest can fit either
+          }
+          if (seedSnap === undefined) seedSnap = await this.seedOddsSnapshot(c.contestId);
+          const snapOdds = seedSnap === null ? null : seedSnap.odds[mkt];
+          const seedRef = snapOdds === null ? null : referenceOddsFromSdk(snapOdds);
+          if (seedRef === null) {
+            // No usable reference odds for this market (the snapshot failed, or a missing /
+            // partial row) — we can't price a seed, so don't create one.
+            this.eventLog.emit('candidate', { contestId: c.contestId, skipReason: 'no-reference-odds', ...marketTag(mkt) });
+            continue;
+          }
+          const seedLineTicks = oracleLineTicks(seedRef) ?? 0; // moneyline → 0 (no line); spread / total → the oracle line
+          const seedId = seedSpeculationId(c.contestId, mkt, seedLineTicks);
+          this.trackedMarkets.set(marketKey(c.contestId, mkt, seedLineTicks), {
+            contestId: c.contestId,
+            marketType: mkt,
+            referenceGameId: full.referenceGameId,
+            sport: full.sport,
+            awayTeam: full.awayTeam,
+            homeTeam: full.homeTeam,
+            speculationId: seedId,
+            lineTicks: seedLineTicks,
+            matchTimeSec,
+            subscription: null,
+            lastReferenceOdds: null,
+            lastOddsAt: null,
+            dirty: false,
+            lastReconciledAt: null,
+            departing: false,
+          });
+          this.eventLog.emit('candidate', { contestId: c.contestId, sport: full.sport, matchTime: full.matchTime, speculationId: seedId, ...marketTag(mkt) });
           continue;
         }
         if (this.trackedMarkets.size >= ms.maxTrackedMarkets) {
@@ -2002,6 +2042,22 @@ export class Runner {
       return await this.adapter.getOddsSnapshot(m.contestId);
     } catch (err) {
       this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase, contestId: m.contestId });
+      return null;
+    }
+  }
+
+  /**
+   * One-shot reference-odds snapshot for a SEED candidate at discovery — read to pick its
+   * oracle-primary line BEFORE the market is tracked + subscribed (a newcomer has no streamed
+   * odds yet). Distinct from {@link snapshotOdds}, which takes an already-tracked market. Logs
+   * an `error` (`phase: 'discovery'`, like the other discovery reads) and returns `null` on
+   * failure — the caller then emits `no-reference-odds` and skips seeding that market.
+   */
+  private async seedOddsSnapshot(contestId: string): Promise<ContestOddsSnapshot | null> {
+    try {
+      return await this.adapter.getOddsSnapshot(contestId);
+    } catch (err) {
+      this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'discovery', contestId });
       return null;
     }
   }
@@ -2313,6 +2369,20 @@ export class Runner {
       this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'stale-reference', ...marketTag(m.marketType) });
       return outcome;
     }
+    // Gate (seeding): a SEED market carries a placeholder `speculationId` — no on-chain
+    // speculation exists at its line yet. We can't read it (`getSpeculation` would throw on
+    // the placeholder), and this slice does NOT post (the posting + lazy-creation path ships
+    // later). Recognize it and refuse, emitting `would-create-lazy-speculation`. By here the
+    // reference odds are fresh + usable (the gates above passed), so the refusal is "a real
+    // seed candidate we're not creating yet", not a degraded-data skip. The pull is a no-op (a
+    // seed has no visible quotes), but mirrors the other refusal gates' shape. Once a real
+    // speculation appears at the line (ours, post-match, or anyone's), the discovery refresh
+    // re-binds `m.speculationId` to it (`selectRefreshSpec`) and this gate stops firing.
+    if (isSeedSpeculationId(m.speculationId)) {
+      const outcome = await this.pullVisibleQuotes(m, now);
+      this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'would-create-lazy-speculation', ...marketTag(m.marketType) });
+      return outcome;
+    }
     // Gate (spread / total): the tracked speculation's ON-CHAIN line must match the line
     // the reference odds are priced for. `m.lineTicks` is the spec's away-perspective,
     // 10×-scaled line; `oracleLineTicks(ref)` derives the same from the reference odds
@@ -2365,8 +2435,8 @@ export class Runner {
     // event focuses on the exposure-side reasoning that operators ask "why
     // didn't the MM post here?" about. Emitted only when the engine actually
     // runs — i.e. after the pre-engine gates (no-reference-odds /
-    // start-too-soon / stale-reference / no-open-speculation /
-    // reference-line-mismatch) have passed.
+    // start-too-soon / stale-reference / would-create-lazy-speculation /
+    // no-open-speculation / reference-line-mismatch) have passed.
     // For each side (`away` / `home` as the *taker offer* — the side a taker
     // would back), `allowed` mirrors `desired.result.{away,home} !== null`;
     // `sizeUSDC` is the engine-bound size when allowed (zero when refused);

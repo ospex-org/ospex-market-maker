@@ -45,6 +45,8 @@ function rec(hash: string, overrides: Partial<MakerCommitmentRecord> = {}): Make
     awayTeam: 'A',
     homeTeam: 'B',
     scorer: '0xscorer',
+    marketType: 'moneyline',
+    lineTicks: 0,
     makerSide: 'away',
     oddsTick: 200,
     riskAmountWei6: '1000000',

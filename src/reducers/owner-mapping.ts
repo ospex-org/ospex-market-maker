@@ -186,6 +186,17 @@ export function mapOwnerCommitmentToMaker(c: OwnerCommitment): MakerCommitmentRe
     awayTeam: c.awayTeam,
     homeTeam: c.homeTeam,
     scorer: c.scorer,
+    // marketType / lineTicks from the owner-auth commitment body. A null lineTicks is the
+    // moneyline norm (no line → 0). A null marketType means core-api could not classify the
+    // market — today that can only be a moneyline commitment (the only live market), so the
+    // moneyline default is safe AND byte-identical. NOTE this is a fail-OPEN: once spread /
+    // total ship, the per-market risk re-key must source marketType from the scorer / signed
+    // payload rather than defaulting to moneyline here, or a null-marketType spread / total
+    // body would be silently mis-grouped (and paired with its real lineTicks, an inconsistent
+    // moneyline-with-a-line record). Tracked for that slice. (The state validator, by
+    // contrast, fail-CLOSES on a present-but-unknown marketType.)
+    marketType: c.marketType ?? 'moneyline',
+    lineTicks: c.lineTicks ?? 0,
     makerSide: sideFromPositionType(c.positionType),
     oddsTick: c.oddsTick,
     riskAmountWei6: c.riskAmount,

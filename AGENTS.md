@@ -398,6 +398,8 @@ interface MakerCommitmentRecord {
   awayTeam: string;                 // denormalized
   homeTeam: string;                 // denormalized
   scorer: string;
+  marketType: 'moneyline' | 'spread' | 'total';  // denormalized from scorer; pre-this-field records migrate to 'moneyline'
+  lineTicks: number;                // away-perspective 10×-scaled line; 0 for moneyline; legacy records migrate to 0
   makerSide: 'away' | 'home';
   oddsTick: number;                 // uint16 ticks at 100× scale (1.91 = 191)
   riskAmountWei6: string;

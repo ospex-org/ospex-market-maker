@@ -36,6 +36,8 @@ function commitment(overrides: Partial<MakerCommitmentRecord> = {}): MakerCommit
     awayTeam: 'NYM',
     homeTeam: 'LAD',
     scorer: '0xscorer',
+    marketType: 'moneyline',
+    lineTicks: 0,
     makerSide: 'away',
     oddsTick: 191,
     riskAmountWei6: '250000',
@@ -190,6 +192,60 @@ describe('StateStore.load', () => {
     expect(status.kind).toBe('loaded');
     expect(state.commitments[c.hash]?.lifecycle).toBe('softCancelled');
     expect(state.commitments[c.hash]?.riskAmountWei6).toBe('100');
+  });
+
+  it('commitment marketType / lineTicks: a spread record round-trips, a pre-field record migrates to moneyline/0, an unknown marketType is `lost`', () => {
+    const store = StateStore.at(dir);
+    // (1) a non-moneyline record round-trips losslessly.
+    const spread = commitment({ marketType: 'spread', lineTicks: -15 });
+    store.flush(stateWith({ commitments: { [spread.hash]: spread } }));
+    let loaded = store.load();
+    expect(loaded.status.kind).toBe('loaded');
+    expect(loaded.state.commitments[spread.hash]).toMatchObject({ marketType: 'spread', lineTicks: -15 });
+
+    // (2) migration: a record from a pre-this-field state file (neither key present) loads
+    //     as moneyline / 0 — every legacy record is moneyline — and is NOT `lost`.
+    const legacy: Record<string, unknown> = { ...commitment() };
+    delete legacy.marketType;
+    delete legacy.lineTicks;
+    writeFileSync(join(dir, STATE_FILE), JSON.stringify(stateWith({ commitments: { '0xabc': legacy as unknown as MakerCommitmentRecord } })), 'utf8');
+    loaded = store.load();
+    expect(loaded.status.kind).toBe('loaded');
+    expect(loaded.state.commitments['0xabc']).toMatchObject({ marketType: 'moneyline', lineTicks: 0 });
+
+    // (3) an unknown marketType fails closed.
+    writeFileSync(join(dir, STATE_FILE), JSON.stringify(stateWith({ commitments: { '0xabc': commitment({ marketType: 'parlay' as unknown as 'moneyline' }) } })), 'utf8');
+    let status = store.load().status;
+    expect(status.kind).toBe('lost');
+    if (status.kind === 'lost') expect(status.reason).toMatch(/marketType/);
+
+    // (4) a non-integer lineTicks fails closed too (the line is an integer tick count).
+    writeFileSync(join(dir, STATE_FILE), JSON.stringify(stateWith({ commitments: { '0xabc': commitment({ lineTicks: 1.5 }) } })), 'utf8');
+    status = store.load().status;
+    expect(status.kind).toBe('lost');
+    if (status.kind === 'lost') expect(status.reason).toMatch(/lineTicks/);
+
+    // (5) the migration is PAIRED: a half-written record (exactly one of the two fields) is
+    //     rejected rather than normalized to an inconsistent shape (spread/0 or moneyline/-15).
+    const marketTypeOnly: Record<string, unknown> = { ...commitment({ marketType: 'spread', lineTicks: -15 }) };
+    delete marketTypeOnly.lineTicks;
+    writeFileSync(join(dir, STATE_FILE), JSON.stringify(stateWith({ commitments: { '0xabc': marketTypeOnly as unknown as MakerCommitmentRecord } })), 'utf8');
+    status = store.load().status;
+    expect(status.kind).toBe('lost');
+    if (status.kind === 'lost') expect(status.reason).toMatch(/present together/);
+
+    const lineTicksOnly: Record<string, unknown> = { ...commitment({ marketType: 'spread', lineTicks: -15 }) };
+    delete lineTicksOnly.marketType;
+    writeFileSync(join(dir, STATE_FILE), JSON.stringify(stateWith({ commitments: { '0xabc': lineTicksOnly as unknown as MakerCommitmentRecord } })), 'utf8');
+    status = store.load().status;
+    expect(status.kind).toBe('lost');
+    if (status.kind === 'lost') expect(status.reason).toMatch(/present together/);
+
+    // (6) moneyline has no line — a moneyline record with a non-zero lineTicks is inconsistent → lost.
+    writeFileSync(join(dir, STATE_FILE), JSON.stringify(stateWith({ commitments: { '0xabc': commitment({ marketType: 'moneyline', lineTicks: -15 }) } })), 'utf8');
+    status = store.load().status;
+    expect(status.kind).toBe('lost');
+    if (status.kind === 'lost') expect(status.reason).toMatch(/moneyline/);
   });
 
   // ── sensitive state hardening (own-state SSE plan §M6/B) ────────────────────

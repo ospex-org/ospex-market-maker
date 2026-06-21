@@ -91,8 +91,16 @@ export interface MarketSelectionConfig {
   maxStartsWithinHours: number;
   maxTrackedMarkets: number;
   requireReferenceOdds: boolean;
-  /** v0: only quote markets whose speculation already exists (no lazy creation). */
-  requireOpenSpeculation: boolean;
+  /**
+   * Opt-in to **seeding** — posting a commitment at the oracle-primary line for a
+   * wanted market that has **no open speculation yet**, lazily creating the
+   * speculation on first match. Consequential: it makes the MM actively create
+   * speculations, pay the protocol creation fee (a USDC cost, not just gas), and
+   * approve the `TreasuryModule` (a wider approval surface than the default
+   * PositionModule-only). Default `false` — the MM only quotes markets whose
+   * speculation already exists. (Replaces the former dead `requireOpenSpeculation`.)
+   */
+  seedSpeculations: boolean;
   contestAllowList: string[];
   contestDenyList: string[];
 }

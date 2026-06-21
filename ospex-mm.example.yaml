@@ -29,7 +29,10 @@ marketSelection:
                                    #   single contest can consume several slots. Each tracked market opens one live odds stream,
                                    #   so this also bounds SSE connections — see odds.maxRealtimeChannels.
   requireReferenceOdds: true       # skip games with no upstream odds linkage
-  requireOpenSpeculation: true     # v0: only quote markets whose speculation already exists (no lazy creation)
+  seedSpeculations: false          # opt-in to SEEDING — posting at the oracle line where no speculation exists yet,
+                                   #   lazily creating it on first match. Consequential: the MM actively creates
+                                   #   speculations, pays the protocol creation fee (a USDC cost), and approves the
+                                   #   TreasuryModule. Default false = only quote markets whose speculation already exists.
   contestAllowList: []             # optional: if non-empty, ONLY these contestIds
   contestDenyList: []              # optional: never these contestIds
 

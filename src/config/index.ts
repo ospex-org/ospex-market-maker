@@ -222,7 +222,7 @@ const ROOT_KEYS = [
 const WALLET_KEYS = ['keystorePath'] as const;
 const MARKET_SELECTION_KEYS = [
   'sports', 'markets', 'maxStartsWithinHours', 'maxTrackedMarkets', 'requireReferenceOdds',
-  'requireOpenSpeculation', 'contestAllowList', 'contestDenyList',
+  'seedSpeculations', 'contestAllowList', 'contestDenyList',
 ] as const;
 const DISCOVERY_KEYS = ['everyNTicks', 'jitterPct'] as const;
 const ODDS_KEYS = ['subscribe', 'maxRealtimeChannels'] as const;
@@ -312,7 +312,7 @@ export function parseConfig(raw: unknown, env: EnvLike = {}): Config {
     maxStartsWithinHours: def(ms.maxStartsWithinHours, 24, (v) => asPositiveNumber(v, 'marketSelection.maxStartsWithinHours')),
     maxTrackedMarkets: def(ms.maxTrackedMarkets, 5, (v) => asPositiveInt(v, 'marketSelection.maxTrackedMarkets')),
     requireReferenceOdds: def(ms.requireReferenceOdds, true, (v) => asBoolean(v, 'marketSelection.requireReferenceOdds')),
-    requireOpenSpeculation: def(ms.requireOpenSpeculation, true, (v) => asBoolean(v, 'marketSelection.requireOpenSpeculation')),
+    seedSpeculations: def(ms.seedSpeculations, false, (v) => asBoolean(v, 'marketSelection.seedSpeculations')),
     contestAllowList: def<string[]>(ms.contestAllowList, [], (v) => asStringArray(v, 'marketSelection.contestAllowList')),
     contestDenyList: def<string[]>(ms.contestDenyList, [], (v) => asStringArray(v, 'marketSelection.contestDenyList')),
   };

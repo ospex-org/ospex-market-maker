@@ -654,6 +654,18 @@ export class Runner {
         'Runner: live mode (config.mode.dryRun=false) requires `makerAddress` (the signer\'s wallet) — the own-state SSE stream is owner-authenticated, scoped to the signer\'s address. `runRun` passes it from `signer.getAddress()`.',
       );
     }
+    // Seeding (marketSelection.seedSpeculations) is the opt-in to lazily creating
+    // speculations — posting at the oracle-primary line where no speculation exists
+    // yet. The flag is staged ahead of its behavior: the seeding path (the discovery
+    // branch, the TreasuryModule creation-fee allowance + budget, the per-seed risk
+    // keying) ships in subsequent slices. Until then, refuse `true` at boot rather
+    // than silently no-op a money-consequential opt-in (it pays the protocol creation
+    // fee and widens the approval surface). Removed when the seeding path lands.
+    if (this.config.marketSelection.seedSpeculations) {
+      throw new Error(
+        'Runner: marketSelection.seedSpeculations is enabled, but speculation seeding is not yet implemented in this build — set it to false. Seeding lazily creates speculations (posting where none exists), pays the protocol creation fee, and approves the TreasuryModule; the path ships in a later release.',
+      );
+    }
     this.makerAddress = opts.makerAddress === undefined ? null : (opts.makerAddress.toLowerCase() as Hex);
     this.scorers = this.adapter.addresses().scorers;
     this.stateStore = opts.stateStore;

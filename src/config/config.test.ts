@@ -95,6 +95,14 @@ describe('parseConfig', () => {
     expect(() => parseConfig({ rpcUrl: 'x', marketSelection: { maxTrackedContests: 5 } }, {})).toThrow(/not a known config field/);
   });
 
+  it('marketSelection.seedSpeculations defaults false, accepts a boolean, and the retired requireOpenSpeculation key is rejected', () => {
+    expect(parseConfig({ rpcUrl: 'x' }, {}).marketSelection.seedSpeculations).toBe(false); // default off
+    expect(parseConfig({ rpcUrl: 'x', marketSelection: { seedSpeculations: true } }, {}).marketSelection.seedSpeculations).toBe(true);
+    expect(() => parseConfig({ rpcUrl: 'x', marketSelection: { seedSpeculations: 'yes' } }, {})).toThrow(/seedSpeculations/);
+    // the former dead flag is retired → an old config carrying it fails loud (no silent fallback)
+    expect(() => parseConfig({ rpcUrl: 'x', marketSelection: { requireOpenSpeculation: true } }, {})).toThrow(/not a known config field/);
+  });
+
   it('rejects out-of-range / mistyped values with a clear message', () => {
     expect(() => parseConfig({ rpcUrl: 'x', chainId: 999 }, {})).toThrow(/137/);
     expect(() => parseConfig({ rpcUrl: 'x', pricing: { maxPerQuotePctOfCapital: 2 } }, {})).toThrow(/maxPerQuotePctOfCapital/);

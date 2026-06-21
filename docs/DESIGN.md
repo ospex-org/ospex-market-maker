@@ -323,7 +323,7 @@ marketSelection:
   maxStartsWithinHours: 24         # only quote games starting within this window
   maxTrackedMarkets: 5             # hard cap on (contest, market, line) entries tracked at once (one odds stream each — bounds subscriptions)
   requireReferenceOdds: true       # skip games with no upstream odds linkage
-  requireOpenSpeculation: true     # v0: only quote markets whose speculation already exists (no lazy creation)
+  seedSpeculations: false          # opt-in to SEEDING (post at the oracle line where no speculation exists yet, lazily creating it). Consequential: pays the protocol creation fee + approves TreasuryModule. Default false = only quote existing open speculations.
   contestAllowList: []             # optional: if non-empty, ONLY these contestIds
   contestDenyList: []              # optional: never these contestIds
 

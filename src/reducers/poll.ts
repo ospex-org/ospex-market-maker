@@ -22,6 +22,7 @@ import type {
 } from '../state/index.js';
 
 import type { ReducerDescriptor } from './descriptors.js';
+import { marketTag } from '../telemetry/index.js';
 
 export interface ReducerConfig {
   /** `config.orders.expiryReleaseGraceSeconds` — passed through to `isExpiredForRelease`. */
@@ -152,6 +153,7 @@ function applyFillToRecord(
         newFillWei6: deltaWei6.toString(),
         filledRiskWei6: record.filledRiskWei6,
         partial: finalLifecycle === 'partiallyFilled',
+        ...marketTag(record.marketType),
       },
     });
   }
@@ -215,6 +217,7 @@ function convergeSoftCancelledCumulative(
       newFillWei6: newFill.toString(),
       filledRiskWei6: record.filledRiskWei6,
       partial: finalLifecycle !== 'filled',
+      ...marketTag(record.marketType),
     },
   });
 }
@@ -532,6 +535,7 @@ export function reducePolledPositionObservation(
         positionType: p.positionType,
         newFillWei6: delta.toString(),
         cumulativeRiskWei6: (localRiskWei6 + delta).toString(),
+        ...marketTag(context.marketType),
       },
     });
   }

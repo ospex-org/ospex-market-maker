@@ -301,11 +301,13 @@ Canonical vocabulary (`TELEMETRY_KINDS` in [`src/telemetry/index.ts`](./src/tele
 
 ### 3.3 Order lifecycle (`would-*` in dry-run, plain in live)
 
+**Market tag:** the commitment/position events below — `submit` / `would-submit`, `replace` / `would-replace`, `soft-cancel` / `would-soft-cancel`, `fill`, `settle`, `claim` — carry the same telemetry `market` tag as the per-market `candidate` event (`market?: 'spread' \| 'total'`, **omitted for moneyline** — the unmarked default — so a moneyline-only run's NDJSON is byte-identical; see §3.2 / `marketTag`). `summary` reads it (absent ⇒ moneyline) to bucket fill rate + realized P&L by market (`liveMetrics.fills.byMarket` / `liveMetrics.realizedPnl.byMarket`).
+
 | `kind` | Payload |
 |---|---|
-| `submit` / `would-submit` | `{ commitmentHash, speculationId, contestId, sport, awayTeam, homeTeam, takerSide, makerSide, positionType, makerOddsTick, riskAmountWei6, expiryUnixSec, takerOddsTick, takerImpliedProb }`. Live submit signs + POSTs the EIP-712 commitment via `commitments.submitRaw` (the API relay path); gasless — no `gasPolWei`. |
-| `replace` / `would-replace` | `{ replacedCommitmentHash, newCommitmentHash, speculationId, contestId, sport, awayTeam, homeTeam, takerSide, makerSide, positionType, reason: 'stale' \| 'mispriced', fromMakerOddsTick, toMakerOddsTick, fromTakerOddsTick, toTakerOddsTick, riskAmountWei6, expiryUnixSec }` |
-| `soft-cancel` / `would-soft-cancel` | `{ commitmentHash, speculationId, contestId, sport, awayTeam, homeTeam, takerSide, makerSide, positionType, makerOddsTick, reason: SoftCancelReason }` |
+| `submit` / `would-submit` | `{ commitmentHash, speculationId, contestId, sport, awayTeam, homeTeam, takerSide, makerSide, positionType, makerOddsTick, riskAmountWei6, expiryUnixSec, takerOddsTick, takerImpliedProb, market?: 'spread' \| 'total' }`. Live submit signs + POSTs the EIP-712 commitment via `commitments.submitRaw` (the API relay path); gasless — no `gasPolWei`. |
+| `replace` / `would-replace` | `{ replacedCommitmentHash, newCommitmentHash, speculationId, contestId, sport, awayTeam, homeTeam, takerSide, makerSide, positionType, reason: 'stale' \| 'mispriced', fromMakerOddsTick, toMakerOddsTick, fromTakerOddsTick, toTakerOddsTick, riskAmountWei6, expiryUnixSec, market?: 'spread' \| 'total' }` |
+| `soft-cancel` / `would-soft-cancel` | `{ commitmentHash, speculationId, contestId, sport, awayTeam, homeTeam, takerSide, makerSide, positionType, makerOddsTick, reason: SoftCancelReason, market?: 'spread' \| 'total' }` |
 | `expire` | `{ commitmentHash, speculationId, contestId, makerSide, oddsTick }` — clock-only terminalization; headroom released |
 | `onchain-cancel` | `{ commitmentHash, speculationId, contestId, makerSide, txHash, gasPolWei: string }` — `MatchingModule.cancelCommitment` landed (the routine `cancelMode: onchain` cancel of a matched remainder — a visible `partiallyFilled` retained partial OR a recovered soft-cancel, i.e. soft-cancelled then matched on chain — the funding guard's `underfundedCancelMode: onchain` sweep, the §5.1 own-state-health active cancel-sweep (PR3b-ii), or the operator-explicit shutdown kill / `cancel-stale --authoritative`). Record → `authoritativelyInvalidated`. |
 | `cancel-blocked-missing-payload` | `{ commitmentHash, speculationId, contestId, makerSide, lifecycle, reason: 'missing-legacy-signed-payload-and-hidden', detail: string, phase?: 'shutdown-kill' \| 'cli-cancel-stale' }` — an on-chain cancel sweep hit a pre-M6/A record (`signedPayloadStatus: 'missing-legacy'`) that is also book-hidden (`lifecycle: 'softCancelled'`): the public commitments API redacts the signed payload (M2) so `cancelOnchain` has no recovery path. The record is SKIPPED (no cancel attempted, no gas spent) and its latent exposure rides to expiry. Emitted once per stuck record per sweep — the routine `cancelMode: onchain` recovered-soft-cancel pre-pass (no `phase`), the shutdown kill (`phase: 'shutdown-kill'`), or `cancel-stale --authoritative` (`phase: 'cli-cancel-stale'`). **Operator action required**: recover the payload via owner-auth own-state or wait for expiry (own-state SSE plan §M6). |
@@ -315,13 +317,13 @@ Canonical vocabulary (`TELEMETRY_KINDS` in [`src/telemetry/index.ts`](./src/tele
 
 | `kind` | Payload |
 |---|---|
-| `fill` (source `'own-state-stream'`) | `{ source: 'own-state-stream', commitmentHash, speculationId, contestId, sport, awayTeam, homeTeam, takerSide, makerSide, positionType, makerOddsTick, newFillWei6, cumulativeRiskWei6 }` — the **only live fill source** since the own-state polling retirement: an owner `fill` delivered over the own-state SSE stream (the canonical state writer in live mode), deduped on `(txHash, logIndex)`. Creates/extends the maker-side position record; `cumulativeRiskWei6` is the position's post-fill own risk. The commitment's `filledRiskWei6` bump arrives separately via the stream's `commitment` event. |
-| `fill` (source `'commitment-diff'`) | **RESERVED — not emitted since the own-state polling retirement** (historical logs may contain it; the audit probes suppress their fill descriptors). `{ source: 'commitment-diff', commitmentHash, speculationId, contestId, sport, awayTeam, homeTeam, takerSide, makerSide, positionType, makerOddsTick, newFillWei6, filledRiskWei6, partial: boolean }` |
-| `fill` (source `'position-poll'`) | **RESERVED — not emitted since the own-state polling retirement** (historical logs may contain it). `{ source: 'position-poll', positionId, speculationId, contestId, sport, awayTeam, homeTeam, makerSide, positionType, newFillWei6, cumulativeRiskWei6 }` — was the backfill from `getPositionStatus`; no `makerOddsTick` (the API surfaces aggregate own/counterparty stake, not per-fill ticks) |
+| `fill` (source `'own-state-stream'`) | `{ source: 'own-state-stream', commitmentHash, speculationId, contestId, sport, awayTeam, homeTeam, takerSide, makerSide, positionType, makerOddsTick, newFillWei6, cumulativeRiskWei6, market?: 'spread' \| 'total' }` — the **only live fill source** since the own-state polling retirement: an owner `fill` delivered over the own-state SSE stream (the canonical state writer in live mode), deduped on `(txHash, logIndex)`. Creates/extends the maker-side position record; `cumulativeRiskWei6` is the position's post-fill own risk. The commitment's `filledRiskWei6` bump arrives separately via the stream's `commitment` event. `market` (omitted for moneyline; shared `FillEventPayload` field across all sources) is the originating commitment's market — `summary` buckets fills/P&L by it. |
+| `fill` (source `'commitment-diff'`) | **RESERVED — not emitted since the own-state polling retirement** (historical logs may contain it; the audit probes suppress their fill descriptors). `{ source: 'commitment-diff', commitmentHash, speculationId, contestId, sport, awayTeam, homeTeam, takerSide, makerSide, positionType, makerOddsTick, newFillWei6, filledRiskWei6, partial: boolean, market?: 'spread' \| 'total' }` |
+| `fill` (source `'position-poll'`) | **RESERVED — not emitted since the own-state polling retirement** (historical logs may contain it). `{ source: 'position-poll', positionId, speculationId, contestId, sport, awayTeam, homeTeam, makerSide, positionType, newFillWei6, cumulativeRiskWei6, market?: 'spread' \| 'total' }` — was the backfill from `getPositionStatus`; no `makerOddsTick` (the API surfaces aggregate own/counterparty stake, not per-fill ticks) |
 | `fill` (source `'softcancel-recovery'`) | **RESERVED — not emitted since the own-state polling retirement** (historical logs may contain it). `{ source: 'softcancel-recovery', commitmentHash, speculationId, contestId, sport, awayTeam, homeTeam, takerSide, makerSide, positionType, makerOddsTick, newFillWei6, filledRiskWei6, partial: boolean }` — was `reconcileSoftCancelledFills` converging a `softCancelled` commitment's `filledRiskWei6` up to the authoritative cumulative `getCommitment` reports (a soft-cancelled signed payload that matched on chain — invisible to `commitment-diff`, which can't see soft-cancelled rows). **Commitment-only — did NOT mutate the position.** Same payload shape as `'commitment-diff'`. |
 | `position-transition` | `{ positionId, speculationId, contestId, sport, awayTeam, homeTeam, makerSide, positionType, fromStatus, toStatus, result?: 'won' \| 'push' \| 'void', predictedWinSide?: 'away' \| 'home' \| 'over' \| 'under' \| 'push' }`. `fromStatus`/`toStatus` ∈ `'active' \| 'pendingSettle' \| 'claimable'`. `result` carried on `pendingSettle` and `claimable`; `predictedWinSide` on `pendingSettle` only. |
-| `settle` | `{ speculationId, contestId, sport, awayTeam, homeTeam, makerSide, winSide: 'away' \| 'home' \| 'push' \| 'over' \| 'under', txHash, gasPolWei }` — `SPECULATION_SETTLED` landed |
-| `claim` | `{ speculationId, contestId, sport, awayTeam, homeTeam, makerSide, positionType, payoutWei6, txHash, gasPolWei, result?: 'won' \| 'push' \| 'void' }` — `POSITION_CLAIMED` landed; `result` (when present) is authoritative for `summary`'s realized-P&L classification (origin: `ClaimablePositionView.result`); local `MakerPositionStatus` stamped `'claimed'` |
+| `settle` | `{ speculationId, contestId, sport, awayTeam, homeTeam, makerSide, winSide: 'away' \| 'home' \| 'push' \| 'over' \| 'under', txHash, gasPolWei, market?: 'spread' \| 'total' }` — `SPECULATION_SETTLED` landed |
+| `claim` | `{ speculationId, contestId, sport, awayTeam, homeTeam, makerSide, positionType, payoutWei6, txHash, gasPolWei, result?: 'won' \| 'push' \| 'void', market?: 'spread' \| 'total' }` — `POSITION_CLAIMED` landed; `result` (when present) is authoritative for `summary`'s realized-P&L classification (origin: `ClaimablePositionView.result`); local `MakerPositionStatus` stamped `'claimed'` |
 
 ### 3.5 Environment
 
@@ -522,6 +524,7 @@ interface LiveMetrics {
     quotedUsdcWei6: string;         // Σ riskAmountWei6 across submit + replace
     filledUsdcWei6: string;         // Σ newFillWei6 across fill events
     fillRate: number | null;        // filledUsdcWei6 / quotedUsdcWei6; null on div-by-zero
+    byMarket: Record<MarketType, { quotedUsdcWei6: string; filledUsdcWei6: string; fillRate: number | null }>;  // same three fields per market ('moneyline' | 'spread' | 'total'), zero-filled; attributed by each event's `market` tag (absent ⇒ moneyline); the run-wide quoted/filled equal the sum across markets
   };
   gas: {
     totalPolWei: string;
@@ -537,7 +540,7 @@ interface LiveMetrics {
   totalFeeUsdcWei6: string;             // '0' in v0 (no maker-side USDC fees)
 }
 
-interface RealizedPnl {
+interface RealizedPnlAmounts {           // the run-wide totals AND each per-market bucket share this shape
   netUsdcWei6: string;                  // SIGNED — '-X' for losses
   claimedProfitUsdcWei6: string;        // Σ (payout - cumulativeStake) across won positions; ≥ 0
   realizedLossUsdcWei6: string;         // Σ stake across lost positions; ≥ 0
@@ -547,6 +550,10 @@ interface RealizedPnl {
   wonUnclaimedCount: number;            // settle.winSide === makerSide AND no claim event AND no already-claimed skip in window (paper profit; no net contribution)
   alreadyClaimedCount: number;          // auto-claim found it already claimed (candidate already-claimed, no claim event) — claimed out-of-window / prior run / concurrent caller; distinct from wonUnclaimed; no derived payout, no net contribution
   unsettledCount: number;               // fills exist but no settle in window (held over to unrealized — future slice)
+}
+
+interface RealizedPnl extends RealizedPnlAmounts {
+  byMarket: Record<MarketType, RealizedPnlAmounts>;  // per-market breakdown ('moneyline' | 'spread' | 'total'), zero-filled; a position's market is resolved from its fill/settle/claim `market` tag (absent ⇒ moneyline); the run-wide totals equal the sum across markets
 }
 ```
 
@@ -650,7 +657,14 @@ jq -c 'select(.kind == "candidate"    and .contestId == "C")' run-*.ndjson
 **"What's the fill rate so far?"**
 ```
 ospex-mm summary --json | jq '.summary.liveMetrics.fills'
-# { "quotedUsdcWei6": "…", "filledUsdcWei6": "…", "fillRate": 0.0–1.0+ | null }
+# { "quotedUsdcWei6": "…", "filledUsdcWei6": "…", "fillRate": 0.0–1.0+ | null, "byMarket": { "moneyline": {…}, "spread": {…}, "total": {…} } }
+```
+
+**"Which markets are filling / making money (spread vs total vs moneyline)?"**
+```
+ospex-mm summary --json | jq '{ fills: .summary.liveMetrics.fills.byMarket,
+                                pnl:   .summary.liveMetrics.realizedPnl.byMarket }'
+# Each carries the same shape as its run-wide parent, zero-filled per market; the run-wide totals equal the sum across markets.
 ```
 
 **"Is the MM holding quoting right now (state-loss hold)?"**

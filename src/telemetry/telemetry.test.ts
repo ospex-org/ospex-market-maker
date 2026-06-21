@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { CANDIDATE_SKIP_REASONS, EventLog, eventLogsExist, listRunLogs, newRunId, summarize, TELEMETRY_KINDS, type TelemetryKind } from './index.js';
+import { CANDIDATE_SKIP_REASONS, EventLog, eventLogsExist, listRunLogs, marketTag, newRunId, summarize, TELEMETRY_KINDS, type TelemetryKind } from './index.js';
 
 function readLines(path: string): Array<Record<string, unknown>> {
   return readFileSync(path, 'utf8')
@@ -11,6 +11,16 @@ function readLines(path: string): Array<Record<string, unknown>> {
     .split('\n')
     .map((line) => JSON.parse(line) as Record<string, unknown>);
 }
+
+describe('marketTag', () => {
+  it('OMITS the market for moneyline (the unmarked default → byte-identical NDJSON)', () => {
+    expect(marketTag('moneyline')).toEqual({});
+  });
+  it('carries the market for spread / total', () => {
+    expect(marketTag('spread')).toEqual({ market: 'spread' });
+    expect(marketTag('total')).toEqual({ market: 'total' });
+  });
+});
 
 describe('EventLog', () => {
   let dir: string;
@@ -582,6 +592,12 @@ describe('summarize', () => {
         quotedUsdcWei6: '1200000', // 0.5 + 0.3 + 0.4
         filledUsdcWei6: '500000', //  0.2 + 0.3
         fillRate: 500000 / 1200000,
+        byMarket: {
+          // all events are moneyline (no `market` tag) → the moneyline bucket equals the aggregate.
+          moneyline: { quotedUsdcWei6: '1200000', filledUsdcWei6: '500000', fillRate: 500000 / 1200000 },
+          spread: { quotedUsdcWei6: '0', filledUsdcWei6: '0', fillRate: null },
+          total: { quotedUsdcWei6: '0', filledUsdcWei6: '0', fillRate: null },
+        },
       });
     });
 
@@ -593,6 +609,41 @@ describe('summarize', () => {
       expect(s.liveMetrics.fills.quotedUsdcWei6).toBe('0');
       expect(s.liveMetrics.fills.filledUsdcWei6).toBe('100000');
       expect(s.liveMetrics.fills.fillRate).toBeNull();
+    });
+
+    it('breaks fills + realized P&L down by market via the `market` tag (the aggregate equals the sum across markets; absent tag ⇒ moneyline)', () => {
+      const path = writeLog('run-multimarket.ndjson', [
+        // moneyline (NO `market` tag) — quote 1.0, fully filled, won (claim 1.8 → +0.8)
+        { kind: 'submit', commitmentHash: '0xml', speculationId: 'spec-ML', contestId: 'C1', makerSide: 'home', oddsTick: 180, riskAmountWei6: '1000000' },
+        { kind: 'fill', source: 'commitment-diff', commitmentHash: '0xml', speculationId: 'spec-ML', contestId: 'C1', makerSide: 'home', newFillWei6: '1000000', filledRiskWei6: '1000000', partial: false },
+        { kind: 'claim', speculationId: 'spec-ML', contestId: 'C1', sport: 'mlb', awayTeam: 'A', homeTeam: 'B', makerSide: 'home', positionType: 1, payoutWei6: '1800000', result: 'won', txHash: '0xc1' },
+        // spread — quote 0.5, filled, lost (settle away ≠ maker home, no claim) → -0.5
+        { kind: 'submit', commitmentHash: '0xsp', speculationId: 'spec-SP', contestId: 'C1', makerSide: 'home', oddsTick: 190, riskAmountWei6: '500000', market: 'spread' },
+        { kind: 'fill', source: 'commitment-diff', commitmentHash: '0xsp', speculationId: 'spec-SP', contestId: 'C1', makerSide: 'home', newFillWei6: '500000', filledRiskWei6: '500000', partial: false, market: 'spread' },
+        { kind: 'settle', speculationId: 'spec-SP', contestId: 'C1', sport: 'mlb', awayTeam: 'A', homeTeam: 'B', makerSide: 'home', winSide: 'away', txHash: '0xs2', market: 'spread' },
+        // total — quote 0.4, partially filled 0.2, unsettled
+        { kind: 'submit', commitmentHash: '0xto', speculationId: 'spec-TO', contestId: 'C1', makerSide: 'home', oddsTick: 195, riskAmountWei6: '400000', market: 'total' },
+        { kind: 'fill', source: 'commitment-diff', commitmentHash: '0xto', speculationId: 'spec-TO', contestId: 'C1', makerSide: 'home', newFillWei6: '200000', filledRiskWei6: '200000', partial: true, market: 'total' },
+      ]);
+      const s = summarize([path]);
+
+      // fills.byMarket — quoted/filled attributed by each event's tag
+      expect(s.liveMetrics.fills.byMarket.moneyline).toEqual({ quotedUsdcWei6: '1000000', filledUsdcWei6: '1000000', fillRate: 1 });
+      expect(s.liveMetrics.fills.byMarket.spread).toEqual({ quotedUsdcWei6: '500000', filledUsdcWei6: '500000', fillRate: 1 });
+      expect(s.liveMetrics.fills.byMarket.total).toEqual({ quotedUsdcWei6: '400000', filledUsdcWei6: '200000', fillRate: 0.5 });
+      // aggregate == sum across markets
+      expect(s.liveMetrics.fills.quotedUsdcWei6).toBe('1900000'); // 1.0 + 0.5 + 0.4
+      expect(s.liveMetrics.fills.filledUsdcWei6).toBe('1700000'); // 1.0 + 0.5 + 0.2
+
+      // realizedPnl.byMarket — each position bucketed by its speculation's market
+      expect(s.liveMetrics.realizedPnl.byMarket.moneyline).toMatchObject({ netUsdcWei6: '800000', claimedProfitUsdcWei6: '800000', wonCount: 1, lostCount: 0, unsettledCount: 0 });
+      expect(s.liveMetrics.realizedPnl.byMarket.spread).toMatchObject({ netUsdcWei6: '-500000', realizedLossUsdcWei6: '500000', wonCount: 0, lostCount: 1, unsettledCount: 0 });
+      expect(s.liveMetrics.realizedPnl.byMarket.total).toMatchObject({ netUsdcWei6: '0', wonCount: 0, lostCount: 0, unsettledCount: 1 });
+      // aggregate == sum across markets
+      expect(s.liveMetrics.realizedPnl.netUsdcWei6).toBe('300000'); // +0.8 − 0.5
+      expect(s.liveMetrics.realizedPnl.wonCount).toBe(1);
+      expect(s.liveMetrics.realizedPnl.lostCount).toBe(1);
+      expect(s.liveMetrics.realizedPnl.unsettledCount).toBe(1);
     });
 
     it('sums `gasPolWei` across `approval` / `onchain-cancel` / `settle` / `claim` events into per-kind + total POL wei18', () => {

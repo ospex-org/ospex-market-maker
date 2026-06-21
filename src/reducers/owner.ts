@@ -49,6 +49,7 @@ import {
 } from './owner-mapping.js';
 
 import type { ReducerDescriptor } from './descriptors.js';
+import { marketTag } from '../telemetry/index.js';
 
 /** Transport-level status delivered by the SDK's `onStatus` handler. */
 export type OwnStateTransportStatus = 'connected' | 'reconnecting' | 'degraded' | 'resync';
@@ -303,6 +304,7 @@ export function reduceOwnerFill(
         makerOddsTick: commitment.oddsTick,
         newFillWei6: fillRisk.toString(),
         cumulativeRiskWei6,
+        ...marketTag(commitment.marketType),
       },
     },
   ];

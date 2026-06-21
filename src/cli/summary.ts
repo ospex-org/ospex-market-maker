@@ -124,6 +124,8 @@ export function renderSummaryReportText(summary: RunSummary, logDir: string, out
     out.write(`  (no live activity — submit / fill / settle / claim events absent; check the event-count histogram below)\n`);
   } else {
     out.write(`  Fills:        ${formatUsdcWei6(lm.fills.filledUsdcWei6)} / ${formatUsdcWei6(lm.fills.quotedUsdcWei6)} USDC filled / quoted (rate ${pctOrNa(lm.fills.fillRate)})\n`);
+    const fillsMarkets = activeFillMarkets(lm.fills.byMarket);
+    if (fillsMarkets.length >= 2) out.write(`                by market: ${fillsMarkets.join('  ')}\n`); // shown only on a multi-market run; a moneyline-only run is unchanged
     out.write(`  Settlements:  ${lm.settlements.settleCount} settle / ${lm.settlements.claimCount} claim — total claimed payout ${formatUsdcWei6(lm.settlements.totalClaimedPayoutWei6)} USDC\n`);
     const r = lm.realizedPnl;
     out.write(`  Realized P&L: ${formatSignedUsdcWei6(r.netUsdcWei6)} USDC — ${r.wonCount} won / ${r.lostCount} lost / ${r.pushCount} push`);
@@ -131,6 +133,8 @@ export function renderSummaryReportText(summary: RunSummary, logDir: string, out
     if (r.alreadyClaimedCount > 0) out.write(` / ${r.alreadyClaimedCount} already-claimed`);
     if (r.unsettledCount > 0) out.write(` / ${r.unsettledCount} unsettled`);
     out.write(`\n`);
+    const pnlMarkets = activePnlMarkets(r.byMarket);
+    if (pnlMarkets.length >= 2) out.write(`                by market: ${pnlMarkets.join('  ')}\n`); // shown only when ≥2 markets have settled positions
     if (r.claimedProfitUsdcWei6 !== '0' || r.realizedLossUsdcWei6 !== '0') {
       out.write(`                claimed profit ${formatUsdcWei6(r.claimedProfitUsdcWei6)} USDC / realized loss ${formatUsdcWei6(r.realizedLossUsdcWei6)} USDC\n`);
     }
@@ -152,6 +156,24 @@ export function renderSummaryReportText(summary: RunSummary, logDir: string, out
 }
 
 // ── tiny render helpers ──────────────────────────────────────────────────────
+
+/** Display order for the per-market breakdown lines. */
+const MARKET_ORDER = ['moneyline', 'spread', 'total'] as const;
+
+/** Per-market `filled/quoted (rate)` segments for the markets that saw any quote/fill activity. */
+function activeFillMarkets(byMarket: RunSummary['liveMetrics']['fills']['byMarket']): string[] {
+  return MARKET_ORDER.filter((m) => byMarket[m].quotedUsdcWei6 !== '0' || byMarket[m].filledUsdcWei6 !== '0').map(
+    (m) => `${m} ${formatUsdcWei6(byMarket[m].filledUsdcWei6)}/${formatUsdcWei6(byMarket[m].quotedUsdcWei6)} (${pctOrNa(byMarket[m].fillRate)})`,
+  );
+}
+
+/** Per-market `net (w/l/p)` segments for the markets that had any settled position. */
+function activePnlMarkets(byMarket: RunSummary['liveMetrics']['realizedPnl']['byMarket']): string[] {
+  return MARKET_ORDER.filter((m) => {
+    const b = byMarket[m];
+    return b.wonCount + b.lostCount + b.pushCount + b.wonUnclaimedCount + b.alreadyClaimedCount + b.unsettledCount > 0;
+  }).map((m) => `${m} ${formatSignedUsdcWei6(byMarket[m].netUsdcWei6)} (${byMarket[m].wonCount}w/${byMarket[m].lostCount}l/${byMarket[m].pushCount}p)`);
+}
 
 function histogramText(m: Record<string, number>): string {
   return Object.entries(m)

@@ -580,9 +580,11 @@ ospex-mm doctor --address 0x… --json | jq '.doctor.ready.postCommitments'
 **"What could the MM quote right now? What needs setting up first?"**
 ```
 ospex-mm candidates --json | jq '.candidates.summary'
-# quote-ready contest ids, ready to feed to `quote --dry-run`:
+# quote-ready (contest, market) pairs. The `quote --dry-run` CLI prices MONEYLINE only — feed
+# it the market=="moneyline" ones; spread/total quote_ready are quoted by the runner (preview
+# with `run --dry-run`):
 ospex-mm candidates --json | jq '.candidates.items[] | select(.kind == "quote_ready")
-                                 | {contestId, awayTeam, homeTeam, matchTime, referenceOdds}'
+                                 | {contestId, market, awayTeam, homeTeam, matchTime, referenceOdds}'
 # upcoming games someone could turn into contests:
 ospex-mm candidates --json | jq '.candidates.items[] | select(.kind == "setup")
                                  | {gameId, awayTeam, homeTeam, matchTime}'

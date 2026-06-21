@@ -461,6 +461,8 @@ interface MakerPositionRecord {
   sport: string;
   awayTeam: string;
   homeTeam: string;
+  marketType: 'moneyline' | 'spread' | 'total';  // sourced from the originating commitment (fill path) or the position body's `market`; pre-this-field records migrate to 'moneyline'
+  lineTicks: number;                // away-perspective 10×-scaled line; sourced from the originating commitment (the own-state position body carries no line → 0 on the snapshot path); legacy records migrate to 0
   side: 'away' | 'home';
   riskAmountWei6: string;           // own staked risk
   counterpartyRiskWei6: string;     // counterparty's stake (the payout-above-stake delta on a win)

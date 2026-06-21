@@ -261,6 +261,14 @@ export function mapOwnerPositionToMaker(p: OwnerPosition): MakerPositionRecord {
     sport: p.sport,
     awayTeam: p.awayTeam,
     homeTeam: p.homeTeam,
+    // marketType from the position body's `market` (always present). lineTicks, by contrast,
+    // is NOT on the own-state position body (the core-api gap), so it is 0 here — correct for
+    // moneyline (the only live market; no line). A spread / total position reconstructed from
+    // a snapshot therefore lacks its line until the per-market risk re-key sources it from the
+    // originating commitment (positions are created with the real line by the fill path) or
+    // core-api adds lineTicks to the position body. Dormant today (spread/total gated off).
+    marketType: p.market,
+    lineTicks: 0,
     side: sideFromPositionType(p.positionType),
     riskAmountWei6: p.riskAmountWei6,
     counterpartyRiskWei6: p.counterpartyRiskWei6,

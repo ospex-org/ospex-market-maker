@@ -266,6 +266,8 @@ export function reduceOwnerFill(
       sport: commitment.sport,
       awayTeam: commitment.awayTeam,
       homeTeam: commitment.homeTeam,
+      marketType: commitment.marketType, // from the originating commitment (authoritative line + market)
+      lineTicks: commitment.lineTicks,
       side,
       riskAmountWei6: fillRisk.toString(),
       counterpartyRiskWei6: counterpartyRisk.toString(),

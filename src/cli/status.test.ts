@@ -72,6 +72,8 @@ function pos(id: string, overrides: Partial<MakerPositionRecord> = {}): MakerPos
     sport: 'mlb',
     awayTeam: 'A',
     homeTeam: 'B',
+    marketType: 'moneyline',
+    lineTicks: 0,
     side: 'away',
     riskAmountWei6: '1000000', // 1 USDC
     counterpartyRiskWei6: '910000',

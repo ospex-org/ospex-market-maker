@@ -367,6 +367,13 @@ describe('reducePolledPositionObservation', () => {
     expect(descriptors.some((d) => d.kind === 'emit-position-transition')).toBe(false);
   });
 
+  it('a fresh position inherits marketType / lineTicks from its source commitment', () => {
+    const record = commitmentRecord({ lifecycle: 'softCancelled', marketType: 'spread', lineTicks: -15 });
+    const state = makerState({ commitments: { [record.hash]: record } });
+    reducePolledPositionObservation(state, 'active', p(), undefined, undefined, NOW);
+    expect(state.positions['spec-1:away']).toMatchObject({ marketType: 'spread', lineTicks: -15 });
+  });
+
   it('PositionWithoutCommitment when no source commitment exists; no mutation', () => {
     const state = makerState();
     const descriptors = reducePolledPositionObservation(state, 'active', p(), undefined, undefined, NOW);
@@ -389,6 +396,8 @@ describe('reducePolledPositionObservation', () => {
           sport: 'mlb',
           awayTeam: 'NYM',
           homeTeam: 'LAD',
+          marketType: 'moneyline',
+          lineTicks: 0,
           side: 'away',
           riskAmountWei6: '100000',
           counterpartyRiskWei6: '150000',
@@ -417,6 +426,8 @@ describe('reducePolledPositionObservation', () => {
           sport: 'mlb',
           awayTeam: 'NYM',
           homeTeam: 'LAD',
+          marketType: 'moneyline',
+          lineTicks: 0,
           side: 'away',
           riskAmountWei6: '100000',
           counterpartyRiskWei6: '150000',

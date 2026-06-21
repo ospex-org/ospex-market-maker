@@ -132,6 +132,8 @@ function makerPosition(overrides: Partial<MakerPositionRecord> = {}): MakerPosit
     sport: 'baseball_mlb',
     awayTeam: 'NYM',
     homeTeam: 'LAD',
+    marketType: 'moneyline',
+    lineTicks: 0,
     side: 'away',
     riskAmountWei6: '100000',
     counterpartyRiskWei6: '150000',
@@ -326,6 +328,8 @@ describe('mapOwnerPositionToMaker', () => {
       sport: 'baseball_mlb',
       awayTeam: 'NYM',
       homeTeam: 'LAD',
+      marketType: 'moneyline', // from the position body's `market`
+      lineTicks: 0, // the position body carries no line — 0 (correct for moneyline)
       side: 'away', // positionType 0
       riskAmountWei6: '100000',
       counterpartyRiskWei6: '150000',
@@ -333,6 +337,13 @@ describe('mapOwnerPositionToMaker', () => {
       updatedAtUnixSec: 1735689600,
     });
     expect('result' in r).toBe(false);
+  });
+
+  it('position marketType comes from the body `market`; lineTicks is 0 (the body carries no line)', () => {
+    // A spread position body: marketType flows through, lineTicks stays 0 (the own-state position
+    // body has no line — the per-market risk re-key sources spread/total lines from the commitment).
+    const r = mapOwnerPositionToMaker({ ...ACTIVE_POSITION, market: 'spread' } as OwnerPosition);
+    expect(r).toMatchObject({ marketType: 'spread', lineTicks: 0 });
   });
 
   it('positionType 1 → side home', () => {

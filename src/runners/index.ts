@@ -8,12 +8,12 @@
  *     a graceful shutdown);
  *   - the tick loop;
  *   - **discovery** (every `discovery.everyNTicks` ticks — jittered — find the
- *     verified contests with an open moneyline speculation + a reference-game id
+ *     verified contests with an open speculation for a configured market + a reference-game id
  *     starting within `marketSelection.maxStartsWithinHours`, honour the allow/deny
- *     lists, track up to `marketSelection.maxTrackedContests` of them, untrack the
+ *     lists, track up to `marketSelection.maxTrackedMarkets` of them, untrack the
  *     departed ones; `candidate` telemetry for the skipped/tracked);
  *   - **reference odds** (DESIGN §10's stream guardrails): for each tracked
- *     market keep its reference moneyline odds + freshness current — by default a
+ *     market keep its reference odds + freshness current — by default a
  *     core-api SSE odds stream per market (snapshot-first seed, then the stream's
  *     `onChange` / `onRefresh` / `onError`), capped at `odds.maxRealtimeChannels`
  *     (markets over the cap stay tracked but *degraded* — no odds — and are retried
@@ -253,8 +253,8 @@ type ShutdownReason = 'kill-file' | 'signal';
 interface TrackedMarket {
   contestId: string;
   /**
-   * Which market this entry tracks — `moneyline` today (discovery is gated to it),
-   * `spread` / `total` once those markets are discovered. Part of the tracking
+   * Which market this entry tracks — `moneyline` by default; `spread` / `total`
+   * when the operator configures them (opt-in). Part of the tracking
    * identity: a single contest can carry distinct moneyline / spread / total
    * markets, so the `trackedMarkets` map keys on `marketKey(contestId, marketType,
    * lineTicks)` rather than `contestId` alone (DESIGN §6).
@@ -694,12 +694,12 @@ export class Runner {
       const anonOddsBudget = DEFAULT_PER_IP_STREAM_CAP - DEFAULT_PER_IP_OWNER_RESERVE;
       if (channels > anonOddsBudget) {
         this.deps.log(
-          `[runner] odds.maxRealtimeChannels=${channels} exceeds the ANONYMOUS per-IP SSE budget of ${anonOddsBudget} (the core-api per-IP cap ${DEFAULT_PER_IP_STREAM_CAP} minus its ${DEFAULT_PER_IP_OWNER_RESERVE} owner-auth-reserved slots) — odds subscriptions past it are refused (HTTP 429), even though the own-state stream uses the reserve. Lower odds.maxRealtimeChannels (and marketSelection.maxTrackedContests), or on your core-api raise MAX_STREAM_CONNECTIONS_PER_IP and/or lower RESERVED_STREAM_CONNECTIONS_PER_IP_OWNER.`,
+          `[runner] odds.maxRealtimeChannels=${channels} exceeds the ANONYMOUS per-IP SSE budget of ${anonOddsBudget} (the core-api per-IP cap ${DEFAULT_PER_IP_STREAM_CAP} minus its ${DEFAULT_PER_IP_OWNER_RESERVE} owner-auth-reserved slots) — odds subscriptions past it are refused (HTTP 429), even though the own-state stream uses the reserve. Lower odds.maxRealtimeChannels (and marketSelection.maxTrackedMarkets), or on your core-api raise MAX_STREAM_CONNECTIONS_PER_IP and/or lower RESERVED_STREAM_CONNECTIONS_PER_IP_OWNER.`,
         );
       }
       if (perInstance > DEFAULT_PER_IP_STREAM_CAP) {
         this.deps.log(
-          `[runner] one instance needs ${perInstance} SSE connections (odds.maxRealtimeChannels=${channels} + 1 own-state), exceeding the core-api per-IP cap of ${DEFAULT_PER_IP_STREAM_CAP} — connections past the cap are refused (HTTP 429). Lower odds.maxRealtimeChannels (and marketSelection.maxTrackedContests), or raise MAX_STREAM_CONNECTIONS_PER_IP on your core-api.`,
+          `[runner] one instance needs ${perInstance} SSE connections (odds.maxRealtimeChannels=${channels} + 1 own-state), exceeding the core-api per-IP cap of ${DEFAULT_PER_IP_STREAM_CAP} — connections past the cap are refused (HTTP 429). Lower odds.maxRealtimeChannels (and marketSelection.maxTrackedMarkets), or raise MAX_STREAM_CONNECTIONS_PER_IP on your core-api.`,
         );
       }
       this.deps.log(
@@ -1684,9 +1684,9 @@ export class Runner {
    * its odds channel); refresh the still-tracked markets' `matchTimeSec` /
    * `speculationId` from the latest listing (so a rescheduled start reaches the gates);
    * for each *new* candidate
-   * (soonest game first) — confirm it has an open moneyline speculation (else
+   * (soonest game first) — confirm it has an open speculation for a wanted market (else
    * `candidate` `no-open-speculation`), isn't already started (else `start-too-soon`),
-   * and there's room under `marketSelection.maxTrackedContests` (else
+   * and there's room under `marketSelection.maxTrackedMarkets` (else
    * `tracking-cap-reached`); then `getContest` for the reference-game id (else
    * `no-reference-odds`) and track it, with a `candidate` event (no `skipReason`). A
    * `listContests` failure aborts the cycle (the tracked set is left as-is, retried
@@ -1794,11 +1794,10 @@ export class Runner {
     }
 
     // Newcomer discovery — track an open speculation for each CONFIGURED market the
-    // contest doesn't already carry. `marketSelection.markets` is the gate: the config
-    // schema rejects everything but moneyline today, so this reduces to the single
-    // moneyline-market-per-contest path; once the gate widens, a contest gains a tracked
-    // market per configured market (the `trackedMarkets` composite key already supports
-    // it). "Already tracked" is a (contest, market) test (any line), since a contest's
+    // contest doesn't already carry. `marketSelection.markets` is the gate (default
+    // moneyline; spread / total opt-in): a contest gains one tracked market per configured
+    // market with an open spec (the `trackedMarkets` composite key keys each separately).
+    // "Already tracked" is a (contest, market) test (any line), since a contest's
     // markets key on `marketKey(contest, market, line)`.
     const wantedMarkets = ms.markets;
     const isMarketTracked = (contestId: string, market: MarketType): boolean =>
@@ -1822,11 +1821,10 @@ export class Runner {
         this.eventLog.emit('candidate', { contestId: c.contestId, skipReason: 'start-too-soon' });
         continue;
       }
-      // The cap bounds total tracked markets. One market per contest today (moneyline-
-      // gated), so it still bounds contests as the config name promises; once a contest
-      // tracks several markets it bounds markets. Pre-check skips a full map before the
+      // The cap bounds total tracked markets — one slot per `(contest, market, line)`, so a
+      // multi-market contest consumes one slot per market. Pre-check skips a full map before the
       // `getContest` we couldn't use; the per-market create below stops adding mid-contest.
-      if (this.trackedMarkets.size >= ms.maxTrackedContests) {
+      if (this.trackedMarkets.size >= ms.maxTrackedMarkets) {
         this.eventLog.emit('candidate', { contestId: c.contestId, skipReason: 'tracking-cap-reached' });
         continue;
       }
@@ -1851,7 +1849,7 @@ export class Runner {
           this.eventLog.emit('candidate', { contestId: c.contestId, skipReason: 'no-open-speculation', ...this.candidateMarketTag(mkt) });
           continue;
         }
-        if (this.trackedMarkets.size >= ms.maxTrackedContests) {
+        if (this.trackedMarkets.size >= ms.maxTrackedMarkets) {
           this.eventLog.emit('candidate', { contestId: c.contestId, skipReason: 'tracking-cap-reached', ...this.candidateMarketTag(mkt) });
           break; // map is full — no remaining market for this contest can fit either
         }
@@ -1938,7 +1936,7 @@ export class Runner {
    *   cycles. The discovery interval is the (re)subscription throttle, so this is a
    *   no-op on non-discovery ticks.
    * - `odds.subscribe: false` — no streaming; snapshot every tracked market every
-   *   tick (bounded — one `getOddsSnapshot` per tracked market, ≤ `maxTrackedContests`).
+   *   tick (bounded — one `getOddsSnapshot` per tracked market, ≤ `maxTrackedMarkets`).
    *
    * Each (re)subscribe is "snapshot-first": a `getOddsSnapshot` seed so the market
    * can be quoted next tick rather than only after the upstream price next moves. A
@@ -4991,7 +4989,7 @@ export class Runner {
     return Math.max(1, Math.round(everyNTicks * factor));
   }
 
-  /** Every tracked market belonging to `contestId` (the map keys on `marketKey`, not `contestId`, so a `.get` by contest id won't find them). At most one today — discovery is moneyline-gated — but a contest gains independent spread / total markets once those are discovered. */
+  /** Every tracked market belonging to `contestId` (the map keys on `marketKey`, not `contestId`, so a `.get` by contest id won't find them). At most one for a moneyline-only operator (the default); a contest gains independent spread / total markets when those are configured (opt-in). */
   private marketsForContest(contestId: string): TrackedMarket[] {
     const out: TrackedMarket[] = [];
     for (const m of this.trackedMarkets.values()) if (m.contestId === contestId) out.push(m);

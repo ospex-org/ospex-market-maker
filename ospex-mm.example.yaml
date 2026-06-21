@@ -21,10 +21,13 @@ chainId: 137          # 137 = Polygon mainnet, 80002 = Amoy testnet.
 
 marketSelection:
   sports: ["mlb"]                  # any of: mlb, nba, nhl, ncaab, ncaaf, nfl (config-driven; add more freely)
-  markets: ["moneyline"]           # v0 supports only "moneyline"; "spread"/"total" are REJECTED by config validation.
+  markets: ["moneyline"]           # opt-in list — any of "moneyline", "spread", "total". Default is moneyline only.
+                                   #   ORDER IS PRIORITY: when the tracking cap is tight, earlier-listed markets win slots
+                                   #   (a later market can be starved). List the markets you care about most first.
   maxStartsWithinHours: 24         # only quote games starting within this window
-  maxTrackedContests: 5            # hard cap on contests tracked at once. Each tracked contest opens one live odds stream
-                                   #   (moneyline-only in v0), so this also bounds SSE connections — see odds.maxRealtimeChannels.
+  maxTrackedMarkets: 5             # hard cap on (contest, market, line) entries tracked at once. With more than one market a
+                                   #   single contest can consume several slots. Each tracked market opens one live odds stream,
+                                   #   so this also bounds SSE connections — see odds.maxRealtimeChannels.
   requireReferenceOdds: true       # skip games with no upstream odds linkage
   requireOpenSpeculation: true     # v0: only quote markets whose speculation already exists (no lazy creation)
   contestAllowList: []             # optional: if non-empty, ONLY these contestIds
@@ -37,7 +40,7 @@ discovery:
 odds:
   subscribe: true                  # subscription-first: stream reference-odds changes over core-api SSE. Strongly preferred.
                                    #   false = degraded fallback to bounded snapshot polling (restricted nets only).
-  maxRealtimeChannels: 5           # hard cap on open odds-stream connections (~ maxTrackedContests * markets; moneyline-only in v0).
+  maxRealtimeChannels: 5           # hard cap on open odds-stream connections (~ maxTrackedMarkets — one stream per tracked market).
                                    #   core-api enforces a per-IP cap (default 10, MAX_STREAM_CONNECTIONS_PER_IP) shared across ALL
                                    #   streams from one host — keep this (plus ~3 reserved for own-state streams) under it, or raise
                                    #   the server cap. The runner warns at boot if the budget would be exceeded.

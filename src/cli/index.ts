@@ -18,7 +18,8 @@
  * + P&L and the `raiseMinNonce` bulk-invalidate optimization (see DESIGN §14).
  *
  * CLI conventions (mirroring the SDK's AGENT_CONTRACT):
- *   - `--json` prints a `{ schemaVersion: 1, … }` envelope on stdout; everything
+ *   - `--json` prints a `{ schemaVersion: N, … }` envelope on stdout (N is 1 for
+ *     most commands; `candidates` is at 2); everything
  *     else goes to stderr. (`run` has no `--json` — it's a loop, not a query; its
  *     structured output is the NDJSON event log under `telemetry.logDir`.)
  *   - exit `0` on success, `1` on any failure (config load, operational error, a
@@ -101,7 +102,7 @@ program
 
 program
   .command('quote')
-  .description('Compute a two-sided moneyline quote for a contest. Dry-run only in v0 — never posts.')
+  .description('Compute a two-sided MONEYLINE quote for a contest (moneyline only — for spread/total previews use `run --dry-run`). Dry-run only — never posts.')
   .argument('<contestId>', 'the contest to price')
   .option('-c, --config <path>', 'path to the config YAML', DEFAULT_CONFIG_PATH)
   .option('--dry-run', 'required — `quote` is a preview in v0 (posting quotes is `run --live`, Phase 3)')
@@ -122,11 +123,11 @@ program
 
 program
   .command('candidates')
-  .description('Read-only operator preflight: contests the MM could quote right now (verified + open moneyline speculation + reference odds) plus upcoming games that can be turned into quotable contests. Signer-free — no keystore, no passphrase prompt, no writes. An empty listing is a valid answer (exit 0).')
+  .description('Read-only operator preflight: the (contest, market) pairs the MM could quote right now (verified contest + open speculation for each configured market + reference odds) plus upcoming games that can be turned into quotable contests. Market-aware — classifies each market in marketSelection.markets (default moneyline). Signer-free — no keystore, no passphrase prompt, no writes. An empty listing is a valid answer (exit 0).')
   .option('-c, --config <path>', 'path to the config YAML', DEFAULT_CONFIG_PATH)
   .option('--sport <sport>', 'restrict to one sport (default: config marketSelection.sports)')
   .option('--hours <n>', 'look-ahead window in hours, integer 1-720 (default: config marketSelection.maxStartsWithinHours). The games leg uses the full window; the contests leg is capped at 168h — the contests API max')
-  .option('--json', 'emit a JSON envelope { schemaVersion: 1, candidates: … } on stdout')
+  .option('--json', 'emit a JSON envelope { schemaVersion: 2, candidates: … } on stdout')
   .action(async (opts: { config: string; sport?: string; hours?: string; json?: boolean }) => {
     const config = loadConfigOrExit(opts.config);
     let sports: Sport[];

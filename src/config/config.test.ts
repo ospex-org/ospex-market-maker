@@ -12,7 +12,7 @@ describe('parseConfig', () => {
     expect(c.mode.dryRun).toBe(true);
     expect(c.marketSelection.markets).toEqual(['moneyline']);
     expect(c.marketSelection.sports).toEqual(['mlb']);
-    expect(c.marketSelection.maxTrackedContests).toBe(5);
+    expect(c.marketSelection.maxTrackedMarkets).toBe(5);
     expect(c.discovery.everyNTicks).toBe(10);
     expect(c.odds.subscribe).toBe(true);
     expect(c.odds.maxRealtimeChannels).toBe(5);
@@ -84,10 +84,15 @@ describe('parseConfig', () => {
     expect(c.wallet.keystorePath).toBe('/keys/mm');
   });
 
-  it('rejects v0-unsupported markets and single-sided quoting', () => {
-    expect(() => parseConfig({ rpcUrl: 'x', marketSelection: { markets: ['spread'] } }, {})).toThrow(/not supported in v0/);
-    expect(() => parseConfig({ rpcUrl: 'x', marketSelection: { markets: ['moneyline', 'total'] } }, {})).toThrow(/not supported in v0/);
+  it('accepts spread / total markets (opt-in), rejects unknown markets and single-sided quoting', () => {
+    expect(parseConfig({ rpcUrl: 'x', marketSelection: { markets: ['spread'] } }, {}).marketSelection.markets).toEqual(['spread']);
+    expect(parseConfig({ rpcUrl: 'x', marketSelection: { markets: ['moneyline', 'spread', 'total'] } }, {}).marketSelection.markets).toEqual(['moneyline', 'spread', 'total']);
+    expect(() => parseConfig({ rpcUrl: 'x', marketSelection: { markets: ['parlay'] } }, {})).toThrow(/not a known market type/);
     expect(() => parseConfig({ rpcUrl: 'x', pricing: { quoteBothSides: false } }, {})).toThrow(/quoteBothSides/);
+  });
+
+  it('rejects the renamed maxTrackedContests key with a loud unknown-field error (now maxTrackedMarkets)', () => {
+    expect(() => parseConfig({ rpcUrl: 'x', marketSelection: { maxTrackedContests: 5 } }, {})).toThrow(/not a known config field/);
   });
 
   it('rejects out-of-range / mistyped values with a clear message', () => {

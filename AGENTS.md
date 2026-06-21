@@ -126,11 +126,14 @@ interface StatusReport {
   commitments: {
     total: number;
     byLifecycle: Record<CommitmentLifecycle, number>;
-    distinctContestsNonTerminal: number;  // contests with `visibleOpen` / `softCancelled` / `partiallyFilled` records
+    distinctContestsNonTerminal: number;       // distinct CONTESTS with `visibleOpen` / `softCancelled` / `partiallyFilled` records (a contest may carry several markets — NOT the count of markets exposed)
+    distinctSpeculationsNonTerminal: number;   // distinct speculationIds (= markets + lines, 1:1 with a contest's market + line on chain) with non-terminal records; equals distinctContestsNonTerminal for a moneyline-only maker
+    byMarket: Record<MarketType, number>;      // commitment count per market ('moneyline' | 'spread' | 'total'), zero-filled
   };
   positions: {
     total: number;
     byStatus: Record<MakerPositionStatus, { count: number; ownRiskWei6: string }>;
+    byMarket: Record<MarketType, { count: number; ownRiskWei6: string }>;  // count + own-risk USDC per market, zero-filled — the exposure-by-market view
   };
   dailyCounters: {
     today: string;                    // YYYY-MM-DD UTC
@@ -605,7 +608,15 @@ ospex-mm status --json | jq '.status.stateLossAssessment'
 **"How much capital do I have exposed (latent + filled) right now?"**
 ```
 ospex-mm status --json | jq '.status.commitments.distinctContestsNonTerminal,
+                              .status.commitments.distinctSpeculationsNonTerminal,
                               .status.positions.byStatus'
+```
+
+**"How is my exposure split across markets (moneyline / spread / total)?"**
+```
+ospex-mm status --json | jq '{ commitments: .status.commitments.byMarket,
+                               positions:   .status.positions.byMarket }'
+# positions.byMarket carries per-market { count, ownRiskWei6 }; commitments.byMarket is a per-market count.
 ```
 
 **"How much have I claimed today? Lifetime?"**

@@ -271,6 +271,29 @@ describe('runStatus — commitments summary', () => {
     expect(report.commitments.byLifecycle.authoritativelyInvalidated).toBe(1);
     expect(report.commitments.distinctContestsNonTerminal).toBe(2); // C1 (from 0x1+0x2) and C2 (from 0x3)
   });
+
+  it('breaks commitments down by market and counts distinct speculations (markets+lines) with non-terminal exposure', async () => {
+    const records: MakerCommitmentRecord[] = [
+      // contest C1 carries all three markets — each its own speculation, all non-terminal.
+      rec('0x1', { contestId: 'C1', marketType: 'moneyline', speculationId: 'C1-ml', lineTicks: 0, lifecycle: 'visibleOpen' }),
+      rec('0x2', { contestId: 'C1', marketType: 'spread', speculationId: 'C1-sp', lineTicks: -15, lifecycle: 'visibleOpen' }),
+      rec('0x3', { contestId: 'C1', marketType: 'total', speculationId: 'C1-to', lineTicks: 85, lifecycle: 'softCancelled' }),
+      // contest C2 moneyline, terminal — still counted byMarket, but excluded from both non-terminal cardinalities.
+      rec('0x4', { contestId: 'C2', marketType: 'moneyline', speculationId: 'C2-ml', lineTicks: 0, lifecycle: 'filled' }),
+    ];
+    const state: MakerState = {
+      ...emptyMakerState(),
+      commitments: Object.fromEntries(records.map((r) => [r.hash, r])),
+    };
+    const adapter = adapterWithLivePositions(zeroTotals);
+    const report = await runStatus(
+      { config: cfg(), configPath: '/c.yaml', adapter },
+      defaultDeps({}, { state, status: { kind: 'loaded' } }),
+    );
+    expect(report.commitments.byMarket).toEqual({ moneyline: 2, spread: 1, total: 1 });
+    expect(report.commitments.distinctContestsNonTerminal).toBe(1); // only C1 (C2 is filled)
+    expect(report.commitments.distinctSpeculationsNonTerminal).toBe(3); // C1-ml, C1-sp, C1-to
+  });
 });
 
 // ── position summarization ───────────────────────────────────────────────────
@@ -301,6 +324,27 @@ describe('runStatus — positions summary', () => {
     expect(report.positions.byStatus.claimable.ownRiskWei6).toBe('500000');
     expect(report.positions.byStatus.claimed.count).toBe(1);
     expect(report.positions.byStatus.claimed.ownRiskWei6).toBe('750000');
+  });
+
+  it('breaks positions down by market with per-market count + own-risk USDC', async () => {
+    const positions: MakerPositionRecord[] = [
+      pos('s1', { marketType: 'moneyline', riskAmountWei6: '1000000' }), //  1 USDC
+      pos('s2', { marketType: 'spread', riskAmountWei6: '2000000' }), //     2 USDC
+      pos('s3', { marketType: 'spread', riskAmountWei6: '500000' }), //      0.5 USDC
+      pos('s4', { marketType: 'total', riskAmountWei6: '750000' }), //       0.75 USDC
+    ];
+    const state: MakerState = {
+      ...emptyMakerState(),
+      positions: Object.fromEntries(positions.map((p) => [`${p.speculationId}:${p.side}`, p])),
+    };
+    const adapter = adapterWithLivePositions(zeroTotals);
+    const report = await runStatus(
+      { config: cfg(), configPath: '/c.yaml', adapter },
+      defaultDeps({}, { state, status: { kind: 'loaded' } }),
+    );
+    expect(report.positions.byMarket.moneyline).toEqual({ count: 1, ownRiskWei6: '1000000' });
+    expect(report.positions.byMarket.spread).toEqual({ count: 2, ownRiskWei6: '2500000' }); // 2 + 0.5 USDC
+    expect(report.positions.byMarket.total).toEqual({ count: 1, ownRiskWei6: '750000' });
   });
 });
 
@@ -446,6 +490,8 @@ describe('runStatus — renderers', () => {
         total: 2,
         byLifecycle: { visibleOpen: 1, softCancelled: 0, partiallyFilled: 1, filled: 0, expired: 0, authoritativelyInvalidated: 0 },
         distinctContestsNonTerminal: 2,
+        distinctSpeculationsNonTerminal: 2,
+        byMarket: { moneyline: 2, spread: 0, total: 0 },
       },
       positions: {
         total: 1,
@@ -456,6 +502,11 @@ describe('runStatus — renderers', () => {
           claimed: { count: 0, ownRiskWei6: '0' },
           settledLost: { count: 0, ownRiskWei6: '0' },
           void: { count: 0, ownRiskWei6: '0' },
+        },
+        byMarket: {
+          moneyline: { count: 1, ownRiskWei6: '1500000' },
+          spread: { count: 0, ownRiskWei6: '0' },
+          total: { count: 0, ownRiskWei6: '0' },
         },
       },
       dailyCounters: {
@@ -500,6 +551,42 @@ describe('runStatus — renderers', () => {
     expect(out).toMatch(/gas spent\s+3\.000000 POL/);
     expect(out).toMatch(/Live position status \(from API\)/);
     expect(out).toMatch(/active\s+1$/m);
+  });
+
+  it('text renderer prints the per-market breakdown lines and the distinct-market count', () => {
+    const c = collect();
+    renderStatusReportText(buildSampleReport({
+      commitments: {
+        total: 3,
+        byLifecycle: { visibleOpen: 2, softCancelled: 1, partiallyFilled: 0, filled: 0, expired: 0, authoritativelyInvalidated: 0 },
+        distinctContestsNonTerminal: 1,
+        distinctSpeculationsNonTerminal: 3,
+        byMarket: { moneyline: 1, spread: 1, total: 1 },
+      },
+      positions: {
+        total: 2,
+        byStatus: {
+          active: { count: 2, ownRiskWei6: '3000000' },
+          pendingSettle: { count: 0, ownRiskWei6: '0' },
+          claimable: { count: 0, ownRiskWei6: '0' },
+          claimed: { count: 0, ownRiskWei6: '0' },
+          settledLost: { count: 0, ownRiskWei6: '0' },
+          void: { count: 0, ownRiskWei6: '0' },
+        },
+        byMarket: {
+          moneyline: { count: 1, ownRiskWei6: '1000000' },
+          spread: { count: 1, ownRiskWei6: '2000000' },
+          total: { count: 0, ownRiskWei6: '0' }, // zero — omitted from the rendered line
+        },
+      },
+    }), c.sink);
+    const out = c.text();
+    expect(out).toMatch(/1 distinct contest\(s\) \/ 3 distinct market\(s\)/);
+    expect(out).toMatch(/by market: moneyline 1 {2}spread 1 {2}total 1/);
+    expect(out).toMatch(/by market: moneyline 1 \(1\.000000 USDC\) {2}spread 1 \(2\.000000 USDC\)/);
+    // the zero-count `total` position bucket is omitted from the rendered line
+    // (the positions per-market format is `<market> <n> (<usdc> USDC)`).
+    expect(out).not.toMatch(/total \d \(/);
   });
 
   it('text renderer flags a lost state with the assessment reason on its own line', () => {

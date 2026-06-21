@@ -31,6 +31,12 @@ import {
   readKeystoreAddress,
   unlockKeystoreSigner,
   type OspexClientLike,
+  type PrepareSubmitArgs,
+  type SubmitPreview,
+  type CheckSubmitFundabilityArgs,
+  type CheckSubmitFundabilityResult,
+  type SubmitPreparedResult,
+  type ApproveCreationFeeResult,
 } from './index.js';
 import { parseConfig } from '../config/index.js';
 
@@ -231,6 +237,10 @@ function makeFakeClient(overrides: DeepPartial<OspexClientLike> = {}): OspexClie
       raiseMinNonce: notStubbed('commitments.raiseMinNonce'),
       approve: notStubbed('commitments.approve'),
       getNonceFloor: notStubbed('commitments.getNonceFloor'),
+      prepareSubmit: notStubbed('commitments.prepareSubmit'),
+      checkSubmitFundability: notStubbed('commitments.checkSubmitFundability'),
+      submitPrepared: notStubbed('commitments.submitPrepared'),
+      approveCreationFee: notStubbed('commitments.approveCreationFee'),
       ...overrides.commitments,
     },
     positions: {
@@ -779,6 +789,52 @@ describe('OspexAdapter — write surface', () => {
     expect(await adapter.approveUSDC(5_000_000n)).toBe(result);
     await adapter.approveUSDC('max');
     expect(received).toEqual([5_000_000n, 'max']);
+  });
+
+  // ── Option-B seed-submit pipeline passthroughs (the moneyline path stays on submitCommitment) ──
+
+  it('prepareSubmit forwards the high-level args to commitments.prepareSubmit and returns the preview', async () => {
+    let received: unknown = null;
+    const preview = { market: { speculation: { mode: 'lazy' } } } as unknown as SubmitPreview;
+    const args = { parent: { kind: 'contest', contestId: '1', market: 'total', line: '7.5' }, side: 'over', odds: '2.0', riskUsdc: '1' } as unknown as PrepareSubmitArgs;
+    const adapter = liveAdapterWith({
+      commitments: { prepareSubmit: (a) => { received = a; return Promise.resolve(preview); } },
+    });
+    expect(await adapter.prepareSubmit(args)).toBe(preview);
+    expect(received).toBe(args);
+  });
+
+  it('checkSubmitFundability forwards { preview, bookScope } to commitments.checkSubmitFundability', async () => {
+    let received: unknown = null;
+    const result = { fundableNow: true } as unknown as CheckSubmitFundabilityResult;
+    const args = { preview: {} as unknown as SubmitPreview, bookScope: 'visible-book-only' } as unknown as CheckSubmitFundabilityArgs;
+    const adapter = liveAdapterWith({
+      commitments: { checkSubmitFundability: (a) => { received = a; return Promise.resolve(result); } },
+    });
+    expect(await adapter.checkSubmitFundability(args)).toBe(result);
+    expect(received).toBe(args);
+  });
+
+  it('submitPrepared forwards the preview to commitments.submitPrepared and returns the result', async () => {
+    let received: unknown = null;
+    const preview = {} as unknown as SubmitPreview;
+    const result = { hash: '0xseed' as Hex, commitment: {} as unknown as never, signedPayload: {} as unknown as never } as unknown as SubmitPreparedResult;
+    const adapter = liveAdapterWith({
+      commitments: { submitPrepared: (p) => { received = p; return Promise.resolve(result); } },
+    });
+    expect(await adapter.submitPrepared(preview)).toBe(result);
+    expect(received).toBe(preview);
+  });
+
+  it('approveCreationFee forwards the amount to commitments.approveCreationFee (exact wei6 and the "max" sentinel)', async () => {
+    const received: unknown[] = [];
+    const result = { txHash: '0xtx' as Hex, receipt: {} as unknown as never, spender: '0xtreasury', token: '0xusdc', amount: 250_000n } as unknown as ApproveCreationFeeResult;
+    const adapter = liveAdapterWith({
+      commitments: { approveCreationFee: (amount) => { received.push(amount); return Promise.resolve(result); } },
+    });
+    expect(await adapter.approveCreationFee(250_000n)).toBe(result);
+    await adapter.approveCreationFee('max');
+    expect(received).toEqual([250_000n, 'max']);
   });
 
   it('settleSpeculation forwards { speculationId } to positions.settleSpeculation', async () => {

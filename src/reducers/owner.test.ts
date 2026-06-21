@@ -185,9 +185,45 @@ describe('reduceOwnerCommitmentObservation', () => {
 
   it('throws OwnerMappingError on missing metadata (the runner drain catch handles it; reducers do NOT catch)', () => {
     const state = emptyMakerState();
-    expect(() => reduceOwnerCommitmentObservation(state, ownerCommitment({ speculationId: null }))).toThrow();
+    // empty sport is genuinely missing metadata (a null speculationId is NOT — that is a seed,
+    // covered below). The reducer lets the mapper throw; the runner drain catches + skips.
+    expect(() => reduceOwnerCommitmentObservation(state, ownerCommitment({ sport: '' }))).toThrow();
     // state untouched on a throw
     expect(state.commitments).toEqual({});
+  });
+
+  it('a null-speculationId SEED is written under its placeholder key (no throw, no cursor freeze)', () => {
+    const state = emptyMakerState();
+    // A seed total commitment posted before its speculation exists arrives with speculationId:null.
+    const descriptors = reduceOwnerCommitmentObservation(
+      state,
+      ownerCommitment({ commitmentHash: '0xseed', speculationId: null, marketType: 'total', lineTicks: 85 }),
+    );
+    expect(descriptors).toEqual([{ kind: 'mark-dirty', contestId: '1' }]);
+    const rec = state.commitments['0xseed'];
+    expect(rec).toBeDefined();
+    expect(rec?.speculationId).toBe('seed:1:total:85');
+    expect(rec?.marketType).toBe('total');
+    expect(rec?.lifecycle).toBe('visibleOpen');
+  });
+
+  it('seed → real-spec migration: a later delta carrying the real id replaces the placeholder record', () => {
+    const state = emptyMakerState();
+    // 1) pre-match: the seed lands under the placeholder.
+    reduceOwnerCommitmentObservation(
+      state,
+      ownerCommitment({ commitmentHash: '0xseed', speculationId: null, marketType: 'total', lineTicks: 85 }),
+    );
+    expect(state.commitments['0xseed']?.speculationId).toBe('seed:1:total:85');
+    // 2) post-match: own-state re-delivers the SAME commitmentHash now carrying the real
+    //    on-chain speculationId. The wholesale-replace adopts it (the keying is by hash).
+    reduceOwnerCommitmentObservation(
+      state,
+      ownerCommitment({ commitmentHash: '0xseed', speculationId: '4217', marketType: 'total', lineTicks: 85, filledRiskAmount: '100000' }),
+    );
+    const rec = state.commitments['0xseed'];
+    expect(rec?.speculationId).toBe('4217'); // real id adopted — no lingering placeholder
+    expect(rec?.lifecycle).toBe('partiallyFilled');
   });
 
   it('PRESERVES a previously-captured signedPayload when a later delta arrives WITHOUT one (M#5)', () => {

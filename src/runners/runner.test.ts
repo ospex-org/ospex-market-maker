@@ -1574,6 +1574,39 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
     await runPromise;
   });
 
+  it('a null-speculationId SEED commitment delta drains into canonical state under its placeholder (no owner-mapping-failed, no cursor freeze)', async () => {
+    const { runner, recorder, runPromise, sleepCalls, resolvers, triggerKill } = await makePausedSubscribedRunner();
+
+    // Baseline first — the drain gates on ready (PR3b drain ready-gate).
+    recorder.fire('onSnapshot', { cursor: 'c1', commitments: [], positions: [], truncated: false, positionsTruncated: false });
+    recorder.fire('onReady');
+
+    // A seed total commitment, posted at the oracle line before its speculation exists,
+    // arrives with speculationId:null. Pre-PR-B the mapper threw OwnerMappingError → the
+    // drain emitted owner-mapping-failed and FROZE the cursor (the §5.1 posting blocker).
+    // It must now project to the discovery placeholder instead.
+    recorder.fire('onCommitment', mappableOwnerCommitment('0xseed', {
+      speculationId: null, marketType: 'total', lineTicks: 85,
+    }));
+
+    await waitFor(() => sleepCalls.filter((ms) => ms === 500).length >= 1);
+    const idx = sleepCalls.findIndex((ms) => ms === 500);
+    const debounceResolve = resolvers[idx];
+    if (debounceResolve === undefined) throw new Error('expected debounce resolver');
+    debounceResolve();
+    await waitFor(() => runner.stateForTest().commitments['0xseed'] !== undefined);
+
+    const rec = runner.stateForTest().commitments['0xseed'];
+    expect(rec?.speculationId).toBe('seed:1:total:85');
+    expect(rec?.marketType).toBe('total');
+    // The blocker symptom must be ABSENT for this row: the mapper didn't throw, so the
+    // drain emitted no mapping failure (which would have frozen own-state → halted posting).
+    expect(readEvents().some((e) => e.kind === 'owner-mapping-failed' && e.commitmentHash === '0xseed')).toBe(false);
+
+    triggerKill();
+    await runPromise;
+  });
+
   it('onStatus(\'resync\') drops pre-resync queued events — prevents double-count when post-resync baseline is applied (Hermes #69 blocker)', async () => {
     // Without the queue.clear() on resync, this sequence double-counts:
     //   1. SDK delivers a fill — runner queues it (drain pending).

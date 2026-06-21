@@ -74,6 +74,16 @@ With only one of the two, the MM runs dry and tells you why. The `--dry-run` fla
 - The example config is conservative. Start there or tighter. Caps bind **worst-case USDC loss by outcome** — they account for filled positions, your visible quotes, *and* latent quotes (see below).
 - The caps at boot are the caps for the whole run. The MM never widens its own risk during a run. To change a cap, stop and restart.
 
+## Markets — spread / total (opt-in)
+
+`marketSelection.markets` defaults to `["moneyline"]`. Spread and total are **opt-in** — add them to the list to quote them. Before you do:
+
+- **Order is priority.** When the tracking cap (`maxTrackedMarkets`) is tight, earlier-listed markets win slots — a market listed later can be starved of tracking on a busy slate. List the markets you care about most first.
+- **Each market is its own odds stream.** `maxTrackedMarkets` caps `(contest, market, line)` entries, and each opens its own reference-odds SSE connection. Enabling three markets can roughly **triple** your stream count for the same number of contests — size `maxTrackedMarkets` and `odds.maxRealtimeChannels` (and your core-api per-IP cap) accordingly.
+- **Caps are per market + line.** Worst-case exposure is summed independently across a contest's moneyline / spread / total speculations (they can all lose at once), so a multi-market contest draws more of your per-contest / bankroll caps than moneyline alone. Size your caps for the markets you enable.
+- **Line-sanity rail.** Every spread / total commitment carries an on-chain line; the MM refuses to sign a line outside a conservative magnitude band (`MM_MAX_SANE_LINE_TICKS`, ±500.0 points) — a hard safety rail against a pathological line, not a tuning knob. Moneyline (no line) is unaffected.
+- **The MM follows the oracle line.** For spread / total it tracks the open speculation at the reference (oracle) line and re-binds as that line moves (debounced by `orders.replaceOnLineMoveTicks`); if the tracked line and the reference line diverge, it pulls its quotes and refuses rather than post at a mispriced line.
+
 ## Latent matchable exposure — important
 
 When the MM "cancels" a quote, by default it does so **off-chain**: it tells the API to stop surfacing that quote. But the quote is a *signed* `OspexCommitment` — pulling it from the order book does **not** invalidate the signature. A taker who already has the signed payload can still match it on chain until it:

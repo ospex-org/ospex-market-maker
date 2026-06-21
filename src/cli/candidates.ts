@@ -152,7 +152,7 @@ export interface CandidatesReport {
      * be listed) rather than its true contest status.
      */
     contestsHours: number;
-    maxTrackedContests: number;
+    maxTrackedMarkets: number;
     requireReferenceOdds: boolean;
     contestAllowListSize: number;
   };
@@ -438,7 +438,7 @@ export async function runCandidates(opts: CandidatesOpts): Promise<CandidatesRep
       sports,
       hours,
       contestsHours,
-      maxTrackedContests: config.marketSelection.maxTrackedContests,
+      maxTrackedMarkets: config.marketSelection.maxTrackedMarkets,
       requireReferenceOdds: config.marketSelection.requireReferenceOdds,
       contestAllowListSize: config.marketSelection.contestAllowList.length,
     },

@@ -207,7 +207,7 @@ interface CandidatesReport {
                                         //   API caps at 168h while the games API allows 720h. Beyond 168h only
                                         //   game rows are visible, so a created game out there classifies
                                         //   needs_verification with contestStatus: null
-            maxTrackedContests: number;
+            maxTrackedMarkets: number;  // hard cap on tracked (contest, market, line) entries (renamed from maxTrackedContests)
             requireReferenceOdds: boolean; contestAllowListSize: number };
   summary: {
     gamesAvailableToCreate: number;      // == count of kind 'setup'

@@ -3241,8 +3241,8 @@ describe('Runner — discovery', () => {
     expect(candidates.find((e) => e.contestId === 'E')?.skipReason).toBe('start-too-soon');
   });
 
-  it('honours marketSelection.maxTrackedContests — tracks the soonest games, the rest get tracking-cap-reached', async () => {
-    const config = cfg({ marketSelection: { sports: ['mlb'], maxTrackedContests: 2 } });
+  it('honours marketSelection.maxTrackedMarkets — tracks the soonest games, the rest get tracking-cap-reached', async () => {
+    const config = cfg({ marketSelection: { sports: ['mlb'], maxTrackedMarkets: 2 } });
     const listed = [
       contestView({ contestId: 'A', matchTime: '2099-01-01T00:00:00Z' }),
       contestView({ contestId: 'B', matchTime: '2099-01-02T00:00:00Z' }),
@@ -4138,16 +4138,15 @@ describe('Runner — live execution', () => {
     expect(runner.trackedMarketView('1234')?.lineTicks).toBe(5);
   });
 
-  // ── multi-market discovery (config-driven; gated dormant until the market gate widens) ──
+  // ── multi-market discovery (config-driven) ──
   //
   // Discovery tracks an open speculation for EACH configured market, keyed by
   // `marketKey(contest, market, line)` — so one contest can carry independent
-  // moneyline / spread / total markets. The production config schema rejects
-  // spread/total (SUPPORTED_MARKETS), so these tests widen the *parsed* market list
-  // directly to exercise the path before the gate flips — without enabling the markets
-  // in any real config.
+  // moneyline / spread / total markets. The config schema now ACCEPTS spread/total
+  // (default is still moneyline-only, opt-in); `withMarkets` just sets the parsed
+  // market list directly so these tests don't depend on the example-yaml default.
 
-  /** TEST-ONLY gate bypass: widen a parsed config's market list past the SUPPORTED_MARKETS schema gate. */
+  /** Set a parsed config's market list directly (the schema accepts spread/total; this overrides the default). */
   function withMarkets(config: Config, markets: string[]): Config {
     config.marketSelection.markets = markets as unknown as typeof config.marketSelection.markets;
     return config;

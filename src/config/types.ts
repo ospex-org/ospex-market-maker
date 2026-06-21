@@ -7,8 +7,8 @@
 export const KNOWN_SPORTS = ['mlb', 'nba', 'nhl', 'ncaab', 'ncaaf', 'nfl'] as const;
 export type Sport = (typeof KNOWN_SPORTS)[number];
 
-/** v0 supports only moneyline — the config schema rejects `spread` / `total`. */
-export const SUPPORTED_MARKETS = ['moneyline'] as const;
+/** The market types `marketSelection.markets` accepts. The default is moneyline only — spread / total are opt-in. */
+export const SUPPORTED_MARKETS = ['moneyline', 'spread', 'total'] as const;
 export type MarketType = (typeof SUPPORTED_MARKETS)[number];
 
 export const CHAIN_IDS = [137, 80002] as const;
@@ -89,7 +89,7 @@ export interface MarketSelectionConfig {
   sports: Sport[];
   markets: MarketType[];
   maxStartsWithinHours: number;
-  maxTrackedContests: number;
+  maxTrackedMarkets: number;
   requireReferenceOdds: boolean;
   /** v0: only quote markets whose speculation already exists (no lazy creation). */
   requireOpenSpeculation: boolean;

@@ -6,7 +6,8 @@
  * needs only `rpcUrl` (here or via `OSPEX_RPC_URL`). Whatever the operator sets
  * is validated; an invalid / mistyped field — including an unknown / misspelled
  * key at any level — throws a clear `Error` (the CLI catches it and exits 1).
- * v0-specific rejections: `marketSelection.markets` must be `["moneyline"]`;
+ * Validation rules of note: `marketSelection.markets` accepts any of `moneyline` /
+ * `spread` / `total` (default `["moneyline"]`; spread + total are opt-in);
  * `pricing.quoteBothSides` must be `true`.
  *
  * `parseConfig(raw, env)` is deterministic — `env` defaults to `{}` (no overrides).
@@ -191,7 +192,7 @@ function asMarketArray(v: unknown, name: string): MarketType[] {
   if (arr.length === 0) fail(name, 'must list at least one market type');
   for (const m of arr) {
     if (!(SUPPORTED_MARKETS as readonly string[]).includes(m)) {
-      fail(name, `"${m}" is not supported in v0 — only "moneyline" is implemented (spread / total are future work; see DESIGN §5)`);
+      fail(name, `"${m}" is not a known market type — supported: ${SUPPORTED_MARKETS.join(', ')}`);
     }
   }
   return arr as MarketType[];
@@ -220,7 +221,7 @@ const ROOT_KEYS = [
 ] as const;
 const WALLET_KEYS = ['keystorePath'] as const;
 const MARKET_SELECTION_KEYS = [
-  'sports', 'markets', 'maxStartsWithinHours', 'maxTrackedContests', 'requireReferenceOdds',
+  'sports', 'markets', 'maxStartsWithinHours', 'maxTrackedMarkets', 'requireReferenceOdds',
   'requireOpenSpeculation', 'contestAllowList', 'contestDenyList',
 ] as const;
 const DISCOVERY_KEYS = ['everyNTicks', 'jitterPct'] as const;
@@ -309,7 +310,7 @@ export function parseConfig(raw: unknown, env: EnvLike = {}): Config {
     sports: def<Sport[]>(ms.sports, ['mlb'], (v) => asSportArray(v, 'marketSelection.sports')),
     markets: def<MarketType[]>(ms.markets, ['moneyline'], (v) => asMarketArray(v, 'marketSelection.markets')),
     maxStartsWithinHours: def(ms.maxStartsWithinHours, 24, (v) => asPositiveNumber(v, 'marketSelection.maxStartsWithinHours')),
-    maxTrackedContests: def(ms.maxTrackedContests, 5, (v) => asPositiveInt(v, 'marketSelection.maxTrackedContests')),
+    maxTrackedMarkets: def(ms.maxTrackedMarkets, 5, (v) => asPositiveInt(v, 'marketSelection.maxTrackedMarkets')),
     requireReferenceOdds: def(ms.requireReferenceOdds, true, (v) => asBoolean(v, 'marketSelection.requireReferenceOdds')),
     requireOpenSpeculation: def(ms.requireOpenSpeculation, true, (v) => asBoolean(v, 'marketSelection.requireOpenSpeculation')),
     contestAllowList: def<string[]>(ms.contestAllowList, [], (v) => asStringArray(v, 'marketSelection.contestAllowList')),

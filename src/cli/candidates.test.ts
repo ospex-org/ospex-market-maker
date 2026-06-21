@@ -420,7 +420,7 @@ describe('runCandidates — report envelope + determinism', () => {
       sports: ['mlb'],
       hours: 24,
       contestsHours: 24, // == hours while within the contests API's 168h max
-      maxTrackedContests: 5,
+      maxTrackedMarkets: 5,
       requireReferenceOdds: true,
       contestAllowListSize: 0,
     });

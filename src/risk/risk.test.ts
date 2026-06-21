@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   canSpendGas,
+  contestWorstCaseUSDC,
   headroomForSide,
   requiredPositionModuleAllowanceUSDC,
   teamExposureUSDC,
@@ -15,7 +16,7 @@ import {
 } from './index.js';
 
 function item(o: Partial<ExposureItem> & Pick<ExposureItem, 'contestId' | 'makerSide' | 'riskAmountUSDC'>): ExposureItem {
-  return { sport: o.sport ?? 'mlb', awayTeam: o.awayTeam ?? 'AWAY', homeTeam: o.homeTeam ?? 'HOME', ...o };
+  return { sport: o.sport ?? 'mlb', awayTeam: o.awayTeam ?? 'AWAY', homeTeam: o.homeTeam ?? 'HOME', marketType: o.marketType ?? 'moneyline', lineTicks: o.lineTicks ?? 0, ...o };
 }
 function inventory(items: ExposureItem[], openCommitmentCount = items.length): Inventory {
   return { items, openCommitmentCount };
@@ -35,6 +36,8 @@ const market = (o: Partial<Market> = {}): Market => ({
   sport: o.sport ?? 'mlb',
   awayTeam: o.awayTeam ?? 'AWAY',
   homeTeam: o.homeTeam ?? 'HOME',
+  marketType: o.marketType ?? 'moneyline',
+  lineTicks: o.lineTicks ?? 0,
 });
 
 describe('worstCaseByOutcome', () => {
@@ -150,6 +153,96 @@ describe('verdictForMarket', () => {
     expect(v.allowed).toBe(false);
     if (v.allowed) throw new Error('unreachable');
     expect(v.reason).toMatch(/no exposure headroom on either side/);
+  });
+});
+
+describe('per-market exposure grouping (worst case sums independent (market, line) groups)', () => {
+  it('a moneyline-only contest is a single group — worst case is max, identical to the pre-PR model', () => {
+    const items = [
+      item({ contestId: 'C1', marketType: 'moneyline', lineTicks: 0, makerSide: 'away', riskAmountUSDC: 5 }), // ifHomeWins 5
+      item({ contestId: 'C1', marketType: 'moneyline', lineTicks: 0, makerSide: 'home', riskAmountUSDC: 3 }), // ifAwayWins 3
+    ];
+    expect(contestWorstCaseUSDC(items, 'C1')).toBe(5); // max(5, 3) within the one group — NOT 8
+    expect(totalWorstCaseUSDC(items)).toBe(5);
+  });
+
+  it('sums per-group worst cases across markets in a contest — Σ, not the single-axis max', () => {
+    const items = [
+      item({ contestId: 'C1', marketType: 'moneyline', lineTicks: 0, makerSide: 'home', riskAmountUSDC: 5 }), // ml group: ifAwayWins 5
+      item({ contestId: 'C1', marketType: 'spread', lineTicks: -15, makerSide: 'away', riskAmountUSDC: 4 }), //  spread group: ifHomeWins 4
+    ];
+    // moneyline + spread are independent events that can both lose → 5 + 4. The old
+    // single-axis projection would bucket these as max(ifAwayWins 5, ifHomeWins 4) = 5 and UNDER-state.
+    expect(contestWorstCaseUSDC(items, 'C1')).toBe(9);
+    expect(totalWorstCaseUSDC(items)).toBe(9);
+    // worstCaseByOutcome stays the moneyline-axis projection (diagnostic) — distinct from the cap value:
+    expect(worstCaseByOutcome(items, 'C1')).toEqual({ ifAwayWins: 5, ifHomeWins: 4 });
+  });
+
+  it('keys distinct lines of the same market as separate groups (a market-only key would under-state opposing covers)', () => {
+    const items = [
+      item({ contestId: 'C1', marketType: 'spread', lineTicks: -15, makerSide: 'away', riskAmountUSDC: 3 }), // group A: ifHomeWins 3
+      item({ contestId: 'C1', marketType: 'spread', lineTicks: -20, makerSide: 'home', riskAmountUSDC: 2 }), // group B: ifAwayWins 2
+    ];
+    // Two groups (line is in the key) → 3 + 2. A market-only key would merge them to
+    // {ifAwayWins 2, ifHomeWins 3} → max 3, which under-states by netting different lines.
+    expect(contestWorstCaseUSDC(items, 'C1')).toBe(5);
+  });
+
+  it('nets opposing sides WITHIN a single group to max (they are mutually exclusive outcomes)', () => {
+    const items = [
+      item({ contestId: 'C1', marketType: 'spread', lineTicks: -15, makerSide: 'away', riskAmountUSDC: 3 }), // ifHomeWins 3
+      item({ contestId: 'C1', marketType: 'spread', lineTicks: -15, makerSide: 'home', riskAmountUSDC: 5 }), // ifAwayWins 5
+    ];
+    expect(contestWorstCaseUSDC(items, 'C1')).toBe(5); // max(5, 3) within the one group — NOT 8
+  });
+
+  it('excludes total (over/under) from per-team exposure; counts moneyline + spread cover sides', () => {
+    const items = [
+      item({ contestId: 'C1', marketType: 'moneyline', lineTicks: 0, makerSide: 'away', awayTeam: 'A', riskAmountUSDC: 5 }),
+      item({ contestId: 'C2', marketType: 'spread', lineTicks: -15, makerSide: 'away', awayTeam: 'A', riskAmountUSDC: 2 }),
+      item({ contestId: 'C1', marketType: 'total', lineTicks: 75, makerSide: 'away', awayTeam: 'A', riskAmountUSDC: 99 }), // over — no team
+    ];
+    expect(teamExposureUSDC(items, 'A')).toBe(7); // 5 + 2; the total's 99 is excluded
+  });
+
+  it('headroom for one market reserves room for the contest other markets worst case', () => {
+    const inv = inventory([
+      item({ contestId: 'C1', marketType: 'moneyline', lineTicks: 0, makerSide: 'home', riskAmountUSDC: 6 }), // ml group: ifAwayWins 6
+    ]);
+    const spreadMarket = market({ contestId: 'C1', marketType: 'spread', lineTicks: -15 });
+    // spread-away target group is empty; the contest's other group (moneyline) has worst case 6 → 10 - (6 + 0)
+    expect(headroomForSide(inv, spreadMarket, 'away', caps({ maxRiskPerContestUSDC: 10 }))).toBeCloseTo(4, 9);
+    // the moneyline away side is independent of its own home-side 6 (established single-market semantics) → 10 - 0
+    expect(headroomForSide(inv, market({ contestId: 'C1', marketType: 'moneyline', lineTicks: 0 }), 'away', caps({ maxRiskPerContestUSDC: 10 }))).toBeCloseTo(10, 9);
+  });
+
+  it('does not bind a total market by the per-team cap (over/under has no team), but does bind moneyline', () => {
+    const totalMarket = market({ marketType: 'total', lineTicks: 75 });
+    expect(headroomForSide(inventory([]), totalMarket, 'away', caps({ maxRiskPerTeamUSDC: 0.001, maxRiskPerCommitmentUSDC: 5 }))).toBe(5);
+    expect(headroomForSide(inventory([]), market(), 'away', caps({ maxRiskPerTeamUSDC: 0.001, maxRiskPerCommitmentUSDC: 5 }))).toBeCloseTo(0.001, 9);
+  });
+
+  it('the bankroll ceiling sums independent markets — refuses where the single-axis max would have allowed', () => {
+    const inv = inventory([
+      item({ contestId: 'C1', marketType: 'moneyline', lineTicks: 0, makerSide: 'home', riskAmountUSDC: 5 }), // ml max 5
+      item({ contestId: 'C1', marketType: 'spread', lineTicks: -15, makerSide: 'away', riskAmountUSDC: 4 }), //  spread max 4
+    ]);
+    // worst case = 5 + 4 = 9 ≥ ceiling 8 → refuse. The moneyline-axis max is only 5, which would wrongly allow.
+    const v = verdictForMarket(inv, market({ contestId: 'C1', marketType: 'total', lineTicks: 75 }), caps({ bankrollUSDC: 8, maxBankrollUtilizationPct: 1 }));
+    expect(v.allowed).toBe(false);
+    if (v.allowed) throw new Error('unreachable');
+    expect(v.reason).toMatch(/bankroll exposure ceiling/);
+  });
+
+  it('validates marketType + lineTicks at the boundary (they drive money grouping)', () => {
+    const badMkt = inventory([item({ contestId: 'C1', makerSide: 'away', riskAmountUSDC: 1, marketType: 'parlay' as unknown as 'moneyline' })]);
+    expect(() => totalWorstCaseUSDC(badMkt.items)).toThrow(/marketType must be one of/);
+    const badLine = inventory([item({ contestId: 'C1', makerSide: 'away', riskAmountUSDC: 1, lineTicks: 1.5 })]);
+    expect(() => contestWorstCaseUSDC(badLine.items, 'C1')).toThrow(/lineTicks must be an integer/);
+    // the Market's grouping selectors are validated too
+    expect(() => headroomForSide(inventory([]), market({ marketType: 'parlay' as unknown as 'moneyline' }), 'away', caps())).toThrow(/market\.marketType must be/);
+    expect(() => verdictForMarket(inventory([]), market({ lineTicks: 2.5 }), caps())).toThrow(/market\.lineTicks must be an integer/);
   });
 });
 

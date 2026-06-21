@@ -134,11 +134,15 @@ export async function runQuote(opts: QuoteOpts): Promise<QuoteReport> {
   }
 
   // 3. Build the desired quote — config + reference odds + headroom over an empty inventory.
+  //    The `quote` CLI prices moneyline only (`extractMoneylineOdds`), so the market
+  //    identity is the moneyline group (`marketType: 'moneyline', lineTicks: 0`).
   const market = {
     contestId: contest.contestId,
     sport: contest.sport,
     awayTeam: contest.awayTeam,
     homeTeam: contest.homeTeam,
+    marketType: 'moneyline' as const,
+    lineTicks: 0,
   };
   const desired = buildDesiredQuote(
     config,

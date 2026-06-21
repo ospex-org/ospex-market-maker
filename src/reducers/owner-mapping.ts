@@ -190,11 +190,11 @@ export function mapOwnerCommitmentToMaker(c: OwnerCommitment): MakerCommitmentRe
     // moneyline norm (no line → 0). A null marketType means core-api could not classify the
     // market — today that can only be a moneyline commitment (the only live market), so the
     // moneyline default is safe AND byte-identical. NOTE this is a fail-OPEN: once spread /
-    // total ship, the per-market risk re-key must source marketType from the scorer / signed
-    // payload rather than defaulting to moneyline here, or a null-marketType spread / total
-    // body would be silently mis-grouped (and paired with its real lineTicks, an inconsistent
-    // moneyline-with-a-line record). Tracked for that slice. (The state validator, by
-    // contrast, fail-CLOSES on a present-but-unknown marketType.)
+    // total ship, a follow-up (the gate-flip prerequisite) must source marketType from the
+    // scorer / signed payload rather than defaulting to moneyline here, or a null-marketType
+    // spread / total body would be silently mis-grouped by the risk engine (and paired with its
+    // real lineTicks, an inconsistent moneyline-with-a-line record). Tracked for that slice.
+    // (The state validator, by contrast, fail-CLOSES on a present-but-unknown marketType.)
     marketType: c.marketType ?? 'moneyline',
     lineTicks: c.lineTicks ?? 0,
     makerSide: sideFromPositionType(c.positionType),
@@ -264,9 +264,9 @@ export function mapOwnerPositionToMaker(p: OwnerPosition): MakerPositionRecord {
     // marketType from the position body's `market` (always present). lineTicks, by contrast,
     // is NOT on the own-state position body (the core-api gap), so it is 0 here — correct for
     // moneyline (the only live market; no line). A spread / total position reconstructed from
-    // a snapshot therefore lacks its line until the per-market risk re-key sources it from the
-    // originating commitment (positions are created with the real line by the fill path) or
-    // core-api adds lineTicks to the position body. Dormant today (spread/total gated off).
+    // a snapshot therefore lacks its line until a follow-up (the gate-flip prerequisite) sources
+    // it from the originating commitment (positions are created with the real line by the fill
+    // path) or core-api adds lineTicks to the position body. Dormant today (spread/total gated off).
     marketType: p.market,
     lineTicks: 0,
     side: sideFromPositionType(p.positionType),

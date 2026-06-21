@@ -224,6 +224,28 @@ describe('StateStore.load', () => {
     status = store.load().status;
     expect(status.kind).toBe('lost');
     if (status.kind === 'lost') expect(status.reason).toMatch(/lineTicks/);
+
+    // (5) the migration is PAIRED: a half-written record (exactly one of the two fields) is
+    //     rejected rather than normalized to an inconsistent shape (spread/0 or moneyline/-15).
+    const marketTypeOnly: Record<string, unknown> = { ...commitment({ marketType: 'spread', lineTicks: -15 }) };
+    delete marketTypeOnly.lineTicks;
+    writeFileSync(join(dir, STATE_FILE), JSON.stringify(stateWith({ commitments: { '0xabc': marketTypeOnly as unknown as MakerCommitmentRecord } })), 'utf8');
+    status = store.load().status;
+    expect(status.kind).toBe('lost');
+    if (status.kind === 'lost') expect(status.reason).toMatch(/present together/);
+
+    const lineTicksOnly: Record<string, unknown> = { ...commitment({ marketType: 'spread', lineTicks: -15 }) };
+    delete lineTicksOnly.marketType;
+    writeFileSync(join(dir, STATE_FILE), JSON.stringify(stateWith({ commitments: { '0xabc': lineTicksOnly as unknown as MakerCommitmentRecord } })), 'utf8');
+    status = store.load().status;
+    expect(status.kind).toBe('lost');
+    if (status.kind === 'lost') expect(status.reason).toMatch(/present together/);
+
+    // (6) moneyline has no line — a moneyline record with a non-zero lineTicks is inconsistent → lost.
+    writeFileSync(join(dir, STATE_FILE), JSON.stringify(stateWith({ commitments: { '0xabc': commitment({ marketType: 'moneyline', lineTicks: -15 }) } })), 'utf8');
+    status = store.load().status;
+    expect(status.kind).toBe('lost');
+    if (status.kind === 'lost') expect(status.reason).toMatch(/moneyline/);
   });
 
   // ── sensitive state hardening (own-state SSE plan §M6/B) ────────────────────

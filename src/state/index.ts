@@ -742,25 +742,34 @@ function validateCommitmentRecord(
       fills.push(f.fill);
     }
   }
-  // marketType + lineTicks (per-market risk re-key). Migration: a record from a
-  // pre-this-field state file carries neither — every such record is moneyline,
-  // so default marketType → 'moneyline' and lineTicks → 0. Newer records must
-  // carry a known marketType and an integer lineTicks.
+  // marketType + lineTicks (per-market risk re-key) — a PAIRED migration: both fields were
+  // added in the same slice, so a record carries NEITHER (a pre-this-field state file →
+  // migrate to the moneyline default; every legacy record is moneyline) or BOTH. Exactly one
+  // present is a half-written / hand-edited record → fail closed: normalizing it would
+  // produce an inconsistent self-describing shape (spread/0, or moneyline/-15) that the risk
+  // re-key would mis-group. When both are present, validate them — including the invariant
+  // that moneyline has no line (lineTicks must be 0).
+  const hasMarketType = value.marketType !== undefined;
+  const hasLineTicks = value.lineTicks !== undefined;
   let marketType: MarketType;
-  if (value.marketType === undefined) {
-    marketType = 'moneyline';
-  } else if (typeof value.marketType !== 'string' || !(MARKET_TYPES as readonly string[]).includes(value.marketType)) {
-    return { ok: false, reason: `marketType ${describe(value.marketType)} is not a known market type (expected ${MARKET_TYPES.map((m) => `"${m}"`).join(' / ')})` };
-  } else {
-    marketType = value.marketType as MarketType;
-  }
   let lineTicks: number;
-  if (value.lineTicks === undefined) {
+  if (!hasMarketType && !hasLineTicks) {
+    marketType = 'moneyline';
     lineTicks = 0;
-  } else if (typeof value.lineTicks !== 'number' || !Number.isInteger(value.lineTicks)) {
-    return { ok: false, reason: `lineTicks ${describe(value.lineTicks)} must be an integer` };
+  } else if (hasMarketType !== hasLineTicks) {
+    return { ok: false, reason: `marketType and lineTicks must be present together — only ${hasMarketType ? 'marketType' : 'lineTicks'} is set; a partial record is rejected rather than normalized to an inconsistent shape` };
   } else {
+    if (typeof value.marketType !== 'string' || !(MARKET_TYPES as readonly string[]).includes(value.marketType)) {
+      return { ok: false, reason: `marketType ${describe(value.marketType)} is not a known market type (expected ${MARKET_TYPES.map((m) => `"${m}"`).join(' / ')})` };
+    }
+    if (typeof value.lineTicks !== 'number' || !Number.isInteger(value.lineTicks)) {
+      return { ok: false, reason: `lineTicks ${describe(value.lineTicks)} must be an integer` };
+    }
+    marketType = value.marketType as MarketType;
     lineTicks = value.lineTicks;
+    if (marketType === 'moneyline' && lineTicks !== 0) {
+      return { ok: false, reason: `marketType 'moneyline' has no line — lineTicks must be 0, got ${lineTicks}` };
+    }
   }
   const record: MakerCommitmentRecord = {
     hash: key,

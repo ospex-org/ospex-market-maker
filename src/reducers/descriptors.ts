@@ -28,6 +28,8 @@ export interface FillEventPayload {
   filledRiskWei6?: string;
   cumulativeRiskWei6?: string;
   partial?: boolean;
+  /** The fill's market — `'spread'` | `'total'`; OMITTED for moneyline (the unmarked default — see telemetry `marketTag`), so `summarize` buckets it as `moneyline`. From the originating commitment. */
+  market?: 'spread' | 'total';
 }
 
 export interface ExpireEventPayload {

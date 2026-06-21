@@ -146,7 +146,7 @@ import { compareAuditVsCanonical, type TrackedDivergence } from './audit-compara
 import { WakeSignal } from './wake-signal.js';
 import { canSpendGas, requiredPositionModuleAllowanceUSDC, type Market } from '../risk/index.js';
 import { assessStateLoss, dispatchCancel, emptyMakerState, isTerminalPositionStatus, toMakerSignedPayload, type CancelDispatch, type MakerCommitmentRecord, type MakerSide, type MakerSignedPayload, type MakerState, type StateLossAssessment, type StateStore } from '../state/index.js';
-import { EventLog, eventLogsExist } from '../telemetry/index.js';
+import { EventLog, eventLogsExist, marketTag } from '../telemetry/index.js';
 
 // ── injectable seams (the defaults are the real impls; tests override) ───────
 
@@ -1846,11 +1846,11 @@ export class Runner {
         if (isMarketTracked(c.contestId, mkt)) continue;
         const confirmedSpec = full.speculations.find((s) => s.marketType === mkt && s.open);
         if (confirmedSpec === undefined) {
-          this.eventLog.emit('candidate', { contestId: c.contestId, skipReason: 'no-open-speculation', ...this.candidateMarketTag(mkt) });
+          this.eventLog.emit('candidate', { contestId: c.contestId, skipReason: 'no-open-speculation', ...marketTag(mkt) });
           continue;
         }
         if (this.trackedMarkets.size >= ms.maxTrackedMarkets) {
-          this.eventLog.emit('candidate', { contestId: c.contestId, skipReason: 'tracking-cap-reached', ...this.candidateMarketTag(mkt) });
+          this.eventLog.emit('candidate', { contestId: c.contestId, skipReason: 'tracking-cap-reached', ...marketTag(mkt) });
           break; // map is full — no remaining market for this contest can fit either
         }
         const lineTicks = confirmedSpec.lineTicks ?? 0; // moneyline: the spec's lineTicks is null → 0
@@ -1871,7 +1871,7 @@ export class Runner {
           lastReconciledAt: null,
           departing: false,
         });
-        this.eventLog.emit('candidate', { contestId: c.contestId, sport: full.sport, matchTime: full.matchTime, speculationId: confirmedSpec.speculationId, ...this.candidateMarketTag(confirmedSpec.marketType) });
+        this.eventLog.emit('candidate', { contestId: c.contestId, sport: full.sport, matchTime: full.matchTime, speculationId: confirmedSpec.speculationId, ...marketTag(confirmedSpec.marketType) });
       }
     }
   }
@@ -1911,16 +1911,6 @@ export class Runner {
     // is open at the chosen line, follow the oracle line rather than strand on a closed one.
     const targetTicks = Math.abs(oracleTicks - m.lineTicks) > this.config.orders.replaceOnLineMoveTicks ? oracleTicks : m.lineTicks;
     return openAtLine(targetTicks) ?? openAtLine(oracleTicks);
-  }
-
-  /**
-   * Telemetry tag identifying a per-market `candidate` event's market. Omitted for moneyline
-   * (the unmarked default) so moneyline candidate telemetry stays byte-identical; present for
-   * spread / total so a multi-market contest's per-market refusals are attributable (a
-   * `candidate` keys on `contestId`, which a multi-market contest shares across its markets).
-   */
-  private candidateMarketTag(market: MarketType): { market?: 'spread' | 'total' } {
-    return market === 'moneyline' ? {} : { market };
   }
 
   /**
@@ -2282,19 +2272,19 @@ export class Runner {
     // until that deletion.)
     if (m.departing) {
       const outcome = await this.pullVisibleQuotes(m, now);
-      this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'untracked', ...this.candidateMarketTag(m.marketType) });
+      this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'untracked', ...marketTag(m.marketType) });
       return outcome;
     }
     // Gate: the game starts within one expiry window — stop quoting it (a fresh quote would still be matchable at game time / outlive the pre-game window), and pull whatever's still up.
     if (m.matchTimeSec - now <= this.config.orders.expirySeconds) {
       const outcome = await this.pullVisibleQuotes(m, now);
-      this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'start-too-soon', ...this.candidateMarketTag(m.marketType) });
+      this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'start-too-soon', ...marketTag(m.marketType) });
       return outcome;
     }
     // Gate: the reference odds have gone stale (the upstream feed stopped advancing). A never-seen-odds market (`lastOddsAt === null`) falls through to the `no-reference-odds` gate below — `lastOddsAt === null` iff `lastReferenceOdds === null` (`recordOdds` sets both or neither).
     if (m.lastOddsAt !== null && now - m.lastOddsAt > this.config.orders.staleReferenceAfterSeconds) {
       const outcome = await this.pullVisibleQuotes(m, now);
-      this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'stale-reference', ...this.candidateMarketTag(m.marketType) });
+      this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'stale-reference', ...marketTag(m.marketType) });
       return outcome;
     }
     // Gate: no usable reference odds (`referenceOddsFromSdk` null-collapses a missing or
@@ -2302,13 +2292,13 @@ export class Runner {
     const ref = m.lastReferenceOdds;
     if (ref === null) {
       const outcome = await this.pullVisibleQuotes(m, now);
-      this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'no-reference-odds', ...this.candidateMarketTag(m.marketType) });
+      this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'no-reference-odds', ...marketTag(m.marketType) });
       return outcome;
     }
     // Gate: the SSE odds stream is down (subscription mode) — the reference is no longer being kept fresh, so treat it as unsafe and pull. (`syncOddsSubscriptions` re-subscribes on the next discovery cycle; the existing `degraded` event already carries the precise cause.)
     if (this.config.odds.subscribe && m.subscription === null) {
       const outcome = await this.pullVisibleQuotes(m, now);
-      this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'stale-reference', ...this.candidateMarketTag(m.marketType) });
+      this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'stale-reference', ...marketTag(m.marketType) });
       return outcome;
     }
     // Gate (spread / total): the tracked speculation's ON-CHAIN line must match the line
@@ -2325,7 +2315,7 @@ export class Runner {
     const oracleTicks = oracleLineTicks(ref);
     if (oracleTicks !== null && oracleTicks !== m.lineTicks) {
       const outcome = await this.pullVisibleQuotes(m, now);
-      this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'reference-line-mismatch', ...this.candidateMarketTag(m.marketType) });
+      this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'reference-line-mismatch', ...marketTag(m.marketType) });
       return outcome;
     }
     // Lazy-creation re-check (DESIGN §6/§9): the speculation we'd post to must still exist + be open — discovery confirmed it; re-confirm via the per-speculation detail read (PR 5's competitiveness check reuses the `getSpeculation` orderbook).
@@ -2338,7 +2328,7 @@ export class Runner {
     }
     if (!spec.open) {
       const outcome = await this.pullVisibleQuotes(m, now);
-      this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'no-open-speculation', ...this.candidateMarketTag(m.marketType) });
+      this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'no-open-speculation', ...marketTag(m.marketType) });
       return outcome;
     }
     // Price → plan → apply.
@@ -2747,6 +2737,7 @@ export class Runner {
         toTakerOddsTick: rp.replacement.quoteTick,
         riskAmountWei6: record.riskAmountWei6,
         expiryUnixSec,
+        ...marketTag(record.marketType),
       });
     }
 
@@ -2758,7 +2749,7 @@ export class Runner {
     }
     if ((await this.maybeOnchainCancelRetainedPartials(plan.retainedPartials, now)) === 'transient-failure') outcome = 'transient-failure'; // cancelMode:onchain authoritative cancel threw — re-arm the market so the cancel retries next tick (not throttled behind staleAfterSeconds)
     for (const offerSide of plan.deferredSides) {
-      this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'cap-hit', takerSide: offerSide, ...this.candidateMarketTag(m.marketType) });
+      this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'cap-hit', takerSide: offerSide, ...marketTag(m.marketType) });
     }
     return outcome;
   }
@@ -2902,6 +2893,7 @@ export class Runner {
       makerOddsTick: record.oddsTick,
       riskAmountWei6: record.riskAmountWei6,
       expiryUnixSec: record.expiryUnixSec,
+      ...marketTag(record.marketType),
     };
   }
 
@@ -4642,6 +4634,7 @@ export class Runner {
           winSide: result.winSide,
           txHash: result.txHash,
           gasPolWei: gasPolWei.toString(),
+          ...marketTag(r.marketType),
         });
       } else {
         // Already settled (pre-flight read) or recovered from a concurrent
@@ -4736,6 +4729,7 @@ export class Runner {
           payoutWei6: result.payoutWei6.toString(),
           txHash: result.txHash,
           gasPolWei: gasPolWei.toString(),
+          ...marketTag(r.marketType),
         };
         // Settled outcome from the API's ClaimablePositionView.result (captured
         // during the position-status poll, stored on r.result). Lets the summary
@@ -5141,5 +5135,6 @@ export function softCancelEventPayload(record: MakerCommitmentRecord, reason: So
     positionType: positionTypeForSide(record.makerSide),
     makerOddsTick: record.oddsTick,
     reason,
+    ...marketTag(record.marketType),
   };
 }

@@ -47,6 +47,8 @@
 import { appendFileSync, mkdirSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
+import type { MarketType } from '../state/index.js';
+
 /**
  * The `kind` vocabulary for event-log lines (DESIGN §11). Adding a kind is an
  * additive change; removing or renaming one is a breaking change to the scorecard
@@ -111,6 +113,21 @@ export const CANDIDATE_SKIP_REASONS = [
   'already-claimed', //                ensurePositionClaimed found the position already claimed (pre-flight) or recovered from a benign already-claimed race — a boring skip, not an error, and NOT a `claim` event (no event-sourced payout; the contract zeroes economic fields post-claim, so we never fake/derive one). Emitted by the auto-claim path with `purpose: 'claimPosition'`; `outcome` distinguishes `alreadyClaimed` vs `recovered`. Gas accounting mirrors `already-settled`: a `recovered` race that broadcast a claim which reverted on inclusion DID spend gas — `revertedTxHash` + `gasPolWei` are present and that gas IS billed (state daily counter + the run summary under `claim`); `gasAccountingGap: true` flags a reverted receipt that couldn't be fetched. `alreadyClaimed` / pre-send recovery send no tx → no gas. The run summary classifies these positions `alreadyClaimed` (NOT `wonUnclaimed`) and folds no payout into realized P&L.
 ] as const;
 export type CandidateSkipReason = (typeof CANDIDATE_SKIP_REASONS)[number];
+
+/**
+ * The telemetry `market` tag (DESIGN §11). Present (`'spread'` | `'total'`) on a
+ * non-moneyline event; **OMITTED for moneyline** (the unmarked default) so a
+ * moneyline-only run's NDJSON stays byte-identical to before markets existed.
+ *
+ * Used on the per-market `candidate` event AND on the live commitment / position
+ * events that feed the run-summary metrics — `submit` / `would-submit` /
+ * `replace` / `would-replace` / `soft-cancel` / `would-soft-cancel` / `fill` /
+ * `settle` / `claim` — so `summarize` can bucket fills + realized P&L by market.
+ * Consumers read it as `market ?? 'moneyline'`.
+ */
+export function marketTag(market: MarketType): { market?: 'spread' | 'total' } {
+  return market === 'moneyline' ? {} : { market };
+}
 
 /** Free-form payload for an event-log line — merged into `{ ts, runId, kind }`. See the bigint / reserved-key rules. */
 export type TelemetryPayload = Record<string, unknown>;
@@ -600,7 +617,12 @@ export interface LiveGasByKind {
  * Unrealized P&L (active positions marked to current fair) is the remaining
  * Phase-3 follow-up and requires `summarize` to accept an `OspexAdapter`.
  */
-export interface RealizedPnl {
+/**
+ * The realized-P&L economic fields. The run-wide totals AND each per-market
+ * bucket ({@link RealizedPnl.byMarket}) share this exact shape, so the run-wide
+ * figure equals the sum across the per-market buckets.
+ */
+export interface RealizedPnlAmounts {
   /** Net realized P&L in USDC wei6 (SIGNED decimal string — leading `-` for losses; `"0"` for zero). Sum of `won` profits minus `lost` stakes; `push`, `wonUnclaimed`, and `alreadyClaimed` contribute nothing. */
   netUsdcWei6: string;
   /** Sum of `payoutWei6 - cumulativeStake` across `won` positions (always non-negative — a claim only fires on winning positions). */
@@ -621,6 +643,17 @@ export interface RealizedPnl {
   unsettledCount: number;
 }
 
+export interface RealizedPnl extends RealizedPnlAmounts {
+  /**
+   * Per-market breakdown of the same realized-P&L amounts (`moneyline` /
+   * `spread` / `total`) — zero-filled for all three. The market of each position
+   * is resolved from the `market` tag on its `fill` / `settle` / `claim` events
+   * (absent ⇒ `moneyline`), so an older moneyline-only log buckets entirely under
+   * `moneyline` and the per-market figures reconcile with the run-wide totals.
+   */
+  byMarket: Record<MarketType, RealizedPnlAmounts>;
+}
+
 /**
  * Live-mode run metrics (DESIGN §2.3 / §11). The fill / settlement / gas /
  * fees / realized-P&L aggregators populated by the `submit` / `replace` /
@@ -634,13 +667,17 @@ export interface LiveMetrics {
    * onto the book); `filledUsdcWei6` sums `newFillWei6` across every `fill`
    * event (USDC of that committed risk that takers matched). `fillRate` is
    * `filledUsdc / quotedUsdc` as a number in [0, 1+]; `null` when nothing
-   * was quoted (division-by-zero). Future per-sport / per-time-to-tip
-   * bucketing is a follow-up (`bucketed: …`).
+   * was quoted (division-by-zero). `byMarket` carries the same three fields
+   * per market (`moneyline` / `spread` / `total`), zero-filled — quoted/filled
+   * attributed by the `market` tag on each `submit` / `replace` / `fill` event
+   * (absent ⇒ `moneyline`); the run-wide quoted/filled equal the sum across
+   * markets. Future per-sport / per-time-to-tip bucketing is a follow-up.
    */
   fills: {
     quotedUsdcWei6: string;
     filledUsdcWei6: string;
     fillRate: number | null;
+    byMarket: Record<MarketType, { quotedUsdcWei6: string; filledUsdcWei6: string; fillRate: number | null }>;
   };
   /**
    * Gas spent on chain. `totalPolWei` is the sum across every on-chain op
@@ -867,6 +904,24 @@ export function summarize(logPaths: readonly string[], opts: { sinceIso?: string
   const isMakerSide = (v: unknown): v is 'away' | 'home' => v === 'away' || v === 'home';
   const isClaimResult = (v: unknown): v is 'won' | 'push' | 'void' => v === 'won' || v === 'push' || v === 'void';
 
+  // Per-market breakdown accumulators (DESIGN §2.3 — fill rate / P&L "bucketed
+  // by market"). The `market` tag is OMITTED for moneyline (the unmarked
+  // default), so an absent tag ⇒ 'moneyline'; an older moneyline-only log
+  // buckets entirely under 'moneyline' and the per-market figures reconcile
+  // with the run-wide totals. `quoted`/`filled` come from each event's own tag;
+  // realized P&L resolves a position's market from `marketBySpeculation` (a
+  // speculationId is 1:1 with a market on chain), populated from the same
+  // fill/settle/claim events so a `--since` window that clips one kind still
+  // resolves the bucket.
+  const zeroMarkets = (): Record<MarketType, bigint> => ({ moneyline: 0n, spread: 0n, total: 0n });
+  const quotedByMarket = zeroMarkets();
+  const filledByMarket = zeroMarkets();
+  const marketBySpeculation = new Map<string, MarketType>();
+  const marketOf = (p: Record<string, unknown>): MarketType => {
+    const m = p.market;
+    return m === 'spread' || m === 'total' ? m : 'moneyline';
+  };
+
   // The `ts`-ordered walk: track each posted would-be quote by its synthetic hash to
   // reconstruct the running `visibleOpen + softCancelled-not-yet-expired` risk (peak)
   // and the per-quote visible-life ages. A `would-soft-cancel` / `would-replace`-of /
@@ -999,23 +1054,34 @@ export function summarize(logPaths: readonly string[], opts: { sinceIso?: string
       }
       // ── live-mode (Phase 3 g-i) — fill rate / gas / settlements / fees ──
       case 'submit': {
-        if (isWei6String(p.riskAmountWei6)) quotedWei6 += BigInt(p.riskAmountWei6);
+        if (isWei6String(p.riskAmountWei6)) {
+          const risk = BigInt(p.riskAmountWei6);
+          quotedWei6 += risk;
+          quotedByMarket[marketOf(p)] += risk;
+        }
         break;
       }
       case 'replace': {
-        if (isWei6String(p.riskAmountWei6)) quotedWei6 += BigInt(p.riskAmountWei6);
+        if (isWei6String(p.riskAmountWei6)) {
+          const risk = BigInt(p.riskAmountWei6);
+          quotedWei6 += risk;
+          quotedByMarket[marketOf(p)] += risk;
+        }
         break;
       }
       case 'fill': {
         if (isWei6String(p.newFillWei6)) {
           const delta = BigInt(p.newFillWei6);
+          if (delta === 0n) break; // a zero-delta fill is a no-op for the metrics (mirrors poll.ts's >0n guards) — never creates a phantom 0-stake position, keeps fills.byMarket / realizedPnl.byMarket symmetric
           filledWei6 += delta;
+          filledByMarket[marketOf(p)] += delta;
           // Realized-P&L: accumulate per-position own stake. Both commitment-diff
           // and position-poll `fill` sources carry `speculationId` + `makerSide`.
           if (typeof p.speculationId === 'string' && isMakerSide(p.makerSide)) {
             const key = `${p.speculationId}:${p.makerSide}`;
             stakesByPosition.set(key, (stakesByPosition.get(key) ?? 0n) + delta);
           }
+          if (typeof p.speculationId === 'string') marketBySpeculation.set(p.speculationId, marketOf(p));
         }
         break;
       }
@@ -1037,11 +1103,13 @@ export function summarize(logPaths: readonly string[], opts: { sinceIso?: string
         if (typeof p.speculationId === 'string' && typeof p.winSide === 'string') {
           outcomeBySpeculation.set(p.speculationId, p.winSide);
         }
+        if (typeof p.speculationId === 'string') marketBySpeculation.set(p.speculationId, marketOf(p));
         break;
       }
       case 'claim': {
         claimCount += 1;
         addGas('claim', readGas(p.gasPolWei));
+        if (typeof p.speculationId === 'string') marketBySpeculation.set(p.speculationId, marketOf(p));
         if (isWei6String(p.payoutWei6)) {
           const payout = BigInt(p.payoutWei6);
           totalClaimedPayoutWei6 += payout;
@@ -1109,89 +1177,75 @@ export function summarize(logPaths: readonly string[], opts: { sinceIso?: string
   //   6. settle.winSide ≠ makerSide (and not push/void) → lost. A stray
   //      claim in this case is anomalous; the outcome verdict wins.
   //   7. settle.winSide === makerSide and no claim → wonUnclaimed.
-  let netRealizedPnlWei6 = 0n;
-  let claimedProfitWei6 = 0n;
-  let realizedLossWei6 = 0n;
-  let wonCount = 0;
-  let lostCount = 0;
-  let pushCount = 0;
-  let wonUnclaimedCount = 0;
-  let alreadyClaimedCount = 0;
-  let unsettledCount = 0;
+  // A per-bucket accumulator (run-wide AND each per-market bucket share this).
+  interface PnlAcc { net: bigint; profit: bigint; loss: bigint; won: number; lost: number; push: number; wonUnclaimed: number; alreadyClaimed: number; unsettled: number }
+  const newPnlAcc = (): PnlAcc => ({ net: 0n, profit: 0n, loss: 0n, won: 0, lost: 0, push: 0, wonUnclaimed: 0, alreadyClaimed: 0, unsettled: 0 });
+  // Classify a position into exactly one bucket (+ its P&L delta), implementing
+  // the precedence documented above. Pure — applied to BOTH the run-wide and the
+  // per-market accumulator so the two can never diverge.
+  type PnlVerdict =
+    | { bucket: 'push' | 'wonUnclaimed' | 'alreadyClaimed' | 'unsettled' }
+    | { bucket: 'won'; profit: bigint }
+    | { bucket: 'lost'; stake: bigint };
+  const classifyPosition = (
+    stake: bigint,
+    makerSide: string,
+    outcome: string | undefined,
+    claim: { payout: bigint; result?: 'won' | 'push' | 'void' } | undefined,
+    alreadyClaimed: boolean,
+  ): PnlVerdict => {
+    if (claim?.result === 'push' || claim?.result === 'void') return { bucket: 'push' }; // (1)
+    if (outcome === 'push' || outcome === 'void') return { bucket: 'push' }; //              (2)
+    if (claim?.result === 'won') return { bucket: 'won', profit: claim.payout - stake }; //  (3)
+    if (claim !== undefined && (outcome === undefined || outcome === makerSide)) return { bucket: 'won', profit: claim.payout - stake }; // (4)
+    if (alreadyClaimed && (outcome === undefined || outcome === makerSide)) return { bucket: 'alreadyClaimed' }; //                        (4.5)
+    if (outcome === undefined) return { bucket: 'unsettled' }; //                            (5)
+    if (outcome !== makerSide) return { bucket: 'lost', stake }; //                          (6)
+    return { bucket: 'wonUnclaimed' }; //                                                    (7)
+  };
+  const foldPnl = (acc: PnlAcc, v: PnlVerdict): void => {
+    switch (v.bucket) {
+      case 'push': acc.push += 1; break;
+      case 'won': acc.net += v.profit; acc.profit += v.profit; acc.won += 1; break;
+      case 'lost': acc.net -= v.stake; acc.loss += v.stake; acc.lost += 1; break;
+      case 'alreadyClaimed': acc.alreadyClaimed += 1; break;
+      case 'unsettled': acc.unsettled += 1; break;
+      case 'wonUnclaimed': acc.wonUnclaimed += 1; break;
+    }
+  };
+  const finalizePnl = (acc: PnlAcc): RealizedPnlAmounts => ({
+    netUsdcWei6: acc.net.toString(),
+    claimedProfitUsdcWei6: acc.profit.toString(),
+    realizedLossUsdcWei6: acc.loss.toString(),
+    wonCount: acc.won,
+    lostCount: acc.lost,
+    pushCount: acc.push,
+    wonUnclaimedCount: acc.wonUnclaimed,
+    alreadyClaimedCount: acc.alreadyClaimed,
+    unsettledCount: acc.unsettled,
+  });
+  const pnlAggregate = newPnlAcc();
+  const pnlByMarket: Record<MarketType, PnlAcc> = { moneyline: newPnlAcc(), spread: newPnlAcc(), total: newPnlAcc() };
   for (const [key, stake] of stakesByPosition) {
     const idx = key.indexOf(':');
     const speculationId = key.slice(0, idx);
     const makerSide = key.slice(idx + 1); // 'away' | 'home'
-    const outcome = outcomeBySpeculation.get(speculationId);
-    const claim = claimByPosition.get(key);
-
-    // (1) claim.result is authoritative — push / void here means the claim
-    // was a refund, regardless of whether settle.winSide is in the window.
-    if (claim?.result === 'push' || claim?.result === 'void') {
-      pushCount += 1;
-      continue;
-    }
-    // (2) push / void from the settle event (claim.result absent — older logs
-    // or window-clipped). Discards any claim event that may have fired for
-    // the refund.
-    if (outcome === 'push' || outcome === 'void') {
-      pushCount += 1;
-      continue;
-    }
-    // (3) claim.result === 'won' — authoritative win.
-    if (claim?.result === 'won') {
-      const profit = claim.payout - stake;
-      netRealizedPnlWei6 += profit;
-      claimedProfitWei6 += profit;
-      wonCount += 1;
-      continue;
-    }
-    // (4) winning claim without result (older log): trust the claim when the
-    // outcome is unknown (externally settled / `--since`-clipped) or agrees
-    // with makerSide.
-    if (claim !== undefined && (outcome === undefined || outcome === makerSide)) {
-      const profit = claim.payout - stake;
-      netRealizedPnlWei6 += profit;
-      claimedProfitWei6 += profit;
-      wonCount += 1;
-      continue;
-    }
-    // (4.5) Already claimed out-of-window — the auto-claim path found this
-    // position already claimed (or recovered from a benign already-claimed
-    // race) and emitted a `candidate skipReason:'already-claimed'` instead of a
-    // `claim` event, so there's no event-sourced payout. The position IS
-    // claimed (a winner — claimPosition reverts on losers / no-payout), just
-    // not in this window. Classify it `alreadyClaimed` (NOT `wonUnclaimed` /
-    // `unsettled`) and fold no payout into realized P&L (we never derive one).
-    // Guarded to the winning / outcome-unknown shape so a genuine push/void
-    // (handled in 1–2 above) or a loss (6 below) still wins on the outcome
-    // verdict — an already-claimed loss would be anomalous.
-    if (alreadyClaimedPositions.has(key) && (outcome === undefined || outcome === makerSide)) {
-      alreadyClaimedCount += 1;
-      continue;
-    }
-    // (5) no settle and no claim → unsettled.
-    if (outcome === undefined) {
-      unsettledCount += 1;
-      continue;
-    }
-    // (6) settled against the maker (and not push/void) → lost. A stray
-    // claim event in this case is anomalous; the outcome verdict wins.
-    if (outcome !== makerSide) {
-      netRealizedPnlWei6 -= stake;
-      realizedLossWei6 += stake;
-      lostCount += 1;
-      continue;
-    }
-    // (7) outcome === makerSide AND no claim — paper profit; payout pending.
-    wonUnclaimedCount += 1;
+    const verdict = classifyPosition(stake, makerSide, outcomeBySpeculation.get(speculationId), claimByPosition.get(key), alreadyClaimedPositions.has(key));
+    foldPnl(pnlAggregate, verdict);
+    foldPnl(pnlByMarket[marketBySpeculation.get(speculationId) ?? 'moneyline'], verdict);
   }
 
+  const fillsBucket = (m: MarketType): { quotedUsdcWei6: string; filledUsdcWei6: string; fillRate: number | null } => ({
+    quotedUsdcWei6: quotedByMarket[m].toString(),
+    filledUsdcWei6: filledByMarket[m].toString(),
+    fillRate: quotedByMarket[m] === 0n ? null : Number(filledByMarket[m]) / Number(quotedByMarket[m]),
+  });
   const liveMetrics: LiveMetrics = {
     fills: {
       quotedUsdcWei6: quotedWei6.toString(),
       filledUsdcWei6: filledWei6.toString(),
       fillRate: quotedWei6 === 0n ? null : Number(filledWei6) / Number(quotedWei6),
+      byMarket: { moneyline: fillsBucket('moneyline'), spread: fillsBucket('spread'), total: fillsBucket('total') },
     },
     gas: {
       totalPolWei: totalPolWei.toString(),
@@ -1204,15 +1258,8 @@ export function summarize(logPaths: readonly string[], opts: { sinceIso?: string
       totalClaimedPayoutWei6: totalClaimedPayoutWei6.toString(),
     },
     realizedPnl: {
-      netUsdcWei6: netRealizedPnlWei6.toString(),
-      claimedProfitUsdcWei6: claimedProfitWei6.toString(),
-      realizedLossUsdcWei6: realizedLossWei6.toString(),
-      wonCount,
-      lostCount,
-      pushCount,
-      wonUnclaimedCount,
-      alreadyClaimedCount,
-      unsettledCount,
+      ...finalizePnl(pnlAggregate),
+      byMarket: { moneyline: finalizePnl(pnlByMarket.moneyline), spread: finalizePnl(pnlByMarket.spread), total: finalizePnl(pnlByMarket.total) },
     },
     totalFeeUsdcWei6: totalFeeUsdcWei6.toString(),
   };

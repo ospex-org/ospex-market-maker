@@ -124,7 +124,23 @@ describe('reducePolledCommitmentObservation — still-listed', () => {
       expect(fill.payload.source).toBe('commitment-diff');
       expect(fill.payload.partial).toBe(true);
       expect(fill.payload.newFillWei6).toBe('50000');
+      // moneyline commitment → the `market` tag is OMITTED (byte-identical NDJSON).
+      expect('market' in fill.payload).toBe(false);
     }
+  });
+
+  it("a spread commitment's fill descriptor carries `market: 'spread'` (the summary buckets fills/P&L by it)", () => {
+    const record = commitmentRecord({ hash: '0xsp', speculationId: 'spec-sp', marketType: 'spread', lineTicks: -15, filledRiskWei6: '0' });
+    const state = makerState({ commitments: { [record.hash]: record } });
+    const observation: PolledCommitmentObservation = {
+      kind: 'still-listed',
+      record,
+      apiCommitment: visibleCommitment({ commitmentHash: '0xsp', filledRiskAmount: '50000' }),
+    };
+    const descriptors = reducePolledCommitmentObservation(state, observation, NOW, REDUCER_CONFIG);
+    const fill = descriptors.find((d) => d.kind === 'emit-fill');
+    expect(fill?.kind).toBe('emit-fill');
+    if (fill?.kind === 'emit-fill') expect(fill.payload.market).toBe('spread');
   });
 });
 

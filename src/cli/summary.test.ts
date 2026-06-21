@@ -26,6 +26,21 @@ function collect(): { sink: { write(s: string): void }; text: () => string } {
   return { sink: { write: (s: string) => { buf += s; } }, text: () => buf };
 }
 /** A plausible `RunSummary` for renderer / exit-code tests. */
+/** Zero-filled per-market `fills.byMarket` (a moneyline-only / no-activity fixture). */
+function zeroFillsByMarket(): RunSummary['liveMetrics']['fills']['byMarket'] {
+  return {
+    moneyline: { quotedUsdcWei6: '0', filledUsdcWei6: '0', fillRate: null },
+    spread: { quotedUsdcWei6: '0', filledUsdcWei6: '0', fillRate: null },
+    total: { quotedUsdcWei6: '0', filledUsdcWei6: '0', fillRate: null },
+  };
+}
+
+/** Zero-filled per-market `realizedPnl.byMarket`. */
+function zeroPnlByMarket(): RunSummary['liveMetrics']['realizedPnl']['byMarket'] {
+  const z = { netUsdcWei6: '0', claimedProfitUsdcWei6: '0', realizedLossUsdcWei6: '0', wonCount: 0, lostCount: 0, pushCount: 0, wonUnclaimedCount: 0, alreadyClaimedCount: 0, unsettledCount: 0 };
+  return { moneyline: { ...z }, spread: { ...z }, total: { ...z } };
+}
+
 function fakeSummary(over: Partial<RunSummary> = {}): RunSummary {
   return {
     schemaVersion: 1,
@@ -52,10 +67,10 @@ function fakeSummary(over: Partial<RunSummary> = {}): RunSummary {
     errors: { total: 0, byPhase: {} },
     kill: { reason: 'kill-file', ticks: 5 },
     liveMetrics: {
-      fills: { quotedUsdcWei6: '0', filledUsdcWei6: '0', fillRate: null },
+      fills: { quotedUsdcWei6: '0', filledUsdcWei6: '0', fillRate: null, byMarket: zeroFillsByMarket() },
       gas: { totalPolWei: '0', byKind: { approval: '0', onchainCancel: '0', settle: '0', claim: '0' }, totalUsdcEquivWei6: null },
       settlements: { settleCount: 0, claimCount: 0, totalClaimedPayoutWei6: '0' },
-      realizedPnl: { netUsdcWei6: '0', claimedProfitUsdcWei6: '0', realizedLossUsdcWei6: '0', wonCount: 0, lostCount: 0, pushCount: 0, wonUnclaimedCount: 0, alreadyClaimedCount: 0, unsettledCount: 0 },
+      realizedPnl: { netUsdcWei6: '0', claimedProfitUsdcWei6: '0', realizedLossUsdcWei6: '0', wonCount: 0, lostCount: 0, pushCount: 0, wonUnclaimedCount: 0, alreadyClaimedCount: 0, unsettledCount: 0, byMarket: zeroPnlByMarket() },
       totalFeeUsdcWei6: '0',
     },
     ...over,
@@ -150,10 +165,10 @@ describe('renderSummaryReport*', () => {
     const { sink, text } = collect();
     renderSummaryReportText(fakeSummary({
       liveMetrics: {
-        fills: { quotedUsdcWei6: '1000000', filledUsdcWei6: '600000', fillRate: 0.6 },
+        fills: { quotedUsdcWei6: '1000000', filledUsdcWei6: '600000', fillRate: 0.6, byMarket: zeroFillsByMarket() },
         gas: { totalPolWei: '0', byKind: { approval: '0', onchainCancel: '0', settle: '0', claim: '0' }, totalUsdcEquivWei6: null },
         settlements: { settleCount: 2, claimCount: 1, totalClaimedPayoutWei6: '900000' },
-        realizedPnl: { netUsdcWei6: '-100000', claimedProfitUsdcWei6: '400000', realizedLossUsdcWei6: '500000', wonCount: 1, lostCount: 1, pushCount: 0, wonUnclaimedCount: 0, alreadyClaimedCount: 0, unsettledCount: 0 },
+        realizedPnl: { netUsdcWei6: '-100000', claimedProfitUsdcWei6: '400000', realizedLossUsdcWei6: '500000', wonCount: 1, lostCount: 1, pushCount: 0, wonUnclaimedCount: 0, alreadyClaimedCount: 0, unsettledCount: 0, byMarket: zeroPnlByMarket() },
         totalFeeUsdcWei6: '0',
       },
     }), logDir, sink);
@@ -166,10 +181,10 @@ describe('renderSummaryReport*', () => {
     const { sink, text } = collect();
     renderSummaryReportText(fakeSummary({
       liveMetrics: {
-        fills: { quotedUsdcWei6: '500000', filledUsdcWei6: '500000', fillRate: 1 },
+        fills: { quotedUsdcWei6: '500000', filledUsdcWei6: '500000', fillRate: 1, byMarket: zeroFillsByMarket() },
         gas: { totalPolWei: '0', byKind: { approval: '0', onchainCancel: '0', settle: '0', claim: '0' }, totalUsdcEquivWei6: null },
         settlements: { settleCount: 1, claimCount: 0, totalClaimedPayoutWei6: '0' },
-        realizedPnl: { netUsdcWei6: '0', claimedProfitUsdcWei6: '0', realizedLossUsdcWei6: '0', wonCount: 0, lostCount: 0, pushCount: 0, wonUnclaimedCount: 1, alreadyClaimedCount: 0, unsettledCount: 0 },
+        realizedPnl: { netUsdcWei6: '0', claimedProfitUsdcWei6: '0', realizedLossUsdcWei6: '0', wonCount: 0, lostCount: 0, pushCount: 0, wonUnclaimedCount: 1, alreadyClaimedCount: 0, unsettledCount: 0, byMarket: zeroPnlByMarket() },
         totalFeeUsdcWei6: '0',
       },
     }), logDir, sink);
@@ -183,10 +198,10 @@ describe('renderSummaryReport*', () => {
     const { sink, text } = collect();
     renderSummaryReportText(fakeSummary({
       liveMetrics: {
-        fills: { quotedUsdcWei6: '500000', filledUsdcWei6: '500000', fillRate: 1 },
+        fills: { quotedUsdcWei6: '500000', filledUsdcWei6: '500000', fillRate: 1, byMarket: zeroFillsByMarket() },
         gas: { totalPolWei: '0', byKind: { approval: '0', onchainCancel: '0', settle: '0', claim: '0' }, totalUsdcEquivWei6: null },
         settlements: { settleCount: 1, claimCount: 0, totalClaimedPayoutWei6: '0' },
-        realizedPnl: { netUsdcWei6: '0', claimedProfitUsdcWei6: '0', realizedLossUsdcWei6: '0', wonCount: 0, lostCount: 0, pushCount: 0, wonUnclaimedCount: 0, alreadyClaimedCount: 1, unsettledCount: 0 },
+        realizedPnl: { netUsdcWei6: '0', claimedProfitUsdcWei6: '0', realizedLossUsdcWei6: '0', wonCount: 0, lostCount: 0, pushCount: 0, wonUnclaimedCount: 0, alreadyClaimedCount: 1, unsettledCount: 0, byMarket: zeroPnlByMarket() },
         totalFeeUsdcWei6: '0',
       },
     }), logDir, sink);
@@ -196,14 +211,72 @@ describe('renderSummaryReport*', () => {
     expect(out).toContain('ospex-mm status');
   });
 
+  it('text render shows per-market Fills + Realized P&L lines on a multi-market run', () => {
+    const { sink, text } = collect();
+    renderSummaryReportText(fakeSummary({
+      liveMetrics: {
+        fills: {
+          quotedUsdcWei6: '1500000', filledUsdcWei6: '900000', fillRate: 0.6,
+          byMarket: {
+            moneyline: { quotedUsdcWei6: '1000000', filledUsdcWei6: '600000', fillRate: 0.6 },
+            spread: { quotedUsdcWei6: '500000', filledUsdcWei6: '300000', fillRate: 0.6 },
+            total: { quotedUsdcWei6: '0', filledUsdcWei6: '0', fillRate: null }, // inactive → omitted from the line
+          },
+        },
+        gas: { totalPolWei: '0', byKind: { approval: '0', onchainCancel: '0', settle: '0', claim: '0' }, totalUsdcEquivWei6: null },
+        settlements: { settleCount: 2, claimCount: 1, totalClaimedPayoutWei6: '1800000' },
+        realizedPnl: {
+          netUsdcWei6: '300000', claimedProfitUsdcWei6: '800000', realizedLossUsdcWei6: '500000', wonCount: 1, lostCount: 1, pushCount: 0, wonUnclaimedCount: 0, alreadyClaimedCount: 0, unsettledCount: 0,
+          byMarket: {
+            moneyline: { netUsdcWei6: '800000', claimedProfitUsdcWei6: '800000', realizedLossUsdcWei6: '0', wonCount: 1, lostCount: 0, pushCount: 0, wonUnclaimedCount: 0, alreadyClaimedCount: 0, unsettledCount: 0 },
+            spread: { netUsdcWei6: '-500000', claimedProfitUsdcWei6: '0', realizedLossUsdcWei6: '500000', wonCount: 0, lostCount: 1, pushCount: 0, wonUnclaimedCount: 0, alreadyClaimedCount: 0, unsettledCount: 0 },
+            total: { netUsdcWei6: '0', claimedProfitUsdcWei6: '0', realizedLossUsdcWei6: '0', wonCount: 0, lostCount: 0, pushCount: 0, wonUnclaimedCount: 0, alreadyClaimedCount: 0, unsettledCount: 0 }, // inactive → omitted
+          },
+        },
+        totalFeeUsdcWei6: '0',
+      },
+    }), logDir, sink);
+    const out = text();
+    expect(out).toContain('by market: moneyline 0.600000/1.000000 (60.0%)  spread 0.300000/0.500000 (60.0%)');
+    expect(out).toContain('by market: moneyline +0.800000 (1w/0l/0p)  spread -0.500000 (0w/1l/0p)');
+  });
+
+  it('does NOT show per-market lines on a single-market (moneyline-only) run — the breakdown is suppressed below 2 active markets', () => {
+    const { sink, text } = collect();
+    renderSummaryReportText(fakeSummary({
+      liveMetrics: {
+        fills: {
+          quotedUsdcWei6: '1000000', filledUsdcWei6: '600000', fillRate: 0.6,
+          byMarket: {
+            moneyline: { quotedUsdcWei6: '1000000', filledUsdcWei6: '600000', fillRate: 0.6 },
+            spread: { quotedUsdcWei6: '0', filledUsdcWei6: '0', fillRate: null },
+            total: { quotedUsdcWei6: '0', filledUsdcWei6: '0', fillRate: null },
+          },
+        },
+        gas: { totalPolWei: '0', byKind: { approval: '0', onchainCancel: '0', settle: '0', claim: '0' }, totalUsdcEquivWei6: null },
+        settlements: { settleCount: 1, claimCount: 1, totalClaimedPayoutWei6: '1800000' },
+        realizedPnl: {
+          netUsdcWei6: '800000', claimedProfitUsdcWei6: '800000', realizedLossUsdcWei6: '0', wonCount: 1, lostCount: 0, pushCount: 0, wonUnclaimedCount: 0, alreadyClaimedCount: 0, unsettledCount: 0,
+          byMarket: {
+            moneyline: { netUsdcWei6: '800000', claimedProfitUsdcWei6: '800000', realizedLossUsdcWei6: '0', wonCount: 1, lostCount: 0, pushCount: 0, wonUnclaimedCount: 0, alreadyClaimedCount: 0, unsettledCount: 0 },
+            spread: { netUsdcWei6: '0', claimedProfitUsdcWei6: '0', realizedLossUsdcWei6: '0', wonCount: 0, lostCount: 0, pushCount: 0, wonUnclaimedCount: 0, alreadyClaimedCount: 0, unsettledCount: 0 },
+            total: { netUsdcWei6: '0', claimedProfitUsdcWei6: '0', realizedLossUsdcWei6: '0', wonCount: 0, lostCount: 0, pushCount: 0, wonUnclaimedCount: 0, alreadyClaimedCount: 0, unsettledCount: 0 },
+          },
+        },
+        totalFeeUsdcWei6: '0',
+      },
+    }), logDir, sink);
+    expect(text()).not.toContain('by market:');
+  });
+
   it('text render shows the Fills line on fill-only activity (a --since window that catches a fill but misses its submit — Hermes review-PR32 blocker #1)', () => {
     const { sink, text } = collect();
     renderSummaryReportText(fakeSummary({
       liveMetrics: {
-        fills: { quotedUsdcWei6: '0', filledUsdcWei6: '100000', fillRate: null },
+        fills: { quotedUsdcWei6: '0', filledUsdcWei6: '100000', fillRate: null, byMarket: zeroFillsByMarket() },
         gas: { totalPolWei: '0', byKind: { approval: '0', onchainCancel: '0', settle: '0', claim: '0' }, totalUsdcEquivWei6: null },
         settlements: { settleCount: 0, claimCount: 0, totalClaimedPayoutWei6: '0' },
-        realizedPnl: { netUsdcWei6: '0', claimedProfitUsdcWei6: '0', realizedLossUsdcWei6: '0', wonCount: 0, lostCount: 0, pushCount: 0, wonUnclaimedCount: 0, alreadyClaimedCount: 0, unsettledCount: 0 },
+        realizedPnl: { netUsdcWei6: '0', claimedProfitUsdcWei6: '0', realizedLossUsdcWei6: '0', wonCount: 0, lostCount: 0, pushCount: 0, wonUnclaimedCount: 0, alreadyClaimedCount: 0, unsettledCount: 0, byMarket: zeroPnlByMarket() },
         totalFeeUsdcWei6: '0',
       },
     }), logDir, sink);

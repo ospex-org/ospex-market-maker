@@ -254,6 +254,8 @@ describe('reduceOwnerFill — maker side (ourAddress matches fill.maker)', () =>
       expect(fillDesc.payload.sport).toBe('baseball_mlb');
       expect(fillDesc.payload.awayTeam).toBe('NYM');
       expect(fillDesc.payload.homeTeam).toBe('LAD');
+      // moneyline commitment → the `market` tag is OMITTED (byte-identical NDJSON)
+      expect('market' in fillDesc.payload).toBe(false);
     }
 
     // position created with the commitment's denormalized identity
@@ -275,11 +277,14 @@ describe('reduceOwnerFill — maker side (ourAddress matches fill.maker)', () =>
     expect(dedup.size).toBe(1);
   });
 
-  it('the created position inherits marketType / lineTicks from the sibling commitment', () => {
+  it('the created position inherits marketType / lineTicks from the sibling commitment, and the emit-fill carries the `market` tag (the only live fill source the summary buckets by)', () => {
     const state = emptyMakerState();
     state.commitments['0xabc'] = mapOwnerCommitmentToMaker(ownerCommitment({ marketType: 'spread', lineTicks: -15 }));
-    reduceOwnerFill(state, fill(), new Set<string>(), OUR_ADDR, 1);
+    const descriptors = reduceOwnerFill(state, fill(), new Set<string>(), OUR_ADDR, 1);
     expect(state.positions['spec-1:away']).toMatchObject({ marketType: 'spread', lineTicks: -15 });
+    const fillDesc = descriptors.find((d) => d.kind === 'emit-fill');
+    expect(fillDesc?.kind).toBe('emit-fill');
+    if (fillDesc?.kind === 'emit-fill') expect(fillDesc.payload.market).toBe('spread');
   });
 
   it('dedup: same (txHash, logIndex) twice → second is a no-op', () => {

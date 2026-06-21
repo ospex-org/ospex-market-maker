@@ -4081,6 +4081,11 @@ describe('Runner — live execution', () => {
     expect(() => makeRunner({ config: cfg({ mode: { dryRun: false } }) })).toThrow(/live mode .* requires a signed adapter/);
   });
 
+  it('refuses to boot when marketSelection.seedSpeculations is enabled — seeding is not yet implemented (the flag is staged ahead of its behavior)', () => {
+    StateStore.at(stateDir).flush(emptyMakerState());
+    expect(() => makeRunner({ config: cfg({ marketSelection: { seedSpeculations: true } }) })).toThrow(/seeding is not yet implemented/);
+  });
+
   it('posts both sides via submitCommitment, records the real hashes, emits `submit` (not `would-submit`) — the protocol tuple flows through `toProtocolQuote`', async () => {
     StateStore.at(stateDir).flush(emptyMakerState());
     const config = cfg({ mode: { dryRun: false } });

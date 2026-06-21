@@ -108,6 +108,7 @@ export const CANDIDATE_SKIP_REASONS = [
   'gas-budget-blocks-reapproval',
   'gas-budget-blocks-settlement', // on-chain settleSpeculation / claimPosition denied by canSpendGas (mayUseReserve = settlement.continueOnGasBudgetExhausted); `purpose` distinguishes `settleSpeculation` vs `claimPosition`
   'gas-budget-blocks-onchain-cancel', // on-chain cancelCommitment denied by canSpendGas. Two emit shapes: the automatic, reserve-preserving cancels (mayUseReserve: false, carry `contestId` — all via `onchainCancelCommitment`: the routine `cancelMode: onchain` partial-remainder / recovered-soft-cancel, the funding-guard `underfundedCancelMode: onchain` sweep, and the §5.1 own-state-health active cancel-sweep) vs the operator-explicit shutdown kill / cancel-stale --authoritative paths (mayUseReserve: true, no `contestId`); the candidate's `commitmentHash` identifies the record that couldn't be cancelled
+  'fee-budget-exhausted', //           a SEED market reached the per-market reconcile post gate but `canSpendFee` refused — the daily creation-fee budget (`risk.maxDailyFeeUSDC`) is exhausted or disabled (the default `0`). Distinct from `would-create-lazy-speculation` (the seed-posting-disabled refusal): this fires ONLY once seed POSTING is enabled and the budget denies the post. Carries `contestId` + the `market` tag (spread/total; omitted for moneyline). Emitted by the seed-posting slice; unreachable in the current build (the `would-create-lazy-speculation` gate refuses a seed first).
   'partial-remainder-retained', //     a `partiallyFilled` remainder left in place (never off-chain-cancelled, never reposted over): it occupies its maker side until expiry / authoritative on-chain cancel. Carries `commitmentHash` / `contestId` / `speculationId` / `makerSide` / `takerSide` and a `reason` (`side-not-quoted` / `stale` / `mispriced` / `duplicate` / `shutdown`)
   'already-settled', //                ensureSpeculationSettled found the speculation already settled (pre-flight) or recovered from a concurrent settle — a boring skip, not an error. Emitted by the auto-settle path with `purpose: 'settleSpeculation'`; `outcome` distinguishes `alreadySettled` vs `recovered`. A `recovered` race that broadcast a settle which reverted on inclusion DID spend gas: `revertedTxHash` + `gasPolWei` are present and that gas IS billed (state daily counter + the run summary under `settle`); if the reverted receipt couldn't be fetched, `gasAccountingGap: true` flags the gap. `alreadySettled` / pre-send recovery send no tx → no gas, no faked txHash.
   'already-claimed', //                ensurePositionClaimed found the position already claimed (pre-flight) or recovered from a benign already-claimed race — a boring skip, not an error, and NOT a `claim` event (no event-sourced payout; the contract zeroes economic fields post-claim, so we never fake/derive one). Emitted by the auto-claim path with `purpose: 'claimPosition'`; `outcome` distinguishes `alreadyClaimed` vs `recovered`. Gas accounting mirrors `already-settled`: a `recovered` race that broadcast a claim which reverted on inclusion DID spend gas — `revertedTxHash` + `gasPolWei` are present and that gas IS billed (state daily counter + the run summary under `claim`); `gasAccountingGap: true` flags a reverted receipt that couldn't be fetched. `alreadyClaimed` / pre-send recovery send no tx → no gas. The run summary classifies these positions `alreadyClaimed` (NOT `wonUnclaimed`) and folds no payout into realized P&L.
@@ -713,10 +714,10 @@ export interface LiveMetrics {
    */
   realizedPnl: RealizedPnl;
   /**
-   * Total protocol fees paid by the maker (USDC wei6 decimal string).
-   * Genuinely `"0"` in v0 — v0 refuses lazy-creation commitments so there's
-   * no `TreasuryModule` creation fee. Kept here for forward-compat: a future
-   * event may emit a `feeUsdcWei6` field that gets summed here.
+   * Total protocol creation fees paid by the maker (USDC wei6 decimal string) —
+   * the sum of every `fill` event's `feeUsdcWei6` (the maker's share of a seed
+   * speculation's lazy-creation fee, charged once at its first match). `"0"` until
+   * the seed-posting slice makes a fill carry a fee; a current log carries none.
    */
   totalFeeUsdcWei6: string;
 }
@@ -868,11 +869,11 @@ export function summarize(logPaths: readonly string[], opts: { sinceIso?: string
   let settleCount = 0;
   let claimCount = 0;
   let totalClaimedPayoutWei6 = 0n;
-  // `totalFeeUsdcWei6` is genuinely zero in v0 (no maker-side USDC fees — no
-  // lazy-creation path) but the aggregator is kept so a future fee-bearing
-  // event can sum into it without a walker change. `const` because no `let`
-  // path mutates it yet.
-  const totalFeeUsdcWei6 = 0n;
+  // `totalFeeUsdcWei6` sums the maker's protocol creation-fee share across `fill`
+  // events that carry a `feeUsdcWei6` (the fee-incurring first match of a seed
+  // speculation). Stays `0` until the seed-posting slice makes a fill carry a fee —
+  // no fill does today, so a current log sums nothing (byte-identical output).
+  let totalFeeUsdcWei6 = 0n;
   const gasByKind: LiveGasByKind = { approval: '0', onchainCancel: '0', settle: '0', claim: '0' };
   const addGas = (kind: keyof LiveGasByKind, gasPolWei: bigint): void => {
     gasByKind[kind] = (BigInt(gasByKind[kind]) + gasPolWei).toString();
@@ -1070,6 +1071,10 @@ export function summarize(logPaths: readonly string[], opts: { sinceIso?: string
         break;
       }
       case 'fill': {
+        // Sum the maker's creation-fee share if this fill carried one (the seed first-match
+        // lazy creation). Read independently of the stake delta — a zero-delta fill breaks out
+        // below, but a fee always rides a real (delta>0) first match, so order is immaterial.
+        if (isWei6String(p.feeUsdcWei6)) totalFeeUsdcWei6 += BigInt(p.feeUsdcWei6);
         if (isWei6String(p.newFillWei6)) {
           const delta = BigInt(p.newFillWei6);
           if (delta === 0n) break; // a zero-delta fill is a no-op for the metrics (mirrors poll.ts's >0n guards) — never creates a phantom 0-stake position, keeps fills.byMarket / realizedPnl.byMarket symmetric

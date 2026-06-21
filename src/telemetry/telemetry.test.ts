@@ -394,7 +394,7 @@ describe('vocabulary', () => {
     }
   });
   it('CANDIDATE_SKIP_REASONS covers the DESIGN §11 skip reasons', () => {
-    for (const r of ['no-reference-odds', 'no-open-speculation', 'reference-line-mismatch', 'would-create-lazy-speculation', 'cap-hit', 'gas-budget-blocks-reapproval'] as const) {
+    for (const r of ['no-reference-odds', 'no-open-speculation', 'reference-line-mismatch', 'would-create-lazy-speculation', 'fee-budget-exhausted', 'cap-hit', 'gas-budget-blocks-reapproval'] as const) {
       expect(CANDIDATE_SKIP_REASONS).toContain(r);
     }
   });
@@ -609,6 +609,25 @@ describe('summarize', () => {
       expect(s.liveMetrics.fills.quotedUsdcWei6).toBe('0');
       expect(s.liveMetrics.fills.filledUsdcWei6).toBe('100000');
       expect(s.liveMetrics.fills.fillRate).toBeNull();
+    });
+
+    it('sums a fill\'s `feeUsdcWei6` (the seed lazy-creation fee) into totalFeeUsdcWei6; only the fee-carrying fill contributes', () => {
+      const path = writeLog('run-fee.ndjson', [
+        // a seed FIRST-MATCH fill carrying the maker's 0.25 USDC creation-fee share
+        { kind: 'fill', source: 'own-state-stream', commitmentHash: '0xseed', speculationId: '4217', contestId: 'C1', makerSide: 'home', newFillWei6: '500000', feeUsdcWei6: '250000', market: 'total' },
+        // a LATER fill on the now-created speculation — no fee
+        { kind: 'fill', source: 'own-state-stream', commitmentHash: '0xseed', speculationId: '4217', contestId: 'C1', makerSide: 'home', newFillWei6: '300000', market: 'total' },
+        // a moneyline fill — no fee field at all
+        { kind: 'fill', source: 'commitment-diff', commitmentHash: '0xml', speculationId: 'spec-ML', contestId: 'C2', makerSide: 'away', newFillWei6: '100000' },
+      ]);
+      expect(summarize([path]).liveMetrics.totalFeeUsdcWei6).toBe('250000');
+    });
+
+    it('totalFeeUsdcWei6 stays 0 when no fill carries a fee (the current build — byte-identical)', () => {
+      const path = writeLog('run-nofee.ndjson', [
+        { kind: 'fill', source: 'commitment-diff', commitmentHash: '0xa', speculationId: 'spec-A', contestId: 'A', makerSide: 'home', newFillWei6: '200000', filledRiskWei6: '200000', partial: false },
+      ]);
+      expect(summarize([path]).liveMetrics.totalFeeUsdcWei6).toBe('0');
     });
 
     it('breaks fills + realized P&L down by market via the `market` tag (the aggregate equals the sum across markets; absent tag ⇒ moneyline)', () => {

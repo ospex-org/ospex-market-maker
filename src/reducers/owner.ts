@@ -50,6 +50,7 @@ import {
 
 import type { ReducerDescriptor } from './descriptors.js';
 import { marketTag } from '../telemetry/index.js';
+import { seedSpeculationId } from '../orders/seed.js';
 
 /** Transport-level status delivered by the SDK's `onStatus` handler. */
 export type OwnStateTransportStatus = 'connected' | 'reconnecting' | 'degraded' | 'resync';
@@ -289,6 +290,26 @@ export function reduceOwnerFill(
   commitment.fills.push({ txHash: body.txHash, logIndex: body.logIndex, amountWei6: fillRisk.toString(), ts: now });
 
   const cumulativeRiskWei6 = state.positions[posKey]!.riskAmountWei6;
+
+  // Seed creation-fee attribution. If THIS commitment's speculation was seeded by
+  // us (a lazy creation we posted), the protocol charges the maker creation-fee
+  // share at the FIRST match. Reconstruct the durable seed key from the
+  // commitment's stable `(contestId, marketType, lineTicks)` — NOT `body.speculationId`
+  // (the real, post-match id) nor the commitment's `speculationId` (which the
+  // own-state observation may already have migrated placeholder → real) — and
+  // attribute the fee exactly once: the `charged` flip below plus the fill-dedup
+  // gate above both guard a re-delivery from double-counting. A fill whose key is
+  // absent (every existing-speculation match, all moneyline) is untouched —
+  // `seedFeeBySpecKey` is empty unless the seed-posting path wrote it, so this is
+  // byte-identical when seeding is off.
+  let feeUsdcWei6: string | undefined;
+  const seedFeeKey = seedSpeculationId(commitment.contestId, commitment.marketType, commitment.lineTicks);
+  const seedFee = state.seedFeeBySpecKey[seedFeeKey];
+  if (seedFee !== undefined && !seedFee.charged) {
+    seedFee.charged = true;
+    feeUsdcWei6 = seedFee.feeUsdcWei6;
+  }
+
   return [
     { kind: 'mark-dirty', contestId: commitment.contestId },
     {
@@ -308,6 +329,7 @@ export function reduceOwnerFill(
         newFillWei6: fillRisk.toString(),
         cumulativeRiskWei6,
         ...marketTag(commitment.marketType),
+        ...(feeUsdcWei6 !== undefined ? { feeUsdcWei6 } : {}),
       },
     },
   ];

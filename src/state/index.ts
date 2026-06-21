@@ -411,8 +411,32 @@ export interface PnlSnapshot {
 export interface DailyCounters {
   /** POL gas spent that day, in 18-decimal wei (decimal string). */
   gasPolWei: string;
-  /** Protocol fees paid that day, in USDC wei6 (decimal string). Genuinely `"0"` in v0 — no lazy creation (DESIGN §6). */
+  /**
+   * Protocol creation fees paid that day, in USDC wei6 (decimal string).
+   * `recordFeeSpentToday` accumulates the maker creation-fee share at a seed
+   * speculation's fee-incurring first fill (DESIGN §6). Stays `"0"` until the
+   * seed-posting path writes a seed, so it is genuinely `"0"` for a moneyline-only
+   * operator (and while seeding is off).
+   */
   feeUsdcWei6: string;
+}
+
+/**
+ * A pending/charged protocol creation fee for ONE seed speculation, keyed under
+ * {@link MakerState.seedFeeBySpecKey} by the seed placeholder
+ * `seed:${contestId}:${marketType}:${lineTicks}` (see `seedSpeculationId`).
+ *
+ * Written when the MM posts a seed whose submit preview reports a lazy creation —
+ * the protocol charges the maker creation-fee share on-chain at the seed's FIRST
+ * match, not at post. `feeUsdcWei6` is the maker's share (USDC wei6 decimal
+ * string) taken from that preview — the authoritative runtime amount, not a
+ * hardcoded constant. `charged` flips to `true` when the fee-incurring first fill
+ * is observed (own-state), so the fee is attributed exactly ONCE per speculation,
+ * regardless of which side fills first or a re-delivered fill.
+ */
+export interface SeedFeeEntry {
+  feeUsdcWei6: string;
+  charged: boolean;
 }
 
 export const MAKER_STATE_VERSION = 1;
@@ -429,6 +453,14 @@ export interface MakerState {
   pnl: PnlSnapshot;
   /** Daily POL-gas / fee counters, keyed by `YYYY-MM-DD` (UTC). */
   dailyCounters: Record<string, DailyCounters>;
+  /**
+   * Pending/charged creation fees for the MM's own SEED speculations, keyed by the
+   * seed placeholder `seed:${contestId}:${marketType}:${lineTicks}` (see
+   * `seedSpeculationId`). Written ONLY by the seed-posting path — empty when seeding
+   * is off (→ byte-identical, no fee ever attributed). Read at a fill to attribute
+   * the maker creation-fee share exactly once per speculation. See {@link SeedFeeEntry}.
+   */
+  seedFeeBySpecKey: Record<string, SeedFeeEntry>;
   /** ISO-8601 — when this state was last flushed. `null` for a never-flushed (fresh) state. */
   lastFlushedAt: string | null;
 }
@@ -441,6 +473,7 @@ export function emptyMakerState(): MakerState {
     positions: {},
     pnl: { realizedUsdcWei6: '0', unrealizedUsdcWei6: '0', asOfUnixSec: 0 },
     dailyCounters: {},
+    seedFeeBySpecKey: {},
     lastFlushedAt: null,
   };
 }
@@ -647,6 +680,24 @@ function validateMakerState(parsed: unknown): Validated {
     dailyCounters[key] = { gasPolWei: value.gasPolWei, feeUsdcWei6: value.feeUsdcWei6 };
   }
 
+  // `seedFeeBySpecKey` is additive (the seed-posting slice). A legacy state file
+  // predating it has no such key → migrate to `{}` (no seeds tracked is the
+  // conservative default — it can only under-attribute a fee, never invent one). A
+  // present value must be a plain object whose entries are
+  // `{ feeUsdcWei6: <decimal string>, charged: boolean }`; fail closed on a
+  // malformed entry — it is a money-tracking field, and a corrupt shape could
+  // mis-attribute or silently skip a creation fee.
+  const seedFeeBySpecKey: Record<string, SeedFeeEntry> = {};
+  if (parsed.seedFeeBySpecKey !== undefined) {
+    if (!isPlainObject(parsed.seedFeeBySpecKey)) return fail('`seedFeeBySpecKey` is not an object');
+    for (const [key, value] of Object.entries(parsed.seedFeeBySpecKey)) {
+      if (!isPlainObject(value) || !isDecimalString(value.feeUsdcWei6) || typeof value.charged !== 'boolean') {
+        return fail(`seedFeeBySpecKey["${key}"] is malformed`);
+      }
+      seedFeeBySpecKey[key] = { feeUsdcWei6: value.feeUsdcWei6, charged: value.charged };
+    }
+  }
+
   const pnl = parsed.pnl;
   if (!isSignedDecimalString(pnl.realizedUsdcWei6) || !isSignedDecimalString(pnl.unrealizedUsdcWei6) || !isNonNegInt(pnl.asOfUnixSec)) {
     return fail('`pnl` is malformed');
@@ -665,6 +716,7 @@ function validateMakerState(parsed: unknown): Validated {
       positions,
       pnl: { realizedUsdcWei6: pnl.realizedUsdcWei6, unrealizedUsdcWei6: pnl.unrealizedUsdcWei6, asOfUnixSec: pnl.asOfUnixSec },
       dailyCounters,
+      seedFeeBySpecKey,
       lastFlushedAt: typeof parsed.lastFlushedAt === 'string' ? parsed.lastFlushedAt : null,
     },
   };

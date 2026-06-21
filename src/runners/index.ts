@@ -3263,7 +3263,22 @@ export class Runner {
     for (const d of descriptors) {
       switch (d.kind) {
         case 'emit-fill':
-          if (!audit) this.eventLog.emit('fill', d.payload as unknown as Record<string, unknown>);
+          if (!audit) {
+            // A seed's fee-incurring first fill carries the maker creation-fee share
+            // (set by the reducer from `seedFeeBySpecKey`); fold it into today's
+            // counter BEFORE emitting — the codebase's record-before-emit convention
+            // (see the gas sites, e.g. recordGasSpentToday before the onchain-cancel
+            // emit). The reducer has already flipped the marker's `charged`, so a
+            // throwing `emit` (a swallowed telemetry I/O failure) must not be able to
+            // strand that flip with no counter update — that would permanently
+            // under-count the daily fee and could let `canSpendFee` permit spend above
+            // the cap. Absent on every existing-speculation match → no-op (the audit
+            // poll never reaches this branch, so there is no double-count on replay).
+            if (d.payload.feeUsdcWei6 !== undefined) {
+              this.recordFeeSpentToday(todayUTCDateString(this.deps.now()), BigInt(d.payload.feeUsdcWei6));
+            }
+            this.eventLog.emit('fill', d.payload as unknown as Record<string, unknown>);
+          }
           break;
         case 'emit-expire':
           // The audit poll is NOT authoritative for expiry — `ageOut()` emits the
@@ -4865,6 +4880,16 @@ export class Runner {
     this.state.dailyCounters[today] = {
       gasPolWei: (prior + gasPolWei).toString(),
       feeUsdcWei6: existing !== undefined ? existing.feeUsdcWei6 : '0',
+    };
+  }
+
+  /** Add `feeUsdcWei6` (a maker creation-fee share) to today's `state.dailyCounters` counter (additive; preserves `gasPolWei`; lazy-creates the entry). Called at a seed speculation's fee-incurring first fill — mirrors {@link recordGasSpentToday}. */
+  private recordFeeSpentToday(today: string, feeUsdcWei6: bigint): void {
+    const existing = this.state.dailyCounters[today];
+    const prior = existing !== undefined ? BigInt(existing.feeUsdcWei6) : 0n;
+    this.state.dailyCounters[today] = {
+      gasPolWei: existing !== undefined ? existing.gasPolWei : '0',
+      feeUsdcWei6: (prior + feeUsdcWei6).toString(),
     };
   }
 

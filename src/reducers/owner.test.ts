@@ -185,19 +185,24 @@ describe('reduceOwnerCommitmentObservation', () => {
 
   it('throws OwnerMappingError on missing metadata (the runner drain catch handles it; reducers do NOT catch)', () => {
     const state = emptyMakerState();
-    // empty sport is genuinely missing metadata (a null speculationId is NOT — that is a seed,
-    // covered below). The reducer lets the mapper throw; the runner drain catches + skips.
+    // empty sport is genuinely missing metadata. The reducer lets the mapper throw; the
+    // runner drain catches + skips.
     expect(() => reduceOwnerCommitmentObservation(state, ownerCommitment({ sport: '' }))).toThrow();
+    // With seeding OFF (the default 3rd arg) a null speculationId ALSO fails closed — a
+    // matched commitment can only carry a null id transiently (indexer-lag join), which
+    // must wait, not be mis-keyed to a seed placeholder.
+    expect(() => reduceOwnerCommitmentObservation(state, ownerCommitment({ speculationId: null }))).toThrow();
     // state untouched on a throw
     expect(state.commitments).toEqual({});
   });
 
-  it('a null-speculationId SEED is written under its placeholder key (no throw, no cursor freeze)', () => {
+  it('a null-speculationId SEED (seeding ON) is written under its placeholder key (no throw, no cursor freeze)', () => {
     const state = emptyMakerState();
     // A seed total commitment posted before its speculation exists arrives with speculationId:null.
     const descriptors = reduceOwnerCommitmentObservation(
       state,
       ownerCommitment({ commitmentHash: '0xseed', speculationId: null, marketType: 'total', lineTicks: 85 }),
+      true, // seedSpeculations
     );
     expect(descriptors).toEqual([{ kind: 'mark-dirty', contestId: '1' }]);
     const rec = state.commitments['0xseed'];
@@ -209,10 +214,11 @@ describe('reduceOwnerCommitmentObservation', () => {
 
   it('seed → real-spec migration: a later delta carrying the real id replaces the placeholder record', () => {
     const state = emptyMakerState();
-    // 1) pre-match: the seed lands under the placeholder.
+    // 1) pre-match: the seed lands under the placeholder (seeding on).
     reduceOwnerCommitmentObservation(
       state,
       ownerCommitment({ commitmentHash: '0xseed', speculationId: null, marketType: 'total', lineTicks: 85 }),
+      true,
     );
     expect(state.commitments['0xseed']?.speculationId).toBe('seed:1:total:85');
     // 2) post-match: own-state re-delivers the SAME commitmentHash now carrying the real
@@ -220,6 +226,7 @@ describe('reduceOwnerCommitmentObservation', () => {
     reduceOwnerCommitmentObservation(
       state,
       ownerCommitment({ commitmentHash: '0xseed', speculationId: '4217', marketType: 'total', lineTicks: 85, filledRiskAmount: '100000' }),
+      true,
     );
     const rec = state.commitments['0xseed'];
     expect(rec?.speculationId).toBe('4217'); // real id adopted — no lingering placeholder

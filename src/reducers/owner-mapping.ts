@@ -21,13 +21,19 @@
  *   carrying the offending `field` and the record's identifier (`commitmentHash`
  *   / `speculationId`) — never a partial or coerced record. The PR3b call site
  *   catches it, emits `owner-mapping-failed`, and skips the row.
- * - **Seed tolerance (NOT a fail-closed case).** A commitment with a null
- *   `speculationId` is a SEED — posted at a market's oracle line before any
- *   speculation exists there — not corrupt data. It maps to the stable
- *   placeholder {@link seedSpeculationId} (reconstructed from the body's reliable
- *   `contestId` / `marketType` / `lineTicks`) rather than throwing, so a
- *   pre-match seed never freezes the own-state cursor; the real id is adopted by
- *   the wholesale-replace once the speculation is created on first match.
+ * - **Seed tolerance — gated on `seedSpeculations`.** When the caller passes
+ *   `seedSpeculations: true`, a commitment with a null `speculationId` is treated
+ *   as a SEED — one posted at a market's oracle line before any speculation
+ *   exists there — and maps to the stable placeholder {@link seedSpeculationId}
+ *   (reconstructed from the body's reliable `contestId` / `marketType` /
+ *   `lineTicks`) rather than throwing, so a pre-match seed never freezes the
+ *   own-state cursor; the real id is adopted by the wholesale-replace once the
+ *   speculation is created on first match. With seeding OFF (the default) a null
+ *   `speculationId` stays a fail-closed case — a real commitment can only reach
+ *   own-state with a null id via a transient indexer-lag join (the speculations
+ *   row briefly absent), which must WAIT (skip + cold-restart), not be mis-keyed
+ *   to a placeholder. So the mapper is byte-identical to the pre-seed behavior
+ *   whenever seeding is off.
  * - **Wei6 only.** Canonical records carry authoritative `*Wei6` decimal
  *   strings; the SDK's float `riskAmountUSDC` / `profitAmountUSDC` fields are
  *   ignored (they exist for other consumers' backwards-compat).
@@ -145,19 +151,32 @@ function sideFromPositionType(positionType: 0 | 1): MakerSide {
  * denormalized identity (`sport` / `awayTeam` / `homeTeam`), and on an
  * unparseable `createdAt` / `expiry`.
  *
- * **`speculationId` is the exception** — a null one is a SEED (a commitment
- * posted before its speculation exists), not missing metadata, so it maps to the
- * {@link seedSpeculationId} placeholder rather than throwing (see the module
- * docstring). `contestId` is therefore validated FIRST, since the placeholder is
- * reconstructed from it.
+ * **`speculationId` is the exception, gated on `seedSpeculations`** — with
+ * seeding ON, a null one is a SEED (a commitment posted before its speculation
+ * exists), not missing metadata, so it maps to the {@link seedSpeculationId}
+ * placeholder rather than throwing (see the module docstring); with seeding OFF
+ * (the default) a null one fails closed exactly as before. The fail-closed check
+ * stays first (preserving the seeding-off error precedence); `contestId` is
+ * validated before the placeholder is reconstructed from it.
  *
  * `fills` is always `[]` — the mapper does NOT enumerate fills; those are
  * appended by the `onFill` reducer as `Match` events arrive (own-state plan
  * §6.3). `signedPayloadStatus` follows the SDK's `signedPayload` presence.
  */
-export function mapOwnerCommitmentToMaker(c: OwnerCommitment): MakerCommitmentRecord {
+export function mapOwnerCommitmentToMaker(
+  c: OwnerCommitment,
+  seedSpeculations = false,
+): MakerCommitmentRecord {
   const hash = c.commitmentHash;
-  // contestId is validated FIRST: it is required to reconstruct a seed's placeholder
+  if (!c.speculationId && !seedSpeculations) {
+    // Seeding OFF (the default): a null/empty speculationId is missing metadata, NOT a
+    // seed — a real commitment can only reach own-state with a null id via a transient
+    // indexer-lag join (the speculations row briefly absent), which must wait + cold-restart
+    // rather than be mis-keyed to a placeholder. Fail closed exactly as the pre-seed mapper
+    // did (this check stays first so the seeding-off error precedence is byte-identical).
+    throw new OwnerMappingError(`commitment ${hash}: missing speculationId`, { field: 'speculationId', commitmentHash: hash });
+  }
+  // contestId is validated next: it is required to reconstruct a seed's placeholder
   // speculationId below (and the record needs it regardless of the seed/non-seed path).
   if (c.contestId === null) {
     throw new OwnerMappingError(`commitment ${hash}: null contestId`, { field: 'contestId', commitmentHash: hash });
@@ -167,10 +186,10 @@ export function mapOwnerCommitmentToMaker(c: OwnerCommitment): MakerCommitmentRe
   // (the only live market core-api leaves unclassified), a null lineTicks → 0 (no line).
   const marketType: MarketType = c.marketType ?? 'moneyline';
   const lineTicks = c.lineTicks ?? 0;
-  // A matched commitment carries its real on-chain speculationId. A SEED commitment —
-  // posted at a market's oracle line before any speculation exists there — arrives with
-  // speculationId null (core-api has no speculation row to join yet; see enrich.ts). It
-  // maps to the SAME stable placeholder the discovery branch minted,
+  // A matched commitment carries its real on-chain speculationId. With seeding ON, a SEED
+  // commitment — posted at a market's oracle line before any speculation exists there —
+  // arrives with speculationId null (core-api has no speculation row to join yet; see
+  // enrich.ts), and maps to the SAME stable placeholder the discovery branch minted,
   // `seed:contestId:marketType:lineTicks`, so its exposure groups with the tracked seed
   // market; the real id is adopted by the wholesale-replace once the speculation is
   // created (post-match). The body carries reliable contestId / marketType / lineTicks

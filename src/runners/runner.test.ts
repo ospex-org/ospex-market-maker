@@ -1574,17 +1574,19 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
     await runPromise;
   });
 
-  it('a null-speculationId SEED commitment delta drains into canonical state under its placeholder (no owner-mapping-failed, no cursor freeze)', async () => {
-    const { runner, recorder, runPromise, sleepCalls, resolvers, triggerKill } = await makePausedSubscribedRunner();
+  it('a null-speculationId SEED commitment delta (seeding ON) drains into canonical state under its placeholder (no owner-mapping-failed, no cursor freeze)', async () => {
+    const { runner, recorder, runPromise, sleepCalls, resolvers, triggerKill } = await makePausedSubscribedRunner({
+      config: cfg({ marketSelection: { seedSpeculations: true }, ownState: { recoveryHoldMs: 0 } }),
+    });
 
     // Baseline first — the drain gates on ready (PR3b drain ready-gate).
     recorder.fire('onSnapshot', { cursor: 'c1', commitments: [], positions: [], truncated: false, positionsTruncated: false });
     recorder.fire('onReady');
 
     // A seed total commitment, posted at the oracle line before its speculation exists,
-    // arrives with speculationId:null. Pre-PR-B the mapper threw OwnerMappingError → the
-    // drain emitted owner-mapping-failed and FROZE the cursor (the §5.1 posting blocker).
-    // It must now project to the discovery placeholder instead.
+    // arrives with speculationId:null. Without the seed tolerance the mapper throws
+    // OwnerMappingError → the drain emits owner-mapping-failed and FREEZES the cursor (the
+    // §5.1 posting blocker). With seeding on it must project to the discovery placeholder.
     recorder.fire('onCommitment', mappableOwnerCommitment('0xseed', {
       speculationId: null, marketType: 'total', lineTicks: 85,
     }));
@@ -1602,6 +1604,59 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
     // The blocker symptom must be ABSENT for this row: the mapper didn't throw, so the
     // drain emitted no mapping failure (which would have frozen own-state → halted posting).
     expect(readEvents().some((e) => e.kind === 'owner-mapping-failed' && e.commitmentHash === '0xseed')).toBe(false);
+
+    triggerKill();
+    await runPromise;
+  });
+
+  it('a null-speculationId commitment delta with seeding OFF (default) still FAILS CLOSED (owner-mapping-failed, row skipped)', async () => {
+    // The gate: with seeding off, a null speculationId is missing metadata (a transient
+    // indexer-lag join on a matched commitment), not a seed — it must not be silently
+    // mapped to a placeholder. This proves the seeding-off behavior is byte-identical.
+    const { runner, recorder, runPromise, sleepCalls, resolvers, triggerKill } = await makePausedSubscribedRunner();
+
+    recorder.fire('onSnapshot', { cursor: 'c1', commitments: [], positions: [], truncated: false, positionsTruncated: false });
+    recorder.fire('onReady');
+
+    recorder.fire('onCommitment', mappableOwnerCommitment('0xnullspec', {
+      speculationId: null, marketType: 'total', lineTicks: 85,
+    }));
+
+    await waitFor(() => sleepCalls.filter((ms) => ms === 500).length >= 1);
+    const idx = sleepCalls.findIndex((ms) => ms === 500);
+    const debounceResolve = resolvers[idx];
+    if (debounceResolve === undefined) throw new Error('expected debounce resolver');
+    debounceResolve();
+    await waitFor(() => readEvents().some((e) => e.kind === 'owner-mapping-failed' && e.commitmentHash === '0xnullspec'));
+
+    // Failed closed: the row is skipped (never written), and the mapping failure is surfaced.
+    expect(runner.stateForTest().commitments['0xnullspec']).toBeUndefined();
+    const fail = readEvents().find((e) => e.kind === 'owner-mapping-failed' && e.commitmentHash === '0xnullspec');
+    expect(fail).toMatchObject({ field: 'speculationId' });
+
+    triggerKill();
+    await runPromise;
+  });
+
+  it('a null-speculationId SEED in the SNAPSHOT baseline (seeding ON) lands in canonical state under its placeholder on onReady (no owner-mapping-failed)', async () => {
+    // The second mapper call site: handleOwnerSnapshot. Every subscription cold-starts
+    // cursor-less, so a pre-match seed lands in the snapshot baseline on a restart/reconnect.
+    const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner({
+      config: cfg({ marketSelection: { seedSpeculations: true }, ownState: { recoveryHoldMs: 0 } }),
+    });
+
+    recorder.fire('onSnapshot', {
+      cursor: 'c1',
+      commitments: [mappableOwnerCommitment('0xseedsnap', { speculationId: null, marketType: 'spread', lineTicks: -15 })],
+      positions: [],
+      truncated: false,
+      positionsTruncated: false,
+    });
+    recorder.fire('onReady');
+
+    await waitFor(() => runner.stateForTest().commitments['0xseedsnap'] !== undefined);
+    expect(runner.stateForTest().commitments['0xseedsnap']?.speculationId).toBe('seed:1:spread:-15');
+    expect(readEvents().some((e) => e.kind === 'owner-mapping-failed' && e.commitmentHash === '0xseedsnap')).toBe(false);
 
     triggerKill();
     await runPromise;

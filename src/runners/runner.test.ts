@@ -3082,6 +3082,45 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
       });
     });
 
+    // ── seed creation-fee accounting (recordFeeSpentToday wiring) ────────────────
+    //
+    // When a seed's fee-incurring first fill arrives, the reducer stamps the maker
+    // creation-fee share (from `seedFeeBySpecKey`) onto the emit-fill, and the runner
+    // folds it into today's `dailyCounters.feeUsdcWei6`. The seed-posting path (a
+    // later slice) writes the pending marker at POST; here we boot with it pre-seeded
+    // (the baseline swap preserves `seedFeeBySpecKey`).
+    describe('seed creation-fee accounting', () => {
+      it('a seed fill folds the maker creation-fee share into dailyCounters + flips charged', async () => {
+        const seedState = { ...emptyMakerState(), seedFeeBySpecKey: { 'seed:1:moneyline:0': { feeUsdcWei6: '250000', charged: false } } };
+        const { runner, recorder, runPromise, resolvers, triggerKill } = await makePausedSubscribedRunner({
+          config: cfg({ ownState: { recoveryHoldMs: 0, staleMaxMs: 300000 } }),
+          seedState,
+        });
+        // Baseline carrying the sibling commitment (contestId '1', moneyline, lineTicks 0
+        // → the seed key seed:1:moneyline:0 the reducer reconstructs).
+        recorder.fire('onFrame', { receivedAtMs: 0, kind: 'heartbeat' });
+        recorder.fire('onSnapshot', { commitments: [mappableOwnerCommitment('0xabc')], positions: [], truncated: false, positionsTruncated: false }, { cursor: 's1' });
+        recorder.fire('onReady', undefined, { cursor: 'r1' });
+        recorder.fire('onStatus', 'connected');
+        recorder.fire('onFill', mappableOwnerFill());
+        await waitFor(() => { resolvers.forEach((r) => r?.()); return readEvents().some((e) => e.kind === 'fill'); });
+
+        // The fill event carries the fee, and the runner folded it into today's counter
+        // (exactly one day entry; gas untouched).
+        const fillEvent = readEvents().find((e) => e.kind === 'fill');
+        expect(fillEvent).toMatchObject({ feeUsdcWei6: '250000' });
+        const counters = Object.values(runner.stateForTest().dailyCounters);
+        expect(counters).toHaveLength(1);
+        expect(counters[0]?.feeUsdcWei6).toBe('250000');
+        expect(counters[0]?.gasPolWei).toBe('0');
+        // charged flips → a later fill on the same speculation can't re-charge.
+        expect(runner.stateForTest().seedFeeBySpecKey['seed:1:moneyline:0']?.charged).toBe(true);
+
+        triggerKill();
+        await runPromise;
+      });
+    });
+
     // ── §7.2 unknown-own-fill (an SSE fill for a commitment not in canonical state) ──
 
     describe('§7.2 unknown-own-fill', () => {

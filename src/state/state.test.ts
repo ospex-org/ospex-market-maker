@@ -291,6 +291,43 @@ describe('StateStore.load', () => {
     if (status.kind === 'lost') expect(status.reason).toMatch(/present together/);
   });
 
+  it('seedFeeBySpecKey: a populated map round-trips, a pre-field state migrates to {}, a malformed entry is `lost`', () => {
+    const store = StateStore.at(dir);
+    // (1) a populated map round-trips losslessly.
+    store.flush(stateWith({ seedFeeBySpecKey: { 'seed:1:spread:-15': { feeUsdcWei6: '250000', charged: false }, 'seed:2:total:75': { feeUsdcWei6: '250000', charged: true } } }));
+    let loaded = store.load();
+    expect(loaded.status.kind).toBe('loaded');
+    expect(loaded.state.seedFeeBySpecKey['seed:1:spread:-15']).toEqual({ feeUsdcWei6: '250000', charged: false });
+    expect(loaded.state.seedFeeBySpecKey['seed:2:total:75']).toEqual({ feeUsdcWei6: '250000', charged: true });
+
+    // (2) migration: a state file predating the field (no `seedFeeBySpecKey` key) loads with
+    //     `{}` — no seeds tracked is the conservative default — and is NOT `lost`.
+    const legacy: Record<string, unknown> = { ...stateWith({}) };
+    delete legacy.seedFeeBySpecKey;
+    writeFileSync(join(dir, STATE_FILE), JSON.stringify(legacy), 'utf8');
+    loaded = store.load();
+    expect(loaded.status.kind).toBe('loaded');
+    expect(loaded.state.seedFeeBySpecKey).toEqual({});
+
+    // (3) a malformed amount fails closed (money-tracking field — never trust a corrupt shape).
+    writeFileSync(join(dir, STATE_FILE), JSON.stringify({ ...stateWith({}), seedFeeBySpecKey: { 'seed:1:spread:-15': { feeUsdcWei6: 'oops', charged: false } } }), 'utf8');
+    let status = store.load().status;
+    expect(status.kind).toBe('lost');
+    if (status.kind === 'lost') expect(status.reason).toMatch(/seedFeeBySpecKey/);
+
+    // (4) a non-boolean `charged` fails closed.
+    writeFileSync(join(dir, STATE_FILE), JSON.stringify({ ...stateWith({}), seedFeeBySpecKey: { 'seed:1:spread:-15': { feeUsdcWei6: '250000', charged: 'yes' } } }), 'utf8');
+    status = store.load().status;
+    expect(status.kind).toBe('lost');
+    if (status.kind === 'lost') expect(status.reason).toMatch(/seedFeeBySpecKey/);
+
+    // (5) a non-object `seedFeeBySpecKey` value fails closed.
+    writeFileSync(join(dir, STATE_FILE), JSON.stringify({ ...stateWith({}), seedFeeBySpecKey: 'nope' }), 'utf8');
+    status = store.load().status;
+    expect(status.kind).toBe('lost');
+    if (status.kind === 'lost') expect(status.reason).toMatch(/seedFeeBySpecKey/);
+  });
+
   // ── sensitive state hardening (own-state SSE plan §M6/B) ────────────────────
   //
   // The state blob now carries the maker's signed EIP-712 commitment payloads

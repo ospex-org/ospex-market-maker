@@ -183,8 +183,8 @@ export function buildDesiredQuote(
   // Spread cover sides are away/home like moneyline; total over/under map to the
   // away (Upper/over) and home (Lower/under) protocol sides — `priceTotal` is
   // relabelled back to away/home below so the planning chain stays two-outcome.
-  // The risk engine keys exposure by `(contestId, market.marketType, market.lineTicks)`,
-  // so headroom here reserves room for the contest's other markets too (DESIGN §6).
+  // The risk engine keys exposure by `market.speculationId` (the protocol's settlement
+  // unit), so headroom here reserves room for the contest's other markets too (DESIGN §6).
   const headroomUSDC = {
     away: headroomForSide(inventory, market, 'home', caps),
     home: headroomForSide(inventory, market, 'away', caps),
@@ -317,8 +317,8 @@ export function inventoryFromState(state: MakerState, nowUnixSec: number, graceS
       sport: record.sport,
       awayTeam: record.awayTeam,
       homeTeam: record.homeTeam,
+      speculationId: record.speculationId,
       marketType: record.marketType,
-      lineTicks: record.lineTicks,
       makerSide: record.makerSide,
       riskAmountUSDC: wei6ToUSDC(Number(remainingWei6)),
     });
@@ -334,8 +334,8 @@ export function inventoryFromState(state: MakerState, nowUnixSec: number, graceS
       sport: record.sport,
       awayTeam: record.awayTeam,
       homeTeam: record.homeTeam,
+      speculationId: record.speculationId,
       marketType: record.marketType,
-      lineTicks: record.lineTicks,
       makerSide: record.side,
       riskAmountUSDC: wei6ToUSDC(Number(riskWei6)),
     });

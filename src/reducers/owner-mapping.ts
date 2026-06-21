@@ -142,8 +142,11 @@ function sideFromPositionType(positionType: 0 | 1): MakerSide {
  */
 export function mapOwnerCommitmentToMaker(c: OwnerCommitment): MakerCommitmentRecord {
   const hash = c.commitmentHash;
-  if (c.speculationId === null) {
-    throw new OwnerMappingError(`commitment ${hash}: null speculationId`, { field: 'speculationId', commitmentHash: hash });
+  if (!c.speculationId) {
+    // null OR empty-string — speculationId is the risk engine's exposure group key,
+    // so reject a blank one at the boundary (matching the position mapper) rather than
+    // letting it reach the risk engine's fail-closed guard and abort a whole tick.
+    throw new OwnerMappingError(`commitment ${hash}: missing speculationId`, { field: 'speculationId', commitmentHash: hash });
   }
   if (c.contestId === null) {
     throw new OwnerMappingError(`commitment ${hash}: null contestId`, { field: 'contestId', commitmentHash: hash });
@@ -189,12 +192,14 @@ export function mapOwnerCommitmentToMaker(c: OwnerCommitment): MakerCommitmentRe
     // marketType / lineTicks from the owner-auth commitment body. A null lineTicks is the
     // moneyline norm (no line → 0). A null marketType means core-api could not classify the
     // market — today that can only be a moneyline commitment (the only live market), so the
-    // moneyline default is safe AND byte-identical. NOTE this is a fail-OPEN: once spread /
-    // total ship, a follow-up (the gate-flip prerequisite) must source marketType from the
-    // scorer / signed payload rather than defaulting to moneyline here, or a null-marketType
-    // spread / total body would be silently mis-grouped by the risk engine (and paired with its
-    // real lineTicks, an inconsistent moneyline-with-a-line record). Tracked for that slice.
-    // (The state validator, by contrast, fail-CLOSES on a present-but-unknown marketType.)
+    // moneyline default is safe AND byte-identical. The risk engine groups exposure by
+    // speculationId (which this body always carries), so this default does NOT affect grouping;
+    // its only consequence is the per-team cap exemption — a `total` body wrongly defaulted to
+    // moneyline would be (incorrectly) subjected to the per-team cap, which over-states team
+    // exposure (conservative, not an under-state). Still, once spread / total ship a follow-up
+    // (the gate-flip prerequisite) should source the real marketType from the scorer / signed
+    // payload rather than defaulting here. (The state validator, by contrast, fail-CLOSES on a
+    // present-but-unknown marketType.)
     marketType: c.marketType ?? 'moneyline',
     lineTicks: c.lineTicks ?? 0,
     makerSide: sideFromPositionType(c.positionType),
@@ -261,12 +266,13 @@ export function mapOwnerPositionToMaker(p: OwnerPosition): MakerPositionRecord {
     sport: p.sport,
     awayTeam: p.awayTeam,
     homeTeam: p.homeTeam,
-    // marketType from the position body's `market` (always present). lineTicks, by contrast,
-    // is NOT on the own-state position body (the core-api gap), so it is 0 here — correct for
-    // moneyline (the only live market; no line). A spread / total position reconstructed from
-    // a snapshot therefore lacks its line until a follow-up (the gate-flip prerequisite) sources
-    // it from the originating commitment (positions are created with the real line by the fill
-    // path) or core-api adds lineTicks to the position body. Dormant today (spread/total gated off).
+    // marketType from the position body's `market` (always present). lineTicks is NOT on the
+    // own-state position body (the core-api gap), so it is 0 here — correct for moneyline (no
+    // line) and harmless for spread / total: the risk engine groups exposure by speculationId
+    // (which this body always carries), NOT by the line, so a snapshot-rehydrated spread / total
+    // position still keys to the right speculation group even with lineTicks 0. The 0 is therefore
+    // informational only; sourcing the true line (for display / telemetry) can wait for core-api
+    // to add lineTicks to the position body. The fill path stamps the real line from the commitment.
     marketType: p.market,
     lineTicks: 0,
     side: sideFromPositionType(p.positionType),

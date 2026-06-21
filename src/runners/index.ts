@@ -2869,6 +2869,8 @@ export class Runner {
       awayTeam: m.awayTeam,
       homeTeam: m.homeTeam,
       scorer: this.scorers[m.marketType],
+      marketType: m.marketType,
+      lineTicks: m.lineTicks,
       makerSide: proto.makerSide,
       oddsTick: proto.makerOddsTick,
       riskAmountWei6: String(qs.sizeWei6),

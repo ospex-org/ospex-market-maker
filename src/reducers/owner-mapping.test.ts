@@ -225,6 +225,8 @@ describe('mapOwnerCommitmentToMaker', () => {
       awayTeam: 'NYM',
       homeTeam: 'LAD',
       scorer: '0xscorer',
+      marketType: 'moneyline',
+      lineTicks: 0,
       makerSide: 'away', // positionType 0
       oddsTick: 250,
       riskAmountWei6: '250000',
@@ -240,6 +242,12 @@ describe('mapOwnerCommitmentToMaker', () => {
 
   it('positionType 1 → makerSide home', () => {
     expect(mapOwnerCommitmentToMaker(commitment({ positionType: 1 })).makerSide).toBe('home');
+  });
+
+  it('carries marketType / lineTicks through, defaulting a null body value to moneyline / 0', () => {
+    expect(mapOwnerCommitmentToMaker(commitment({ marketType: 'spread', lineTicks: -15 }))).toMatchObject({ marketType: 'spread', lineTicks: -15 });
+    // A null marketType / lineTicks (legacy or not-yet-populated body) collapses to the moneyline default.
+    expect(mapOwnerCommitmentToMaker(commitment({ marketType: null, lineTicks: null }))).toMatchObject({ marketType: 'moneyline', lineTicks: 0 });
   });
 
   it('wires the lifecycle through deriveCommitmentLifecycle', () => {

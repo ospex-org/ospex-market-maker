@@ -504,6 +504,8 @@ function commitmentRecord(overrides: Partial<MakerCommitmentRecord>): MakerCommi
     awayTeam: 'NYM',
     homeTeam: 'LAD',
     scorer: '0xscorer',
+    marketType: 'moneyline',
+    lineTicks: 0,
     makerSide: 'away',
     oddsTick: 250,
     riskAmountWei6: '250000',

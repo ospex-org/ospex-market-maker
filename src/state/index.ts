@@ -101,6 +101,10 @@ export function isTerminalPositionStatus(status: MakerPositionStatus): boolean {
 /** Which side of a contest a maker item is on (mirrors `src/risk/`'s `MakerSide`). */
 export type MakerSide = 'away' | 'home';
 
+/** The wager's market type (mirrors the SDK's `MarketType`; defined locally to keep the state layer decoupled). Persisted on commitment / position records so the risk engine can key exposure per market without re-deriving it from the `scorer` address. */
+export const MARKET_TYPES = ['moneyline', 'spread', 'total'] as const;
+export type MarketType = (typeof MARKET_TYPES)[number];
+
 // ── signed payload (own-state SSE plan §M6) ──────────────────────────────────
 
 /**
@@ -307,6 +311,10 @@ export interface MakerCommitmentRecord {
   homeTeam: string;
   /** The scorer module the wager points at (a moneyline scorer address in v0). */
   scorer: string;
+  /** The wager's market type — denormalized (it's implied by `scorer`, but stored so the risk engine keys exposure per market without a scorer→market lookup). Migrated to `'moneyline'` on records from a pre-this-field state file. */
+  marketType: MarketType;
+  /** The speculation's line in away-perspective ticks (10×-scaled): `0` for moneyline (no line), the spread / total line otherwise. Denormalized from the on-chain commitment. Migrated to `0` on legacy records (all of which are moneyline). */
+  lineTicks: number;
   /** Which side the maker is on — if this side loses, the maker loses the at-risk amount. */
   makerSide: MakerSide;
   /** uint16 odds tick the commitment was posted at. */
@@ -734,6 +742,26 @@ function validateCommitmentRecord(
       fills.push(f.fill);
     }
   }
+  // marketType + lineTicks (per-market risk re-key). Migration: a record from a
+  // pre-this-field state file carries neither — every such record is moneyline,
+  // so default marketType → 'moneyline' and lineTicks → 0. Newer records must
+  // carry a known marketType and an integer lineTicks.
+  let marketType: MarketType;
+  if (value.marketType === undefined) {
+    marketType = 'moneyline';
+  } else if (typeof value.marketType !== 'string' || !(MARKET_TYPES as readonly string[]).includes(value.marketType)) {
+    return { ok: false, reason: `marketType ${describe(value.marketType)} is not a known market type (expected ${MARKET_TYPES.map((m) => `"${m}"`).join(' / ')})` };
+  } else {
+    marketType = value.marketType as MarketType;
+  }
+  let lineTicks: number;
+  if (value.lineTicks === undefined) {
+    lineTicks = 0;
+  } else if (typeof value.lineTicks !== 'number' || !Number.isInteger(value.lineTicks)) {
+    return { ok: false, reason: `lineTicks ${describe(value.lineTicks)} must be an integer` };
+  } else {
+    lineTicks = value.lineTicks;
+  }
   const record: MakerCommitmentRecord = {
     hash: key,
     speculationId: value.speculationId,
@@ -742,6 +770,8 @@ function validateCommitmentRecord(
     awayTeam: value.awayTeam,
     homeTeam: value.homeTeam,
     scorer: value.scorer,
+    marketType,
+    lineTicks,
     makerSide: value.makerSide,
     oddsTick: value.oddsTick,
     riskAmountWei6: value.riskAmountWei6,

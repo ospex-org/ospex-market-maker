@@ -107,6 +107,8 @@ function rec(hash: string, postedAtUnixSec: number, overrides: Partial<MakerComm
     awayTeam: 'A',
     homeTeam: 'B',
     scorer: '0xscorer',
+    marketType: 'moneyline',
+    lineTicks: 0,
     makerSide: 'away',
     oddsTick: 200,
     riskAmountWei6: '100',

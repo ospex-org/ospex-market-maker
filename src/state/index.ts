@@ -372,6 +372,10 @@ export interface MakerPositionRecord {
   awayTeam: string;
   /** The home team's name — denormalized for the per-team cap + telemetry. */
   homeTeam: string;
+  /** The wager's market type — denormalized so the risk engine keys exposure per market. Sourced from the originating commitment (fill path) or the own-state position body. Migrated to `'moneyline'` on records from a pre-this-field state file. */
+  marketType: MarketType;
+  /** The speculation's line in away-perspective ticks (10×-scaled): `0` for moneyline; the spread / total line otherwise. Sourced from the originating commitment; the own-state position body carries no line (see the snapshot mapper). Migrated to `0` on legacy records. */
+  lineTicks: number;
   /** The maker's side — loses this stake if this side loses. */
   side: MakerSide;
   /** The maker's own staked risk (USDC wei6, decimal string). */
@@ -666,6 +670,38 @@ function validateMakerState(parsed: unknown): Validated {
   };
 }
 
+/**
+ * Validate + migrate the paired (marketType, lineTicks) fields shared by commitment and
+ * position records (the per-market risk re-key). Both were added in the same slice, so a
+ * record carries NEITHER (a pre-this-field state file → migrate to the moneyline default;
+ * every legacy record is moneyline) or BOTH. Exactly one present is a half-written /
+ * hand-edited record → fail closed: normalizing it would produce an inconsistent
+ * self-describing shape (spread/0, or moneyline/-15) that the risk re-key would mis-group.
+ * When both are present, validate a known marketType, an integer lineTicks, and the invariant
+ * that moneyline has no line (lineTicks must be 0). Shared so the two record validators stay
+ * in lockstep.
+ */
+function validateMarketIdentity(value: Record<string, unknown>): { ok: true; marketType: MarketType; lineTicks: number } | { ok: false; reason: string } {
+  const hasMarketType = value.marketType !== undefined;
+  const hasLineTicks = value.lineTicks !== undefined;
+  if (!hasMarketType && !hasLineTicks) return { ok: true, marketType: 'moneyline', lineTicks: 0 };
+  if (hasMarketType !== hasLineTicks) {
+    return { ok: false, reason: `marketType and lineTicks must be present together — only ${hasMarketType ? 'marketType' : 'lineTicks'} is set; a partial record is rejected rather than normalized to an inconsistent shape` };
+  }
+  if (typeof value.marketType !== 'string' || !(MARKET_TYPES as readonly string[]).includes(value.marketType)) {
+    return { ok: false, reason: `marketType ${describe(value.marketType)} is not a known market type (expected ${MARKET_TYPES.map((m) => `"${m}"`).join(' / ')})` };
+  }
+  if (typeof value.lineTicks !== 'number' || !Number.isInteger(value.lineTicks)) {
+    return { ok: false, reason: `lineTicks ${describe(value.lineTicks)} must be an integer` };
+  }
+  const marketType = value.marketType as MarketType;
+  const lineTicks = value.lineTicks;
+  if (marketType === 'moneyline' && lineTicks !== 0) {
+    return { ok: false, reason: `marketType 'moneyline' has no line — lineTicks must be 0, got ${lineTicks}` };
+  }
+  return { ok: true, marketType, lineTicks };
+}
+
 function validateCommitmentRecord(
   key: string,
   value: unknown,
@@ -742,35 +778,9 @@ function validateCommitmentRecord(
       fills.push(f.fill);
     }
   }
-  // marketType + lineTicks (per-market risk re-key) — a PAIRED migration: both fields were
-  // added in the same slice, so a record carries NEITHER (a pre-this-field state file →
-  // migrate to the moneyline default; every legacy record is moneyline) or BOTH. Exactly one
-  // present is a half-written / hand-edited record → fail closed: normalizing it would
-  // produce an inconsistent self-describing shape (spread/0, or moneyline/-15) that the risk
-  // re-key would mis-group. When both are present, validate them — including the invariant
-  // that moneyline has no line (lineTicks must be 0).
-  const hasMarketType = value.marketType !== undefined;
-  const hasLineTicks = value.lineTicks !== undefined;
-  let marketType: MarketType;
-  let lineTicks: number;
-  if (!hasMarketType && !hasLineTicks) {
-    marketType = 'moneyline';
-    lineTicks = 0;
-  } else if (hasMarketType !== hasLineTicks) {
-    return { ok: false, reason: `marketType and lineTicks must be present together — only ${hasMarketType ? 'marketType' : 'lineTicks'} is set; a partial record is rejected rather than normalized to an inconsistent shape` };
-  } else {
-    if (typeof value.marketType !== 'string' || !(MARKET_TYPES as readonly string[]).includes(value.marketType)) {
-      return { ok: false, reason: `marketType ${describe(value.marketType)} is not a known market type (expected ${MARKET_TYPES.map((m) => `"${m}"`).join(' / ')})` };
-    }
-    if (typeof value.lineTicks !== 'number' || !Number.isInteger(value.lineTicks)) {
-      return { ok: false, reason: `lineTicks ${describe(value.lineTicks)} must be an integer` };
-    }
-    marketType = value.marketType as MarketType;
-    lineTicks = value.lineTicks;
-    if (marketType === 'moneyline' && lineTicks !== 0) {
-      return { ok: false, reason: `marketType 'moneyline' has no line — lineTicks must be 0, got ${lineTicks}` };
-    }
-  }
+  const mi = validateMarketIdentity(value);
+  if (!mi.ok) return mi;
+  const { marketType, lineTicks } = mi;
   const record: MakerCommitmentRecord = {
     hash: key,
     speculationId: value.speculationId,
@@ -885,12 +895,16 @@ function validatePositionRecord(value: unknown): { ok: true; record: MakerPositi
       return { ok: false, reason: `result ${describe(value.result)} is not "won"/"push"/"void"` };
     }
   }
+  const mi = validateMarketIdentity(value);
+  if (!mi.ok) return mi;
   const record: MakerPositionRecord = {
     speculationId: value.speculationId,
     contestId: value.contestId,
     sport: value.sport,
     awayTeam: value.awayTeam,
     homeTeam: value.homeTeam,
+    marketType: mi.marketType,
+    lineTicks: mi.lineTicks,
     side: value.side,
     riskAmountWei6: value.riskAmountWei6,
     counterpartyRiskWei6: value.counterpartyRiskWei6,

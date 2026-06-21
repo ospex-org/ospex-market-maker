@@ -55,6 +55,8 @@ function positionRecord(overrides: Partial<MakerPositionRecord> = {}): MakerPosi
     sport: 'mlb',
     awayTeam: 'NYM',
     homeTeam: 'LAD',
+    marketType: 'moneyline',
+    lineTicks: 0,
     side: 'away',
     riskAmountWei6: '250000',
     counterpartyRiskWei6: '150000',

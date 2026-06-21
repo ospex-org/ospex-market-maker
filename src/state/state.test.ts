@@ -64,6 +64,8 @@ function position(overrides: Partial<MakerPositionRecord> = {}): MakerPositionRe
     sport: 'mlb',
     awayTeam: 'NYM',
     homeTeam: 'LAD',
+    marketType: 'moneyline',
+    lineTicks: 0,
     side: 'away',
     riskAmountWei6: '250000',
     counterpartyRiskWei6: '150000',
@@ -246,6 +248,32 @@ describe('StateStore.load', () => {
     status = store.load().status;
     expect(status.kind).toBe('lost');
     if (status.kind === 'lost') expect(status.reason).toMatch(/moneyline/);
+  });
+
+  it('position marketType / lineTicks: a spread position round-trips, a pre-field record migrates to moneyline/0, a half-written one is `lost` (shared paired validator)', () => {
+    const store = StateStore.at(dir);
+    const spread = position({ marketType: 'spread', lineTicks: -15 });
+    store.flush(stateWith({ positions: { 'spec-1:away': spread } }));
+    let loaded = store.load();
+    expect(loaded.status.kind).toBe('loaded');
+    expect(loaded.state.positions['spec-1:away']).toMatchObject({ marketType: 'spread', lineTicks: -15 });
+
+    // migration: neither field → moneyline / 0 (the same paired validator the commitments use).
+    const legacy: Record<string, unknown> = { ...position() };
+    delete legacy.marketType;
+    delete legacy.lineTicks;
+    writeFileSync(join(dir, STATE_FILE), JSON.stringify(stateWith({ positions: { 'spec-1:away': legacy as unknown as MakerPositionRecord } })), 'utf8');
+    loaded = store.load();
+    expect(loaded.status.kind).toBe('loaded');
+    expect(loaded.state.positions['spec-1:away']).toMatchObject({ marketType: 'moneyline', lineTicks: 0 });
+
+    // a half-written position (one of the pair) fails closed.
+    const partial: Record<string, unknown> = { ...position({ marketType: 'spread', lineTicks: -15 }) };
+    delete partial.lineTicks;
+    writeFileSync(join(dir, STATE_FILE), JSON.stringify(stateWith({ positions: { 'spec-1:away': partial as unknown as MakerPositionRecord } })), 'utf8');
+    const status = store.load().status;
+    expect(status.kind).toBe('lost');
+    if (status.kind === 'lost') expect(status.reason).toMatch(/present together/);
   });
 
   // ── sensitive state hardening (own-state SSE plan §M6/B) ────────────────────

@@ -114,6 +114,8 @@ function makerPosition(status: MakerPositionStatus): MakerPositionRecord {
     sport: 'baseball_mlb',
     awayTeam: 'NYM',
     homeTeam: 'LAD',
+    marketType: 'moneyline',
+    lineTicks: 0,
     side: 'away',
     riskAmountWei6: '50000',
     counterpartyRiskWei6: '75000',
@@ -271,6 +273,13 @@ describe('reduceOwnerFill — maker side (ourAddress matches fill.maker)', () =>
     expect(state.commitments['0xabc']?.filledRiskWei6).toBe(beforeCommitmentFill);
     expect(state.commitments['0xabc']?.fills).toEqual([{ txHash: '0xtx1', logIndex: 0, amountWei6: '50000', ts: 1 }]);
     expect(dedup.size).toBe(1);
+  });
+
+  it('the created position inherits marketType / lineTicks from the sibling commitment', () => {
+    const state = emptyMakerState();
+    state.commitments['0xabc'] = mapOwnerCommitmentToMaker(ownerCommitment({ marketType: 'spread', lineTicks: -15 }));
+    reduceOwnerFill(state, fill(), new Set<string>(), OUR_ADDR, 1);
+    expect(state.positions['spec-1:away']).toMatchObject({ marketType: 'spread', lineTicks: -15 });
   });
 
   it('dedup: same (txHash, logIndex) twice → second is a no-op', () => {

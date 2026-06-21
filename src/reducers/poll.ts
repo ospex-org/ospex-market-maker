@@ -18,6 +18,7 @@ import type {
   MakerPositionStatus,
   MakerSide,
   MakerState,
+  MarketType,
 } from '../state/index.js';
 
 import type { ReducerDescriptor } from './descriptors.js';
@@ -98,6 +99,8 @@ function extendPositionFromCommitmentFill(
       sport: record.sport,
       awayTeam: record.awayTeam,
       homeTeam: record.homeTeam,
+      marketType: record.marketType, // from the originating commitment
+      lineTicks: record.lineTicks,
       side: record.makerSide,
       riskAmountWei6: deltaWei6.toString(),
       counterpartyRiskWei6: counterpartyDelta.toString(),
@@ -443,13 +446,15 @@ export function reducePolledPositionObservation(
     return descriptors;
   }
 
-  let context: { contestId: string; sport: string; awayTeam: string; homeTeam: string };
+  let context: { contestId: string; sport: string; awayTeam: string; homeTeam: string; marketType: MarketType; lineTicks: number };
   if (existing !== undefined) {
     context = {
       contestId: existing.contestId,
       sport: existing.sport,
       awayTeam: existing.awayTeam,
       homeTeam: existing.homeTeam,
+      marketType: existing.marketType,
+      lineTicks: existing.lineTicks,
     };
   } else {
     const sourceCommitment = Object.values(state.commitments).find(
@@ -472,6 +477,8 @@ export function reducePolledPositionObservation(
       sport: sourceCommitment.sport,
       awayTeam: sourceCommitment.awayTeam,
       homeTeam: sourceCommitment.homeTeam,
+      marketType: sourceCommitment.marketType,
+      lineTicks: sourceCommitment.lineTicks,
     };
   }
 
@@ -487,6 +494,8 @@ export function reducePolledPositionObservation(
       sport: context.sport,
       awayTeam: context.awayTeam,
       homeTeam: context.homeTeam,
+      marketType: context.marketType,
+      lineTicks: context.lineTicks,
       side,
       riskAmountWei6: delta.toString(),
       counterpartyRiskWei6: counterpartyDelta > 0n ? counterpartyDelta.toString() : '0',

@@ -5495,7 +5495,7 @@ describe('Runner — soft-cancelled-fill convergence', () => {
       ...emptyMakerState(),
       commitments: { '0xsc': softCancelled },
       positions: {
-        'spec-1234:home': { speculationId: 'spec-1234', contestId: '1234', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', side: 'home', riskAmountWei6: '250000', counterpartyRiskWei6: '250000', status: 'active', updatedAtUnixSec: T0 - 5 },
+        'spec-1234:home': { speculationId: 'spec-1234', contestId: '1234', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', marketType: 'moneyline', lineTicks: 0, side: 'home', riskAmountWei6: '250000', counterpartyRiskWei6: '250000', status: 'active', updatedAtUnixSec: T0 - 5 },
       },
     });
     const config = cfg({ mode: { dryRun: false } });
@@ -5653,7 +5653,7 @@ describe('Runner — position-status poll (review-PR23 B4)', () => {
         '0xc': commitmentRecord({ hash: '0xc', speculationId: 'spec-1234', contestId: '1234', makerSide: 'home', oddsTick: 200, lifecycle: 'filled', riskAmountWei6: '250000', filledRiskWei6: '250000' }),
       },
       positions: {
-        'spec-1234:home': { speculationId: 'spec-1234', contestId: '1234', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', side: 'home', riskAmountWei6: '250000', counterpartyRiskWei6: '250000', status: 'active', updatedAtUnixSec: T0 - 5 },
+        'spec-1234:home': { speculationId: 'spec-1234', contestId: '1234', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', marketType: 'moneyline', lineTicks: 0, side: 'home', riskAmountWei6: '250000', counterpartyRiskWei6: '250000', status: 'active', updatedAtUnixSec: T0 - 5 },
       },
     });
     const config = cfg({ mode: { dryRun: false } });
@@ -5781,7 +5781,7 @@ describe('Runner — position-status transitions (Phase 3 c-ii)', () => {
       ...emptyMakerState(),
       commitments: { '0xc': commitment },
       positions: {
-        [`${speculationId}:home`]: { speculationId, contestId, sport: commitment.sport, awayTeam: commitment.awayTeam, homeTeam: commitment.homeTeam, side: 'home', riskAmountWei6: riskWei6, counterpartyRiskWei6, status: 'active', updatedAtUnixSec: T0 - 60 },
+        [`${speculationId}:home`]: { speculationId, contestId, sport: commitment.sport, awayTeam: commitment.awayTeam, homeTeam: commitment.homeTeam, marketType: commitment.marketType, lineTicks: commitment.lineTicks, side: 'home', riskAmountWei6: riskWei6, counterpartyRiskWei6, status: 'active', updatedAtUnixSec: T0 - 60 },
       },
     };
   }
@@ -5944,7 +5944,7 @@ describe('Runner — position-status transitions (Phase 3 c-ii)', () => {
       ...emptyMakerState(),
       // No commitments — the source commitment was pruned post-fill.
       positions: {
-        'spec-1234:home': { speculationId: 'spec-1234', contestId: '1234', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', side: 'home', riskAmountWei6: '250000', counterpartyRiskWei6: '250000', status: 'active', updatedAtUnixSec: T0 - 7200 },
+        'spec-1234:home': { speculationId: 'spec-1234', contestId: '1234', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', marketType: 'moneyline', lineTicks: 0, side: 'home', riskAmountWei6: '250000', counterpartyRiskWei6: '250000', status: 'active', updatedAtUnixSec: T0 - 7200 },
       },
     });
     const config = cfg({ mode: { dryRun: false } });
@@ -6351,11 +6351,11 @@ describe('Runner — auto-settle + auto-claim (Phase 3 e-i)', () => {
 
   /** A `pendingSettle` position record on `(speculationId, makerSide)`. The position-poll's `reducePolledPositionObservation` puts records here when the API reports them in the `pendingSettle` bucket. */
   function pendingSettleRecord(speculationId: string, contestId: string, side: MakerSide = 'home'): MakerState['positions'][string] {
-    return { speculationId, contestId, sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', side, riskAmountWei6: '250000', counterpartyRiskWei6: '250000', status: 'pendingSettle', updatedAtUnixSec: T0 - 60 };
+    return { speculationId, contestId, sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', marketType: 'moneyline', lineTicks: 0, side, riskAmountWei6: '250000', counterpartyRiskWei6: '250000', status: 'pendingSettle', updatedAtUnixSec: T0 - 60 };
   }
 
   function claimableRecord(speculationId: string, contestId: string, side: MakerSide = 'home'): MakerState['positions'][string] {
-    return { speculationId, contestId, sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', side, riskAmountWei6: '250000', counterpartyRiskWei6: '250000', status: 'claimable', updatedAtUnixSec: T0 - 60 };
+    return { speculationId, contestId, sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', marketType: 'moneyline', lineTicks: 0, side, riskAmountWei6: '250000', counterpartyRiskWei6: '250000', status: 'claimable', updatedAtUnixSec: T0 - 60 };
   }
 
   it('autoSettleOwn=false and autoClaimOwn=false → no settle / claim calls, no telemetry (operator opted out)', async () => {
@@ -6707,7 +6707,7 @@ describe('Runner — auto-settle + auto-claim (Phase 3 e-i)', () => {
       positions: {
         '1:home': pendingSettleRecord('1', '1'),
         '2:home': claimableRecord('2', '2'),
-        '3:home': { speculationId: '3', contestId: '3', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', side: 'home', riskAmountWei6: '250000', counterpartyRiskWei6: '250000', status: 'active', updatedAtUnixSec: T0 - 60 },
+        '3:home': { speculationId: '3', contestId: '3', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', marketType: 'moneyline', lineTicks: 0, side: 'home', riskAmountWei6: '250000', counterpartyRiskWei6: '250000', status: 'active', updatedAtUnixSec: T0 - 60 },
       },
     });
     const config = cfg({ mode: { dryRun: false }, settlement: { autoSettleOwn: true, autoClaimOwn: true, continueOnGasBudgetExhausted: false } });
@@ -8034,7 +8034,7 @@ describe('Runner — §5.1 stream-health active cancel-sweep (PR3b-ii)', () => {
 describe('computeOpenExposureWei6 — terminal positions carry no live exposure', () => {
   const NOW = 1_900_000_000;
   function posRecord(status: MakerState['positions'][string]['status'], riskAmountWei6: string, speculationId: string): MakerState['positions'][string] {
-    return { speculationId, contestId: 'c', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', side: 'home', riskAmountWei6, counterpartyRiskWei6: '0', status, updatedAtUnixSec: NOW - 60 };
+    return { speculationId, contestId: 'c', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', marketType: 'moneyline', lineTicks: 0, side: 'home', riskAmountWei6, counterpartyRiskWei6: '0', status, updatedAtUnixSec: NOW - 60 };
   }
 
   it('sums active / pendingSettle / claimable; EXCLUDES every terminal (claimed / settledLost / void)', () => {

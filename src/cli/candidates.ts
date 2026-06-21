@@ -2,11 +2,16 @@
  * `ospex-mm candidates` — read-only operator preflight (no DESIGN § yet; spec'd
  * for the live-test setup workflow). Answers two questions in one listing:
  *
- *   (a) which contests could the MM quote *right now* (`quote_ready` — verified,
- *       open moneyline speculation, reference odds when required), and
+ *   (a) which (contest, market) pairs the MM could quote *right now* (`quote_ready`
+ *       — verified contest, an open speculation for that configured market, reference
+ *       odds when required), and
  *   (b) which upcoming games could be *turned into* quotable contests
  *       (`setup` — uncreated, creatable, priced upstream), plus the
- *       in-between states (`needs_verification`, `needs_moneyline_speculation`).
+ *       in-between states (`needs_verification`, `needs_speculation`).
+ *
+ * **Market-aware:** for a verified contest it classifies each market in
+ * `marketSelection.markets` separately — one item per `(contest, market)` (default
+ * config is moneyline-only, so a default operator sees one item per contest as before).
  *
  * Strictly read-only and signer-free: built on the read-only adapter, it never
  * writes, never touches a keystore, and never prompts. Discovery shows the
@@ -20,15 +25,16 @@
  * throw — the CLI catches and exits 1.
  */
 
-import type { Config, Sport } from '../config/index.js';
+import type { Config, MarketType, Sport } from '../config/index.js';
 import { KNOWN_SPORTS } from '../config/index.js';
+import { referenceOddsFromSdk, type ReferenceOdds } from '../orders/index.js';
 import type { ContestView, GameView, GamesListOptions, OspexAdapter } from '../ospex/index.js';
 
-// ── report shape (the `{ schemaVersion: 1, candidates: … }` JSON contract) ───
+// ── report shape (the `{ schemaVersion: 2, candidates: … }` JSON contract) ───
 
 export type CandidateKind =
   | 'quote_ready'
-  | 'needs_moneyline_speculation'
+  | 'needs_speculation'
   | 'needs_verification'
   | 'setup'
   | 'skipped';
@@ -48,12 +54,6 @@ export const CANDIDATES_SKIP_REASONS = [
   'game-status-postponed-or-cancelled',
 ] as const;
 export type CandidatesSkipReason = (typeof CANDIDATES_SKIP_REASONS)[number];
-
-/** Latest reference moneyline for a quote-ready contest (either side can be null if the upstream hasn't priced it). */
-export interface ReferenceMoneyline {
-  awayAmerican: number | null;
-  homeAmerican: number | null;
-}
 
 /**
  * Fields every candidate item carries. Game-derived fields (`gameId`, `slug`,
@@ -77,8 +77,15 @@ export interface CandidateItemBase {
   canCreateContest: boolean | null;
   contestCreated: boolean;
   contestId: string | null;
-  /** The open moneyline speculation id, when one exists on a verified contest. */
-  moneylineSpeculationId: string | null;
+  /**
+   * The configured market this item is about — set on the per-market kinds
+   * (`quote_ready` / `needs_speculation`, and a per-market `no-reference-odds`
+   * skip) of a *verified* contest; `null` on contest-level kinds (`needs_verification`
+   * / `setup` / contest-level skips) which apply regardless of market.
+   */
+  market: MarketType | null;
+  /** The open speculation id for this item's `market`, when one exists on a verified contest; else `null`. */
+  speculationId: string | null;
   /**
    * Present on contest-backed items iff `marketSelection.contestAllowList` is
    * non-empty — discovery hides nothing by allow-list; this flags what a live
@@ -89,15 +96,21 @@ export interface CandidateItemBase {
 
 export interface QuoteReadyCandidate extends CandidateItemBase {
   kind: 'quote_ready';
+  /** The configured market this (contest, market) item is quote-ready for. */
+  market: MarketType;
+  /** The open speculation id for `market`. */
+  speculationId: string;
   recommendedAction: 'quote';
   contestStatus: string;
-  /** Null only when `requireReferenceOdds: false` let a contest through without complete odds. */
-  referenceOdds: ReferenceMoneyline | null;
+  /** Null only when `requireReferenceOdds: false` let a market through without complete odds. */
+  referenceOdds: ReferenceOdds | null;
 }
 
-export interface NeedsMoneylineSpeculationCandidate extends CandidateItemBase {
-  kind: 'needs_moneyline_speculation';
-  recommendedAction: 'seed_moneyline_speculation';
+export interface NeedsSpeculationCandidate extends CandidateItemBase {
+  kind: 'needs_speculation';
+  /** The configured market that lacks an open speculation on this verified contest. */
+  market: MarketType;
+  recommendedAction: 'seed_speculation';
   contestStatus: string;
 }
 
@@ -110,7 +123,7 @@ export interface NeedsVerificationCandidate extends CandidateItemBase {
 
 export interface SetupCandidate extends CandidateItemBase {
   kind: 'setup';
-  recommendedAction: 'create_contest_then_seed_moneyline';
+  recommendedAction: 'create_contest_then_seed';
 }
 
 export interface SkippedCandidate extends CandidateItemBase {
@@ -122,7 +135,7 @@ export interface SkippedCandidate extends CandidateItemBase {
 
 export type CandidateItem =
   | QuoteReadyCandidate
-  | NeedsMoneylineSpeculationCandidate
+  | NeedsSpeculationCandidate
   | NeedsVerificationCandidate
   | SetupCandidate
   | SkippedCandidate;
@@ -130,10 +143,12 @@ export type CandidateItem =
 export interface CandidatesSummary {
   /** Count of `setup` items — upcoming, uncreated, creatable, priced upstream. */
   gamesAvailableToCreate: number;
+  /** Count of `quote_ready` items — `(contest, market)` pairs quotable now (one per configured market on a verified contest). */
   quoteReady: number;
   /** Planning-doc parity alias — always equals `gamesAvailableToCreate`. */
   needsContest: number;
-  needsMoneylineSpeculation: number;
+  /** Count of `needs_speculation` items — `(contest, market)` pairs on verified contests whose configured market has no open speculation. */
+  needsSpeculation: number;
   needsVerification: number;
   /** Only nonzero reasons appear. */
   skipped: Partial<Record<CandidatesSkipReason, number>>;
@@ -143,6 +158,8 @@ export interface CandidatesReport {
   generatedAt: string;
   config: {
     sports: Sport[];
+    /** The configured markets each verified contest is classified for (default `['moneyline']`; spread / total opt-in). */
+    markets: MarketType[];
     hours: number;
     /**
      * The contests leg's effective window: `min(hours, 168)` — the contests
@@ -321,9 +338,10 @@ export async function runCandidates(opts: CandidatesOpts): Promise<CandidatesRep
     return item;
   };
 
+  const wantedMarkets = config.marketSelection.markets;
   const items: CandidateItem[] = [];
-  /** Contests classified quote-ready-so-far — confirmed against an odds snapshot in step 4. */
-  const pendingQuoteReady: Array<{ base: CandidateItemBase; contestStatus: string }> = [];
+  /** `(contest, market)` pairs classified quote-ready-so-far — confirmed against an odds snapshot in step 4. */
+  const pendingQuoteReady: Array<{ base: CandidateItemBase; market: MarketType; speculationId: string; contestStatus: string }> = [];
 
   // 3. Classify every game (joined with its contest where one exists), then
   //    every contest no game row claimed.
@@ -375,12 +393,17 @@ export async function runCandidates(opts: CandidatesOpts): Promise<CandidatesRep
         items.push(finalize({ ...base, kind: 'needs_verification', recommendedAction: 'wait_for_verification', contestStatus: contest.status }));
         return;
       }
-      const spec = contest.speculations.find((s) => s.marketType === 'moneyline' && s.open);
-      if (spec === undefined) {
-        items.push(finalize({ ...base, kind: 'needs_moneyline_speculation', recommendedAction: 'seed_moneyline_speculation', contestStatus: contest.status }));
-        return;
+      // Verified — classify EACH configured market separately. A contest can be
+      // quote-ready for one market and need a speculation for another, so a verified
+      // contest yields one item per configured market.
+      for (const market of wantedMarkets) {
+        const spec = contest.speculations.find((s) => s.marketType === market && s.open);
+        if (spec === undefined) {
+          items.push(finalize({ ...base, market, kind: 'needs_speculation', recommendedAction: 'seed_speculation', contestStatus: contest.status }));
+          continue;
+        }
+        pendingQuoteReady.push({ base: { ...base, market, speculationId: spec.speculationId }, market, speculationId: spec.speculationId, contestStatus: contest.status });
       }
-      pendingQuoteReady.push({ base: { ...base, moneylineSpeculationId: spec.speculationId }, contestStatus: contest.status });
       return;
     }
 
@@ -401,7 +424,7 @@ export async function runCandidates(opts: CandidatesOpts): Promise<CandidatesRep
         items.push(finalize(skipped(base, 'cannot-create-contest')));
         return;
       }
-      items.push(finalize({ ...base, kind: 'setup', recommendedAction: 'create_contest_then_seed_moneyline' }));
+      items.push(finalize({ ...base, kind: 'setup', recommendedAction: 'create_contest_then_seed' }));
     }
   }
 
@@ -409,23 +432,23 @@ export async function runCandidates(opts: CandidatesOpts): Promise<CandidatesRep
   //    snapshot failure degrades that item to `no-reference-odds` — it must
   //    never fail the command.
   await Promise.all(
-    pendingQuoteReady.map(async ({ base, contestStatus }) => {
-      let reference: ReferenceMoneyline | null = null;
+    pendingQuoteReady.map(async ({ base, market, speculationId, contestStatus }) => {
+      let reference: ReferenceOdds | null = null;
       if (base.contestId !== null) {
         try {
           const snapshot = await adapter.getOddsSnapshot(base.contestId);
-          const m = snapshot.odds.moneyline;
-          if (m !== null) reference = { awayAmerican: m.awayOddsAmerican, homeAmerican: m.homeOddsAmerican };
+          const o = snapshot.odds[market];
+          // referenceOddsFromSdk returns null unless every field this market needs is present.
+          if (o != null) reference = referenceOddsFromSdk(o);
         } catch {
           reference = null; // degrade, don't throw — reported as no-reference-odds below (when required)
         }
       }
-      const complete = reference !== null && reference.awayAmerican !== null && reference.homeAmerican !== null;
-      if (config.marketSelection.requireReferenceOdds && !complete) {
+      if (config.marketSelection.requireReferenceOdds && reference === null) {
         items.push(finalize(skipped(base, 'no-reference-odds', contestStatus)));
         return;
       }
-      items.push(finalize({ ...base, kind: 'quote_ready', recommendedAction: 'quote', contestStatus, referenceOdds: reference }));
+      items.push(finalize({ ...base, market, speculationId, kind: 'quote_ready', recommendedAction: 'quote', contestStatus, referenceOdds: reference }));
     }),
   );
 
@@ -436,6 +459,7 @@ export async function runCandidates(opts: CandidatesOpts): Promise<CandidatesRep
     generatedAt: generated.toISOString(),
     config: {
       sports,
+      markets: wantedMarkets,
       hours,
       contestsHours,
       maxTrackedMarkets: config.marketSelection.maxTrackedMarkets,
@@ -468,7 +492,8 @@ function baseFromGame(game: GameView, contest: ContestView | undefined): Candida
     canCreateContest: game.canCreateContest,
     contestCreated: game.contestCreated || contest !== undefined,
     contestId: contest?.contestId ?? game.contestId,
-    moneylineSpeculationId: null,
+    market: null,
+    speculationId: null,
   };
 }
 
@@ -485,7 +510,8 @@ function baseFromContest(contest: ContestView): CandidateItemBase {
     canCreateContest: null,
     contestCreated: true,
     contestId: contest.contestId,
-    moneylineSpeculationId: null,
+    market: null,
+    speculationId: null,
   };
 }
 
@@ -501,7 +527,7 @@ function skipped(base: CandidateItemBase, skipReason: CandidatesSkipReason, cont
 
 const KIND_ORDER: Record<CandidateKind, number> = {
   quote_ready: 0,
-  needs_moneyline_speculation: 1,
+  needs_speculation: 1,
   needs_verification: 2,
   setup: 3,
   skipped: 4,
@@ -512,13 +538,19 @@ function compareItems(a: CandidateItem, b: CandidateItem): number {
   if (byKind !== 0) return byKind;
   const byTime = Date.parse(a.matchTime) - Date.parse(b.matchTime);
   if (byTime !== 0) return byTime;
-  return (a.contestId ?? a.gameId ?? '').localeCompare(b.contestId ?? b.gameId ?? '');
+  const byId = (a.contestId ?? a.gameId ?? '').localeCompare(b.contestId ?? b.gameId ?? '');
+  if (byId !== 0) return byId;
+  // A verified contest yields one item per configured market — the same kind /
+  // matchTime / contestId — so a final market tiebreak keeps the order total +
+  // deterministic (the per-market items are pushed from `Promise.all` continuations,
+  // whose resolution order is otherwise non-deterministic for live snapshots).
+  return (a.market ?? '').localeCompare(b.market ?? '');
 }
 
 function summarize(items: CandidateItem[]): CandidatesSummary {
   const counts: Record<CandidateKind, number> = {
     quote_ready: 0,
-    needs_moneyline_speculation: 0,
+    needs_speculation: 0,
     needs_verification: 0,
     setup: 0,
     skipped: 0,
@@ -534,7 +566,7 @@ function summarize(items: CandidateItem[]): CandidatesSummary {
     gamesAvailableToCreate: counts.setup,
     quoteReady: counts.quote_ready,
     needsContest: counts.setup,
-    needsMoneylineSpeculation: counts.needs_moneyline_speculation,
+    needsSpeculation: counts.needs_speculation,
     needsVerification: counts.needs_verification,
     skipped: skippedByReason,
   };
@@ -542,9 +574,9 @@ function summarize(items: CandidateItem[]): CandidatesSummary {
 
 // ── renderers ────────────────────────────────────────────────────────────────
 
-/** Write the JSON envelope `{ schemaVersion: 1, candidates: CandidatesReport }` to `out` — stable agent contract. */
+/** Write the JSON envelope `{ schemaVersion: 2, candidates: CandidatesReport }` to `out` — stable agent contract. (v2: market-aware — items carry `market`, a verified contest yields one item per configured market; renamed `needs_moneyline_speculation`→`needs_speculation`.) */
 export function renderCandidatesReportJson(report: CandidatesReport, out: { write(s: string): void }): void {
-  out.write(`${JSON.stringify({ schemaVersion: 1, candidates: report })}\n`);
+  out.write(`${JSON.stringify({ schemaVersion: 2, candidates: report })}\n`);
 }
 
 /** Write the human-readable listing to `out`. Not a stable contract — use `--json` for parsing (AGENT_CONTRACT §1). All times ISO UTC. */
@@ -553,12 +585,12 @@ export function renderCandidatesReportText(report: CandidatesReport, out: { writ
   out.write(`ospex-mm candidates — generated ${report.generatedAt}\n`);
   const windowNote = c.contestsHours < c.hours ? ` (contests leg capped at ${c.contestsHours}h — the contests API max)` : '';
   out.write(
-    `Sports: ${c.sports.join(', ')}   Window: next ${c.hours}h${windowNote}   requireReferenceOdds: ${c.requireReferenceOdds}   allow-list: ${
+    `Sports: ${c.sports.join(', ')}   Markets: ${c.markets.join(', ')}   Window: next ${c.hours}h${windowNote}   requireReferenceOdds: ${c.requireReferenceOdds}   allow-list: ${
       c.contestAllowListSize === 0 ? '(empty)' : `${c.contestAllowListSize} id(s) — annotated, never filtered`
     }\n\n`);
 
   const s = report.summary;
-  out.write(`Quote-ready: ${s.quoteReady}   Needs moneyline speculation: ${s.needsMoneylineSpeculation}   Needs verification: ${s.needsVerification}   Setup (creatable games): ${s.gamesAvailableToCreate}   Skipped: ${skippedTotal(s)}\n`);
+  out.write(`Quote-ready: ${s.quoteReady}   Needs speculation: ${s.needsSpeculation}   Needs verification: ${s.needsVerification}   Setup (creatable games): ${s.gamesAvailableToCreate}   Skipped: ${skippedTotal(s)}\n`);
   if (report.truncated) {
     out.write(`WARNING: pagination bound hit — this listing may be incomplete; narrow the window with --hours or --sport.\n`);
   }
@@ -571,12 +603,13 @@ export function renderCandidatesReportText(report: CandidatesReport, out: { writ
 
   const rows = report.items.map((item) => [
     item.kind,
+    item.market ?? '—',
     `${item.awayTeam} @ ${item.homeTeam} (${item.sport})`,
     item.matchTime,
     item.contestId ?? '—',
     detailFor(item),
   ]);
-  const header = ['KIND', 'AWAY @ HOME', 'MATCH TIME (UTC)', 'CONTEST', 'ACTION / REASON'];
+  const header = ['KIND', 'MARKET', 'AWAY @ HOME', 'MATCH TIME (UTC)', 'CONTEST', 'ACTION / REASON'];
   const widths = header.map((h, i) => Math.max(h.length, ...rows.map((r) => (r[i] ?? '').length)));
   const line = (cells: string[]): string => cells.map((cell, i) => cell.padEnd(widths[i] ?? cell.length)).join('  ').trimEnd();
   out.write(`${line(header)}\n`);
@@ -591,22 +624,32 @@ function detailFor(item: CandidateItem): string {
   const allowTag = item.inContestAllowList === undefined ? '' : item.inContestAllowList ? ' [allow-listed]' : ' [NOT allow-listed]';
   switch (item.kind) {
     case 'quote_ready': {
-      const r = item.referenceOdds;
-      const ref = r === null ? 'ref n/a' : `ref away ${signed(r.awayAmerican)} / home ${signed(r.homeAmerican)}`;
+      const ref = item.referenceOdds === null ? 'ref n/a' : formatRef(item.referenceOdds);
       return `quote — ${ref}${allowTag}`;
     }
-    case 'needs_moneyline_speculation':
-      return `seed_moneyline_speculation${allowTag}`;
+    case 'needs_speculation':
+      return `seed_speculation${allowTag}`;
     case 'needs_verification':
       return `wait_for_verification${allowTag}`;
     case 'setup':
-      return 'create_contest_then_seed_moneyline';
+      return 'create_contest_then_seed';
     case 'skipped':
       return `skipped: ${item.skipReason}${allowTag}`;
   }
 }
 
-function signed(n: number | null): string {
-  if (n === null) return 'n/a';
+/** Compact one-line reference-odds display per market (all fields are present — `referenceOddsFromSdk` returned non-null). */
+function formatRef(ref: ReferenceOdds): string {
+  switch (ref.market) {
+    case 'moneyline':
+      return `away ${signed(ref.awayOddsAmerican)} / home ${signed(ref.homeOddsAmerican)}`;
+    case 'spread':
+      return `away ${signed(ref.awayLine)} (${signed(ref.awayOddsAmerican)}) / home ${signed(ref.homeLine)} (${signed(ref.homeOddsAmerican)})`;
+    case 'total':
+      return `o/u ${ref.line} — over ${signed(ref.overOddsAmerican)} / under ${signed(ref.underOddsAmerican)}`;
+  }
+}
+
+function signed(n: number): string {
   return n >= 0 ? `+${n}` : `${n}`;
 }

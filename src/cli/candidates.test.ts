@@ -164,12 +164,12 @@ describe('runCandidates — setup slate (no contests yet)', () => {
 
     expect(report.items).toHaveLength(15);
     expect(report.items.every((i) => i.kind === 'setup')).toBe(true);
-    expect(report.items.every((i) => i.recommendedAction === 'create_contest_then_seed_moneyline')).toBe(true);
+    expect(report.items.every((i) => i.recommendedAction === 'create_contest_then_seed')).toBe(true);
     expect(report.summary).toEqual({
       gamesAvailableToCreate: 15,
       quoteReady: 0,
       needsContest: 15,
-      needsMoneylineSpeculation: 0,
+      needsSpeculation: 0,
       needsVerification: 0,
       skipped: {},
     });
@@ -191,7 +191,8 @@ describe('runCandidates — setup slate (no contests yet)', () => {
       canCreateContest: true,
       contestCreated: false,
       contestId: null,
-      moneylineSpeculationId: null,
+      market: null,
+      speculationId: null,
     });
   });
 });
@@ -202,16 +203,17 @@ describe('runCandidates — contest classification', () => {
   const createdGame = (contestId: string, overrides: Partial<Game> = {}): Game =>
     gameWith({ gameId: `game-${contestId}`, contestCreated: true, contestId, ...overrides });
 
-  it('verified contest with NO open moneyline speculation → needs_moneyline_speculation', async () => {
+  it('verified contest with NO open moneyline speculation → needs_speculation (market moneyline)', async () => {
     const contest = contestWith({ speculations: [spreadSpec('contest-1'), moneylineSpec('contest-1', false)] });
     const report = await run(adapterFor([createdGame('contest-1')], [contest]));
-    expect(report.items).toHaveLength(1);
+    expect(report.items).toHaveLength(1); // default config tracks moneyline only → one item per verified contest
     expect(report.items[0]).toMatchObject({
-      kind: 'needs_moneyline_speculation',
-      recommendedAction: 'seed_moneyline_speculation',
+      kind: 'needs_speculation',
+      market: 'moneyline',
+      recommendedAction: 'seed_speculation',
       contestId: 'contest-1',
       contestStatus: 'verified',
-      moneylineSpeculationId: null,
+      speculationId: null,
     });
   });
 
@@ -222,14 +224,73 @@ describe('runCandidates — contest classification', () => {
     expect(report.items).toHaveLength(1);
     expect(report.items[0]).toMatchObject({
       kind: 'quote_ready',
+      market: 'moneyline',
       recommendedAction: 'quote',
       contestId: 'contest-1',
       contestStatus: 'verified',
-      moneylineSpeculationId: 'spec-ml-contest-1',
-      referenceOdds: { awayAmerican: -113, homeAmerican: -100 },
+      speculationId: 'spec-ml-contest-1',
+      referenceOdds: { market: 'moneyline', awayOddsAmerican: -113, homeOddsAmerican: -100 },
     });
     expect(report.summary.quoteReady).toBe(1);
     expect(candidatesExitCode(report)).toBe(0);
+  });
+
+  it('MARKET-AWARE: markets [moneyline, spread] on a verified contest → one quote_ready item PER market', async () => {
+    const config = cfg({ marketSelection: { markets: ['moneyline', 'spread'] } });
+    const contest = contestWith({ speculations: [moneylineSpec('contest-1'), spreadSpec('contest-1')] });
+    const snapshot: ContestOddsSnapshot = {
+      contestId: 'contest-1',
+      odds: {
+        moneyline: { market: 'moneyline', awayOddsAmerican: -113, homeOddsAmerican: -100, upstreamLastUpdated: 'x', pollCapturedAt: 'x', changedAt: 'x' },
+        spread: { market: 'spread', awayLine: -3.5, homeLine: 3.5, awayOddsAmerican: -110, homeOddsAmerican: -110, upstreamLastUpdated: 'x', pollCapturedAt: 'x', changedAt: 'x' },
+        total: null,
+      },
+    };
+    const report = await run(adapterFor([createdGame('contest-1')], [contest], { 'contest-1': snapshot }), config);
+    expect(report.items).toHaveLength(2);
+    const byMarket = new Map(report.items.map((i) => [i.market, i]));
+    expect(byMarket.get('moneyline')).toMatchObject({ kind: 'quote_ready', speculationId: 'spec-ml-contest-1', referenceOdds: { market: 'moneyline', awayOddsAmerican: -113 } });
+    expect(byMarket.get('spread')).toMatchObject({ kind: 'quote_ready', speculationId: 'spec-sp-contest-1', referenceOdds: { market: 'spread', awayLine: -3.5 } });
+    expect(report.summary.quoteReady).toBe(2);
+  });
+
+  it('MARKET-AWARE: a configured market with no open spec → needs_speculation for THAT market only', async () => {
+    const config = cfg({ marketSelection: { markets: ['moneyline', 'spread'] } });
+    const contest = contestWith({ speculations: [moneylineSpec('contest-1')] }); // moneyline open, no spread spec
+    const report = await run(adapterFor([createdGame('contest-1')], [contest], { 'contest-1': oddsSnapshot('contest-1') }), config);
+    expect(report.items).toHaveLength(2);
+    const byMarket = new Map(report.items.map((i) => [i.market, i.kind]));
+    expect(byMarket.get('moneyline')).toBe('quote_ready');
+    expect(byMarket.get('spread')).toBe('needs_speculation');
+    expect(report.summary.quoteReady).toBe(1);
+    expect(report.summary.needsSpeculation).toBe(1);
+  });
+
+  it('MARKET-AWARE: same-contest multi-market quote_ready items are deterministically ordered by market (not by snapshot resolution order)', async () => {
+    const config = cfg({ marketSelection: { markets: ['moneyline', 'spread'] } });
+    const contest = contestWith({ speculations: [moneylineSpec('contest-1'), spreadSpec('contest-1')] });
+    const snapshot: ContestOddsSnapshot = {
+      contestId: 'contest-1',
+      odds: {
+        moneyline: { market: 'moneyline', awayOddsAmerican: -113, homeOddsAmerican: -100, upstreamLastUpdated: 'x', pollCapturedAt: 'x', changedAt: 'x' },
+        spread: { market: 'spread', awayLine: -3.5, homeLine: 3.5, awayOddsAmerican: -110, homeOddsAmerican: -110, upstreamLastUpdated: 'x', pollCapturedAt: 'x', changedAt: 'x' },
+        total: null,
+      },
+    };
+    // Resolve the FIRST snapshot call (moneyline, pushed first) LATE and the second
+    // (spread) immediately, so the spread item would be pushed first absent a sort
+    // tiebreak. A stable sort would then leave spread before moneyline — the bug.
+    let call = 0;
+    const adapter = fakeAdapter({
+      games: { list: () => Promise.resolve([createdGame('contest-1')]) },
+      contests: { list: () => Promise.resolve([contest]) },
+      odds: {
+        snapshot: () => (call++ === 0 ? new Promise<ContestOddsSnapshot>((r) => setTimeout(() => r(snapshot), 5)) : Promise.resolve(snapshot)),
+        subscribe: () => Promise.resolve({ unsubscribe: async () => {} }),
+      },
+    });
+    const report = await run(adapter, config);
+    expect(report.items.map((i) => i.market)).toEqual(['moneyline', 'spread']); // sorted by market, regardless of resolution order
   });
 
   it('created game whose contest is still unverified → needs_verification', async () => {
@@ -356,7 +417,8 @@ describe('runCandidates — skip reasons', () => {
     expect(report.items[0]).toMatchObject({
       kind: 'skipped',
       skipReason: 'no-reference-odds',
-      moneylineSpeculationId: 'spec-ml-contest-1',
+      market: 'moneyline',
+      speculationId: 'spec-ml-contest-1',
     });
     expect(report.summary.skipped).toEqual({ 'no-reference-odds': 1 });
     expect(candidatesExitCode(report)).toBe(0);
@@ -409,15 +471,16 @@ describe('runCandidates — report envelope + determinism', () => {
     return run(adapterFor(games, contests, { 'c-ready': oddsSnapshot('c-ready') }));
   }
 
-  it('JSON envelope is { schemaVersion: 1, candidates: CandidatesReport } and never surfaces externalIds', async () => {
+  it('JSON envelope is { schemaVersion: 2, candidates: CandidatesReport } and never surfaces externalIds', async () => {
     const report = await mixedReport();
     const { sink, text } = collect();
     renderCandidatesReportJson(report, sink);
     const parsed = JSON.parse(text()) as { schemaVersion: number; candidates: CandidatesReport };
-    expect(parsed.schemaVersion).toBe(1);
+    expect(parsed.schemaVersion).toBe(2);
     expect(parsed.candidates.generatedAt).toBe(new Date(T0_ISO).toISOString());
     expect(parsed.candidates.config).toEqual({
       sports: ['mlb'],
+      markets: ['moneyline'],
       hours: 24,
       contestsHours: 24, // == hours while within the contests API's 168h max
       maxTrackedMarkets: 5,
@@ -431,7 +494,7 @@ describe('runCandidates — report envelope + determinism', () => {
     const report = await mixedReport();
     const count = (kind: CandidateItem['kind']): number => report.items.filter((i) => i.kind === kind).length;
     expect(report.summary.quoteReady).toBe(count('quote_ready'));
-    expect(report.summary.needsMoneylineSpeculation).toBe(count('needs_moneyline_speculation'));
+    expect(report.summary.needsSpeculation).toBe(count('needs_speculation'));
     expect(report.summary.needsVerification).toBe(count('needs_verification'));
     expect(report.summary.gamesAvailableToCreate).toBe(count('setup'));
     expect(report.summary.needsContest).toBe(report.summary.gamesAvailableToCreate);
@@ -444,7 +507,7 @@ describe('runCandidates — report envelope + determinism', () => {
     const report = await mixedReport();
     expect(report.items.map((i) => i.kind)).toEqual([
       'quote_ready',
-      'needs_moneyline_speculation',
+      'needs_speculation',
       'needs_verification',
       'setup',
       'setup',
@@ -461,7 +524,7 @@ describe('runCandidates — report envelope + determinism', () => {
       gamesAvailableToCreate: 0,
       quoteReady: 0,
       needsContest: 0,
-      needsMoneylineSpeculation: 0,
+      needsSpeculation: 0,
       needsVerification: 0,
       skipped: {},
     });

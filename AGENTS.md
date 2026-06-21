@@ -25,7 +25,7 @@ Everything else (Heroku logs, internal monitoring) is out of scope for this doc.
 
 ## 2. CLI surface
 
-Every command supports `--json` (except `run` — it's a loop, not a query; its structured output is the NDJSON log). All `--json` envelopes share the shape `{ schemaVersion: 1, <name>: <Report> }`.
+Every command supports `--json` (except `run` — it's a loop, not a query; its structured output is the NDJSON log). All `--json` envelopes share the shape `{ schemaVersion: N, <name>: <Report> }` — `N` is `1` for every command except `candidates`, which is at `2` (see §2.7).
 
 Numeric values that can exceed `Number.MAX_SAFE_INTEGER` (USDC wei6, POL wei18, block numbers) are emitted as **decimal strings**. Booleans, finite numbers, and nested plain objects are emitted as normal JSON.
 
@@ -35,7 +35,7 @@ Numeric values that can exceed `Number.MAX_SAFE_INTEGER` (USDC wei6, POL wei18, 
 |---|---|---|---|---|---|
 | `doctor [--address <0x…>] [--json]` | config, keystore, API/RPC reachability, wallet balances + allowance, state file | — (read-only) | `{schemaVersion:1, doctor: DoctorReport}` | no FAIL checks | any FAIL (config invalid, API/RPC unreachable, keystore set but missing, …); a WARN does NOT fail |
 | `quote --dry-run <contestId> [--json]` | config, contest + reference odds | — (read-only) | `{schemaVersion:1, quote: QuoteReport}` | `pipeline:'computed' && canQuote:true` | refused (closed, no open speculation, no reference odds, etc.) |
-| `candidates [--sport <sport>] [--hours <n>] [--json]` | config, games schedule, contests, per-candidate odds snapshots | — (read-only, signer-free) | `{schemaVersion:1, candidates: CandidatesReport}` | listing succeeded — an **empty result is a valid answer** (exit 0) | operational throw only (config invalid, API unreachable, bad flag) |
+| `candidates [--sport <sport>] [--hours <n>] [--json]` | config, games schedule, contests, per-candidate odds snapshots | — (read-only, signer-free) | `{schemaVersion:2, candidates: CandidatesReport}` | listing succeeded — an **empty result is a valid answer** (exit 0) | operational throw only (config invalid, API unreachable, bad flag) |
 | `run --dry-run [--address <0x…>] [--keystore <p>] [--ignore-missing-state]` | config, state, contests, odds | state, telemetry log | (no `--json`) | graceful shutdown (KILL file / SIGTERM/SIGINT) | startup refusal (config invalid, state-loss without override, …) |
 | `run --live [--keystore <p>] [--ignore-missing-state] [--yes]` | same + signed adapter | state, telemetry log, **on chain** | (no `--json`) | graceful shutdown | refusal (`mode.dryRun:true` + `--live` mismatch, no keystore, prompt rejected, `--yes`-requiring config without it, ...) |
 | `cancel-stale [--authoritative] [--keystore <p>] [--ignore-missing-state] [--json]` | config, state | state (lifecycle stamps), telemetry log, **off-chain DELETE; on-chain cancelCommitment if `--authoritative`** | `{schemaVersion:1, cancelStale: CancelStaleReport}` | clean cleanup | any `errored > 0`, `gasDenied > 0`, or `blockedMissingPayload > 0` (incomplete sweep); refusal (`mode.dryRun:true`, no keystore, state-loss without override, dry: synthetic hash in state, ...) |
@@ -194,14 +194,15 @@ interface RunSummary {
 
 The `summary` command threads `config.gas.nativeTokenUSDCPrice` into `summarize` when `config.gas.reportInUSDC: true`, populating `liveMetrics.gas.totalUsdcEquivWei6`.
 
-### 2.7 CandidatesReport (envelope: `{schemaVersion:1, candidates: …}`)
+### 2.7 CandidatesReport (envelope: `{schemaVersion:2, candidates: …}`)
 
-The quote-target / setup-target preflight. Read-only and signer-free (no keystore, no writes). Each in-window game/contest gets exactly one `kind`; the allow-list **annotates** (`inContestAllowList`) but never hides; the deny-list skips (`skipReason: 'deny-list'`).
+The quote-target / setup-target preflight. Read-only and signer-free (no keystore, no writes). **Market-aware:** a *verified* contest yields one item **per configured market** (`marketSelection.markets`, default `['moneyline']`) — the per-market kinds (`quote_ready` / `needs_speculation`, and a per-market `no-reference-odds` skip) carry `market`; the contest-level kinds (`needs_verification` / `setup` / contest-level skips) carry `market: null` and appear once. The allow-list **annotates** (`inContestAllowList`) but never hides; the deny-list skips (`skipReason: 'deny-list'`). **v2** (was v1): per-market items + `market` field, `needs_moneyline_speculation`→`needs_speculation`, `moneylineSpeculationId`→`speculationId`, `referenceOdds` is now the market-typed `ReferenceOdds`, `config.markets` added.
 
 ```typescript
 interface CandidatesReport {
   generatedAt: string;                   // ISO-8601 UTC
   config: { sports: string[];
+            markets: MarketType[];      // configured markets each verified contest is classified for (default ['moneyline'])
             hours: number;              // the games leg's window (1-720)
             contestsHours: number;      // the contests leg's effective window: min(hours, 168) — the contests
                                         //   API caps at 168h while the games API allows 720h. Beyond 168h only
@@ -211,19 +212,19 @@ interface CandidatesReport {
             requireReferenceOdds: boolean; contestAllowListSize: number };
   summary: {
     gamesAvailableToCreate: number;      // == count of kind 'setup'
-    quoteReady: number;
+    quoteReady: number;                  // count of quote_ready items == (contest, market) pairs quotable now
     needsContest: number;                // planning-doc parity alias — always == gamesAvailableToCreate
-    needsMoneylineSpeculation: number;
+    needsSpeculation: number;            // (contest, market) pairs on verified contests whose market has no open speculation
     needsVerification: number;
     skipped: Record<string, number>;     // by skipReason; only nonzero reasons present
   };
   truncated: boolean;                    // a pagination bound was hit — the listing may be incomplete
-  items: CandidateItem[];                // sorted: kind priority (quote_ready, needs_moneyline_speculation,
+  items: CandidateItem[];                // sorted: kind priority (quote_ready, needs_speculation,
                                          //   needs_verification, setup, skipped), then matchTime ascending
 }
 
 interface CandidateItem {
-  kind: 'quote_ready' | 'needs_moneyline_speculation' | 'needs_verification' | 'setup' | 'skipped';
+  kind: 'quote_ready' | 'needs_speculation' | 'needs_verification' | 'setup' | 'skipped';
   gameId: string | null;                 // stable schedule id — key on this, never slug; null when no game row joined
   slug: string | null;                   // display-only; mutable (doubleheader renames)
   sport: string;
@@ -235,28 +236,31 @@ interface CandidateItem {
   canCreateContest: boolean | null;
   contestCreated: boolean;
   contestId: string | null;
-  moneylineSpeculationId: string | null; // the open moneyline speculation, when one exists
-  recommendedAction: 'quote' | 'seed_moneyline_speculation' | 'wait_for_verification'
-                   | 'create_contest_then_seed_moneyline' | null;   // null on 'skipped'
-  contestStatus?: string | null;         // ALWAYS present on quote_ready / needs_moneyline_speculation / needs_verification
+  market: MarketType | null;             // the configured market for per-market kinds (quote_ready / needs_speculation /
+                                         //   per-market no-reference-odds skip); null on contest-level kinds (needs_verification / setup / contest-level skips)
+  speculationId: string | null;          // the open speculation for this item's market, when one exists
+  recommendedAction: 'quote' | 'seed_speculation' | 'wait_for_verification'
+                   | 'create_contest_then_seed' | null;   // null on 'skipped'
+  contestStatus?: string | null;         // ALWAYS present on quote_ready / needs_speculation / needs_verification
                                          //   ('verified' / 'unverified' / …; null = contest row not visible yet);
                                          //   on 'skipped' only when the skip is contest-backed; never on 'setup'
-  referenceOdds?: { awayAmerican: number | null; homeAmerican: number | null } | null;  // 'quote_ready' only
+  referenceOdds?: ReferenceOdds | null;  // 'quote_ready' only — the market-typed reference (moneyline: away/home American;
+                                         //   spread: away/home line + American; total: line + over/under American); null when requireReferenceOdds:false let it through
   inContestAllowList?: boolean;          // contest-backed items; present iff marketSelection.contestAllowList is non-empty
   skipReason?: 'started-or-live' | 'no-odds' | 'no-reference-odds' | 'cannot-create-contest'
              | 'deny-list' | 'not-quotable-status' | 'game-status-postponed-or-cancelled';  // 'skipped' only
 }
 ```
 
-Classification table (one `kind` per item):
+Classification table (one `kind` per item; the per-market kinds repeat per configured market on a verified contest):
 
 | kind | condition | recommendedAction |
 |---|---|---|
-| `quote_ready` | contest `verified` + open `moneyline` speculation + (odds present, when `requireReferenceOdds`) | `quote` |
-| `needs_moneyline_speculation` | contest `verified`, no open moneyline speculation | `seed_moneyline_speculation` |
+| `quote_ready` | contest `verified` + open speculation for **that market** + (odds present, when `requireReferenceOdds`) | `quote` |
+| `needs_speculation` | contest `verified`, no open speculation for **that market** | `seed_speculation` |
 | `needs_verification` | game created but contest not yet `verified` (or contest row not visible yet) | `wait_for_verification` |
-| `setup` | game upcoming, `contestCreated=false`, `canCreateContest=true`, `hasOdds=true` | `create_contest_then_seed_moneyline` |
-| `skipped` | anything else in the window — see `skipReason` | `null` |
+| `setup` | game upcoming, `contestCreated=false`, `canCreateContest=true`, `hasOdds=true` | `create_contest_then_seed` |
+| `skipped` | anything else in the window — see `skipReason` (a verified contest can be `quote_ready` for one market and a `no-reference-odds` skip for another) | `null` |
 
 ---
 

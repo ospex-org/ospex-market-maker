@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  canSpendFee,
   canSpendGas,
   contestWorstCaseUSDC,
   headroomForSide,
@@ -371,5 +372,34 @@ describe('canSpendGas (Phase 3 d-ii)', () => {
     // Reserve == cap. Normal mode denies on misconfig; mayUseReserve mode proceeds (the spendable target is the cap, not cap-reserve).
     const v = canSpendGas({ todayGasSpentPolWei: 0n, maxDailyGasPolWei: POL, emergencyReservePolWei: POL, mayUseReserve: true });
     expect(v).toEqual({ allowed: true });
+  });
+});
+
+describe('canSpendFee (seeding creation-fee budget)', () => {
+  const USDC = 1_000_000n; // wei6
+  const FEE = 250_000n; //    the maker's 0.25 USDC creation-fee share
+
+  it('allows a seed creation fee within the daily budget', () => {
+    expect(canSpendFee({ todayFeeSpentUsdcWei6: 0n, requestedFeeUsdcWei6: FEE, maxDailyFeeUsdcWei6: 5n * USDC })).toEqual({ allowed: true });
+  });
+
+  it('PRE-ACCOUNTS the requested fee: allows reaching the cap exactly, denies one wei6 over (unlike gas, the fee is a known amount)', () => {
+    // today 4.75 + 0.25 = 5.0 == cap → allowed (exactly reaching the cap is fine)
+    expect(canSpendFee({ todayFeeSpentUsdcWei6: 5n * USDC - FEE, requestedFeeUsdcWei6: FEE, maxDailyFeeUsdcWei6: 5n * USDC })).toEqual({ allowed: true });
+    // one wei6 more spent → 5.0 + 1 wei6 > cap → denied
+    const v = canSpendFee({ todayFeeSpentUsdcWei6: 5n * USDC - FEE + 1n, requestedFeeUsdcWei6: FEE, maxDailyFeeUsdcWei6: 5n * USDC });
+    expect(v.allowed).toBe(false);
+    if (!v.allowed) expect(v.reason).toMatch(/would exceed the daily fee cap/);
+  });
+
+  it('denies on the default zero budget — no fee budget means seeding cannot incur a creation fee', () => {
+    const v = canSpendFee({ todayFeeSpentUsdcWei6: 0n, requestedFeeUsdcWei6: FEE, maxDailyFeeUsdcWei6: 0n });
+    expect(v.allowed).toBe(false);
+    if (!v.allowed) expect(v.reason).toMatch(/maxDailyFeeUSDC must be > 0/);
+  });
+
+  it('defense-in-depth: denies on a negative spent or requested amount (caller bug / state corruption)', () => {
+    expect(canSpendFee({ todayFeeSpentUsdcWei6: -1n, requestedFeeUsdcWei6: FEE, maxDailyFeeUsdcWei6: 5n * USDC }).allowed).toBe(false);
+    expect(canSpendFee({ todayFeeSpentUsdcWei6: 0n, requestedFeeUsdcWei6: -1n, maxDailyFeeUsdcWei6: 5n * USDC }).allowed).toBe(false);
   });
 });

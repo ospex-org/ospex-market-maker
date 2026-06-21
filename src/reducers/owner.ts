@@ -141,7 +141,9 @@ function positionStatusRank(s: MakerPositionStatus): number {
  * Apply one SSE `commitment` delta to canonical {@link MakerState}. Projects the
  * SDK's `OwnerCommitment` via {@link mapOwnerCommitmentToMaker} (which throws
  * `OwnerMappingError` on missing metadata — the runner's drain catch handles it)
- * and inserts/replaces `state.commitments[hash]`.
+ * and inserts/replaces `state.commitments[hash]`. `seedSpeculations` is threaded
+ * to the mapper: when on, a seed's null `speculationId` maps to its placeholder
+ * instead of failing closed (the caller passes `config.marketSelection.seedSpeculations`).
  *
  * **Preserves the existing record's `fills[]`** across the replace: the mapper
  * sets `fills: []`, but the SSE-fill audit/dedup array is owned by
@@ -167,8 +169,9 @@ function positionStatusRank(s: MakerPositionStatus): number {
 export function reduceOwnerCommitmentObservation(
   state: MakerState,
   body: OwnerCommitment,
+  seedSpeculations = false,
 ): ReducerDescriptor[] {
-  const mapped = mapOwnerCommitmentToMaker(body);
+  const mapped = mapOwnerCommitmentToMaker(body, seedSpeculations);
   const existing = state.commitments[body.commitmentHash];
   if (existing !== undefined) {
     mapped.fills = existing.fills;

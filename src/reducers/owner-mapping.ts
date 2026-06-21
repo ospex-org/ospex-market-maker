@@ -16,23 +16,38 @@
  *   (`createdAt` / `updatedAtUnixSec` / `sourceUpdatedAt`), which reflects the
  *   actual chain/indexer event time rather than wall-clock-at-map-time.
  * - **Fail closed.** A payload missing metadata the canonical record requires
- *   as non-null (e.g. a delivered commitment with a null `speculationId`)
- *   throws {@link OwnerMappingError} carrying the offending `field` and the
- *   record's identifier (`commitmentHash` / `speculationId`) — never a partial
- *   or coerced record. The PR3b call site catches it, emits
- *   `owner-mapping-failed`, and skips the row.
+ *   as non-null (e.g. a delivered commitment with an empty `sport` / null
+ *   `contestId`, or an unparseable timestamp) throws {@link OwnerMappingError}
+ *   carrying the offending `field` and the record's identifier (`commitmentHash`
+ *   / `speculationId`) — never a partial or coerced record. The PR3b call site
+ *   catches it, emits `owner-mapping-failed`, and skips the row.
+ * - **Seed tolerance — gated on `seedSpeculations`.** When the caller passes
+ *   `seedSpeculations: true`, a commitment with a null `speculationId` is treated
+ *   as a SEED — one posted at a market's oracle line before any speculation
+ *   exists there — and maps to the stable placeholder {@link seedSpeculationId}
+ *   (reconstructed from the body's reliable `contestId` / `marketType` /
+ *   `lineTicks`) rather than throwing, so a pre-match seed never freezes the
+ *   own-state cursor; the real id is adopted by the wholesale-replace once the
+ *   speculation is created on first match. With seeding OFF (the default) a null
+ *   `speculationId` stays a fail-closed case — a real commitment can only reach
+ *   own-state with a null id via a transient indexer-lag join (the speculations
+ *   row briefly absent), which must WAIT (skip + cold-restart), not be mis-keyed
+ *   to a placeholder. So the mapper is byte-identical to the pre-seed behavior
+ *   whenever seeding is off.
  * - **Wei6 only.** Canonical records carry authoritative `*Wei6` decimal
  *   strings; the SDK's float `riskAmountUSDC` / `profitAmountUSDC` fields are
  *   ignored (they exist for other consumers' backwards-compat).
  */
 
 import type { OwnerCommitment, OwnerPosition, PositionLifecycle, PositionStatusEvent } from '../ospex/index.js';
+import { seedSpeculationId } from '../orders/seed.js';
 import {
   type CommitmentLifecycle,
   type MakerCommitmentRecord,
   type MakerPositionRecord,
   type MakerPositionStatus,
   type MakerSide,
+  type MarketType,
   type SignedPayloadStatus,
   toMakerSignedPayload,
 } from '../state/index.js';
@@ -132,25 +147,57 @@ function sideFromPositionType(positionType: 0 | 1): MakerSide {
  * Project an SDK `OwnerCommitment` to a canonical {@link MakerCommitmentRecord}.
  *
  * Fail-closed on the nullable SDK fields the canonical record requires as
- * non-null (`speculationId` / `contestId` / `scorer` / `positionType` /
- * `oddsTick`), on empty denormalized identity (`sport` / `awayTeam` /
- * `homeTeam`), and on an unparseable `createdAt` / `expiry`.
+ * non-null (`contestId` / `scorer` / `positionType` / `oddsTick`), on empty
+ * denormalized identity (`sport` / `awayTeam` / `homeTeam`), and on an
+ * unparseable `createdAt` / `expiry`.
+ *
+ * **`speculationId` is the exception, gated on `seedSpeculations`** — with
+ * seeding ON, a null one is a SEED (a commitment posted before its speculation
+ * exists), not missing metadata, so it maps to the {@link seedSpeculationId}
+ * placeholder rather than throwing (see the module docstring); with seeding OFF
+ * (the default) a null one fails closed exactly as before. The fail-closed check
+ * stays first (preserving the seeding-off error precedence); `contestId` is
+ * validated before the placeholder is reconstructed from it.
  *
  * `fills` is always `[]` — the mapper does NOT enumerate fills; those are
  * appended by the `onFill` reducer as `Match` events arrive (own-state plan
  * §6.3). `signedPayloadStatus` follows the SDK's `signedPayload` presence.
  */
-export function mapOwnerCommitmentToMaker(c: OwnerCommitment): MakerCommitmentRecord {
+export function mapOwnerCommitmentToMaker(
+  c: OwnerCommitment,
+  seedSpeculations = false,
+): MakerCommitmentRecord {
   const hash = c.commitmentHash;
-  if (!c.speculationId) {
-    // null OR empty-string — speculationId is the risk engine's exposure group key,
-    // so reject a blank one at the boundary (matching the position mapper) rather than
-    // letting it reach the risk engine's fail-closed guard and abort a whole tick.
+  if (!c.speculationId && !seedSpeculations) {
+    // Seeding OFF (the default): a null/empty speculationId is missing metadata, NOT a
+    // seed — a real commitment can only reach own-state with a null id via a transient
+    // indexer-lag join (the speculations row briefly absent), which must wait + cold-restart
+    // rather than be mis-keyed to a placeholder. Fail closed exactly as the pre-seed mapper
+    // did (this check stays first so the seeding-off error precedence is byte-identical).
     throw new OwnerMappingError(`commitment ${hash}: missing speculationId`, { field: 'speculationId', commitmentHash: hash });
   }
+  // contestId is validated next: it is required to reconstruct a seed's placeholder
+  // speculationId below (and the record needs it regardless of the seed/non-seed path).
   if (c.contestId === null) {
     throw new OwnerMappingError(`commitment ${hash}: null contestId`, { field: 'contestId', commitmentHash: hash });
   }
+  // Sourced ONCE — both the record and a seed's placeholder need them. Semantics are
+  // unchanged from the per-record defaults: a null marketType is the moneyline norm
+  // (the only live market core-api leaves unclassified), a null lineTicks → 0 (no line).
+  const marketType: MarketType = c.marketType ?? 'moneyline';
+  const lineTicks = c.lineTicks ?? 0;
+  // A matched commitment carries its real on-chain speculationId. With seeding ON, a SEED
+  // commitment — posted at a market's oracle line before any speculation exists there —
+  // arrives with speculationId null (core-api has no speculation row to join yet; see
+  // enrich.ts), and maps to the SAME stable placeholder the discovery branch minted,
+  // `seed:contestId:marketType:lineTicks`, so its exposure groups with the tracked seed
+  // market; the real id is adopted by the wholesale-replace once the speculation is
+  // created (post-match). The body carries reliable contestId / marketType / lineTicks
+  // (core-api derives market_type from the scorer at POST and stores it on the commitment
+  // row, independent of whether the speculation exists), so the placeholder is reproducible.
+  const speculationId = c.speculationId
+    ? c.speculationId
+    : seedSpeculationId(c.contestId, marketType, lineTicks);
   if (c.scorer === null) {
     throw new OwnerMappingError(`commitment ${hash}: null scorer`, { field: 'scorer', commitmentHash: hash });
   }
@@ -183,25 +230,23 @@ export function mapOwnerCommitmentToMaker(c: OwnerCommitment): MakerCommitmentRe
   const signedPayloadStatus: SignedPayloadStatus = c.signedPayload === null ? 'missing-legacy' : 'present';
   const record: MakerCommitmentRecord = {
     hash,
-    speculationId: c.speculationId,
+    speculationId,
     contestId: c.contestId,
     sport: c.sport,
     awayTeam: c.awayTeam,
     homeTeam: c.homeTeam,
     scorer: c.scorer,
-    // marketType / lineTicks from the owner-auth commitment body. A null lineTicks is the
-    // moneyline norm (no line → 0). A null marketType means core-api could not classify the
-    // market — today that can only be a moneyline commitment (the only live market), so the
-    // moneyline default is safe AND byte-identical. The risk engine groups exposure by
-    // speculationId (which this body always carries), so this default does NOT affect grouping;
-    // its only consequence is the per-team cap exemption — a `total` body wrongly defaulted to
-    // moneyline would be (incorrectly) subjected to the per-team cap, which over-states team
-    // exposure (conservative, not an under-state). Still, once spread / total ship a follow-up
-    // (the gate-flip prerequisite) should source the real marketType from the scorer / signed
-    // payload rather than defaulting here. (The state validator, by contrast, fail-CLOSES on a
-    // present-but-unknown marketType.)
-    marketType: c.marketType ?? 'moneyline',
-    lineTicks: c.lineTicks ?? 0,
+    // marketType / lineTicks were sourced above (the seed placeholder needs them too).
+    // `c.marketType` is core-api's scorer-derived classification (set at POST, stored on
+    // the commitment row), so it IS the real market for any live commitment; the moneyline
+    // default only applies to a genuinely-null legacy body. The risk engine groups exposure
+    // by speculationId (the real id, or a seed's placeholder), so this default never affects
+    // grouping; its only consequence is the per-team cap exemption — a `total` body wrongly
+    // defaulted to moneyline would be (incorrectly) subjected to the per-team cap, which
+    // over-states team exposure (conservative, not an under-state). (The state validator,
+    // by contrast, fail-CLOSES on a present-but-unknown marketType.)
+    marketType,
+    lineTicks,
     makerSide: sideFromPositionType(c.positionType),
     oddsTick: c.oddsTick,
     riskAmountWei6: c.riskAmount,

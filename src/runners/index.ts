@@ -1362,7 +1362,7 @@ export class Runner {
         let descriptors: ReducerDescriptor[];
         switch (event.kind) {
           case 'commitment':
-            descriptors = reduceOwnerCommitmentObservation(this.state, event.body as OwnerCommitment);
+            descriptors = reduceOwnerCommitmentObservation(this.state, event.body as OwnerCommitment, this.config.marketSelection.seedSpeculations);
             break;
           case 'fill':
             // The reducer needs our address for the maker/taker disambiguation.
@@ -3436,7 +3436,7 @@ export class Runner {
     }
     for (const c of snapshot.commitments) {
       try {
-        this.ownStateSession.pendingBaseline.commitments[c.commitmentHash] = mapOwnerCommitmentToMaker(c);
+        this.ownStateSession.pendingBaseline.commitments[c.commitmentHash] = mapOwnerCommitmentToMaker(c, this.config.marketSelection.seedSpeculations);
       } catch (err) {
         this.emitOwnStateMappingFailure(err, 'snapshot-commitment');
       }

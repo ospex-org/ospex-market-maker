@@ -8,6 +8,7 @@ import type {
   SignedCommitmentPayload,
 } from '../ospex/index.js';
 import type { MakerPositionRecord } from '../state/index.js';
+import { seedSpeculationId } from '../orders/seed.js';
 import {
   OwnerMappingError,
   deriveCommitmentLifecycle,
@@ -288,8 +289,11 @@ describe('mapOwnerCommitmentToMaker', () => {
 
   describe('fail-closed on missing required metadata', () => {
     const cases: ReadonlyArray<[string, Partial<OwnerCommitment>, string]> = [
-      ['null speculationId', { speculationId: null }, 'speculationId'],
-      ['empty speculationId', { speculationId: '' }, 'speculationId'],
+      // With seeding OFF (the default 2nd arg), a null/empty speculationId is still a
+      // fail-closed case — a real commitment can only reach own-state with a null id via a
+      // transient indexer-lag join, which must wait, not be mis-keyed to a seed placeholder.
+      ['null speculationId (seeding off)', { speculationId: null }, 'speculationId'],
+      ['empty speculationId (seeding off)', { speculationId: '' }, 'speculationId'],
       ['null contestId', { contestId: null }, 'contestId'],
       ['null scorer', { scorer: null }, 'scorer'],
       ['null positionType', { positionType: null }, 'positionType'],
@@ -315,6 +319,69 @@ describe('mapOwnerCommitmentToMaker', () => {
         expect(err.speculationId).toBeUndefined();
       });
     }
+  });
+
+  describe('seed commitment (seeding ON: null speculationId → stable placeholder, NOT fail-closed)', () => {
+    it('null speculationId maps to the seed placeholder, reconstructed from contestId/marketType/lineTicks', () => {
+      // moneyline seed: marketType 'moneyline', lineTicks 0 → seed:1:moneyline:0
+      const r = mapOwnerCommitmentToMaker(commitment({ speculationId: null }), true);
+      expect(r.speculationId).toBe(seedSpeculationId('1', 'moneyline', 0));
+      expect(r.speculationId).toBe('seed:1:moneyline:0');
+      // the rest of the record is fully materialized (identity, side, wei6) — not a partial.
+      expect(r).toMatchObject({
+        hash: '0xabc',
+        contestId: '1',
+        marketType: 'moneyline',
+        lineTicks: 0,
+        makerSide: 'away',
+        riskAmountWei6: '250000',
+        lifecycle: 'visibleOpen',
+      });
+    });
+
+    it('spread seed → seed:contestId:spread:lineTicks (line preserved)', () => {
+      const r = mapOwnerCommitmentToMaker(commitment({ speculationId: null, marketType: 'spread', lineTicks: -15 }), true);
+      expect(r.speculationId).toBe(seedSpeculationId('1', 'spread', -15));
+      expect(r.speculationId).toBe('seed:1:spread:-15');
+      expect(r).toMatchObject({ marketType: 'spread', lineTicks: -15 });
+    });
+
+    it('total seed → seed:contestId:total:lineTicks (line preserved)', () => {
+      const r = mapOwnerCommitmentToMaker(commitment({ speculationId: null, marketType: 'total', lineTicks: 85 }), true);
+      expect(r.speculationId).toBe(seedSpeculationId('1', 'total', 85));
+      expect(r.speculationId).toBe('seed:1:total:85');
+      expect(r).toMatchObject({ marketType: 'total', lineTicks: 85 });
+    });
+
+    it('empty-string speculationId is treated as a seed (same placeholder as null)', () => {
+      const r = mapOwnerCommitmentToMaker(commitment({ speculationId: '', marketType: 'total', lineTicks: 85 }), true);
+      expect(r.speculationId).toBe('seed:1:total:85');
+    });
+
+    it('null marketType / lineTicks on a seed collapses to the moneyline default (seed:1:moneyline:0)', () => {
+      const r = mapOwnerCommitmentToMaker(commitment({ speculationId: null, marketType: null, lineTicks: null }), true);
+      expect(r.speculationId).toBe('seed:1:moneyline:0');
+      expect(r).toMatchObject({ marketType: 'moneyline', lineTicks: 0 });
+    });
+
+    it('STILL fail-closed when a seed lacks contestId (the placeholder cannot be formed)', () => {
+      let thrown: unknown;
+      try {
+        mapOwnerCommitmentToMaker(commitment({ speculationId: null, contestId: null }), true);
+      } catch (e) {
+        thrown = e;
+      }
+      expect(thrown).toBeInstanceOf(OwnerMappingError);
+      expect((thrown as OwnerMappingError).field).toBe('contestId');
+    });
+
+    it('GATE: the SAME null-speculationId body throws with seeding OFF but maps to the placeholder with seeding ON', () => {
+      const body = commitment({ speculationId: null, marketType: 'total', lineTicks: 85 });
+      // off (default) → fail-closed
+      expect(() => mapOwnerCommitmentToMaker(body)).toThrow(OwnerMappingError);
+      // on → placeholder
+      expect(mapOwnerCommitmentToMaker(body, true).speculationId).toBe('seed:1:total:85');
+    });
   });
 });
 

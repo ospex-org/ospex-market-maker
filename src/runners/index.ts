@@ -3264,14 +3264,20 @@ export class Runner {
       switch (d.kind) {
         case 'emit-fill':
           if (!audit) {
-            this.eventLog.emit('fill', d.payload as unknown as Record<string, unknown>);
             // A seed's fee-incurring first fill carries the maker creation-fee share
             // (set by the reducer from `seedFeeBySpecKey`); fold it into today's
-            // counter. Absent on every existing-speculation match → no-op (the audit
+            // counter BEFORE emitting — the codebase's record-before-emit convention
+            // (see the gas sites, e.g. recordGasSpentToday before the onchain-cancel
+            // emit). The reducer has already flipped the marker's `charged`, so a
+            // throwing `emit` (a swallowed telemetry I/O failure) must not be able to
+            // strand that flip with no counter update — that would permanently
+            // under-count the daily fee and could let `canSpendFee` permit spend above
+            // the cap. Absent on every existing-speculation match → no-op (the audit
             // poll never reaches this branch, so there is no double-count on replay).
             if (d.payload.feeUsdcWei6 !== undefined) {
               this.recordFeeSpentToday(todayUTCDateString(this.deps.now()), BigInt(d.payload.feeUsdcWei6));
             }
+            this.eventLog.emit('fill', d.payload as unknown as Record<string, unknown>);
           }
           break;
         case 'emit-expire':

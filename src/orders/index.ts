@@ -53,6 +53,7 @@ import type { ReferenceOdds } from './reference-odds.js';
 // `ReferenceOdds`. Re-exported so the spread / total pricing adapters and
 // line-keyed discovery consume one entry point.
 export { oracleLineTicks, referenceOddsEqual, referenceOddsFromSdk, type ReferenceOdds } from './reference-odds.js';
+export { isSeedSpeculationId, seedSpeculationId } from './seed.js';
 
 // ── types ────────────────────────────────────────────────────────────────────
 

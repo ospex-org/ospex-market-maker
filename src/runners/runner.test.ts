@@ -4362,6 +4362,48 @@ describe('Runner — live execution', () => {
     expect(creations).toHaveLength(1);
   });
 
+  it('seeding on: a moneyline seed is tracked at line 0 with NO market tag (the omit-for-moneyline convention), and reconcile refuses it', async () => {
+    const config = seedingCfg(['moneyline']);
+    const lean = contestView({ contestId: '1', speculations: [] }); // no moneyline spec
+    const full = contestView({ contestId: '1', referenceGameId: 'GAME-1', speculations: [] });
+    const adapter = spiedAdapter(config, () => Promise.resolve([lean]), () => Promise.resolve(full), {
+      snapshot: (id) => Promise.resolve({ contestId: id, odds: { moneyline: moneylineOdds(-110, -110), spread: null, total: null } }),
+    });
+    const runner = makeRunner({ config, adapter, maxTicks: 1 });
+    await runner.run();
+
+    const seed = runner.trackedMarketView('1', 'moneyline');
+    expect(seed).toMatchObject({ marketType: 'moneyline', lineTicks: 0 });
+    expect(seed?.speculationId).toBe('seed:1:moneyline:0'); // oracleLineTicks(moneyline) is null -> 0
+    const refusals = readEvents().filter((e) => e.kind === 'candidate' && e.skipReason === 'would-create-lazy-speculation');
+    expect(refusals).toHaveLength(1);
+    expect(refusals[0]?.market).toBeUndefined(); // moneyline omits the market tag
+  });
+
+  it('seeding on: when a real speculation appears at a seed line, the refresh re-binds the seed to it and quotes it (seed -> tracking migration)', async () => {
+    const config = seedingCfg(['spread']);
+    config.discovery.everyNTicks = 1; // discover every tick → cycle 1 seeds, cycle 2 sees the real spec
+    const realSpec: SpeculationView = { speculationId: '4217', contestId: '1', marketType: 'spread', lineTicks: -15, line: -1.5, open: true };
+    // The listing carries no spread spec on the first discovery, then the real open spec on the second.
+    let listCalls = 0;
+    const listContests = () => {
+      listCalls += 1;
+      const specs = listCalls >= 2 ? [realSpec] : [];
+      return Promise.resolve([contestView({ contestId: '1', speculations: specs })]);
+    };
+    const adapter = spiedAdapter(config, listContests, () => Promise.resolve(contestView({ contestId: '1', referenceGameId: 'GAME-1', speculations: [] })), {
+      snapshot: (id) => Promise.resolve({ contestId: id, odds: { moneyline: null, spread: spreadOdds(-1.5), total: null } }),
+    });
+    const runner = makeRunner({ config, adapter, maxTicks: 2 });
+    await runner.run();
+
+    // The seed's placeholder id was re-bound to the real on-chain id by the discovery refresh.
+    expect(runner.trackedMarketView('1', 'spread')?.speculationId).toBe('4217');
+    const events = readEvents();
+    expect(events.some((e) => e.kind === 'candidate' && e.skipReason === 'would-create-lazy-speculation')).toBe(true); // cycle 1 refused as a seed
+    expect(events.some((e) => e.kind === 'quote-intent' && e.speculationId === '4217')).toBe(true); // cycle 2 quotes the now-real market
+  });
+
   // ── line-consistency gate (spread/total: never quote a mispriced line) ──────────
   //
   // A spread/total commitment carries an on-chain line; the reference odds are priced

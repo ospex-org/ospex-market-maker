@@ -37,9 +37,11 @@ export interface FillEventPayload {
    * a realized-fee record: the protocol charges the fee only when a fill lazily CREATES the
    * speculation, which the MM can't observe from own-state, so it assumes its seed's first match
    * created it — exact for a sole seeder, an over-estimate when another maker raced to create the
-   * speculation first. Additive (the NDJSON line is byte-identical when absent — every
-   * seeding-off / moneyline-only run). The runner records it into `dailyCounters.feeUsdcWei6` and
-   * `summarize` sums it into `totalFeeUsdcWei6`.
+   * speculation first. Additive (the NDJSON line is byte-identical when absent — every non-seed
+   * fill, and every fill on a seeding-off run). NOTE: a moneyline market can be SEEDED too
+   * (`seed:contestId:moneyline:0`), so a moneyline-only run is NOT fee-free — only seeding-off (or
+   * no seed fill yet) is. The runner records it into `dailyCounters.feeUsdcWei6` and `summarize`
+   * sums it into `totalFeeUsdcWei6`.
    */
   feeUsdcWei6?: string;
 }

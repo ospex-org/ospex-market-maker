@@ -417,7 +417,9 @@ export interface DailyCounters {
    * speculation's first matched fill (DESIGN §6). A conservative estimate, not a
    * realized-fee ledger — exact for a sole seeder, an over-estimate by at most one fee
    * per speculation another maker raced to create first (see {@link SeedFeeEntry}).
-   * Genuinely `"0"` for a moneyline-only operator (and while seeding is off).
+   * `"0"` while seeding is off, and on any day no seed fill has carried a fee. (A
+   * moneyline market can be SEEDED too — `seed:contestId:moneyline:0` — so a
+   * moneyline-only run is NOT necessarily fee-free.)
    */
   feeUsdcWei6: string;
 }

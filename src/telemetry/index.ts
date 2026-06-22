@@ -719,8 +719,10 @@ export interface LiveMetrics {
    * A **conservative estimate**, NOT a realized-fee ledger: exact when the MM is the
    * sole seeder of each line, but over-states by at most one fee per speculation that
    * another maker raced to create first (the MM's seed then matched into it and paid
-   * no fee — the protocol charges the fee only at creation). `"0"` on any seeding-off /
-   * moneyline-only run. Not folded into `realizedPnl` — reported as a separate estimate.
+   * no fee — the protocol charges the fee only at creation). `"0"` on a seeding-off run,
+   * or any run where no seed fill has carried a fee yet (a moneyline market can be
+   * seeded too, so a moneyline-only run is NOT necessarily fee-free). Not folded into
+   * `realizedPnl` — reported as a separate estimate.
    */
   totalFeeUsdcWei6: string;
 }
@@ -876,7 +878,8 @@ export function summarize(logPaths: readonly string[], opts: { sinceIso?: string
   // events that carry a `feeUsdcWei6` (the first matched fill of a seed speculation).
   // A CONSERVATIVE ESTIMATE (see the field doc / the owner reducer): exact for a sole
   // seeder, an over-estimate by at most one fee per speculation another maker raced to
-  // create first. `0` on any seeding-off / moneyline-only run (no fill carries a fee).
+  // create first. `0` on a seeding-off run, or any run where no seed fill has carried a
+  // fee (a moneyline market can be seeded too, so "moneyline-only" is NOT fee-free).
   let totalFeeUsdcWei6 = 0n;
   const gasByKind: LiveGasByKind = { approval: '0', onchainCancel: '0', settle: '0', claim: '0' };
   const addGas = (kind: keyof LiveGasByKind, gasPolWei: bigint): void => {

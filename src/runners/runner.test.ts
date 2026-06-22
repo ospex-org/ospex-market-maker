@@ -3121,6 +3121,43 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
         triggerKill();
         await runPromise;
       });
+
+      it('charges the fee exactly once across the placeholder→real migration window (a 2nd fill after the commitment migrated to the real id does NOT re-charge)', async () => {
+        // The reconcile-time window: a seed leg first matches (charging the fee once + lazily
+        // creating the speculation), own-state then migrates the commitment placeholder→real,
+        // and a later fill on that same seed leg arrives. The fee key is reconstructed from the
+        // commitment's STABLE (contestId, marketType, lineTicks) — not its now-migrated
+        // speculationId — and `charged` latches, so the migration + 2nd fill must NOT double-charge.
+        const seedState = { ...emptyMakerState(), seedFeeBySpecKey: { 'seed:1:moneyline:0': { feeUsdcWei6: '250000', charged: false, hashes: ['0xabc'] } } };
+        const { runner, recorder, runPromise, resolvers, triggerKill } = await makePausedSubscribedRunner({
+          config: cfg({ ownState: { recoveryHoldMs: 0, staleMaxMs: 300000 } }),
+          seedState,
+        });
+        recorder.fire('onFrame', { receivedAtMs: 0, kind: 'heartbeat' });
+        recorder.fire('onSnapshot', { commitments: [mappableOwnerCommitment('0xabc')], positions: [], truncated: false, positionsTruncated: false }, { cursor: 's1' });
+        recorder.fire('onReady', undefined, { cursor: 'r1' });
+        recorder.fire('onStatus', 'connected');
+        // First fill: lazily creates the speculation → the maker fee share is charged once.
+        recorder.fire('onFill', mappableOwnerFill({ txHash: '0xtx1', logIndex: 0 }));
+        await waitFor(() => { resolvers.forEach((r) => r?.()); return readEvents().filter((e) => e.kind === 'fill').length >= 1; });
+        // own-state migrates the seed leg's commitment placeholder→real (wholesale-replace by hash).
+        recorder.fire('onCommitment', mappableOwnerCommitment('0xabc', { speculationId: '4217', filledRiskAmount: '100000', remainingRiskAmount: '150000' }));
+        // A genuinely-new 2nd fill on that same (now real-id) commitment — must NOT re-charge.
+        recorder.fire('onFill', mappableOwnerFill({ speculationId: '4217', txHash: '0xtx2', logIndex: 1 }));
+        await waitFor(() => { resolvers.forEach((r) => r?.()); return readEvents().filter((e) => e.kind === 'fill').length >= 2; });
+
+        // The commitment migrated to the real id, yet the fee was charged exactly once across the window.
+        expect(runner.stateForTest().commitments['0xabc']?.speculationId).toBe('4217');
+        const counters = Object.values(runner.stateForTest().dailyCounters);
+        expect(counters).toHaveLength(1);
+        expect(counters[0]?.feeUsdcWei6).toBe('250000'); // ONCE — not 500000
+        const fillsWithFee = readEvents().filter((e) => e.kind === 'fill' && (e as Record<string, unknown>).feeUsdcWei6 !== undefined);
+        expect(fillsWithFee).toHaveLength(1); // only the first fill carried the fee
+        expect(runner.stateForTest().seedFeeBySpecKey['seed:1:moneyline:0']?.charged).toBe(true);
+
+        triggerKill();
+        await runPromise;
+      });
     });
 
     // ── §7.2 unknown-own-fill (an SSE fill for a commitment not in canonical state) ──
@@ -4559,6 +4596,41 @@ describe('Runner — live execution', () => {
     const events = readEvents();
     expect(events.some((e) => e.kind === 'candidate' && e.skipReason === 'fee-budget-exhausted' && e.market === 'spread')).toBe(true); // cycle 1 priced the seed but refused it at the fee gate (zero budget)
     expect(events.some((e) => e.kind === 'quote-intent' && e.speculationId === '4217')).toBe(true); // cycle 2 quotes the now-real market
+  });
+
+  it('seeding on: a post-match seed adopts the real spec at its OWN minted line even after the oracle has drifted off it (no placeholder stick)', async () => {
+    const config = seedingCfg(['total']);
+    config.discovery.everyNTicks = 1; // discover every tick → cycle 1 seeds at 85, cycle 2 sees the real spec at 85
+    const realSpec: SpeculationView = { speculationId: '4217', contestId: '1', marketType: 'total', lineTicks: 85, line: 8.5, open: true };
+    // Cycle 1: no open total spec → the seed is minted at the oracle line (total 8.5 → lineTicks 85,
+    // snapshot call #1). The seed's first match then lazily creates the real spec at 85, which the
+    // cycle-2 listing carries — but by then the oracle has DRIFTED to total 9.5 (→ 95, snapshot
+    // call #2+) with NO open spec at 95. The refresh must still ADOPT the spec at the seed's OWN
+    // minted line 85 (migrating the placeholder → real), rather than chase the moved oracle to 95
+    // (no spec there) and stick on the placeholder. (Without the own-line adoption the follow logic
+    // targets 95, finds nothing, and leaves m.speculationId as the placeholder indefinitely.)
+    let listCalls = 0;
+    const listContests = () => {
+      listCalls += 1;
+      return Promise.resolve([contestView({ contestId: '1', speculations: listCalls >= 2 ? [realSpec] : [] })]);
+    };
+    let snapCalls = 0;
+    const adapter = spiedAdapter(
+      config,
+      listContests,
+      () => Promise.resolve(contestView({ contestId: '1', referenceGameId: 'GAME-1', speculations: [] })),
+      { snapshot: (id) => { snapCalls += 1; return Promise.resolve({ contestId: id, odds: { moneyline: null, spread: null, total: totalOdds(snapCalls === 1 ? 8.5 : 9.5) } }); } },
+    );
+    const runner = makeRunner({ config, adapter, maxTicks: 2 });
+    await runner.run();
+    // Adopted the real spec at the seed's own line 85 — NOT stuck on the placeholder seed:1:total:85.
+    expect(runner.trackedMarketView('1', 'total')).toMatchObject({ speculationId: '4217', lineTicks: 85 });
+    expect(runner.trackedMarketKeysForTest()).toEqual(['1:total:85']);
+    // Post-adoption it behaves like any normal market whose oracle sits off the line: it refuses via
+    // reference-line-mismatch (oracle 95 ≠ line 85) — proving it left the seed path (a seed reaching
+    // the post gate at zero budget would emit fee-budget-exhausted instead).
+    const events = readEvents();
+    expect(events.some((e) => e.kind === 'candidate' && e.skipReason === 'reference-line-mismatch' && e.market === 'total')).toBe(true);
   });
 
   // ── seeding POST activation (the second opt-in: risk.maxDailyFeeUSDC > 0) ────────

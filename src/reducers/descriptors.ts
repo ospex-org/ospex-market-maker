@@ -31,12 +31,17 @@ export interface FillEventPayload {
   /** The fill's market — `'spread'` | `'total'`; OMITTED for moneyline (the unmarked default — see telemetry `marketTag`), so `summarize` buckets it as `moneyline`. From the originating commitment. */
   market?: 'spread' | 'total';
   /**
-   * The maker's protocol creation-fee share (USDC wei6 decimal string) charged at THIS fill —
-   * present ONLY on the fee-incurring FIRST match of a seed speculation (the lazy creation),
-   * OMITTED otherwise (matched on an existing speculation → no fee). The seed-posting slice sets
-   * it; until then no fill ever carries it, so this is a dormant, additive field (the NDJSON line
-   * is byte-identical when absent). The runner records it into `dailyCounters.feeUsdcWei6` and
-   * `summarize` sums it into `totalFeeUsdcWei6`.
+   * The maker's ESTIMATED protocol creation-fee share (USDC wei6 decimal string) for THIS fill —
+   * present ONLY on the first matched fill of one of the MM's own seed legs, OMITTED otherwise
+   * (every existing-speculation match, all moneyline non-seed). A **conservative estimate**, not
+   * a realized-fee record: the protocol charges the fee only when a fill lazily CREATES the
+   * speculation, which the MM can't observe from own-state, so it assumes its seed's first match
+   * created it — exact for a sole seeder, an over-estimate when another maker raced to create the
+   * speculation first. Additive (the NDJSON line is byte-identical when absent — every non-seed
+   * fill, and every fill on a seeding-off run). NOTE: a moneyline market can be SEEDED too
+   * (`seed:contestId:moneyline:0`), so a moneyline-only run is NOT fee-free — only seeding-off (or
+   * no seed fill yet) is. The runner records it into `dailyCounters.feeUsdcWei6` and `summarize`
+   * sums it into `totalFeeUsdcWei6`.
    */
   feeUsdcWei6?: string;
 }

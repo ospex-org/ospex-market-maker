@@ -32,7 +32,9 @@ marketSelection:
   seedSpeculations: false          # opt-in to SEEDING — posting at the oracle line where no speculation exists yet,
                                    #   lazily creating it on first match. Consequential: the MM actively creates
                                    #   speculations, pays the protocol creation fee (a USDC cost), and approves the
-                                   #   TreasuryModule. Default false = only quote markets whose speculation already exists.
+                                   #   TreasuryModule. DOUBLE opt-in: also needs risk.maxDailyFeeUSDC > 0, else every
+                                   #   seed is refused at the post gate (fee-budget-exhausted). Default false = only
+                                   #   quote markets whose speculation already exists.
   contestAllowList: []             # optional: if non-empty, ONLY these contestIds
   contestDenyList: []              # optional: never these contestIds
 
@@ -95,7 +97,8 @@ risk:                               # caps bind WORST-CASE USDC LOSS BY OUTCOME 
   maxRiskPerTeamUSDC: "2"
   maxRiskPerSportUSDC: "5"
   maxOpenCommitments: 10            # counts visible + soft-cancelled-not-yet-expired commitments
-  maxDailyFeeUSDC: "0"              # genuinely zero in v0 (no lazy speculation creation)
+  maxDailyFeeUSDC: "0"              # default 0 = no seed posting (every seed refuses at the post gate). Set > 0 — WITH
+                                   #   seedSpeculations: true — to let seeds post and pay the maker creation-fee share.
 
 gas:
   maxDailyGasPOL: "1"               # daily gas budget, in POL (the native token — what's actually spent)

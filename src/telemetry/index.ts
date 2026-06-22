@@ -97,8 +97,7 @@ export type TelemetryKind = (typeof TELEMETRY_KINDS)[number];
 export const CANDIDATE_SKIP_REASONS = [
   'no-reference-odds',
   'no-open-speculation',
-  'would-create-lazy-speculation', //  the per-market reconcile recognized a SEED market (`marketSelection.seedSpeculations` on — one discovery tracks at the oracle-primary line where NO on-chain speculation exists yet, carrying a placeholder `speculationId`) and refused to post it (posting there would lazily create the speculation). Emitted ONLY for a seed: a non-seed market whose speculation has vanished surfaces instead as `transient-failure` (the per-speculation read throws) or `no-open-speculation` (a closed spec) — never this. In the current build it is a hard refusal (the MM never posts where no speculation exists); the seeding path that actually posts + lazily creates the speculation (paying the protocol creation fee) ships in a later slice. Carries `contestId` + the `market` tag (spread/total; omitted for moneyline).
-  'reference-line-mismatch', //        spread/total only: the tracked speculation's on-chain line (away-perspective lineTicks) diverged from the line the reference odds are priced for, so quoting it would post the reference price at a different line (a mispriced commitment). The visible quotes are pulled and the market refuses until the lines agree. Moneyline has no line and never hits this. The discovery refresh FOLLOWS the oracle line (re-binds to the open spec at the new line, debounced by orders.replaceOnLineMoveTicks), so a divergence reaching here is a residual one: a sub-threshold move being debounced, or no open spec at the oracle line yet.
+  'reference-line-mismatch', //        spread/total only: the tracked (or SEED) market's line (away-perspective lineTicks) diverged from the line the reference odds are priced for, so quoting it would post the reference price at a different line (a mispriced commitment). The visible quotes are pulled and the market refuses until the lines agree. Moneyline has no line and never hits this. The discovery refresh FOLLOWS the oracle line (re-binds to the open spec at the new line, debounced by orders.replaceOnLineMoveTicks), so a divergence reaching here is a residual one: a sub-threshold move being debounced, or no open spec at the oracle line yet.
   'stale-reference',
   'start-too-soon',
   'untracked', //                      the contest left the discovery listing and is being DRAINED — its visible quotes are pulled (never re-quoted) each tick until the pull succeeds, after which the next discovery cycle untracks it. Emitted while a `departing` market is retried after an untrack-time pull failed transiently.
@@ -108,7 +107,7 @@ export const CANDIDATE_SKIP_REASONS = [
   'gas-budget-blocks-reapproval',
   'gas-budget-blocks-settlement', // on-chain settleSpeculation / claimPosition denied by canSpendGas (mayUseReserve = settlement.continueOnGasBudgetExhausted); `purpose` distinguishes `settleSpeculation` vs `claimPosition`
   'gas-budget-blocks-onchain-cancel', // on-chain cancelCommitment denied by canSpendGas. Two emit shapes: the automatic, reserve-preserving cancels (mayUseReserve: false, carry `contestId` — all via `onchainCancelCommitment`: the routine `cancelMode: onchain` partial-remainder / recovered-soft-cancel, the funding-guard `underfundedCancelMode: onchain` sweep, and the §5.1 own-state-health active cancel-sweep) vs the operator-explicit shutdown kill / cancel-stale --authoritative paths (mayUseReserve: true, no `contestId`); the candidate's `commitmentHash` identifies the record that couldn't be cancelled
-  'fee-budget-exhausted', //           a SEED market reached the per-market reconcile post gate but `canSpendFee` refused — the daily creation-fee budget (`risk.maxDailyFeeUSDC`) is exhausted or disabled (the default `0`). Distinct from `would-create-lazy-speculation` (the seed-posting-disabled refusal): this fires ONLY once seed POSTING is enabled and the budget denies the post. Carries `contestId` + the `market` tag (spread/total; omitted for moneyline). Emitted by the seed-posting slice; unreachable in the current build (the `would-create-lazy-speculation` gate refuses a seed first).
+  'fee-budget-exhausted', //           a SEED market reached the per-market reconcile post gate but `canSpendFee` refused — the daily creation-fee budget (`risk.maxDailyFeeUSDC`) is exhausted or disabled (the default `0`, so seeding with no fee budget refuses every seed here — the second opt-in). The fee lands at the seed's first match, not at post, so the per-side check is a conservative soft gate. Carries `contestId` + the `market` tag (spread/total; omitted for moneyline).
   'partial-remainder-retained', //     a `partiallyFilled` remainder left in place (never off-chain-cancelled, never reposted over): it occupies its maker side until expiry / authoritative on-chain cancel. Carries `commitmentHash` / `contestId` / `speculationId` / `makerSide` / `takerSide` and a `reason` (`side-not-quoted` / `stale` / `mispriced` / `duplicate` / `shutdown`)
   'already-settled', //                ensureSpeculationSettled found the speculation already settled (pre-flight) or recovered from a concurrent settle — a boring skip, not an error. Emitted by the auto-settle path with `purpose: 'settleSpeculation'`; `outcome` distinguishes `alreadySettled` vs `recovered`. A `recovered` race that broadcast a settle which reverted on inclusion DID spend gas: `revertedTxHash` + `gasPolWei` are present and that gas IS billed (state daily counter + the run summary under `settle`); if the reverted receipt couldn't be fetched, `gasAccountingGap: true` flags the gap. `alreadySettled` / pre-send recovery send no tx → no gas, no faked txHash.
   'already-claimed', //                ensurePositionClaimed found the position already claimed (pre-flight) or recovered from a benign already-claimed race — a boring skip, not an error, and NOT a `claim` event (no event-sourced payout; the contract zeroes economic fields post-claim, so we never fake/derive one). Emitted by the auto-claim path with `purpose: 'claimPosition'`; `outcome` distinguishes `alreadyClaimed` vs `recovered`. Gas accounting mirrors `already-settled`: a `recovered` race that broadcast a claim which reverted on inclusion DID spend gas — `revertedTxHash` + `gasPolWei` are present and that gas IS billed (state daily counter + the run summary under `claim`); `gasAccountingGap: true` flags a reverted receipt that couldn't be fetched. `alreadyClaimed` / pre-send recovery send no tx → no gas. The run summary classifies these positions `alreadyClaimed` (NOT `wonUnclaimed`) and folds no payout into realized P&L.
@@ -714,10 +713,16 @@ export interface LiveMetrics {
    */
   realizedPnl: RealizedPnl;
   /**
-   * Total protocol creation fees paid by the maker (USDC wei6 decimal string) —
-   * the sum of every `fill` event's `feeUsdcWei6` (the maker's share of a seed
-   * speculation's lazy-creation fee, charged once at its first match). `"0"` until
-   * the seed-posting slice makes a fill carry a fee; a current log carries none.
+   * Estimated total protocol creation fees incurred by the maker (USDC wei6 decimal
+   * string) — the sum of every `fill` event's `feeUsdcWei6` (the maker's share of a
+   * seed speculation's lazy-creation fee, attributed once at its first matched fill).
+   * A **conservative estimate**, NOT a realized-fee ledger: exact when the MM is the
+   * sole seeder of each line, but over-states by at most one fee per speculation that
+   * another maker raced to create first (the MM's seed then matched into it and paid
+   * no fee — the protocol charges the fee only at creation). `"0"` on a seeding-off run,
+   * or any run where no seed fill has carried a fee yet (a moneyline market can be
+   * seeded too, so a moneyline-only run is NOT necessarily fee-free). Not folded into
+   * `realizedPnl` — reported as a separate estimate.
    */
   totalFeeUsdcWei6: string;
 }
@@ -870,9 +875,11 @@ export function summarize(logPaths: readonly string[], opts: { sinceIso?: string
   let claimCount = 0;
   let totalClaimedPayoutWei6 = 0n;
   // `totalFeeUsdcWei6` sums the maker's protocol creation-fee share across `fill`
-  // events that carry a `feeUsdcWei6` (the fee-incurring first match of a seed
-  // speculation). Stays `0` until the seed-posting slice makes a fill carry a fee —
-  // no fill does today, so a current log sums nothing (byte-identical output).
+  // events that carry a `feeUsdcWei6` (the first matched fill of a seed speculation).
+  // A CONSERVATIVE ESTIMATE (see the field doc / the owner reducer): exact for a sole
+  // seeder, an over-estimate by at most one fee per speculation another maker raced to
+  // create first. `0` on a seeding-off run, or any run where no seed fill has carried a
+  // fee (a moneyline market can be seeded too, so "moneyline-only" is NOT fee-free).
   let totalFeeUsdcWei6 = 0n;
   const gasByKind: LiveGasByKind = { approval: '0', onchainCancel: '0', settle: '0', claim: '0' };
   const addGas = (kind: keyof LiveGasByKind, gasPolWei: bigint): void => {

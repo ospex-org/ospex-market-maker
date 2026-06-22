@@ -394,7 +394,7 @@ describe('vocabulary', () => {
     }
   });
   it('CANDIDATE_SKIP_REASONS covers the DESIGN §11 skip reasons', () => {
-    for (const r of ['no-reference-odds', 'no-open-speculation', 'reference-line-mismatch', 'would-create-lazy-speculation', 'fee-budget-exhausted', 'cap-hit', 'gas-budget-blocks-reapproval'] as const) {
+    for (const r of ['no-reference-odds', 'no-open-speculation', 'reference-line-mismatch', 'fee-budget-exhausted', 'cap-hit', 'gas-budget-blocks-reapproval'] as const) {
       expect(CANDIDATE_SKIP_REASONS).toContain(r);
     }
   });

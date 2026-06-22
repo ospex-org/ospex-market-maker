@@ -144,7 +144,7 @@ import {
 import { OwnStateQueue } from './own-state-queue.js';
 import { compareAuditVsCanonical, type TrackedDivergence } from './audit-comparator.js';
 import { WakeSignal } from './wake-signal.js';
-import { canSpendGas, requiredPositionModuleAllowanceUSDC, type Market } from '../risk/index.js';
+import { canSpendFee, canSpendGas, requiredPositionModuleAllowanceUSDC, type Market } from '../risk/index.js';
 import { assessStateLoss, dispatchCancel, emptyMakerState, isTerminalPositionStatus, toMakerSignedPayload, type CancelDispatch, type MakerCommitmentRecord, type MakerSide, type MakerSignedPayload, type MakerState, type StateLossAssessment, type StateStore } from '../state/index.js';
 import { EventLog, eventLogsExist, marketTag } from '../telemetry/index.js';
 
@@ -676,6 +676,15 @@ export class Runner {
     this.eventLog = EventLog.open(this.config.telemetry.logDir, opts.runId, instanceMaker);
 
     this.deps.log(`[runner] starting run ${opts.runId} — chain ${this.adapter.chainId}, api ${this.adapter.apiUrl}, mode ${this.config.mode.dryRun ? 'dry-run' : 'live'}`);
+
+    // Double-opt-in diagnostic (DESIGN §6): seeding needs BOTH `marketSelection.seedSpeculations`
+    // AND a positive `risk.maxDailyFeeUSDC` (the per-day creation-fee budget). With seeding on
+    // but the budget at 0 (the default), `canSpendFee` refuses every seed at the post gate
+    // (`fee-budget-exhausted`) — the MM TRACKS seed markets but never POSTS one. Warn loudly so
+    // the operator isn't left wondering why seeds never post.
+    if (this.config.marketSelection.seedSpeculations && this.config.risk.maxDailyFeeUSDC <= 0) {
+      this.deps.log('[runner] WARNING: marketSelection.seedSpeculations is ON but risk.maxDailyFeeUSDC is 0 — seeds will be TRACKED but never POSTED (every seed is refused at the post gate as fee-budget-exhausted). Set a positive risk.maxDailyFeeUSDC to enable seed posting.');
+    }
 
     // Stream-budget guardrail. Each odds subscription is one ANONYMOUS core-api
     // SSE connection; one instance also opens exactly one OWNER-AUTH own-state
@@ -1504,6 +1513,7 @@ export class Runner {
             bootApprovalsApplied = true;
           } else if (!this.isHoldingQuoting()) {
             await this.applyAutoApprovals();
+            await this.applyTreasuryAutoApproval(); // seeding only — gated internally on seedSpeculations + a positive fee budget
             bootApprovalsApplied = true;
           }
           // else: live + holding — leave the latch false, retry next tick.
@@ -1672,7 +1682,22 @@ export class Runner {
     const cutoff = this.deps.now() - Math.max(3600, 10 * this.config.orders.expirySeconds);
     for (const [hash, record] of Object.entries(this.state.commitments)) {
       const terminal = record.lifecycle === 'expired' || record.lifecycle === 'filled' || record.lifecycle === 'authoritativelyInvalidated';
-      if (terminal && record.updatedAtUnixSec < cutoff) delete this.state.commitments[hash];
+      if (terminal && record.updatedAtUnixSec < cutoff) {
+        delete this.state.commitments[hash];
+        // If this was an UNCHARGED seed leg (it never matched, so its `speculationId`
+        // is still the placeholder = the marker key), drop its hash from the marker;
+        // when the last leg is pruned, delete the marker entirely. The seed expired
+        // without ever creating a speculation, so its fee will never be charged —
+        // releasing the marker bounds `seedFeeBySpecKey` growth. (Budget correctness
+        // doesn't depend on this — the fee gate already filters to live legs — this is
+        // memory hygiene. A `charged` marker's lookup misses, since its record migrated
+        // to the real id, so a paid fee is never disturbed.)
+        const marker = this.state.seedFeeBySpecKey[record.speculationId];
+        if (marker !== undefined && !marker.charged) {
+          marker.hashes = marker.hashes.filter((h) => h !== hash);
+          if (marker.hashes.length === 0) delete this.state.seedFeeBySpecKey[record.speculationId];
+        }
+      }
     }
   }
 
@@ -1860,8 +1885,9 @@ export class Runner {
           // No open speculation for this wanted market. Without seeding, that's the end of
           // the line (`no-open-speculation`). With seeding on, it's a SEED candidate: track a
           // placeholder-id market at the oracle-primary line so the MM can post there and
-          // lazily create the speculation (DESIGN §6). This slice tracks + refuses to post
-          // (`would-create-lazy-speculation` at reconcile); the posting path ships later.
+          // lazily create the speculation on first match (DESIGN §6). The per-market reconcile
+          // posts it (gated by the per-day creation-fee budget `risk.maxDailyFeeUSDC` via
+          // `canSpendFee`); the protocol charges the maker creation-fee share at that first match.
           if (!ms.seedSpeculations) {
             this.eventLog.emit('candidate', { contestId: c.contestId, skipReason: 'no-open-speculation', ...marketTag(mkt) });
             continue;
@@ -2369,20 +2395,20 @@ export class Runner {
       this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'stale-reference', ...marketTag(m.marketType) });
       return outcome;
     }
-    // Gate (seeding): a SEED market carries a placeholder `speculationId` — no on-chain
-    // speculation exists at its line yet. We can't read it (`getSpeculation` would throw on
-    // the placeholder), and this slice does NOT post (the posting + lazy-creation path ships
-    // later). Recognize it and refuse, emitting `would-create-lazy-speculation`. By here the
-    // reference odds are fresh + usable (the gates above passed), so the refusal is "a real
-    // seed candidate we're not creating yet", not a degraded-data skip. The pull is a no-op (a
-    // seed has no visible quotes), but mirrors the other refusal gates' shape. Once a real
-    // speculation appears at the line (ours, post-match, or anyone's), the discovery refresh
-    // re-binds `m.speculationId` to it (`selectRefreshSpec`) and this gate stops firing.
-    if (isSeedSpeculationId(m.speculationId)) {
-      const outcome = await this.pullVisibleQuotes(m, now);
-      this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'would-create-lazy-speculation', ...marketTag(m.marketType) });
-      return outcome;
-    }
+    // Seeding: a SEED market carries a placeholder `speculationId` — no on-chain
+    // speculation exists at its line yet. We POST a seed commitment (the protocol lazily
+    // creates the speculation at first match, and `submitQuote` adds the per-day
+    // creation-fee gate). A seed has no readable spec, so below it skips the
+    // `getSpeculation` re-confirm (which would throw on the placeholder) and the
+    // orderbook-based competitiveness check; its existence is established by the POST, not
+    // a read. A seed STILL passes the line-consistency gate just below — its minted
+    // `lineTicks` must still equal the oracle line. If the oracle moves off the minted
+    // line, a PURE seed does NOT chase it: `selectRefreshSpec` finds no open spec to
+    // re-bind to (that's what makes it a seed) and `isMarketTracked` blocks minting a
+    // fresh seed at the new line, so it simply refuses (`reference-line-mismatch`) at the
+    // old line until either a real speculation appears at a line and `selectRefreshSpec`
+    // re-binds `m.speculationId` to it, or the contest leaves discovery and is re-seeded.
+    const isSeed = isSeedSpeculationId(m.speculationId);
     // Gate (spread / total): the tracked speculation's ON-CHAIN line must match the line
     // the reference odds are priced for. `m.lineTicks` is the spec's away-perspective,
     // 10×-scaled line; `oracleLineTicks(ref)` derives the same from the reference odds
@@ -2400,18 +2426,24 @@ export class Runner {
       this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'reference-line-mismatch', ...marketTag(m.marketType) });
       return outcome;
     }
-    // Lazy-creation re-check (DESIGN §6/§9): the speculation we'd post to must still exist + be open — discovery confirmed it; re-confirm via the per-speculation detail read (PR 5's competitiveness check reuses the `getSpeculation` orderbook).
-    let spec: SpeculationView;
-    try {
-      spec = await this.adapter.getSpeculation(m.speculationId);
-    } catch (err) {
-      this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'reconcile', contestId: m.contestId });
-      return 'transient-failure'; // no decision applied — retry next tick rather than wait out the staleAfterSeconds throttle
-    }
-    if (!spec.open) {
-      const outcome = await this.pullVisibleQuotes(m, now);
-      this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'no-open-speculation', ...marketTag(m.marketType) });
-      return outcome;
+    // Lazy-creation re-check (DESIGN §6/§9): for a NON-seed market the speculation we'd
+    // post to must still exist + be open — discovery confirmed it; re-confirm via the
+    // per-speculation detail read (PR 5's competitiveness check reuses the `getSpeculation`
+    // orderbook). A SEED skips this entirely (it has no spec yet — the read would throw on
+    // the placeholder id; the speculation is created by the POST, on first match).
+    let spec: SpeculationView | null = null;
+    if (!isSeed) {
+      try {
+        spec = await this.adapter.getSpeculation(m.speculationId);
+      } catch (err) {
+        this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'reconcile', contestId: m.contestId });
+        return 'transient-failure'; // no decision applied — retry next tick rather than wait out the staleAfterSeconds throttle
+      }
+      if (!spec.open) {
+        const outcome = await this.pullVisibleQuotes(m, now);
+        this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'no-open-speculation', ...marketTag(m.marketType) });
+        return outcome;
+      }
     }
     // Price → plan → apply.
     const market: Market = { contestId: m.contestId, sport: m.sport, awayTeam: m.awayTeam, homeTeam: m.homeTeam, speculationId: m.speculationId, marketType: m.marketType };
@@ -2435,8 +2467,9 @@ export class Runner {
     // event focuses on the exposure-side reasoning that operators ask "why
     // didn't the MM post here?" about. Emitted only when the engine actually
     // runs — i.e. after the pre-engine gates (no-reference-odds /
-    // start-too-soon / stale-reference / would-create-lazy-speculation /
-    // no-open-speculation / reference-line-mismatch) have passed.
+    // start-too-soon / stale-reference / no-open-speculation /
+    // reference-line-mismatch) have passed. (A SEED reaches the engine too — its
+    // post-engine creation-fee gate surfaces as `fee-budget-exhausted` at submit.)
     // For each side (`away` / `home` as the *taker offer* — the side a taker
     // would back), `allowed` mirrors `desired.result.{away,home} !== null`;
     // `sizeUSDC` is the engine-bound size when allowed (zero when refused);
@@ -2465,7 +2498,7 @@ export class Runner {
     const recordsOnSpec = Object.values(this.state.commitments).filter((r) => r.speculationId === m.speculationId);
     const plan = reconcileBook(recordsOnSpec, desired, this.config, now, inventory.openCommitmentCount);
     const outcome = await this.applyReconcilePlan(m, plan, now);
-    this.assessCompetitiveness(m, spec, desired);
+    if (spec !== null) this.assessCompetitiveness(m, spec, desired); // a SEED has no spec/orderbook to assess against — skip (the read was skipped above)
     return outcome; // `'transient-failure'` if a live write failed mid-plan — `reconcileMarkets` then leaves `dirty` / `lastReconciledAt` so the market re-reconciles next tick
   }
 
@@ -2880,6 +2913,50 @@ export class Runner {
       this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'submit', contestId: m.contestId, takerSide: qs.takerSide });
       return null;
     }
+    // Seed creation-fee gate (DESIGN §6). A SEED commitment posts where no on-chain
+    // speculation exists yet; the protocol lazily creates it on first match and the
+    // maker owes a creation-fee share then (`TreasuryModule.processSplitFee`). Before
+    // posting, confirm the per-day fee budget can absorb that fee — `canSpendFee`
+    // refuses unless `risk.maxDailyFeeUSDC > 0` (the seeding fee opt-in) and today's
+    // fee spend + this fee stays within it. The fee lands at MATCH, not post, so it is
+    // attributed (as a conservative estimate — see the reducer) once at the fill via
+    // `seedFeeBySpecKey` (§C2a). To make the
+    // per-day budget a real cap (not just a realized-spend gate), count the LATENT fee
+    // of every OTHER posted-but-unmatched seed too (mirroring the conservative latent-
+    // USDC-risk rule): each such seed will owe its fee at match, so N concurrent seeds
+    // must not each see only the realized counter (0 until a match) and collectively
+    // blow past the budget. A marker counts only while a seed leg of it is still a live
+    // (non-terminal) commitment, so an expired/unfilled seed (whose fee will never be
+    // charged) doesn't permanently consume the budget across UTC days. This seed's own
+    // marker is excluded — `seedFeeWei6` (the requested side) already counts it. A
+    // denial skips the side this tick with `fee-budget-exhausted`. Applies in dry-run
+    // too (so a preview reflects the gate). Boot `applyTreasuryAutoApproval` ensures the
+    // `TreasuryModule` allowance covers it.
+    const isSeed = isSeedSpeculationId(m.speculationId);
+    const seedFeeWei6 = isSeed ? this.adapter.makerCreationFeeWei6() : 0n;
+    if (isSeed) {
+      const today = todayUTCDateString(this.deps.now());
+      const todayFeeSpentUsdcWei6 = BigInt(this.state.dailyCounters[today]?.feeUsdcWei6 ?? '0');
+      // Latent (committed-but-unmatched) seed-fee exposure. A leg is live unless it has
+      // reached a terminal lifecycle (`expired` / `filled` / `authoritativelyInvalidated`
+      // — same set as `pruneTerminalCommitments`); `filled` implies the marker is already
+      // `charged` and so is skipped anyway.
+      let pendingSeedFeeWei6 = 0n;
+      for (const [key, marker] of Object.entries(this.state.seedFeeBySpecKey)) {
+        if (key === m.speculationId || marker.charged) continue;
+        const hasLiveLeg = marker.hashes.some((h) => {
+          const c = this.state.commitments[h];
+          return c !== undefined && c.lifecycle !== 'expired' && c.lifecycle !== 'filled' && c.lifecycle !== 'authoritativelyInvalidated';
+        });
+        if (hasLiveLeg) pendingSeedFeeWei6 += BigInt(marker.feeUsdcWei6);
+      }
+      const maxDailyFeeUsdcWei6 = BigInt(Math.round(this.config.risk.maxDailyFeeUSDC * 1_000_000));
+      const verdict = canSpendFee({ todayFeeSpentUsdcWei6: todayFeeSpentUsdcWei6 + pendingSeedFeeWei6, requestedFeeUsdcWei6: seedFeeWei6, maxDailyFeeUsdcWei6 });
+      if (!verdict.allowed) {
+        this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'fee-budget-exhausted', ...marketTag(m.marketType) });
+        return null;
+      }
+    }
     let hash: string;
     // The SDK's `submitRaw` returns `SubmitResult.signedPayload` (the canonical
     // EIP-712 bundle — own-state SSE plan §M6) on every live submit. We
@@ -2927,6 +3004,22 @@ export class Runner {
     }
     const record = this.commitmentRecord(m, qs, now, expiryUnixSec, hash, proto, signedPayload);
     this.state.commitments[record.hash] = record;
+    // Mark the seed's creation fee PENDING at POST (live only — a dry-run seed never
+    // matches, so it never incurs a fee). Keyed by the seed placeholder
+    // (= `seedSpeculationId(contestId, marketType, lineTicks)`); the fill reducer
+    // reconstructs the same key from the commitment's stable identity. We record THIS
+    // leg's commitment hash in the marker so the reducer charges the fee ONLY when a
+    // seed leg's own hash fills — a later non-seed commitment at the same line can't
+    // trip a stale marker (§C2a). The first side creates the marker; the second side of
+    // a two-sided seed shares it (same fee, append its hash) without resetting it.
+    if (isSeed && !this.config.mode.dryRun) {
+      const existing = this.state.seedFeeBySpecKey[m.speculationId];
+      if (existing === undefined) {
+        this.state.seedFeeBySpecKey[m.speculationId] = { feeUsdcWei6: seedFeeWei6.toString(), charged: false, hashes: [record.hash] };
+      } else if (!existing.hashes.includes(record.hash)) {
+        existing.hashes.push(record.hash);
+      }
+    }
     return record;
   }
 
@@ -4611,6 +4704,84 @@ export class Runner {
     };
     if (walletUSDCWei6 !== undefined) payload.walletBalanceWei6 = walletUSDCWei6.toString();
     this.eventLog.emit('approval', payload);
+  }
+
+  /**
+   * Boot-time `TreasuryModule` USDC approval for SEEDING (DESIGN §6). A seed's maker
+   * creation-fee share is pulled from this allowance at the seed's FIRST match
+   * (`TreasuryModule.processSplitFee`); without it the match REVERTS — the fee is charged
+   * inside the match tx with no try/catch, so a short allowance reverts the whole match
+   * atomically (no maker stranding), but it wastes the taker's gas and the seed never
+   * matches. Gated on the seeding opt-in (`seedSpeculations`) AND a positive per-day fee
+   * budget (`maxDailyFeeUSDC > 0` — the second opt-in; without a budget `canSpendFee`
+   * refuses every seed at the post gate, so the allowance would be pointless). Target = the
+   * wallet's USDC balance (raise-only, wallet-bounded): generous enough that the allowance
+   * is never the binding constraint (the per-day `canSpendFee` budget is) and never
+   * overstates pullable funds — a boot-only allowance set to just the daily budget would
+   * deplete across a multi-day run (the budget resets each UTC day, the on-chain allowance
+   * does not), re-introducing the match-revert. Independent of {@link applyAutoApprovals}
+   * (the two module allowances are separate). No-op in dry-run / read-only (caller gates on
+   * `!dryRun`). Like the PositionModule approval, NOT behind the §5.1 own-state gate —
+   * raising an allowance ceiling creates no matchable commitment.
+   */
+  private async applyTreasuryAutoApproval(): Promise<void> {
+    if (this.makerAddress === null) return; // live-mode invariant — caller gated on `!dryRun`
+    if (!this.config.approvals.autoApprove) return; // operator opted out
+    if (!this.config.marketSelection.seedSpeculations) return; // seeding opt-in
+    if (this.config.risk.maxDailyFeeUSDC <= 0) return; // no fee budget → canSpendFee refuses every seed → no allowance needed
+
+    let snapshot: ApprovalsSnapshot;
+    let walletUsdcWei6: bigint;
+    try {
+      snapshot = await this.adapter.readApprovals(this.makerAddress);
+      walletUsdcWei6 = (await this.adapter.readBalances(this.makerAddress)).usdc;
+    } catch (err) {
+      this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'approve' });
+      return; // fail closed — leave the allowance as-is, retry next boot
+    }
+    const treasuryModule = snapshot.usdc.allowances.treasuryModule;
+    const currentAllowance = treasuryModule.raw;
+    const target = walletUsdcWei6; // wallet-bounded generous ceiling (see the method doc)
+    if (currentAllowance >= target) return; // already sufficient — raise-only, silent
+
+    // Gas-budget verdict (DESIGN §6) — mirror the PositionModule approve gate.
+    const today = todayUTCDateString(this.deps.now());
+    const todayCounter = this.state.dailyCounters[today];
+    const todayGasSpentPolWei = todayCounter !== undefined ? BigInt(todayCounter.gasPolWei) : 0n;
+    const maxDailyGasPolWei = polFloatToWei18(this.config.gas.maxDailyGasPOL);
+    const emergencyReservePolWei = polFloatToWei18(this.config.gas.emergencyReservePOL);
+    const verdict = canSpendGas({ todayGasSpentPolWei, maxDailyGasPolWei, emergencyReservePolWei });
+    if (!verdict.allowed) {
+      this.eventLog.emit('candidate', {
+        skipReason: 'gas-budget-blocks-reapproval',
+        purpose: 'treasuryModule-approve',
+        todayGasSpentPolWei: todayGasSpentPolWei.toString(),
+        maxDailyGasPolWei: maxDailyGasPolWei.toString(),
+        emergencyReservePolWei: emergencyReservePolWei.toString(),
+        detail: verdict.reason,
+      });
+      return;
+    }
+
+    let result: ApproveResult;
+    try {
+      result = await this.adapter.approveCreationFee(target);
+    } catch (err) {
+      this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'approve' });
+      return;
+    }
+    const gasPolWei = BigInt(result.receipt.gasUsed) * BigInt(result.receipt.effectiveGasPrice);
+    this.recordGasSpentToday(today, gasPolWei);
+    this.eventLog.emit('approval', {
+      purpose: 'treasuryModule',
+      spender: treasuryModule.spender,
+      currentAllowance: currentAllowance.toString(),
+      requiredAggregateAllowance: target.toString(),
+      amountSetTo: result.amount.toString(),
+      walletBalanceWei6: walletUsdcWei6.toString(),
+      txHash: result.txHash,
+      gasPolWei: gasPolWei.toString(),
+    });
   }
 
   /**

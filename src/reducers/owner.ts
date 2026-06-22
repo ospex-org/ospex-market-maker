@@ -291,21 +291,34 @@ export function reduceOwnerFill(
 
   const cumulativeRiskWei6 = state.positions[posKey]!.riskAmountWei6;
 
-  // Seed creation-fee attribution. If THIS commitment's speculation was seeded by
-  // us (a lazy creation we posted), the protocol charges the maker creation-fee
-  // share at the FIRST match. Reconstruct the durable seed key from the
-  // commitment's stable `(contestId, marketType, lineTicks)` — NOT `body.speculationId`
-  // (the real, post-match id) nor the commitment's `speculationId` (which the
-  // own-state observation may already have migrated placeholder → real) — and
-  // attribute the fee exactly once: the `charged` flip below plus the fill-dedup
-  // gate above both guard a re-delivery from double-counting. A fill whose key is
-  // absent (every existing-speculation match, all moneyline) is untouched —
+  // Seed creation-fee attribution — a CONSERVATIVE ESTIMATE, not a realized-fee ledger.
+  // The protocol charges the maker creation-fee share on-chain ONLY when a fill lazily
+  // CREATES the speculation (`PositionModule.recordFill` → `SpeculationModule` when no id
+  // exists yet). The MM cannot observe that creation flag / the actual fee from own-state
+  // (it isn't on the stream), so it ESTIMATES: when one of its own seed legs first matches,
+  // it assumes that match created the speculation and stamps the maker share. That is EXACT
+  // when the MM is the sole seeder of the line (the common case). In the rare race where
+  // ANOTHER maker's commitment created the same `(contestId, scorer, lineTicks)` speculation
+  // first, the MM's seed leg matches into the now-existing speculation and pays NO creation
+  // fee — yet this still records the estimate, so the figure can over-state by at most one
+  // fee per raced speculation. Over-stating is the safe direction for the `maxDailyFeeUSDC`
+  // budget (a spend cap). An EXACT figure needs the protocol fee event surfaced through the
+  // indexer → core-api → own-state stream (a cross-repo follow-up). Mechanics: reconstruct
+  // the durable seed key from the commitment's stable `(contestId, marketType, lineTicks)`
+  // — NOT `body.speculationId` (the real, post-match id) nor the commitment's `speculationId`
+  // (which own-state may already have migrated placeholder → real). Then attribute ONLY when
+  // the FILLING commitment's hash is one of the marker's bound seed-leg hashes: this binds
+  // the estimate to the MM's own seed commitments, so a later ORDINARY (non-seed) commitment
+  // that lands at the same line — e.g. a real speculation appearing where the MM once seeded;
+  // moneyline collapses every line to `0` — can never trip a stale marker and incur a PHANTOM
+  // fee. The `charged` flip plus the fill-dedup gate above both guard a re-delivery from
+  // double-counting. A fill with no marker, or whose hash isn't bound, is untouched —
   // `seedFeeBySpecKey` is empty unless the seed-posting path wrote it, so this is
   // byte-identical when seeding is off.
   let feeUsdcWei6: string | undefined;
   const seedFeeKey = seedSpeculationId(commitment.contestId, commitment.marketType, commitment.lineTicks);
   const seedFee = state.seedFeeBySpecKey[seedFeeKey];
-  if (seedFee !== undefined && !seedFee.charged) {
+  if (seedFee !== undefined && !seedFee.charged && seedFee.hashes.includes(body.commitmentHash)) {
     seedFee.charged = true;
     feeUsdcWei6 = seedFee.feeUsdcWei6;
   }

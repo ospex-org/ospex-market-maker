@@ -500,6 +500,33 @@ export class OspexAdapter {
     return getAddresses(this.chainId);
   }
 
+  /**
+   * The maker's share of a speculation's lazy-creation fee, in USDC wei6, for the
+   * configured chain — charged once at a seed speculation's FIRST match
+   * (`TreasuryModule.processSplitFee`). Mirrors the SDK's
+   * `SPECULATION_CREATION_FEE_MAKER_SHARE_WEI6[chainId]` (half of the 0.50 USDC
+   * total). The SDK keeps that constant deep-import-only (not on the package root,
+   * and the v0.7.1 `exports` map exposes only `.` + `./signers/keystore`), so it
+   * cannot be imported here without bumping the pin; the value is mirrored instead.
+   * Safe to mirror: the fee is immutable per deployment (`TreasuryModule` sets it in
+   * the constructor with no setter), so it can change only on a contract redeploy —
+   * which is a new SDK release + re-pin + address update anyway. Re-sync this on a
+   * redeploy, or replace it with a root-exported SDK constant once the pin can move.
+   */
+  makerCreationFeeWei6(): bigint {
+    const fee = OspexAdapter.MAKER_CREATION_FEE_WEI6[this.chainId];
+    if (fee === undefined) {
+      throw new OspexConfigError(`OspexAdapter.makerCreationFeeWei6: no maker creation-fee configured for chainId ${this.chainId}`);
+    }
+    return fee;
+  }
+
+  /** Per-chain maker creation-fee share (USDC wei6) — see {@link makerCreationFeeWei6}. 250000 = 0.25 USDC. */
+  private static readonly MAKER_CREATION_FEE_WEI6: Record<ChainId, bigint> = {
+    137: 250_000n, // Polygon mainnet
+    80002: 250_000n, // Polygon Amoy
+  };
+
   // ── writes (live only) ────────────────────────────────────────────────
   //
   // Every method here calls an SDK write that needs a signer + `rpcUrl`. On a

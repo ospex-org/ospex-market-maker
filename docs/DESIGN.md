@@ -353,6 +353,9 @@ pricing:
   quoteBothSides: true
   minEdgeBps: 0                     # require at least this much edge vs fair to bother quoting
   maxPerQuotePctOfCapital: 0.05     # FLAGGED ASSUMPTION — per-quote concentration cap
+  inventorySkew:                    # asymmetric inventory-aware price lean (Step 3) — default OFF
+    enabled: false                  #   true → lean quotes to flatten net HELD-position inventory (positions only); byte-identical when off
+    maxSkewFraction: 0.5            #   (0,1] CAP on the lean as a fraction of the half-spread, normalized by risk.maxRiskPerContestUSDC
 
 risk:                               # caps bind WORST-CASE USDC LOSS BY OUTCOME over positions + visible + LATENT quotes
   bankrollUSDC: "50"

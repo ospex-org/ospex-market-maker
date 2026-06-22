@@ -277,6 +277,17 @@ describe('buildDesiredQuote', () => {
     const realQuote = buildDesiredQuote(skewCfg(), { ...MARKET, speculationId: 'spec-C1' }, ml(150, -180), heldUnderReal);
     expect(realQuote.skew!.signal).toBeGreaterThan(0);
   });
+
+  it('maxSkewFraction is a TRUE CAP — held inventory beyond the per-contest cap saturates the lean at maxSkewFraction, never past it', () => {
+    // default maxRiskPerContestUSDC 1, maxSkewFraction 0.5. A held maker-on-home position of 2.0
+    // → q = +2 (over the cap). normalized = clamp(2/1, -1, 1) = 1 ⇒ signal = 1 × 0.5 = 0.5 — NOT 1.0
+    // (the scale-then-clamp bug let it reach 1.0). The cap holds exactly when imbalance is largest.
+    const over = buildDesiredQuote(skewCfg(), MARKET, ml(150, -180), heldPosition('home', 2));
+    expect(over.skew).toEqual({ signal: 0.5, inventoryUSDC: 2 });
+    // negative mirror: a held maker-on-away position of 2.0 → q = -2 → signal -0.5 (capped), not -1.0.
+    const overNeg = buildDesiredQuote(skewCfg(), MARKET, ml(150, -180), heldPosition('away', 2));
+    expect(overNeg.skew).toEqual({ signal: -0.5, inventoryUSDC: -2 });
+  });
 });
 
 // ── matchableCommitmentRiskWei6 (funding guard `required`) ───────────────────

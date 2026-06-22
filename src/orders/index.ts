@@ -277,9 +277,10 @@ export function buildDesiredQuote(
  * self-referential loop — and make the desired quote move on every post/pull rather than only
  * on fills). `q > 0` = net maker-on-home ("long home") ⇒ `signal > 0` ⇒ the away offer is
  * priced UP (discouraged — it would add maker-on-home) and the home offer DOWN (encouraged —
- * it adds the rebalancing maker-on-away). Normalised by `maxRiskPerContestUSDC` (the cap that
- * bounds q, so the lean auto-scales with bankroll) and scaled by `maxSkewFraction`, then
- * clamped to [-1, 1].
+ * it adds the rebalancing maker-on-away). The normalised imbalance
+ * `clamp(q / maxRiskPerContestUSDC, -1, 1)` (in [-1, 1], auto-scaling with bankroll since the
+ * cap bounds q) is then scaled by `maxSkewFraction`, so `|signal| <= maxSkewFraction` is a true
+ * cap — held inventory beyond the per-contest cap saturates the lean at `maxSkewFraction`.
  *
  * Seeds need no special-casing: a position is always keyed to the REAL speculation id (a fill
  * carries the post-match id), never a seed placeholder, so a pre-match seed's positions-only q
@@ -291,10 +292,12 @@ function inventorySkew(config: Config, market: Market, inventory: Inventory, cap
   const loss = speculationPositionLoss(inventory.items, market.speculationId);
   const q = loss.ifAwayWins - loss.ifHomeWins;
   if (q === 0) return { signal: 0, q: 0 };
-  // maxRiskPerContestUSDC is `asPositiveAmount` (> 0), so no divide-by-zero. q can marginally
-  // exceed the cap (fills can land at the boundary), so clamp the normalised signal to [-1, 1].
-  const raw = (q / caps.maxRiskPerContestUSDC) * config.pricing.inventorySkew.maxSkewFraction;
-  return { signal: Math.max(-1, Math.min(1, raw)), q };
+  // maxRiskPerContestUSDC is `asPositiveAmount` (> 0), so no divide-by-zero. Clamp the NORMALISED
+  // imbalance to [-1, 1] FIRST, THEN scale by maxSkewFraction — so maxSkewFraction is a true cap:
+  // |signal| <= maxSkewFraction <= 1. Held inventory ABOVE the per-contest cap saturates the lean
+  // AT maxSkewFraction rather than growing past it toward 1 (scaling before the clamp would).
+  const normalized = Math.max(-1, Math.min(1, q / caps.maxRiskPerContestUSDC));
+  return { signal: normalized * config.pricing.inventorySkew.maxSkewFraction, q };
 }
 
 // ── inventoryFromState ───────────────────────────────────────────────────────

@@ -191,6 +191,27 @@ export interface DirectConfig {
   spreadBps: number;
 }
 
+/**
+ * Inventory-aware asymmetric price skew (DESIGN §5). When the maker holds net directional
+ * inventory on a speculation, it leans BOTH quote prices to favour flow that flattens that
+ * inventory, preserving the total edge (an Avellaneda–Stoikov-style reservation-price lean,
+ * clamped to the half-spread so it never quotes below fair). Default OFF — a disabled run is
+ * byte-identical to symmetric quoting. The lean is driven by HELD positions only (not the
+ * maker's own open quotes — that would be a self-referential loop), so it moves only on fills.
+ */
+export interface InventorySkewConfig {
+  /** Master switch. Default `false` → symmetric quoting (byte-identical). */
+  enabled: boolean;
+  /**
+   * Cap on the lean as a fraction of the half-spread, in `(0, 1]`. At the full per-speculation
+   * imbalance (a one-sided held position equal to `risk.maxRiskPerContestUSDC`) the discouraged
+   * side leans up by `maxSkewFraction × halfSpread` and the encouraged side leans symmetrically
+   * down toward fair. `1.0` ⇒ the encouraged side quotes at exactly fair (zero edge that side)
+   * at full imbalance; the default `0.5` keeps half the half-spread on each side at full lean.
+   */
+  maxSkewFraction: number;
+}
+
 export interface PricingConfig {
   mode: SpreadMode;
   economics: EconomicsConfig;
@@ -199,6 +220,7 @@ export interface PricingConfig {
   quoteBothSides: boolean;
   minEdgeBps: number;
   maxPerQuotePctOfCapital: number;
+  inventorySkew: InventorySkewConfig;
 }
 
 export interface RiskConfig {

@@ -6,6 +6,7 @@ import {
   contestWorstCaseUSDC,
   headroomForSide,
   requiredPositionModuleAllowanceUSDC,
+  speculationPositionLoss,
   teamExposureUSDC,
   totalWorstCaseUSDC,
   verdictForMarket,
@@ -20,7 +21,7 @@ function item(o: Partial<ExposureItem> & Pick<ExposureItem, 'contestId' | 'maker
   // Default speculationId from contestId — a moneyline contest is one speculation, so
   // moneyline-only items in the same contest share a group. Multi-market tests pass
   // explicit distinct speculationIds.
-  return { sport: o.sport ?? 'mlb', awayTeam: o.awayTeam ?? 'AWAY', homeTeam: o.homeTeam ?? 'HOME', speculationId: o.speculationId ?? `spec-${o.contestId}`, marketType: o.marketType ?? 'moneyline', ...o };
+  return { sport: o.sport ?? 'mlb', awayTeam: o.awayTeam ?? 'AWAY', homeTeam: o.homeTeam ?? 'HOME', speculationId: o.speculationId ?? `spec-${o.contestId}`, marketType: o.marketType ?? 'moneyline', source: o.source ?? 'commitment', ...o };
 }
 function inventory(items: ExposureItem[], openCommitmentCount = items.length): Inventory {
   return { items, openCommitmentCount };
@@ -53,6 +54,41 @@ describe('worstCaseByOutcome', () => {
     ];
     expect(worstCaseByOutcome(items, 'C1')).toEqual({ ifAwayWins: 3, ifHomeWins: 5 });
     expect(worstCaseByOutcome([], 'C1')).toEqual({ ifAwayWins: 0, ifHomeWins: 0 });
+  });
+});
+
+describe('speculationPositionLoss (inventory-skew signal — held positions only)', () => {
+  it('sums HELD positions per speculation on the away/home axis, ignoring the maker\'s own open commitments', () => {
+    const items = [
+      item({ contestId: 'C1', speculationId: 'S1', makerSide: 'home', riskAmountUSDC: 4, source: 'position' }), // maker-on-home position → ifAwayWins
+      item({ contestId: 'C1', speculationId: 'S1', makerSide: 'away', riskAmountUSDC: 1, source: 'position' }), // maker-on-away position → ifHomeWins
+      item({ contestId: 'C1', speculationId: 'S1', makerSide: 'home', riskAmountUSDC: 9, source: 'commitment' }), // OPEN commitment — excluded from the lean
+    ];
+    expect(speculationPositionLoss(items, 'S1')).toEqual({ ifAwayWins: 4, ifHomeWins: 1 });
+  });
+
+  it('a commitment-only (no-position) speculation has no held imbalance → {0,0} — the lean never reads its own open offers', () => {
+    const items = [
+      item({ contestId: 'C1', speculationId: 'S1', makerSide: 'home', riskAmountUSDC: 5, source: 'commitment' }),
+      item({ contestId: 'C1', speculationId: 'S1', makerSide: 'away', riskAmountUSDC: 5, source: 'commitment' }),
+    ];
+    expect(speculationPositionLoss(items, 'S1')).toEqual({ ifAwayWins: 0, ifHomeWins: 0 });
+    expect(speculationPositionLoss([], 'S1')).toEqual({ ifAwayWins: 0, ifHomeWins: 0 });
+    expect(speculationPositionLoss(items, 'UNKNOWN')).toEqual({ ifAwayWins: 0, ifHomeWins: 0 });
+  });
+
+  it('a total maker-on-UNDER (and spread maker-on-home-cover) position maps to ifAwayWins — the axis holds across markets', () => {
+    // For a total, makerSide 'home' = maker-on-under (Lower); it loses if OVER (away/Upper) hits → ifAwayWins.
+    const totalUnder = [item({ contestId: 'C1', speculationId: 'T1', marketType: 'total', makerSide: 'home', riskAmountUSDC: 3, source: 'position' })];
+    expect(speculationPositionLoss(totalUnder, 'T1')).toEqual({ ifAwayWins: 3, ifHomeWins: 0 });
+    const spreadHomeCover = [item({ contestId: 'C1', speculationId: 'P1', marketType: 'spread', makerSide: 'home', riskAmountUSDC: 2, source: 'position' })];
+    expect(speculationPositionLoss(spreadHomeCover, 'P1')).toEqual({ ifAwayWins: 2, ifHomeWins: 0 });
+  });
+
+  it('validates its inputs at the money boundary (bad source / empty speculationId throw)', () => {
+    const badSource = [{ ...item({ contestId: 'C1', speculationId: 'S1', makerSide: 'away', riskAmountUSDC: 1 }), source: 'offer' as unknown as 'position' }];
+    expect(() => speculationPositionLoss(badSource, 'S1')).toThrow(/source/);
+    expect(() => speculationPositionLoss([], '')).toThrow(/speculationId/);
   });
 });
 

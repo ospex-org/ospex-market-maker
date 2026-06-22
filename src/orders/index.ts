@@ -45,7 +45,7 @@ import {
   type QuoteSide,
   type SpreadPricing,
 } from '../pricing/index.js';
-import { headroomForSide, verdictForMarket, type ExposureItem, type Inventory, type MakerSide, type Market, type RiskCaps } from '../risk/index.js';
+import { headroomForSide, speculationPositionLoss, verdictForMarket, type ExposureItem, type Inventory, type MakerSide, type Market, type RiskCaps } from '../risk/index.js';
 import { isTerminalPositionStatus, type CommitmentLifecycle, type MakerCommitmentRecord, type MakerState } from '../state/index.js';
 import type { ReferenceOdds } from './reference-odds.js';
 
@@ -69,6 +69,12 @@ export interface ReferenceOddsBreakdown {
   overround: number;
 }
 
+/** The applied inventory-skew lean (DESIGN §5) — surfaced for telemetry. `signal` ∈ [-1,1] is the lean computeQuote applied (the away quote leaned up / home down by `signal × halfSpread`); `inventoryUSDC` is the signed per-speculation HELD-position imbalance `q` that drove it (`> 0` = net maker-on-home / "long home"). Present only when `pricing.inventorySkew.enabled`. */
+export interface SkewDiagnostic {
+  signal: number;
+  inventoryUSDC: number;
+}
+
 /** What `buildDesiredQuote` produces: the reference-odds breakdown (`null` when the upstream odds were out of range — see `result.notes`), the per-**offer**-side exposure headroom it priced against, and the `computeQuote` result. */
 export interface DesiredQuote {
   referenceOdds: ReferenceOddsBreakdown | null;
@@ -81,6 +87,8 @@ export interface DesiredQuote {
    */
   headroomUSDC: { away: number; home: number };
   result: QuoteResult;
+  /** The inventory skew applied — present only when `pricing.inventorySkew.enabled` (omitted when skew is off, so a disabled run's telemetry is byte-identical). */
+  skew?: SkewDiagnostic;
 }
 
 /** Why the runner would replace a commitment: pull it off-chain → post a fresh one at the current price. */
@@ -158,8 +166,10 @@ export interface BookReconciliation {
  * ceiling, and "does either side have any headroom?"; `headroomForSide` alone
  * enforces the per-{commitment,contest,team,sport} *size* caps but NOT the count
  * cap — DESIGN §6); then strip the consensus vig, derive the spread (economics or
- * direct mode per `config.pricing`), and size each side against its headroom.
- * Pure — delegates to `src/risk/{verdictForMarket,headroomForSide}` and
+ * direct mode per `config.pricing`), apply any inventory skew (an edge-preserving
+ * asymmetric lean from the maker's net held position on this speculation — `0` /
+ * off by default), and size each side against its headroom. Pure — delegates to
+ * `src/risk/{verdictForMarket,headroomForSide,speculationPositionLoss}` and
  * `src/pricing/computeQuote`.
  *
  * Every operational refusal comes back as `result.canQuote === false` with
@@ -191,6 +201,16 @@ export function buildDesiredQuote(
     home: headroomForSide(inventory, market, 'away', caps),
   };
 
+  // Inventory skew (DESIGN §5): an edge-preserving asymmetric lean toward flow that flattens
+  // the maker's HELD directional inventory on this speculation. Computed once here (this layer
+  // bridges config + market + inventory) and threaded into every market's pricing; `0` when
+  // disabled, so the rest of the chain is byte-identical. The diagnostic is surfaced only when
+  // enabled (omitted telemetry when off).
+  const { signal: skewSignal, q: skewInventoryUSDC } = inventorySkew(config, market, inventory, caps);
+  const skewDiag: { skew?: SkewDiagnostic } = config.pricing.inventorySkew.enabled
+    ? { skew: { signal: skewSignal, inventoryUSDC: skewInventoryUSDC } }
+    : {};
+
   // The two-way reference juice (for the breakdown + the refusal message), in
   // protocol-side order: moneyline / spread away/home, total over/under.
   const [side1American, side2American] =
@@ -201,17 +221,18 @@ export function buildDesiredQuote(
 
   const verdict = verdictForMarket(inventory, market, caps);
   if (!verdict.allowed) {
-    return { referenceOdds, headroomUSDC, result: refusedResult([`REFUSE: ${verdict.reason}`]) };
+    return { referenceOdds, headroomUSDC, result: refusedResult([`REFUSE: ${verdict.reason}`]), ...skewDiag };
   }
   if (referenceOdds === null) {
     return {
       referenceOdds: null,
       headroomUSDC,
       result: refusedResult([`REFUSE: reference ${refOdds.market} odds are invalid / out of range (side1=${side1American}, side2=${side2American})`]),
+      ...skewDiag,
     };
   }
 
-  const pricing = buildMarketPricing(config, headroomUSDC.away, headroomUSDC.home);
+  const pricing = buildMarketPricing(config, headroomUSDC.away, headroomUSDC.home, skewSignal);
   let result: QuoteResult;
   switch (refOdds.market) {
     case 'moneyline':
@@ -240,7 +261,40 @@ export function buildDesiredQuote(
       break;
     }
   }
-  return { referenceOdds, headroomUSDC, result };
+  return { referenceOdds, headroomUSDC, result, ...skewDiag };
+}
+
+/**
+ * The inventory-skew signal (DESIGN §5) for `market` — a value in [-1, 1] that leans the two
+ * quote prices to favour flow that flattens the maker's HELD directional inventory on this
+ * speculation, plus the signed imbalance `q` (USDC) that drove it. `{ signal: 0, q: 0 }` when
+ * skew is disabled (a hard short-circuit — q is never even computed, so a misconfig can't
+ * inject a NaN into the disabled path) or when there is no held imbalance.
+ *
+ * POSITIONS-ONLY (see {@link speculationPositionLoss}): `q = (loss if away wins) − (loss if
+ * home wins)` over the maker's HELD positions on the speculation, excluding its own open
+ * commitments (counting them would make the skew lean off the very offers it sets — a
+ * self-referential loop — and make the desired quote move on every post/pull rather than only
+ * on fills). `q > 0` = net maker-on-home ("long home") ⇒ `signal > 0` ⇒ the away offer is
+ * priced UP (discouraged — it would add maker-on-home) and the home offer DOWN (encouraged —
+ * it adds the rebalancing maker-on-away). Normalised by `maxRiskPerContestUSDC` (the cap that
+ * bounds q, so the lean auto-scales with bankroll) and scaled by `maxSkewFraction`, then
+ * clamped to [-1, 1].
+ *
+ * Seeds need no special-casing: a position is always keyed to the REAL speculation id (a fill
+ * carries the post-match id), never a seed placeholder, so a pre-match seed's positions-only q
+ * is structurally 0 (no lean) and a post-match seed leans off its real-id position cleanly —
+ * no placeholder/real-id fragmentation, unlike a commitment-inclusive signal would have.
+ */
+function inventorySkew(config: Config, market: Market, inventory: Inventory, caps: RiskCaps): { signal: number; q: number } {
+  if (!config.pricing.inventorySkew.enabled) return { signal: 0, q: 0 };
+  const loss = speculationPositionLoss(inventory.items, market.speculationId);
+  const q = loss.ifAwayWins - loss.ifHomeWins;
+  if (q === 0) return { signal: 0, q: 0 };
+  // maxRiskPerContestUSDC is `asPositiveAmount` (> 0), so no divide-by-zero. q can marginally
+  // exceed the cap (fills can land at the boundary), so clamp the normalised signal to [-1, 1].
+  const raw = (q / caps.maxRiskPerContestUSDC) * config.pricing.inventorySkew.maxSkewFraction;
+  return { signal: Math.max(-1, Math.min(1, raw)), q };
 }
 
 // ── inventoryFromState ───────────────────────────────────────────────────────
@@ -322,6 +376,7 @@ export function inventoryFromState(state: MakerState, nowUnixSec: number, graceS
       marketType: record.marketType,
       makerSide: record.makerSide,
       riskAmountUSDC: wei6ToUSDC(Number(remainingWei6)),
+      source: 'commitment',
     });
     openCommitmentCount += 1;
   }
@@ -339,6 +394,7 @@ export function inventoryFromState(state: MakerState, nowUnixSec: number, graceS
       marketType: record.marketType,
       makerSide: record.side,
       riskAmountUSDC: wei6ToUSDC(Number(riskWei6)),
+      source: 'position',
     });
   }
 
@@ -633,7 +689,7 @@ export function toRiskCaps(config: Config): RiskCaps {
  * others) — everything `computeQuote` needs EXCEPT the reference odds, which each
  * market sources from its own juice. Mirrors `SpreadPricing` / `TotalPricing`.
  */
-function buildMarketPricing(config: Config, awayHeadroomUSDC: number, homeHeadroomUSDC: number): SpreadPricing {
+function buildMarketPricing(config: Config, awayHeadroomUSDC: number, homeHeadroomUSDC: number, skewSignal: number): SpreadPricing {
   const { capitalUSDC, ...economicsRest } = config.pricing.economics;
   const common = {
     capitalUSDC,
@@ -642,6 +698,7 @@ function buildMarketPricing(config: Config, awayHeadroomUSDC: number, homeHeadro
     quoteBothSides: config.pricing.quoteBothSides,
     awayHeadroomUSDC,
     homeHeadroomUSDC,
+    skewSignal,
   };
   if (config.pricing.mode === 'economics') {
     return { ...common, mode: 'economics', economics: economicsRest };

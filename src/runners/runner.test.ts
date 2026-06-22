@@ -3932,6 +3932,32 @@ describe('Runner — per-market reconcile', () => {
     expect(runner.trackedMarketView('A')).toMatchObject({ dirty: false, lastReconciledAt: T0 }); // the reconcile consumed the dirty flag
   });
 
+  it('quote-intent OMITS the skew field when inventory skew is disabled (byte-identical telemetry)', async () => {
+    StateStore.at(stateDir).flush(emptyMakerState());
+    const config = cfg(); // pricing.inventorySkew default off
+    const adapter = spiedAdapter(config, () => Promise.resolve([contestView({ contestId: 'A' })]));
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    const qi = readEvents().find((e) => e.kind === 'quote-intent');
+    expect(qi).toMatchObject({ contestId: 'A', canQuote: true });
+    expect('skew' in (qi as object)).toBe(false); // no skew attribution when off
+  });
+
+  it('quote-intent carries the skew attribution when inventory skew is enabled and a held position leans the quote', async () => {
+    // A held maker-on-home position on spec-A (0.5 USDC) → q = +0.5; denom maxRiskPerContestUSDC 1, maxSkewFraction 0.5 → signal 0.25.
+    StateStore.at(stateDir).flush({
+      ...emptyMakerState(),
+      positions: {
+        'spec-A:home': { speculationId: 'spec-A', contestId: 'A', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', marketType: 'moneyline', lineTicks: 0, side: 'home', riskAmountWei6: '500000', counterpartyRiskWei6: '500000', status: 'active', updatedAtUnixSec: T0 - 5 },
+      },
+    });
+    const config = cfg({ pricing: { inventorySkew: { enabled: true } } });
+    const adapter = spiedAdapter(config, () => Promise.resolve([contestView({ contestId: 'A' })]));
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    const qi = readEvents().find((e) => e.kind === 'quote-intent') as { skew?: { signal: number; inventoryUSDC: number } };
+    expect(qi.skew?.signal).toBeCloseTo(0.25, 9);
+    expect(qi.skew?.inventoryUSDC).toBeCloseTo(0.5, 9);
+  });
+
   it('match-time expiry mode: a synthetic quote expires at the contest match time, not now + expirySeconds', async () => {
     StateStore.at(stateDir).flush(emptyMakerState());
     const config = cfg({ orders: { expiryMode: 'match-time', expirySeconds: 120 } });

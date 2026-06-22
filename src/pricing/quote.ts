@@ -1,3 +1,4 @@
+import { MAX_ODDS_TICK, MIN_ODDS_TICK, ODDS_SCALE } from './constants.js';
 import {
   decimalToAmerican,
   decimalToTick,
@@ -61,6 +62,45 @@ function validateCommon(inputs: QuoteInputs): void {
       `computeQuote: headroom must be ≥ 0 (away=${inputs.awayHeadroomUSDC}, home=${inputs.homeHeadroomUSDC})`,
     );
   }
+  // The inventory-skew signal is a caller-derived PARAMETER (the orders layer computes it from
+  // config + inventory), so a non-finite / out-of-range value is a bug → throw, fail-closed.
+  // Omitted is fine (defaults to 0 = symmetric). The [-1, 1] bound is what guarantees
+  // |skewDelta| ≤ halfSpread (never quote below fair) before the per-side range clamp.
+  if (inputs.skewSignal !== undefined) {
+    requireFinite(inputs.skewSignal, 'skewSignal');
+    if (!(inputs.skewSignal >= -1 && inputs.skewSignal <= 1)) {
+      throw new Error(`computeQuote: skewSignal must be in [-1, 1], got ${inputs.skewSignal}`);
+    }
+  }
+}
+
+// Conservative probability band that maps strictly inside the protocol tick range
+// [MIN_ODDS_TICK, MAX_ODDS_TICK]: `tickToDecimal(t) = t / ODDS_SCALE`, so a quote prob at
+// SKEW_PROB_CEIL has decimal `1/ceil = MIN_ODDS_TICK/ODDS_SCALE` ⇒ tick = MIN_ODDS_TICK, and at
+// SKEW_PROB_FLOOR ⇒ tick = MAX_ODDS_TICK. A prob inside [FLOOR, CEIL] therefore has a tick inside
+// [MIN, MAX]. Used to clamp the inventory skew so it can never push a side out of tick range.
+export const SKEW_PROB_CEIL = ODDS_SCALE / MIN_ODDS_TICK; //  ≈ 0.990099 — above this the tick drops below MIN_ODDS_TICK
+export const SKEW_PROB_FLOOR = ODDS_SCALE / MAX_ODDS_TICK; // ≈ 0.009901 — below this the tick exceeds MAX_ODDS_TICK
+
+/**
+ * Clamp the signed inventory-skew lean `desiredDelta` (= skewSignal × halfSpread) so that
+ * neither skewed quote — away = symAwayProb + d, home = symHomeProb − d — leaves the
+ * conservative valid-prob band [SKEW_PROB_FLOOR, SKEW_PROB_CEIL] (⇒ both ticks stay in
+ * [MIN_ODDS_TICK, MAX_ODDS_TICK]). Reduces |d| toward 0 only as much as needed, applying the
+ * SAME clamped d to both sides so the edge-preserving `+d / −d` cancellation (sum = 1+spread)
+ * is kept. The invariant: if the SYMMETRIC quote (d=0) is two-sided tick-valid, the skewed
+ * quote is too — skew never turns a quotable line into a refusal. Over-clamping on an extreme
+ * (near-pathological) line just means slightly less skew there — the safe direction. `d = 0`
+ * (skew off) returns 0 exactly, so the disabled path is byte-identical.
+ */
+export function clampSkewDelta(d: number, symAwayProb: number, symHomeProb: number): number {
+  if (d === 0) return d;
+  if (d > 0) {
+    // away leans UP toward SKEW_PROB_CEIL; home leans DOWN toward SKEW_PROB_FLOOR.
+    return Math.max(0, Math.min(d, SKEW_PROB_CEIL - symAwayProb, symHomeProb - SKEW_PROB_FLOOR));
+  }
+  // d < 0: away leans DOWN toward SKEW_PROB_FLOOR; home leans UP toward SKEW_PROB_CEIL.
+  return Math.min(0, Math.max(d, SKEW_PROB_FLOOR - symAwayProb, symHomeProb - SKEW_PROB_CEIL));
 }
 
 function validateEconomics(e: EconomicsInputs): void {
@@ -171,10 +211,20 @@ export function computeQuote(inputs: QuoteInputs): QuoteResult {
   }
   const spread = spreadResult.spread;
 
-  // Step 3 — build quote probabilities (symmetric split — DESIGN §5; asymmetric is future work).
+  // Step 3 — build quote probabilities. The symmetric half-spread split (DESIGN §5), plus an
+  // optional inventory skew: `skewSignal ∈ [-1,1]` leans the away quote UP and the home quote
+  // DOWN by `skewDelta = skewSignal × halfSpread` (clamped so neither side leaves the protocol
+  // tick range — skew never turns a symmetric-quotable line into a refusal). The +d/−d cancel,
+  // so the two-sided sum stays `fair.away + fair.home + spread = 1 + spread`; |skewDelta| ≤
+  // halfSpread keeps each quote ≥ fair (never gives away edge). skewSignal omitted / 0 ⇒
+  // skewDelta = +0 ⇒ `symProb + 0 === symProb` at IEEE-754 ⇒ byte-identical symmetric quoting.
+  const skewSignal = inputs.skewSignal ?? 0;
   const halfSpread = spread / 2;
-  const awayQuoteProb = fair.awayFairProb + halfSpread;
-  const homeQuoteProb = fair.homeFairProb + halfSpread;
+  const symAwayProb = fair.awayFairProb + halfSpread;
+  const symHomeProb = fair.homeFairProb + halfSpread;
+  const skewDelta = clampSkewDelta(skewSignal * halfSpread, symAwayProb, symHomeProb);
+  const awayQuoteProb = symAwayProb + skewDelta;
+  const homeQuoteProb = symHomeProb - skewDelta;
   if (!(awayQuoteProb < 1) || !(homeQuoteProb < 1)) {
     return refused(
       [

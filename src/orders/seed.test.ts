@@ -5,7 +5,7 @@ import type { ExposureItem, MarketType } from '../risk/types.js';
 import { isSeedSpeculationId, seedSpeculationId } from './seed.js';
 
 function item(speculationId: string, makerSide: 'away' | 'home', riskAmountUSDC: number, marketType: MarketType = 'spread'): ExposureItem {
-  return { contestId: 'C1', sport: 'mlb', awayTeam: 'A', homeTeam: 'B', speculationId, marketType, makerSide, riskAmountUSDC };
+  return { contestId: 'C1', sport: 'mlb', awayTeam: 'A', homeTeam: 'B', speculationId, marketType, makerSide, riskAmountUSDC, source: 'commitment' };
 }
 
 describe('seedSpeculationId / isSeedSpeculationId', () => {

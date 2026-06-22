@@ -164,7 +164,7 @@ describe('buildDesiredQuote', () => {
     // (`headroomForSide(..., 'home', ...)`): away-offer headroom = min(perCommitment 0.25, perContest
     // 1 - 0.9 ≈ 0.1, perTeam(LAD) 2 - 0.9, perSport 5 - 0.9, bankroll 25 - 0.9) ≈ 0.1. The home offer
     // (a maker-on-away commitment) is untouched: home-offer headroom = min(0.25, 1 - 0, 2 - 0, ...) = 0.25.
-    const inv = inventoryWith([{ contestId: 'C1', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', speculationId: 'spec-C1', marketType: 'moneyline', makerSide: 'home', riskAmountUSDC: 0.9 }]);
+    const inv = inventoryWith([{ contestId: 'C1', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', speculationId: 'spec-C1', marketType: 'moneyline', makerSide: 'home', riskAmountUSDC: 0.9, source: 'commitment' }]);
     const d = buildDesiredQuote(cfg(), MARKET, ml(150, -180), inv);
     expect(d.headroomUSDC.away).toBeCloseTo(0.1, 6);
     expect(d.headroomUSDC.home).toBeCloseTo(0.25, 9);
@@ -178,7 +178,7 @@ describe('buildDesiredQuote', () => {
   it('pulls an offer whose headroom has been exhausted (clamps to 0)', () => {
     // 1.5 USDC of maker-on-home exposure on C1 → over the per-contest cap of 1 in the "away wins" bucket
     // → the away offer (a maker-on-home commitment) has 0 headroom and is pulled. The home offer is fine.
-    const inv = inventoryWith([{ contestId: 'C1', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', speculationId: 'spec-C1', marketType: 'moneyline', makerSide: 'home', riskAmountUSDC: 1.5 }]);
+    const inv = inventoryWith([{ contestId: 'C1', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', speculationId: 'spec-C1', marketType: 'moneyline', makerSide: 'home', riskAmountUSDC: 1.5, source: 'commitment' }]);
     const d = buildDesiredQuote(cfg(), MARKET, ml(150, -180), inv);
     expect(d.headroomUSDC.away).toBe(0);
     expect(d.result.away).toBeNull();
@@ -236,6 +236,46 @@ describe('buildDesiredQuote', () => {
     // result.away is the OVER side; via toProtocolQuote the maker of an over offer is on under (home/Lower/1).
     expect(toProtocolQuote({ side: d.result.away!.takerSide, oddsTick: d.result.away!.quoteTick })).toMatchObject({ makerSide: 'home', positionType: 1 });
     expect(toProtocolQuote({ side: d.result.home!.takerSide, oddsTick: d.result.home!.quoteTick })).toMatchObject({ makerSide: 'away', positionType: 0 });
+  });
+
+  // ── inventory skew (DESIGN §5) ──────────────────────────────────────────────
+
+  const skewCfg = (): Config => cfg({ pricing: { mode: 'direct', direct: { spreadBps: 200 }, inventorySkew: { enabled: true } } });
+  const symCfg = (): Config => cfg({ pricing: { mode: 'direct', direct: { spreadBps: 200 } } });
+  const heldPosition = (makerSide: 'away' | 'home', riskAmountUSDC: number, speculationId = 'spec-C1'): Inventory =>
+    inventoryWith([{ contestId: 'C1', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', speculationId, marketType: 'moneyline', makerSide, riskAmountUSDC, source: 'position' }]);
+
+  it('skew disabled (default) → no `skew` key and a symmetric quote, even with held directional inventory', () => {
+    const off = buildDesiredQuote(symCfg(), MARKET, ml(150, -180), heldPosition('home', 0.5));
+    expect(off.skew).toBeUndefined(); // byte-identical telemetry — no skew attribution when off
+    // no lean applied: each quote sits at fair + half-spread
+    expect(off.result.away!.quoteProb).toBeCloseTo(off.result.fair!.awayFairProb + off.result.spread! / 2, 12);
+    expect(off.result.home!.quoteProb).toBeCloseTo(off.result.fair!.homeFairProb + off.result.spread! / 2, 12);
+  });
+
+  it('skew enabled + a net held maker-on-home position → away offer priced UP, home offer DOWN; diagnostic surfaced', () => {
+    const held = heldPosition('home', 0.5); // maker-on-home → ifAwayWins 0.5 → q = +0.5; denom maxRiskPerContestUSDC 1; maxSkewFraction 0.5 → signal 0.25
+    const skewed = buildDesiredQuote(skewCfg(), MARKET, ml(150, -180), held);
+    const sym = buildDesiredQuote(symCfg(), MARKET, ml(150, -180), held);
+    expect(skewed.result.away!.quoteProb).toBeGreaterThan(sym.result.away!.quoteProb);
+    expect(skewed.result.home!.quoteProb).toBeLessThan(sym.result.home!.quoteProb);
+    expect(skewed.skew).toEqual({ signal: 0.25, inventoryUSDC: 0.5 });
+  });
+
+  it('skew reads HELD positions only — an equal one-sided OPEN COMMITMENT never moves the lean (no self-referential loop)', () => {
+    const openOnly = inventoryWith([{ contestId: 'C1', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', speculationId: 'spec-C1', marketType: 'moneyline', makerSide: 'home', riskAmountUSDC: 0.5, source: 'commitment' }]);
+    const d = buildDesiredQuote(skewCfg(), MARKET, ml(150, -180), openOnly);
+    expect(d.skew).toEqual({ signal: 0, inventoryUSDC: 0 }); // commitments excluded → no held imbalance
+  });
+
+  it('a pre-match seed (placeholder speculationId) gets no skew — positions key to the real id, so its positions-only q is 0', () => {
+    // The held position is keyed to the REAL id (a fill carries the post-match id), never the placeholder.
+    const heldUnderReal = heldPosition('home', 0.5, 'spec-C1');
+    const seedQuote = buildDesiredQuote(skewCfg(), { ...MARKET, speculationId: 'seed:C1:moneyline:0' }, ml(150, -180), heldUnderReal);
+    expect(seedQuote.skew).toEqual({ signal: 0, inventoryUSDC: 0 }); // placeholder has no positions → no lean (no fragmentation special-case needed)
+    // once discovery adopts the real id, the same held position drives the lean
+    const realQuote = buildDesiredQuote(skewCfg(), { ...MARKET, speculationId: 'spec-C1' }, ml(150, -180), heldUnderReal);
+    expect(realQuote.skew!.signal).toBeGreaterThan(0);
   });
 });
 
@@ -305,8 +345,8 @@ describe('inventoryFromState', () => {
     const inv = inventoryFromState(stateWith({ commitments: { '0x1': c }, positions: { 'spec-1:home': p } }), NOW, 0);
     expect(inv.openCommitmentCount).toBe(1);
     expect(inv.items).toEqual([
-      { contestId: 'contest-1', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', speculationId: 'spec-1', marketType: 'moneyline', makerSide: 'away', riskAmountUSDC: 0.25 },
-      { contestId: 'contest-1', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', speculationId: 'spec-1', marketType: 'moneyline', makerSide: 'home', riskAmountUSDC: 0.1 },
+      { contestId: 'contest-1', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', speculationId: 'spec-1', marketType: 'moneyline', makerSide: 'away', riskAmountUSDC: 0.25, source: 'commitment' },
+      { contestId: 'contest-1', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', speculationId: 'spec-1', marketType: 'moneyline', makerSide: 'home', riskAmountUSDC: 0.1, source: 'position' },
     ]);
   });
 
@@ -332,14 +372,14 @@ describe('inventoryFromState', () => {
     };
     const inv = inventoryFromState(stateWith({ commitments }), NOW, 0);
     expect(inv.openCommitmentCount).toBe(1);
-    expect(inv.items).toEqual([{ contestId: 'contest-1', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', speculationId: 'spec-1', marketType: 'moneyline', makerSide: 'away', riskAmountUSDC: 0.25 }]);
+    expect(inv.items).toEqual([{ contestId: 'contest-1', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', speculationId: 'spec-1', marketType: 'moneyline', makerSide: 'away', riskAmountUSDC: 0.25, source: 'commitment' }]);
   });
 
   it('counts a partiallyFilled commitment at its remaining (unfilled) risk', () => {
     const partial = commitmentRecord({ hash: 'p', lifecycle: 'partiallyFilled', riskAmountWei6: '500000', filledRiskWei6: '200000' });
     const inv = inventoryFromState(stateWith({ commitments: { p: partial } }), NOW, 0);
     expect(inv.openCommitmentCount).toBe(1);
-    expect(inv.items).toEqual([{ contestId: 'contest-1', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', speculationId: 'spec-1', marketType: 'moneyline', makerSide: 'away', riskAmountUSDC: 0.3 }]);
+    expect(inv.items).toEqual([{ contestId: 'contest-1', sport: 'mlb', awayTeam: 'NYM', homeTeam: 'LAD', speculationId: 'spec-1', marketType: 'moneyline', makerSide: 'away', riskAmountUSDC: 0.3, source: 'commitment' }]);
   });
 
   it('inventoryFromState → contestWorstCaseUSDC: two same-contest positions on distinct speculations SUM (the snapshot-rehydration path)', () => {

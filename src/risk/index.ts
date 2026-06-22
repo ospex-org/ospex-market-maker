@@ -74,6 +74,13 @@ function validateMarketType(v: unknown, name: string): void {
   }
 }
 
+// `source` drives the inventory-skew signal's positions-only filter (a directional lean must
+// never count the maker's own open offers), so it is a money-relevant input — validate it at
+// the boundary like every other field, never trusting the caller.
+function validateSource(v: unknown, name: string): void {
+  if (v !== 'commitment' && v !== 'position') fail(`${name} must be "commitment" or "position", got ${describe(v)}`);
+}
+
 function validateItems(items: readonly ExposureItem[]): void {
   if (!Array.isArray(items)) fail(`inventory.items must be an array, got ${describe(items)}`);
   items.forEach((it, i) => {
@@ -81,6 +88,7 @@ function validateItems(items: readonly ExposureItem[]): void {
     requireFiniteNonNeg(it.riskAmountUSDC, `inventory.items[${i}].riskAmountUSDC`);
     validateSpeculationId(it.speculationId, `inventory.items[${i}].speculationId`);
     validateMarketType(it.marketType, `inventory.items[${i}].marketType`);
+    validateSource(it.source, `inventory.items[${i}].source`);
   });
 }
 
@@ -204,6 +212,27 @@ export function worstCaseByOutcome(items: readonly ExposureItem[], contestId: st
     else ifHomeWins += it.riskAmountUSDC; //                         maker on away → loses if home wins
   }
   return { ifAwayWins, ifHomeWins };
+}
+
+/**
+ * The per-speculation maker-side loss buckets restricted to HELD POSITIONS — the
+ * inventory-skew signal's directional input (DESIGN §5). `{ifAwayWins, ifHomeWins}` for
+ * the one speculation `speculationId`, summed over its `source: 'position'` items only;
+ * `{0, 0}` for an unknown / position-free speculation. EXCLUDES open commitments (the
+ * maker's own outstanding offers): leaning quotes off your own offers is a self-referential
+ * loop, and the held imbalance is what an inventory-aware skew should offset. The exposure
+ * CAPS still count commitments (worst-case solvency, unchanged) — only this lean signal is
+ * positions-only. Reuses {@link groupExposures} (the single source of truth for the
+ * away/home axis) over the positions-filtered items, so its sign convention can never drift
+ * from the caps'. Within a speculation the two maker sides are mutually-exclusive outcomes,
+ * so `ifAwayWins` (Σ maker-on-home/under positions) and `ifHomeWins` (Σ maker-on-away/over
+ * positions) are the signed inventory the caller turns into a skew lean.
+ */
+export function speculationPositionLoss(items: readonly ExposureItem[], speculationId: string): OutcomeLoss {
+  validateItems(items);
+  validateSpeculationId(speculationId, 'speculationId');
+  const positions = items.filter((it) => it.source === 'position');
+  return groupExposures(positions).get(speculationId)?.loss ?? { ifAwayWins: 0, ifHomeWins: 0 };
 }
 
 /** Worst-case USDC loss for one contest — Σ over its speculations of each one's `max(ifAwayWins, ifHomeWins)` (conservative independence across markets). This is what `maxRiskPerContestUSDC` binds. */

@@ -15,7 +15,7 @@ import {
 import { oppositeSide, positionTypeForSide, sideForPositionType, toProtocolQuote } from './protocol.js';
 import { stripVig } from './vig.js';
 import { deriveSpreadDirect, deriveSpreadEconomics, expectedMonthlyFilledVolumeUSDC } from './spread.js';
-import { computeQuote } from './quote.js';
+import { clampSkewDelta, computeQuote, SKEW_PROB_CEIL, SKEW_PROB_FLOOR } from './quote.js';
 import type { EconomicsInputs, QuoteCommonInputs } from './types.js';
 
 // ── odds conversions ──────────────────────────────────────────────────────────
@@ -396,5 +396,66 @@ describe('computeQuote', () => {
     expect(() => computeQuote({ ...COMMON, awayHeadroomUSDC: Number.POSITIVE_INFINITY, mode: 'direct', direct: { spreadBps: 100 } })).toThrow(/finite/);
     expect(() => computeQuote({ ...COMMON, mode: 'economics', economics: { ...ECON, daysHorizon: Number.NaN } })).toThrow(/finite/);
     expect(() => computeQuote({ ...COMMON, mode: 'direct', direct: { spreadBps: Number.NaN } })).toThrow(/finite/);
+  });
+
+  // ── inventory skew (DESIGN §5) ──────────────────────────────────────────────
+
+  it('skew off (skewSignal omitted / 0 / -0) is byte-identical to the symmetric quote', () => {
+    const baseD = computeQuote({ ...COMMON, mode: 'direct', direct: { spreadBps: 200 } });
+    expect(computeQuote({ ...COMMON, skewSignal: 0, mode: 'direct', direct: { spreadBps: 200 } })).toEqual(baseD);
+    expect(computeQuote({ ...COMMON, skewSignal: -0, mode: 'direct', direct: { spreadBps: 200 } })).toEqual(baseD);
+    const baseE = computeQuote({ ...COMMON, mode: 'economics', economics: ECON });
+    expect(computeQuote({ ...COMMON, skewSignal: 0, mode: 'economics', economics: ECON })).toEqual(baseE);
+  });
+
+  it('leans the away quote UP and the home quote DOWN by skewSignal × halfSpread, preserving the two-sided sum (mutation-proof direction)', () => {
+    const sym = computeQuote({ ...COMMON, mode: 'direct', direct: { spreadBps: 200 } });
+    const delta = 0.5 * (sym.spread! / 2); // skewSignal 0.5 × halfSpread
+    const up = computeQuote({ ...COMMON, skewSignal: 0.5, mode: 'direct', direct: { spreadBps: 200 } });
+    expect(up.away!.quoteProb).toBeCloseTo(sym.away!.quoteProb + delta, 12); // away discouraged (priced up)
+    expect(up.home!.quoteProb).toBeCloseTo(sym.home!.quoteProb - delta, 12); // home encouraged (priced down)
+    expect(up.away!.quoteProb + up.home!.quoteProb).toBeCloseTo(1 + sym.spread!, 12); // edge preserved
+    expect(up.away!.quoteProb).toBeGreaterThanOrEqual(up.fair!.awayFairProb); // never below fair
+    expect(up.home!.quoteProb).toBeGreaterThanOrEqual(up.fair!.homeFairProb);
+    const down = computeQuote({ ...COMMON, skewSignal: -0.5, mode: 'direct', direct: { spreadBps: 200 } });
+    expect(down.away!.quoteProb).toBeCloseTo(sym.away!.quoteProb - delta, 12); // mirror: away down, home up
+    expect(down.home!.quoteProb).toBeCloseTo(sym.home!.quoteProb + delta, 12);
+  });
+
+  it('clampSkewDelta keeps both skewed quotes inside the protocol tick band (so skew never forces a refusal)', () => {
+    // Mid-range probs, far from the band edges → the desired lean passes through unclamped.
+    expect(clampSkewDelta(0.01, 0.5, 0.51)).toBe(0.01);
+    expect(clampSkewDelta(-0.01, 0.5, 0.51)).toBe(-0.01);
+    expect(clampSkewDelta(0, 0.5, 0.51)).toBe(0); // off → exact 0 (byte-identical)
+    // Up-leaning away near the ceiling: the away side can rise only to SKEW_PROB_CEIL.
+    expect(clampSkewDelta(0.02, 0.985, 0.025)).toBeCloseTo(SKEW_PROB_CEIL - 0.985, 12);
+    // Down-leaning away near the floor (negative d; home well clear of the ceiling so the away-floor
+    // bound is the binding one): the away side can fall only to SKEW_PROB_FLOOR.
+    expect(clampSkewDelta(-0.02, 0.012, 0.5)).toBeCloseTo(SKEW_PROB_FLOOR - 0.012, 12);
+    // The clamp never flips the sign or overshoots the desired magnitude.
+    expect(clampSkewDelta(0.02, 0.985, 0.025)).toBeLessThanOrEqual(0.02);
+    expect(clampSkewDelta(0.02, 0.985, 0.025)).toBeGreaterThanOrEqual(0);
+  });
+
+  it('skew is wired into computeQuote and well-behaved across the signal range (ticks in range, edge preserved, never refuses)', () => {
+    for (const s of [-1, -0.5, -0.1, 0.1, 0.5, 1]) {
+      const r = computeQuote({ ...COMMON, skewSignal: s, mode: 'direct', direct: { spreadBps: 200 } });
+      expect(r.canQuote, `skewSignal=${s}`).toBe(true);
+      expect(r.away, `skewSignal=${s}`).not.toBeNull();
+      expect(r.home, `skewSignal=${s}`).not.toBeNull();
+      expect(isTickInRange(r.away!.quoteTick)).toBe(true);
+      expect(isTickInRange(r.home!.quoteTick)).toBe(true);
+      expect(r.away!.quoteProb + r.home!.quoteProb).toBeCloseTo(1 + r.spread!, 9); // sum preserved even when clamped (same d on both sides)
+      expect(r.away!.quoteProb).toBeGreaterThanOrEqual(r.fair!.awayFairProb); // never below fair
+      expect(r.home!.quoteProb).toBeGreaterThanOrEqual(r.fair!.homeFairProb);
+    }
+  });
+
+  it('rejects an out-of-range / non-finite skewSignal; accepts the [-1, 1] boundary', () => {
+    for (const bad of [2, -2, 1.0001, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(() => computeQuote({ ...COMMON, skewSignal: bad, mode: 'direct', direct: { spreadBps: 200 } })).toThrow(/skewSignal/);
+    }
+    expect(computeQuote({ ...COMMON, skewSignal: 1, mode: 'direct', direct: { spreadBps: 200 } }).canQuote).toBe(true);
+    expect(computeQuote({ ...COMMON, skewSignal: -1, mode: 'direct', direct: { spreadBps: 200 } }).canQuote).toBe(true);
   });
 });

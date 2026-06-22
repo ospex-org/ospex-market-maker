@@ -411,6 +411,7 @@ function liveSpiedAdapter(
     submitCommitment?: (args: SubmitCommitmentArgs) => Promise<SubmitCommitmentResult>;
     cancelCommitmentOffchain?: (hash: Hex) => Promise<void>;
     approveUSDC?: (amount: ApproveUSDCAmount) => Promise<ApproveResult>;
+    approveCreationFee?: OspexAdapter['approveCreationFee'];
     settleSpeculation?: OspexAdapter['settleSpeculation'];
     ensureSpeculationSettled?: OspexAdapter['ensureSpeculationSettled'];
     claimPosition?: OspexAdapter['claimPosition'];
@@ -441,6 +442,7 @@ function liveSpiedAdapter(
   vi.spyOn(adapter, 'submitCommitment').mockImplementation(writes?.submitCommitment ?? (() => Promise.reject(new Error('liveSpiedAdapter: submitCommitment not stubbed — pass `writes.submitCommitment`'))));
   vi.spyOn(adapter, 'cancelCommitmentOffchain').mockImplementation(writes?.cancelCommitmentOffchain ?? (() => Promise.resolve()));
   vi.spyOn(adapter, 'approveUSDC').mockImplementation(writes?.approveUSDC ?? (() => Promise.reject(new Error('liveSpiedAdapter: approveUSDC not stubbed — pass `writes.approveUSDC`'))));
+  vi.spyOn(adapter, 'approveCreationFee').mockImplementation(writes?.approveCreationFee ?? (() => Promise.reject(new Error('liveSpiedAdapter: approveCreationFee not stubbed — pass `writes.approveCreationFee`'))));
   vi.spyOn(adapter, 'settleSpeculation').mockImplementation(writes?.settleSpeculation ?? (() => Promise.reject(new Error('liveSpiedAdapter: settleSpeculation not stubbed — pass `writes.settleSpeculation`'))));
   vi.spyOn(adapter, 'ensureSpeculationSettled').mockImplementation(writes?.ensureSpeculationSettled ?? (() => Promise.reject(new Error('liveSpiedAdapter: ensureSpeculationSettled not stubbed — pass `writes.ensureSpeculationSettled`'))));
   vi.spyOn(adapter, 'claimPosition').mockImplementation(writes?.claimPosition ?? (() => Promise.reject(new Error('liveSpiedAdapter: claimPosition not stubbed — pass `writes.claimPosition`'))));
@@ -4208,16 +4210,17 @@ describe('Runner — live execution', () => {
     expect(() => makeRunner({ config: cfg({ mode: { dryRun: false } }) })).toThrow(/live mode .* requires a signed adapter/);
   });
 
-  it('boots with marketSelection.seedSpeculations enabled — the discovery seed branch tracks seed markets but reconcile refuses to post them in this slice (no boot guard)', () => {
+  it('boots with marketSelection.seedSpeculations enabled (no boot guard) — seed posting is gated at runtime by the per-day fee budget, not at construction', () => {
     StateStore.at(stateDir).flush(emptyMakerState());
     expect(() => makeRunner({ config: cfg({ marketSelection: { seedSpeculations: true } }) })).not.toThrow();
   });
 
-  it('LIVE mode + seeding: a seed market NEVER reaches submitCommitment — the reconcile gate refuses it (no post, no creation fee, no on-chain leg)', async () => {
+  it('LIVE mode + seeding + ZERO fee budget: a seed market NEVER reaches submitCommitment — the fee gate refuses it (no post, no creation fee, no on-chain leg)', async () => {
     StateStore.at(stateDir).flush(emptyMakerState());
     const config = withMarkets(cfg({ mode: { dryRun: false }, marketSelection: { seedSpeculations: true } }), ['spread']);
+    // maxDailyFeeUSDC defaults to 0 — the second seeding opt-in is OFF, so every seed is refused.
     const submit = submitRecorder();
-    // A verified contest with NO open spread speculation → discovery seeds it; reconcile refuses.
+    // A verified contest with NO open spread speculation → discovery seeds it; the fee gate refuses the POST.
     const lean = contestView({ contestId: '1', speculations: [] });
     const full = contestView({ contestId: '1', referenceGameId: 'GAME-1', speculations: [] });
     const adapter = liveSpiedAdapter(config, () => Promise.resolve([lean]), { submitCommitment: submit.fn }, () => Promise.resolve(full), {
@@ -4225,11 +4228,15 @@ describe('Runner — live execution', () => {
     });
     await makeRunner({ config, adapter, maxTicks: 1 }).run();
 
-    // The seed was tracked + reconciled (the gate fired) — but no post happened, in live mode.
+    // The seed was tracked, priced, and reached the per-side submit gate — but the zero fee
+    // budget refused it, so no live POST happened. This is the money-safety property: with the
+    // fee opt-in OFF, a seed never creates an on-chain leg and never incurs a creation fee.
     const events = readEvents();
-    expect(events.filter((e) => e.kind === 'candidate' && e.skipReason === 'would-create-lazy-speculation')).toHaveLength(1);
-    expect(submit.calls).toHaveLength(0); // no submitCommitment — the money-safety property of this slice
+    expect(events.some((e) => e.kind === 'quote-intent' && e.contestId === '1')).toBe(true); // priced
+    expect(events.filter((e) => e.kind === 'candidate' && e.skipReason === 'fee-budget-exhausted' && e.market === 'spread')).toHaveLength(2);
+    expect(submit.calls).toHaveLength(0); // no submitCommitment
     expect(events.some((e) => e.kind === 'submit' || e.kind === 'would-submit')).toBe(false);
+    expect(StateStore.at(stateDir).load().state.seedFeeBySpecKey).toEqual({}); // no fee marker — nothing posted
     expect(Object.values(StateStore.at(stateDir).load().state.commitments)).toHaveLength(0); // nothing persisted
   });
 
@@ -4358,18 +4365,30 @@ describe('Runner — live execution', () => {
     expect(noOpen).toHaveLength(1);
   });
 
-  // ── seeding (marketSelection.seedSpeculations) — discovery + reconcile-refuse slice ──
+  // ── seeding (marketSelection.seedSpeculations) — discovery + fee-gated POST ──
   //
   // Default off: a wanted market with no open speculation is skipped (`no-open-speculation`).
   // With seeding on, discovery instead tracks a SEED market at the oracle-primary line (read
   // from a one-shot odds snapshot, since a newcomer has no streamed odds yet), carrying a
-  // placeholder `speculationId` (`seed:contest:market:line`). This slice tracks + REFUSES to
-  // post (the reconcile `would-create-lazy-speculation` gate, before pricing + before the
-  // `getSpeculation` read that would throw on a placeholder); the posting path ships later.
+  // placeholder `speculationId` (`seed:contest:market:line`). A seed has no readable spec, so
+  // reconcile skips the `getSpeculation` re-confirm (which would throw on the placeholder) and
+  // the orderbook competitiveness check — but it DOES price (a `quote-intent` is emitted) and
+  // reach the per-side POST. The POST is gated by the per-day creation-fee budget
+  // (`canSpendFee`): a seed posts only when `risk.maxDailyFeeUSDC > 0` (the second seeding
+  // opt-in). With the default zero budget every seed is refused per side at the submit gate
+  // (`fee-budget-exhausted`) — tracked, priced, never posted. (The protocol lazily creates the
+  // on-chain speculation at the seed's first match; the maker owes a creation-fee share then,
+  // pre-flighted here and attributed once at the fill via `seedFeeBySpecKey`, §C2a.)
 
-  /** A market-selection config with seeding on and the given market list. */
-  function seedingCfg(markets: string[]): Config {
-    return withMarkets(cfg({ marketSelection: { seedSpeculations: true } }), markets);
+  /**
+   * A market-selection config with seeding on and the given market list. `maxDailyFeeUSDC`
+   * defaults to 0 (the config default) — every seed is refused at the fee gate; pass a
+   * positive value to enable seed posting.
+   */
+  function seedingCfg(markets: string[], maxDailyFeeUSDC = 0): Config {
+    const c = withMarkets(cfg({ marketSelection: { seedSpeculations: true } }), markets);
+    c.risk.maxDailyFeeUSDC = maxDailyFeeUSDC;
+    return c;
   }
 
   it('seeding off (default): a spec-less contest with a wanted spread market is skipped (no-open-speculation), nothing tracked', async () => {
@@ -4385,11 +4404,11 @@ describe('Runner — live execution', () => {
     expect(runner.trackedMarketView('1', 'spread')).toBeUndefined(); // nothing seeded
     const events = readEvents();
     expect(events.filter((e) => e.kind === 'candidate' && e.skipReason === 'no-open-speculation')).toHaveLength(1);
-    expect(events.some((e) => e.kind === 'candidate' && e.skipReason === 'would-create-lazy-speculation')).toBe(false);
+    expect(events.some((e) => e.kind === 'candidate' && e.skipReason === 'fee-budget-exhausted')).toBe(false); // no seed → never reaches the fee gate
   });
 
-  it('seeding on: a spec-less contest tracks a SEED spread market at the oracle line, and reconcile refuses to post (would-create-lazy-speculation)', async () => {
-    const config = seedingCfg(['spread']);
+  it('seeding on (default zero fee budget): a spec-less contest tracks a SEED spread market at the oracle line, prices it, then refuses to post per side at the fee gate (fee-budget-exhausted)', async () => {
+    const config = seedingCfg(['spread']); // maxDailyFeeUSDC defaults to 0 → fee gate refuses
     const lean = contestView({ contestId: '1', speculations: [] }); // NO spread speculation
     const full = contestView({ contestId: '1', referenceGameId: 'GAME-1', speculations: [] });
     const adapter = spiedAdapter(config, () => Promise.resolve([lean]), () => Promise.resolve(full), {
@@ -4406,10 +4425,13 @@ describe('Runner — live execution', () => {
     const events = readEvents();
     // Discovery emitted a positive (tracked) candidate carrying the placeholder id.
     expect(events.some((e) => e.kind === 'candidate' && e.speculationId === 'seed:1:spread:-15')).toBe(true);
-    // Reconcile recognized the seed and refused — exactly once, before pricing.
-    expect(events.filter((e) => e.kind === 'candidate' && e.skipReason === 'would-create-lazy-speculation')).toHaveLength(1);
-    expect(events.some((e) => e.kind === 'quote-intent' && e.contestId === '1')).toBe(false); // never reached pricing
-    expect(events.some((e) => e.kind === 'would-submit')).toBe(false); // dry-run: no post for a seed
+    // The seed reached pricing (no getSpeculation re-confirm for a seed; the line gate passed
+    // since it was minted at the oracle line) — `quote-intent` proves it was priced.
+    expect(events.some((e) => e.kind === 'quote-intent' && e.contestId === '1')).toBe(true);
+    // The submit gate refused each priced side (both sides of a fresh two-sided quote) — the
+    // zero fee budget can't absorb the creation fee.
+    expect(events.filter((e) => e.kind === 'candidate' && e.skipReason === 'fee-budget-exhausted' && e.market === 'spread')).toHaveLength(2);
+    expect(events.some((e) => e.kind === 'would-submit')).toBe(false); // gate fires before the dry-run post — nothing posted
   });
 
   it('seeding on: a total seed is tracked at the oracle threshold (8.5 → 85)', async () => {
@@ -4425,7 +4447,9 @@ describe('Runner — live execution', () => {
     const seed = runner.trackedMarketView('1', 'total');
     expect(seed).toMatchObject({ marketType: 'total', lineTicks: 85 });
     expect(seed?.speculationId).toBe('seed:1:total:85');
-    expect(readEvents().filter((e) => e.kind === 'candidate' && e.skipReason === 'would-create-lazy-speculation' && e.market === 'total')).toHaveLength(1);
+    const events = readEvents();
+    expect(events.some((e) => e.kind === 'quote-intent' && e.contestId === '1')).toBe(true); // priced
+    expect(events.filter((e) => e.kind === 'candidate' && e.skipReason === 'fee-budget-exhausted' && e.market === 'total')).toHaveLength(2); // refused per side (zero fee budget)
   });
 
   it('seeding on: a market with no usable reference odds is NOT seeded (no-reference-odds, nothing tracked)', async () => {
@@ -4442,7 +4466,7 @@ describe('Runner — live execution', () => {
     expect(runner.trackedMarketView('1', 'spread')).toBeUndefined();
     const events = readEvents();
     expect(events.filter((e) => e.kind === 'candidate' && e.skipReason === 'no-reference-odds')).toHaveLength(1);
-    expect(events.some((e) => e.kind === 'candidate' && e.skipReason === 'would-create-lazy-speculation')).toBe(false);
+    expect(events.some((e) => e.kind === 'candidate' && e.skipReason === 'fee-budget-exhausted')).toBe(false); // no seed → never reaches the fee gate
   });
 
   it('seeding on: a contest with an open moneyline spec AND a missing spread spec tracks moneyline normally + seeds spread', async () => {
@@ -4459,11 +4483,14 @@ describe('Runner — live execution', () => {
     // Moneyline tracks its real open spec; spread is seeded at the oracle line.
     expect(runner.trackedMarketView('1', 'moneyline')?.speculationId).toBe('spec-ml');
     expect(runner.trackedMarketView('1', 'spread')?.speculationId).toBe('seed:1:spread:-15');
-    // Moneyline reconciled normally (reached pricing — only the moneyline market can, the
-    // seeded spread refuses before pricing); spread refused as a seed.
+    // Both markets reconciled to pricing. Moneyline (a REAL spec, not a seed) posts normally —
+    // it is never fee-gated. The seeded spread also prices but is refused per side at the fee
+    // gate (zero fee budget).
     const events = readEvents();
     expect(events.some((e) => e.kind === 'quote-intent' && e.contestId === '1' && e.speculationId === 'spec-ml')).toBe(true);
-    expect(events.filter((e) => e.kind === 'candidate' && e.skipReason === 'would-create-lazy-speculation' && e.market === 'spread')).toHaveLength(1);
+    expect(events.filter((e) => e.kind === 'would-submit' && e.speculationId === 'spec-ml')).toHaveLength(2); // moneyline posts both sides — no fee gate
+    expect(events.some((e) => e.kind === 'candidate' && e.skipReason === 'fee-budget-exhausted' && e.market === undefined)).toBe(false); // moneyline never fee-gated (it has a real spec)
+    expect(events.filter((e) => e.kind === 'candidate' && e.skipReason === 'fee-budget-exhausted' && e.market === 'spread')).toHaveLength(2); // the seed spread refused per side
   });
 
   it('seeding on: a seed already tracked is NOT re-created on the next discovery cycle (single tracked entry, one creation)', async () => {
@@ -4483,13 +4510,14 @@ describe('Runner — live execution', () => {
     // The seed-CREATION candidate (positive: a placeholder speculationId, no skipReason) is
     // emitted only by the discovery seed branch — exactly once. The second cycle sees the seed
     // already tracked (isMarketTracked) and skips it, so there is no second creation. (The
-    // reconcile refusal `would-create-lazy-speculation` may recur each tick — that's expected
-    // and is a distinct, skipReason-bearing event with no speculationId.)
+    // per-side submit refusal `fee-budget-exhausted` may recur each tick under the default zero
+    // fee budget — that's expected and is a distinct, skipReason-bearing event with no
+    // speculationId.)
     const creations = readEvents().filter((e) => e.kind === 'candidate' && e.speculationId === 'seed:1:spread:-15' && e.skipReason === undefined);
     expect(creations).toHaveLength(1);
   });
 
-  it('seeding on: a moneyline seed is tracked at line 0 with NO market tag (the omit-for-moneyline convention), and reconcile refuses it', async () => {
+  it('seeding on: a moneyline seed is tracked at line 0 with NO market tag (the omit-for-moneyline convention), prices, and is refused per side at the fee gate', async () => {
     const config = seedingCfg(['moneyline']);
     const lean = contestView({ contestId: '1', speculations: [] }); // no moneyline spec
     const full = contestView({ contestId: '1', referenceGameId: 'GAME-1', speculations: [] });
@@ -4502,9 +4530,11 @@ describe('Runner — live execution', () => {
     const seed = runner.trackedMarketView('1', 'moneyline');
     expect(seed).toMatchObject({ marketType: 'moneyline', lineTicks: 0 });
     expect(seed?.speculationId).toBe('seed:1:moneyline:0'); // oracleLineTicks(moneyline) is null -> 0
-    const refusals = readEvents().filter((e) => e.kind === 'candidate' && e.skipReason === 'would-create-lazy-speculation');
-    expect(refusals).toHaveLength(1);
-    expect(refusals[0]?.market).toBeUndefined(); // moneyline omits the market tag
+    const events = readEvents();
+    expect(events.some((e) => e.kind === 'quote-intent' && e.contestId === '1')).toBe(true); // priced
+    const refusals = events.filter((e) => e.kind === 'candidate' && e.skipReason === 'fee-budget-exhausted');
+    expect(refusals).toHaveLength(2); // both sides refused (zero fee budget)
+    expect(refusals.every((r) => r.market === undefined)).toBe(true); // moneyline omits the market tag
   });
 
   it('seeding on: when a real speculation appears at a seed line, the refresh re-binds the seed to it and quotes it (seed -> tracking migration)', async () => {
@@ -4527,8 +4557,109 @@ describe('Runner — live execution', () => {
     // The seed's placeholder id was re-bound to the real on-chain id by the discovery refresh.
     expect(runner.trackedMarketView('1', 'spread')?.speculationId).toBe('4217');
     const events = readEvents();
-    expect(events.some((e) => e.kind === 'candidate' && e.skipReason === 'would-create-lazy-speculation')).toBe(true); // cycle 1 refused as a seed
+    expect(events.some((e) => e.kind === 'candidate' && e.skipReason === 'fee-budget-exhausted' && e.market === 'spread')).toBe(true); // cycle 1 priced the seed but refused it at the fee gate (zero budget)
     expect(events.some((e) => e.kind === 'quote-intent' && e.speculationId === '4217')).toBe(true); // cycle 2 quotes the now-real market
+  });
+
+  // ── seeding POST activation (the second opt-in: risk.maxDailyFeeUSDC > 0) ────────
+  //
+  // With BOTH opt-ins on (`seedSpeculations` AND a positive `maxDailyFeeUSDC`), a seed clears
+  // the per-side fee gate and posts: in dry-run it `would-submit`; in live mode it actually
+  // POSTs via `submitCommitment` (the protocol lazily creates the on-chain speculation on first
+  // match) and records the creation fee PENDING under the seed placeholder key. A boot-time
+  // `TreasuryModule` approval (gated on the same double opt-in) raises the allowance the fee is
+  // pulled from at match.
+
+  it('seeding on + positive fee budget (dry-run): a seed clears the fee gate and would-submit both sides (no fee-budget-exhausted, no live fee marker in dry-run)', async () => {
+    StateStore.at(stateDir).flush(emptyMakerState());
+    const config = seedingCfg(['spread'], 5); // $5/day fee budget → the seed posts
+    const lean = contestView({ contestId: '1', speculations: [] });
+    const full = contestView({ contestId: '1', referenceGameId: 'GAME-1', speculations: [] });
+    const adapter = spiedAdapter(config, () => Promise.resolve([lean]), () => Promise.resolve(full), {
+      snapshot: (id) => Promise.resolve({ contestId: id, odds: { moneyline: null, spread: spreadOdds(-1.5), total: null } }),
+    });
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    const events = readEvents();
+    expect(events.some((e) => e.kind === 'quote-intent' && e.contestId === '1')).toBe(true);
+    expect(events.filter((e) => e.kind === 'would-submit' && e.speculationId === 'seed:1:spread:-15')).toHaveLength(2); // both sides clear the gate
+    expect(events.some((e) => e.kind === 'candidate' && e.skipReason === 'fee-budget-exhausted')).toBe(false);
+    // A dry-run seed never posts on chain and never matches, so no fee marker is recorded
+    // (the marker write is live-only — guarded by `!dryRun`).
+    expect(StateStore.at(stateDir).load().state.seedFeeBySpecKey).toEqual({});
+  });
+
+  it('seeding on + positive fee budget (LIVE): a seed POSTs both sides via submitCommitment and records the creation fee PENDING under the placeholder key', async () => {
+    StateStore.at(stateDir).flush(emptyMakerState());
+    const config = withMarkets(cfg({ mode: { dryRun: false }, marketSelection: { seedSpeculations: true } }), ['spread']);
+    config.risk.maxDailyFeeUSDC = 5; // the second opt-in → seeds post
+    const submit = submitRecorder();
+    const lean = contestView({ contestId: '1', speculations: [] }); // NO spread spec → the protocol lazily creates it on match
+    const full = contestView({ contestId: '1', referenceGameId: 'GAME-1', speculations: [] });
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([lean]), { submitCommitment: submit.fn }, () => Promise.resolve(full), {
+      snapshot: (id) => Promise.resolve({ contestId: id, odds: { moneyline: null, spread: spreadOdds(-1.5), total: null } }),
+    });
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    // The seed posted on chain — both sides — carrying the seed's stable identity
+    // (contestId / spread scorer / oracle line). No off-chain-derived speculationId is sent;
+    // the protocol assigns the real one at first match.
+    expect(submit.calls).toHaveLength(2);
+    for (const a of submit.calls) {
+      expect(a).toMatchObject({ contestId: 1n, scorer: adapter.addresses().scorers.spread, lineTicks: -15 });
+    }
+    const events = readEvents();
+    expect(events.filter((e) => e.kind === 'submit').map((e) => e.commitmentHash).sort()).toEqual(['0xlive1', '0xlive2']);
+    expect(events.some((e) => e.kind === 'would-submit')).toBe(false); // live: real submit, not a dry-run preview
+    expect(events.some((e) => e.kind === 'candidate' && e.skipReason === 'fee-budget-exhausted')).toBe(false);
+    // The creation fee is marked PENDING exactly once under the seed placeholder key (the two
+    // sides share the key; the marker isn't reset by the second side). The fill reducer charges
+    // it once at first match (§C2a).
+    const persisted = StateStore.at(stateDir).load().state;
+    expect(persisted.seedFeeBySpecKey['seed:1:spread:-15']).toEqual({ feeUsdcWei6: '250000', charged: false });
+    expect(Object.keys(persisted.seedFeeBySpecKey)).toHaveLength(1);
+    expect(Object.values(persisted.commitments)).toHaveLength(2); // both seed legs persisted
+  });
+
+  it('seeding on + positive fee budget + autoApprove (LIVE): boot raises the TreasuryModule allowance to the wallet balance (wallet-bounded) and emits an approval event', async () => {
+    StateStore.at(stateDir).flush(emptyMakerState());
+    const config = withMarkets(cfg({ mode: { dryRun: false }, approvals: { autoApprove: true, mode: 'exact' }, marketSelection: { seedSpeculations: true } }), ['spread']);
+    config.risk.maxDailyFeeUSDC = 5;
+    // A treasury-approve recorder (mirrors the PositionModule approveRecorder; real bigint gas fields so gasPolWei derives).
+    const calls: Array<bigint | 'max'> = [];
+    const approveCreationFee: OspexAdapter['approveCreationFee'] = (amount) => {
+      calls.push(amount);
+      const receipt = { gasUsed: 50_000n, effectiveGasPrice: 30_000_000_000n } as unknown as ApproveResult['receipt'];
+      const onChainAmount = amount === 'max' ? 2n ** 256n - 1n : amount;
+      return Promise.resolve({ txHash: '0xtreasurytx', receipt, spender: '0xTreasuryModule' as Hex, token: '0xusdc' as Hex, amount: onChainAmount });
+    };
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]), // no contests → the boot approval is the only action
+      { approveCreationFee },
+      undefined, undefined,
+      // Default readApprovals has treasuryModule allowance 0n; give a finite wallet so the wallet-bounded target is legible.
+      { readBalances: (owner: Hex) => Promise.resolve({ owner, chainId: 137, native: 1_000_000_000_000_000_000n, usdc: 100_000_000n, link: 0n, usdcAddress: '0xusdc' as Hex, linkAddress: '0xlink' as Hex }) },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1, makerAddress: DEFAULT_FAKE_MAKER_ADDRESS as Hex }).run();
+
+    expect(calls).toEqual([100_000_000n]); // raise-only, wallet-bounded — target = wallet USDC balance (NOT the daily budget)
+    const approval = readEvents().find((e) => e.kind === 'approval' && e.purpose === 'treasuryModule');
+    expect(approval).toMatchObject({
+      purpose: 'treasuryModule', spender: '0xTreasuryModule', currentAllowance: '0',
+      requiredAggregateAllowance: '100000000', amountSetTo: '100000000', walletBalanceWei6: '100000000',
+      txHash: '0xtreasurytx', gasPolWei: (50_000n * 30_000_000_000n).toString(),
+    });
+  });
+
+  it('double-opt-in diagnostic: seeding ON with a ZERO fee budget logs a WARNING at construction; a positive budget does not', () => {
+    StateStore.at(stateDir).flush(emptyMakerState());
+    const warned: string[] = [];
+    makeRunner({ config: seedingCfg(['spread']), deps: { log: (l) => warned.push(l) } }); // budget 0 → warn
+    expect(warned.some((l) => l.includes('seedSpeculations is ON but risk.maxDailyFeeUSDC is 0'))).toBe(true);
+
+    const notWarned: string[] = [];
+    makeRunner({ config: seedingCfg(['spread'], 5), deps: { log: (l) => notWarned.push(l) } }); // budget > 0 → no warn
+    expect(notWarned.some((l) => l.includes('seedSpeculations is ON but risk.maxDailyFeeUSDC is 0'))).toBe(false);
   });
 
   // ── line-consistency gate (spread/total: never quote a mispriced line) ──────────

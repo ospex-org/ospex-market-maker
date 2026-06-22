@@ -412,11 +412,12 @@ export interface DailyCounters {
   /** POL gas spent that day, in 18-decimal wei (decimal string). */
   gasPolWei: string;
   /**
-   * Protocol creation fees paid that day, in USDC wei6 (decimal string).
+   * ESTIMATED protocol creation fees incurred that day, in USDC wei6 (decimal string).
    * `recordFeeSpentToday` accumulates the maker creation-fee share at a seed
-   * speculation's fee-incurring first fill (DESIGN §6). Stays `"0"` until the
-   * seed-posting path writes a seed, so it is genuinely `"0"` for a moneyline-only
-   * operator (and while seeding is off).
+   * speculation's first matched fill (DESIGN §6). A conservative estimate, not a
+   * realized-fee ledger — exact for a sole seeder, an over-estimate by at most one fee
+   * per speculation another maker raced to create first (see {@link SeedFeeEntry}).
+   * Genuinely `"0"` for a moneyline-only operator (and while seeding is off).
    */
   feeUsdcWei6: string;
 }
@@ -426,12 +427,16 @@ export interface DailyCounters {
  * {@link MakerState.seedFeeBySpecKey} by the seed placeholder
  * `seed:${contestId}:${marketType}:${lineTicks}` (see `seedSpeculationId`).
  *
- * Written when the MM posts a seed — the protocol charges the maker creation-fee
- * share on-chain at the seed's FIRST match, not at post. `feeUsdcWei6` is the
- * maker's share (USDC wei6 decimal string). `charged` flips to `true` when the
- * fee-incurring first fill is observed (own-state), so the fee is attributed
- * exactly ONCE per speculation, regardless of which side fills first or a
- * re-delivered fill.
+ * Written when the MM posts a seed. The protocol charges the maker creation-fee
+ * share on-chain only when a fill LAZILY CREATES the speculation; `feeUsdcWei6` is
+ * the maker's share (USDC wei6 decimal string). `charged` flips to `true` when the
+ * estimate is attributed at the seed's first matched fill (own-state), exactly ONCE
+ * per speculation, regardless of which side fills first or a re-delivered fill. The
+ * attribution is a **conservative estimate**: it assumes the MM's own seed leg created
+ * the speculation (exact when the MM is the sole seeder of the line). In the rare race
+ * where another maker created the same speculation first, the MM's seed matches into it
+ * and pays no fee, yet still records the estimate — so it can over-state by at most one
+ * fee per raced speculation (the safe direction for the `maxDailyFeeUSDC` cap).
  *
  * `hashes` lists the EIP-712 commitment hashes of the MM's OWN seed legs at this
  * line (one per side actually posted). It binds the fee to the seed commitments

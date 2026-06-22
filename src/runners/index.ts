@@ -2918,8 +2918,9 @@ export class Runner {
     // maker owes a creation-fee share then (`TreasuryModule.processSplitFee`). Before
     // posting, confirm the per-day fee budget can absorb that fee — `canSpendFee`
     // refuses unless `risk.maxDailyFeeUSDC > 0` (the seeding fee opt-in) and today's
-    // fee spend + this fee stays within it. The fee lands at MATCH, not post, so this
-    // is attributed exactly once at the fill via `seedFeeBySpecKey` (§C2a). To make the
+    // fee spend + this fee stays within it. The fee lands at MATCH, not post, so it is
+    // attributed (as a conservative estimate — see the reducer) once at the fill via
+    // `seedFeeBySpecKey` (§C2a). To make the
     // per-day budget a real cap (not just a realized-spend gate), count the LATENT fee
     // of every OTHER posted-but-unmatched seed too (mirroring the conservative latent-
     // USDC-risk rule): each such seed will owe its fee at match, so N concurrent seeds

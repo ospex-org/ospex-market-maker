@@ -407,10 +407,10 @@ export function renderStatusReportText(report: StatusReport, out: { write(s: str
 
   out.write(`\nToday (${report.dailyCounters.today}):\n`);
   out.write(`  gas spent          ${formatPolWei18(report.dailyCounters.todayGasPolWei)} POL\n`);
-  out.write(`  fees paid          ${formatUsdcWei6(report.dailyCounters.todayFeeUsdcWei6)} USDC\n`);
+  out.write(`  seed fees (est.)   ${formatUsdcWei6(report.dailyCounters.todayFeeUsdcWei6)} USDC\n`);
   out.write(`Lifetime:\n`);
   out.write(`  gas spent          ${formatPolWei18(report.dailyCounters.lifetimeGasPolWei)} POL\n`);
-  out.write(`  fees paid          ${formatUsdcWei6(report.dailyCounters.lifetimeFeeUsdcWei6)} USDC\n`);
+  out.write(`  seed fees (est.)   ${formatUsdcWei6(report.dailyCounters.lifetimeFeeUsdcWei6)} USDC\n`);
 
   out.write(`\nPnL (${report.pnl.asOfUnixSec === 0 ? 'never computed' : `as of unix ${report.pnl.asOfUnixSec}`}):\n`);
   out.write(`  realized           ${formatSignedUsdcWei6(report.pnl.realizedUsdcWei6)} USDC\n`);

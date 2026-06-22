@@ -417,6 +417,23 @@ describe('reduceOwnerFill — seed creation-fee attribution', () => {
     expect(state.seedFeeBySpecKey['seed:1:spread:-15']?.charged).toBe(false); // marker untouched — no phantom charge
   });
 
+  it('records the ESTIMATE for a bound seed leg even when its commitment now carries a REAL speculationId (conservative — the MM cannot tell from own-state whether this match created the speculation)', () => {
+    // Documented limitation (DESIGN §6 "Daily accounting"): the on-chain creation fee is
+    // charged only when a fill lazily CREATES the speculation. The MM can't observe that, so
+    // a bound seed leg's first matched fill records the estimate regardless of whether the
+    // speculation was created by THIS fill (sole seeder — exact) or already existed because
+    // another maker raced to create it first (the MM paid no fee — an over-estimate). This
+    // pins that intentional behavior: a real, post-match speculationId on the commitment does
+    // NOT change the attribution (it keys off the stable tuple + the bound hash).
+    const state = emptyMakerState();
+    state.commitments['0xabc'] = mapOwnerCommitmentToMaker(ownerCommitment({ marketType: 'spread', lineTicks: -15, speculationId: '4217' }));
+    state.seedFeeBySpecKey['seed:1:spread:-15'] = { feeUsdcWei6: '250000', charged: false, hashes: ['0xabc'] };
+    const descriptors = reduceOwnerFill(state, fill(), new Set<string>(), OUR_ADDR, 1);
+    const fillDesc = descriptors.find((d) => d.kind === 'emit-fill');
+    if (fillDesc?.kind === 'emit-fill') expect(fillDesc.payload.feeUsdcWei6).toBe('250000');
+    expect(state.seedFeeBySpecKey['seed:1:spread:-15']?.charged).toBe(true);
+  });
+
   it('the fee is attributed exactly ONCE — a second fill on the same seeded speculation carries no fee', () => {
     const state = emptyMakerState();
     state.commitments['0xabc'] = mapOwnerCommitmentToMaker(ownerCommitment({ marketType: 'spread', lineTicks: -15 }));

@@ -149,7 +149,7 @@ export function renderSummaryReportText(summary: RunSummary, logDir: string, out
     if (g.totalUsdcEquivWei6 !== null) {
       out.write(`  Gas (≈USDC):  ${formatUsdcWei6(g.totalUsdcEquivWei6)} (POL → USDC via config.gas.nativeTokenUSDCPrice)\n`);
     }
-    out.write(`  Fees:         ${formatUsdcWei6(lm.totalFeeUsdcWei6)} USDC\n`);
+    out.write(`  Seed fees:    ${formatUsdcWei6(lm.totalFeeUsdcWei6)} USDC (est. — conservative seed creation-fee, may over-state in a multi-maker race)\n`);
   }
   out.write(`Note: unrealized P&L (active positions marked to current fair) is the remaining Phase-3 slice (DESIGN §11).\n`);
   out.write(`Event counts: ${histogramText(nonZero(summary.eventCounts)) || '(none)'}\n`);

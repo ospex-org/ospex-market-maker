@@ -69,7 +69,7 @@ export interface ReferenceOddsBreakdown {
   overround: number;
 }
 
-/** The applied inventory-skew lean (DESIGN §5) — surfaced for telemetry. `signal` ∈ [-1,1] is the lean computeQuote applied (the away quote leaned up / home down by `signal × halfSpread`); `inventoryUSDC` is the signed per-speculation HELD-position imbalance `q` that drove it (`> 0` = net maker-on-home / "long home"). Present only when `pricing.inventorySkew.enabled`. */
+/** The inventory-skew lean (DESIGN §5) — surfaced for telemetry. `signal` ∈ [-1,1] is the *requested* lean (the away quote leans up / home down by `signal × halfSpread`); `computeQuote` applies it but clamps the realized move to the protocol tick band, so on an extreme / near-pathological line the actual lean can be smaller than `signal × halfSpread` (the clamp only ever *reduces* skew — never below fair, never into a refusal). `inventoryUSDC` is the signed per-speculation HELD-position imbalance `q` that drove it (`> 0` = net maker-on-home / "long home"). Present only when `pricing.inventorySkew.enabled`. */
 export interface SkewDiagnostic {
   signal: number;
   inventoryUSDC: number;

@@ -55,6 +55,17 @@ export interface QuoteCommonInputs {
    */
   awayHeadroomUSDC: number;
   homeHeadroomUSDC: number;
+  /**
+   * Inventory-skew signal in [-1, 1] (DESIGN §5) — the edge-preserving asymmetric lean
+   * applied to the symmetric half-spread split. The away quote leans UP by `skewSignal ×
+   * halfSpread` and the home quote leans DOWN by the same amount, so the two-sided sum stays
+   * `1 + spread` and (since |lean| ≤ halfSpread) neither side ever quotes below fair. `> 0`
+   * discourages the away offer / encourages the home offer; the caller (`buildDesiredQuote`)
+   * sets the sign from its net *held* directional inventory on the speculation. Omitted / `0`
+   * ⇒ symmetric quoting (byte-identical). Out of [-1, 1] is a caller bug → `computeQuote`
+   * throws. (Must be `| undefined` under `exactOptionalPropertyTypes`.)
+   */
+  skewSignal?: number | undefined;
 }
 
 /** Full input to `computeQuote` for a single moneyline market. */

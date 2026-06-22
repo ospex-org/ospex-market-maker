@@ -72,4 +72,12 @@ describe('priceSpread', () => {
   it('still throws on an invalid caller argument (delegates computeQuote validation)', () => {
     expect(() => priceSpread(REF, { ...PRICING, capitalUSDC: 0 })).toThrow(/capitalUSDC/);
   });
+
+  it('inventory skew leans the away-cover quote up and the home-cover quote down (same away/home axis as moneyline)', () => {
+    const sym = priceSpread(REF, PRICING).result;
+    const skewed = priceSpread(REF, { ...PRICING, skewSignal: 0.5 }).result; // > 0 = net maker-on-home-cover → discourage away-cover
+    expect(skewed.away!.quoteProb).toBeGreaterThan(sym.away!.quoteProb);
+    expect(skewed.home!.quoteProb).toBeLessThan(sym.home!.quoteProb);
+    expect(skewed.away!.quoteProb + skewed.home!.quoteProb).toBeCloseTo(sym.away!.quoteProb + sym.home!.quoteProb, 12); // edge preserved
+  });
 });

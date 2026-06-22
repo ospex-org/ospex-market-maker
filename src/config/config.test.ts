@@ -28,6 +28,8 @@ describe('parseConfig', () => {
     expect(c.pricing.economics.fillRateAssumption).toBe(0.3);
     expect(c.pricing.direct.spreadBps).toBe(300);
     expect(c.pricing.maxPerQuotePctOfCapital).toBe(0.05);
+    expect(c.pricing.inventorySkew).toEqual({ enabled: false, maxSkewFraction: 0.5 }); // default off
+
     expect(c.risk.bankrollUSDC).toBe(50);
     expect(c.risk.maxOpenCommitments).toBe(10);
     expect(c.risk.maxDailyFeeUSDC).toBe(0);
@@ -101,6 +103,17 @@ describe('parseConfig', () => {
     expect(() => parseConfig({ rpcUrl: 'x', marketSelection: { seedSpeculations: 'yes' } }, {})).toThrow(/seedSpeculations/);
     // the former dead flag is retired → an old config carrying it fails loud (no silent fallback)
     expect(() => parseConfig({ rpcUrl: 'x', marketSelection: { requireOpenSpeculation: true } }, {})).toThrow(/not a known config field/);
+  });
+
+  it('pricing.inventorySkew: defaults off, accepts overrides, rejects an out-of-range fraction + unknown sub-keys (incl. the dropped referenceImbalanceUSDC)', () => {
+    expect(parseConfig({ rpcUrl: 'x', pricing: { inventorySkew: { enabled: true, maxSkewFraction: 0.8 } } }, {}).pricing.inventorySkew).toEqual({ enabled: true, maxSkewFraction: 0.8 });
+    expect(parseConfig({ rpcUrl: 'x', pricing: { inventorySkew: { maxSkewFraction: 1 } } }, {}).pricing.inventorySkew.maxSkewFraction).toBe(1); // (0, 1] — 1 is allowed
+    expect(() => parseConfig({ rpcUrl: 'x', pricing: { inventorySkew: { maxSkewFraction: 0 } } }, {})).toThrow(/maxSkewFraction/); // (0, 1] — 0 rejected
+    expect(() => parseConfig({ rpcUrl: 'x', pricing: { inventorySkew: { maxSkewFraction: 1.5 } } }, {})).toThrow(/maxSkewFraction/);
+    expect(() => parseConfig({ rpcUrl: 'x', pricing: { inventorySkew: { enabled: 'yes' } } }, {})).toThrow(/inventorySkew\.enabled/);
+    expect(() => parseConfig({ rpcUrl: 'x', pricing: { inventorySkew: { bogus: 1 } } }, {})).toThrow(/inventorySkew\.bogus/);
+    // the dropped referenceImbalanceUSDC knob fails closed as an unknown key (the denominator is risk.maxRiskPerContestUSDC)
+    expect(() => parseConfig({ rpcUrl: 'x', pricing: { inventorySkew: { referenceImbalanceUSDC: 1 } } }, {})).toThrow(/referenceImbalanceUSDC/);
   });
 
   it('rejects out-of-range / mistyped values with a clear message', () => {

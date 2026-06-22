@@ -45,6 +45,16 @@ export interface ExposureItem {
   makerSide: MakerSide;
   /** The at-risk USDC: a position's stake, or a commitment's remaining risk. */
   riskAmountUSDC: number;
+  /**
+   * Whether this exposure is a HELD position (a realized fill, or the filled portion of a
+   * partially-filled commitment) or a still-matchable OPEN commitment (the maker's own
+   * outstanding offer). The exposure CAPS count both (worst-case solvency); the
+   * inventory-skew signal (DESIGN §5) reads only `'position'` — your realized directional
+   * inventory, not your own outstanding offers, since leaning quotes off your own offers
+   * is a self-referential pricing loop (and Avellaneda–Stoikov inventory is what you hold,
+   * not what you offer). `orders.inventoryFromState` stamps it on every item.
+   */
+  source: 'commitment' | 'position';
 }
 
 /** The maker's current state, as the risk engine sees it. */

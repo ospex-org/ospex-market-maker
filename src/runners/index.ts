@@ -2484,6 +2484,9 @@ export class Runner {
       away: quoteSideSummary(desired.result.away),
       home: quoteSideSummary(desired.result.home),
       notes: desired.result.notes,
+      // Inventory-skew attribution (DESIGN §5) — present only when skew is enabled; omitted
+      // when off, so a skew-disabled run's NDJSON is byte-identical (additive, no schemaVersion bump).
+      ...(desired.skew ? { skew: desired.skew } : {}),
     });
     // ── risk-verdict (Phase 3 h) ─────────────────────────────────────────
     // The risk engine's per-market decision, with the per-cap headroom math

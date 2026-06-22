@@ -38,6 +38,7 @@ import {
   type ExpiryMode,
   type FundingGuardConfig,
   type GasConfig,
+  type InventorySkewConfig,
   type LogLevel,
   type MarketSelectionConfig,
   type MarketType,
@@ -227,7 +228,8 @@ const MARKET_SELECTION_KEYS = [
 const DISCOVERY_KEYS = ['everyNTicks', 'jitterPct'] as const;
 const ODDS_KEYS = ['subscribe', 'maxRealtimeChannels'] as const;
 const OWN_STATE_KEYS = ['debounceMs', 'divergenceToleranceMs', 'auditPollIntervalMs', 'indexerLagMaxSeconds', 'staleMaxMs', 'recoveryHoldMs'] as const;
-const PRICING_KEYS = ['mode', 'economics', 'direct', 'quoteBothSides', 'minEdgeBps', 'maxPerQuotePctOfCapital'] as const;
+const PRICING_KEYS = ['mode', 'economics', 'direct', 'quoteBothSides', 'minEdgeBps', 'maxPerQuotePctOfCapital', 'inventorySkew'] as const;
+const INVENTORY_SKEW_KEYS = ['enabled', 'maxSkewFraction'] as const;
 const ECONOMICS_KEYS = [
   'capitalUSDC', 'targetMonthlyReturnPct', 'daysHorizon', 'estGamesPerDay', 'fillRateAssumption',
   'capitalTurnoverPerDay', 'maxReasonableSpread',
@@ -376,6 +378,11 @@ export function parseConfig(raw: unknown, env: EnvLike = {}): Config {
   };
   const quoteBothSides = def(p.quoteBothSides, true, (v) => asBoolean(v, 'pricing.quoteBothSides'));
   if (!quoteBothSides) fail('pricing.quoteBothSides', 'must be true — single-sided quoting is not implemented in v0');
+  const skewObj = section(p, 'inventorySkew', INVENTORY_SKEW_KEYS);
+  const inventorySkew: InventorySkewConfig = {
+    enabled: def(skewObj.enabled, false, (v) => asBoolean(v, 'pricing.inventorySkew.enabled')),
+    maxSkewFraction: def(skewObj.maxSkewFraction, 0.5, (v) => asNumberInRange(v, 'pricing.inventorySkew.maxSkewFraction', 0, 1, { minInclusive: false, maxInclusive: true })),
+  };
   const pricing: PricingConfig = {
     mode: def<SpreadMode>(p.mode, 'economics', (v) => asEnum(v, 'pricing.mode', SPREAD_MODES)),
     economics,
@@ -383,6 +390,7 @@ export function parseConfig(raw: unknown, env: EnvLike = {}): Config {
     quoteBothSides,
     minEdgeBps: def(p.minEdgeBps, 0, (v) => asNonNegativeNumber(v, 'pricing.minEdgeBps')),
     maxPerQuotePctOfCapital: def(p.maxPerQuotePctOfCapital, 0.05, (v) => asNumberInRange(v, 'pricing.maxPerQuotePctOfCapital', 0, 1, { minInclusive: false, maxInclusive: true })),
+    inventorySkew,
   };
 
   const r = section(root, 'risk', RISK_KEYS);

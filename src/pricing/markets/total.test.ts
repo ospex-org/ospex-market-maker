@@ -66,4 +66,15 @@ describe('priceTotal', () => {
   it('still throws on an invalid caller argument (delegates computeQuote validation)', () => {
     expect(() => priceTotal(REF, { ...PRICING, capitalUSDC: 0 })).toThrow(/capitalUSDC/);
   });
+
+  it('inventory skew leans the OVER (away/Upper) quote up and the UNDER (home/Lower) down — the relabel-axis discriminator', () => {
+    // skewSignal > 0 = net "long under" (maker-on-under) → discourage the over offer (raise the over
+    // price) + encourage the under offer (lower the under price). If the over/under ↔ away/home relabel
+    // were inverted, skewSignal > 0 would lower `over` instead — this test fails only on that inversion.
+    const sym = priceTotal(REF, PRICING);
+    const skewed = priceTotal(REF, { ...PRICING, skewSignal: 0.5 });
+    expect(skewed.over!.quoteProb).toBeGreaterThan(sym.over!.quoteProb);
+    expect(skewed.under!.quoteProb).toBeLessThan(sym.under!.quoteProb);
+    expect(skewed.over!.quoteProb + skewed.under!.quoteProb).toBeCloseTo(sym.over!.quoteProb + sym.under!.quoteProb, 12); // edge preserved
+  });
 });

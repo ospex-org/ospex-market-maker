@@ -1960,6 +1960,13 @@ export class Runner {
    * Moneyline has no line — it keeps the pre-follow behavior: the first open spec for the
    * market type (`m.lineTicks` is always 0, so it never re-keys).
    *
+   * A SEED (placeholder `speculationId`) is bound FIRST to the open spec at its own minted
+   * line (`m.lineTicks`) if one exists — its first match lazily creates the speculation there,
+   * and adopting it promptly migrates the placeholder to the real id even when the oracle has
+   * since moved off the minted line (otherwise the seed would stick on the placeholder and its
+   * real-id legs would be unpullable until expiry). Once adopted it is an ordinary tracked
+   * market and the spread / total follow logic below governs it.
+   *
    * Spread / total FOLLOW the oracle line. With a usable oracle the target line is the
    * oracle line (`oracleLineTicks`) once it has moved MORE than `orders.replaceOnLineMoveTicks`
    * ticks from the line we're quoting, else the current line (so a sub-threshold wobble is
@@ -1981,6 +1988,21 @@ export class Runner {
     if (m.marketType === 'moneyline') return firstOpen();
     const openAtLine = (ticks: number): SpeculationView | undefined =>
       c.speculations.find((s) => s.marketType === m.marketType && s.open && (s.lineTicks ?? 0) === ticks);
+    // A SEED's speculation is lazily created at the seed's OWN minted line (`m.lineTicks`) on
+    // first match. Adopt that open spec the moment it exists — BEFORE the oracle-follow logic
+    // below — so the placeholder migrates to the real id even when the oracle has since drifted
+    // off the minted line. Without this, a post-match seed whose oracle moved would never
+    // re-bind (the follow logic targets the MOVED line, where no spec is open), sticking on the
+    // placeholder indefinitely and leaving its other-side leg — already migrated to the real id
+    // by own-state — unpullable until expiry (`reconcileMarket`'s pulls key on `m.speculationId`).
+    // After adoption the market is an ordinary tracked one and the oracle-follow governs
+    // subsequent refreshes (it may then refuse via `reference-line-mismatch` if the oracle sits
+    // off the line, exactly like any non-seed market). A PRE-match seed has no spec at its line
+    // yet, so this falls through and the seed stays a seed.
+    if (isSeedSpeculationId(m.speculationId)) {
+      const ownLine = openAtLine(m.lineTicks);
+      if (ownLine !== undefined) return ownLine;
+    }
     const oracleTicks = m.lastReferenceOdds === null ? null : oracleLineTicks(m.lastReferenceOdds);
     // No usable oracle: hold the current line if its spec is still open; only re-point (first
     // open) once that spec has closed — never drift off a live held line on a transient null.
@@ -2403,11 +2425,14 @@ export class Runner {
     // orderbook-based competitiveness check; its existence is established by the POST, not
     // a read. A seed STILL passes the line-consistency gate just below — its minted
     // `lineTicks` must still equal the oracle line. If the oracle moves off the minted
-    // line, a PURE seed does NOT chase it: `selectRefreshSpec` finds no open spec to
-    // re-bind to (that's what makes it a seed) and `isMarketTracked` blocks minting a
-    // fresh seed at the new line, so it simply refuses (`reference-line-mismatch`) at the
-    // old line until either a real speculation appears at a line and `selectRefreshSpec`
-    // re-binds `m.speculationId` to it, or the contest leaves discovery and is re-seeded.
+    // line, a PRE-match seed does NOT chase it: `selectRefreshSpec` finds no open spec to
+    // re-bind to (none has been created yet — that's what makes it a seed) and
+    // `isMarketTracked` blocks minting a fresh seed at the new line, so it simply refuses
+    // (`reference-line-mismatch`) at the old line until a real speculation opens. Once the
+    // seed's first match HAS created one at its minted line, `selectRefreshSpec` adopts it
+    // there (regardless of oracle drift) and re-binds `m.speculationId` to the real id — the
+    // market then tracks normally (and may still refuse via `reference-line-mismatch` while
+    // the oracle sits off the line, exactly like any non-seed market).
     const isSeed = isSeedSpeculationId(m.speculationId);
     // Gate (spread / total): the tracked speculation's ON-CHAIN line must match the line
     // the reference odds are priced for. `m.lineTicks` is the spec's away-perspective,

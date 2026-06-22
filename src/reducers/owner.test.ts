@@ -383,18 +383,21 @@ describe('reduceOwnerFill — maker side (ourAddress matches fill.maker)', () =>
 
 // ── reduceOwnerFill — seed creation-fee attribution ──────────────────────────
 //
-// The seed-posting path (a later slice) writes `state.seedFeeBySpecKey[seedKey] =
-// { feeUsdcWei6, charged: false }` when it posts a seed whose preview reports a
-// lazy creation. At the seed's FIRST match the reducer reconstructs that key from
-// the sibling commitment's stable (contestId, marketType, lineTicks), stamps the
-// fee on the emit-fill, and flips `charged` so the fee is attributed exactly once.
-// Here we PRE-SEED the marker (simulating that POST) to exercise the attribution
-// in isolation. The default `ownerCommitment()` resolves to contestId `'1'`.
+// The seed-posting path writes `state.seedFeeBySpecKey[seedKey] = { feeUsdcWei6,
+// charged: false, hashes: [<seed leg hash>] }` when it posts a seed. At the seed's
+// FIRST match the reducer reconstructs that key from the sibling commitment's stable
+// (contestId, marketType, lineTicks) AND requires the FILLING commitment's hash to be
+// one of the marker's bound seed-leg hashes, stamps the fee on the emit-fill, and flips
+// `charged` so the fee is attributed exactly once. The hash binding stops a later
+// non-seed commitment at the same line from tripping a stale marker (a phantom fee).
+// Here we PRE-SEED the marker (simulating that POST) to exercise the attribution in
+// isolation. The default `ownerCommitment()` / `fill()` resolve to contestId `'1'`,
+// commitmentHash `'0xabc'`.
 describe('reduceOwnerFill — seed creation-fee attribution', () => {
-  it('a fill whose (contestId, marketType, lineTicks) is a pending seed key stamps feeUsdcWei6 on the emit-fill + flips charged', () => {
+  it('a fill whose (contestId, marketType, lineTicks) is a pending seed key AND whose hash is bound stamps feeUsdcWei6 on the emit-fill + flips charged', () => {
     const state = emptyMakerState();
     state.commitments['0xabc'] = mapOwnerCommitmentToMaker(ownerCommitment({ marketType: 'spread', lineTicks: -15 }));
-    state.seedFeeBySpecKey['seed:1:spread:-15'] = { feeUsdcWei6: '250000', charged: false };
+    state.seedFeeBySpecKey['seed:1:spread:-15'] = { feeUsdcWei6: '250000', charged: false, hashes: ['0xabc'] };
     const descriptors = reduceOwnerFill(state, fill(), new Set<string>(), OUR_ADDR, 1);
     const fillDesc = descriptors.find((d) => d.kind === 'emit-fill');
     expect(fillDesc?.kind).toBe('emit-fill');
@@ -402,10 +405,22 @@ describe('reduceOwnerFill — seed creation-fee attribution', () => {
     expect(state.seedFeeBySpecKey['seed:1:spread:-15']?.charged).toBe(true);
   });
 
+  it('does NOT charge a fill whose hash is NOT bound to the marker — a non-seed commitment at the same line never trips a stale marker (phantom-fee guard)', () => {
+    const state = emptyMakerState();
+    // An ordinary (non-seed) commitment 0xabc fills at the same (contest, market, line)
+    // a prior, since-expired seed once used — its leg hash was 0xseedleg, not 0xabc.
+    state.commitments['0xabc'] = mapOwnerCommitmentToMaker(ownerCommitment({ marketType: 'spread', lineTicks: -15 }));
+    state.seedFeeBySpecKey['seed:1:spread:-15'] = { feeUsdcWei6: '250000', charged: false, hashes: ['0xseedleg'] };
+    const descriptors = reduceOwnerFill(state, fill(), new Set<string>(), OUR_ADDR, 1);
+    const fillDesc = descriptors.find((d) => d.kind === 'emit-fill');
+    if (fillDesc?.kind === 'emit-fill') expect('feeUsdcWei6' in fillDesc.payload).toBe(false);
+    expect(state.seedFeeBySpecKey['seed:1:spread:-15']?.charged).toBe(false); // marker untouched — no phantom charge
+  });
+
   it('the fee is attributed exactly ONCE — a second fill on the same seeded speculation carries no fee', () => {
     const state = emptyMakerState();
     state.commitments['0xabc'] = mapOwnerCommitmentToMaker(ownerCommitment({ marketType: 'spread', lineTicks: -15 }));
-    state.seedFeeBySpecKey['seed:1:spread:-15'] = { feeUsdcWei6: '250000', charged: false };
+    state.seedFeeBySpecKey['seed:1:spread:-15'] = { feeUsdcWei6: '250000', charged: false, hashes: ['0xabc'] };
     const dedup = new Set<string>();
     reduceOwnerFill(state, fill({ txHash: '0xa', logIndex: 0 }), dedup, OUR_ADDR, 1);
     const descriptors = reduceOwnerFill(state, fill({ txHash: '0xa', logIndex: 1 }), dedup, OUR_ADDR, 2);
@@ -417,7 +432,7 @@ describe('reduceOwnerFill — seed creation-fee attribution', () => {
   it('an already-charged seed key carries no fee (idempotent across a restart that reloaded the marker)', () => {
     const state = emptyMakerState();
     state.commitments['0xabc'] = mapOwnerCommitmentToMaker(ownerCommitment({ marketType: 'spread', lineTicks: -15 }));
-    state.seedFeeBySpecKey['seed:1:spread:-15'] = { feeUsdcWei6: '250000', charged: true };
+    state.seedFeeBySpecKey['seed:1:spread:-15'] = { feeUsdcWei6: '250000', charged: true, hashes: ['0xabc'] };
     const descriptors = reduceOwnerFill(state, fill(), new Set<string>(), OUR_ADDR, 1);
     const fillDesc = descriptors.find((d) => d.kind === 'emit-fill');
     if (fillDesc?.kind === 'emit-fill') expect('feeUsdcWei6' in fillDesc.payload).toBe(false);
@@ -434,7 +449,7 @@ describe('reduceOwnerFill — seed creation-fee attribution', () => {
   it('keys off the commitment line, not just the contest: a pending seed entry at a DIFFERENT line is not charged', () => {
     const state = emptyMakerState();
     state.commitments['0xabc'] = mapOwnerCommitmentToMaker(ownerCommitment({ marketType: 'spread', lineTicks: -15 }));
-    state.seedFeeBySpecKey['seed:1:spread:-20'] = { feeUsdcWei6: '250000', charged: false };
+    state.seedFeeBySpecKey['seed:1:spread:-20'] = { feeUsdcWei6: '250000', charged: false, hashes: ['0xabc'] };
     const descriptors = reduceOwnerFill(state, fill(), new Set<string>(), OUR_ADDR, 1);
     const fillDesc = descriptors.find((d) => d.kind === 'emit-fill');
     if (fillDesc?.kind === 'emit-fill') expect('feeUsdcWei6' in fillDesc.payload).toBe(false);
@@ -444,7 +459,7 @@ describe('reduceOwnerFill — seed creation-fee attribution', () => {
   it('a moneyline seed (lineTicks 0) is keyed seed:<contest>:moneyline:0 and charged', () => {
     const state = emptyMakerState();
     state.commitments['0xabc'] = mapOwnerCommitmentToMaker(ownerCommitment()); // moneyline default
-    state.seedFeeBySpecKey['seed:1:moneyline:0'] = { feeUsdcWei6: '250000', charged: false };
+    state.seedFeeBySpecKey['seed:1:moneyline:0'] = { feeUsdcWei6: '250000', charged: false, hashes: ['0xabc'] };
     const descriptors = reduceOwnerFill(state, fill(), new Set<string>(), OUR_ADDR, 1);
     const fillDesc = descriptors.find((d) => d.kind === 'emit-fill');
     if (fillDesc?.kind === 'emit-fill') expect(fillDesc.payload.feeUsdcWei6).toBe('250000');

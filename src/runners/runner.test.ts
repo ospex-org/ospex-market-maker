@@ -3093,7 +3093,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
     // (the baseline swap preserves `seedFeeBySpecKey`).
     describe('seed creation-fee accounting', () => {
       it('a seed fill folds the maker creation-fee share into dailyCounters + flips charged', async () => {
-        const seedState = { ...emptyMakerState(), seedFeeBySpecKey: { 'seed:1:moneyline:0': { feeUsdcWei6: '250000', charged: false } } };
+        const seedState = { ...emptyMakerState(), seedFeeBySpecKey: { 'seed:1:moneyline:0': { feeUsdcWei6: '250000', charged: false, hashes: ['0xabc'] } } };
         const { runner, recorder, runPromise, resolvers, triggerKill } = await makePausedSubscribedRunner({
           config: cfg({ ownState: { recoveryHoldMs: 0, staleMaxMs: 300000 } }),
           seedState,
@@ -4616,7 +4616,9 @@ describe('Runner — live execution', () => {
     // sides share the key; the marker isn't reset by the second side). The fill reducer charges
     // it once at first match (§C2a).
     const persisted = StateStore.at(stateDir).load().state;
-    expect(persisted.seedFeeBySpecKey['seed:1:spread:-15']).toEqual({ feeUsdcWei6: '250000', charged: false });
+    const marker = persisted.seedFeeBySpecKey['seed:1:spread:-15'];
+    expect(marker).toMatchObject({ feeUsdcWei6: '250000', charged: false });
+    expect([...(marker?.hashes ?? [])].sort()).toEqual(['0xlive1', '0xlive2']); // both seed legs bound to the marker
     expect(Object.keys(persisted.seedFeeBySpecKey)).toHaveLength(1);
     expect(Object.values(persisted.commitments)).toHaveLength(2); // both seed legs persisted
   });
@@ -4660,6 +4662,44 @@ describe('Runner — live execution', () => {
     const notWarned: string[] = [];
     makeRunner({ config: seedingCfg(['spread'], 5), deps: { log: (l) => notWarned.push(l) } }); // budget > 0 → no warn
     expect(notWarned.some((l) => l.includes('seedSpeculations is ON but risk.maxDailyFeeUSDC is 0'))).toBe(false);
+  });
+
+  // The fee budget is a CONSERVATIVE per-day cap: a posted-but-unmatched seed's fee is
+  // committed budget (it lands at match), so the gate counts it against later seeds —
+  // else N concurrent seeds each see only the realized counter (0 until a match) and
+  // collectively overspend the budget.
+  it('seeding on + budget for ONE seed (LIVE): with two spec-less contests, one seed POSTs and the second is refused — the first seed\'s latent fee commits the whole budget', async () => {
+    StateStore.at(stateDir).flush(emptyMakerState());
+    const config = withMarkets(cfg({ mode: { dryRun: false }, marketSelection: { seedSpeculations: true } }), ['moneyline']);
+    config.risk.maxDailyFeeUSDC = 0.25; // budget for exactly ONE 0.25 USDC creation fee
+    const submit = submitRecorder();
+    const leans = [contestView({ contestId: '1', speculations: [] }), contestView({ contestId: '2', speculations: [] })];
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve(leans), { submitCommitment: submit.fn }, (id) => Promise.resolve(contestView({ contestId: id, referenceGameId: `GAME-${id}`, speculations: [] })), {
+      snapshot: (id) => Promise.resolve({ contestId: id, odds: { moneyline: moneylineOdds(-110, -110), spread: null, total: null } }),
+    });
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    // Exactly ONE seed posts (both its sides); the other is refused per side at the fee gate.
+    expect(submit.calls).toHaveLength(2); // one seed, two sides
+    const events = readEvents();
+    expect(events.filter((e) => e.kind === 'candidate' && e.skipReason === 'fee-budget-exhausted')).toHaveLength(2); // the refused seed, two sides
+    expect(Object.keys(StateStore.at(stateDir).load().state.seedFeeBySpecKey)).toHaveLength(1); // only the posted seed has a pending-fee marker
+  });
+
+  it('seeding on + budget for TWO seeds (LIVE): both spec-less contests seed — the conservative gate is non-vacuous', async () => {
+    StateStore.at(stateDir).flush(emptyMakerState());
+    const config = withMarkets(cfg({ mode: { dryRun: false }, marketSelection: { seedSpeculations: true } }), ['moneyline']);
+    config.risk.maxDailyFeeUSDC = 0.5; // budget for TWO 0.25 USDC creation fees
+    const submit = submitRecorder();
+    const leans = [contestView({ contestId: '1', speculations: [] }), contestView({ contestId: '2', speculations: [] })];
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve(leans), { submitCommitment: submit.fn }, (id) => Promise.resolve(contestView({ contestId: id, referenceGameId: `GAME-${id}`, speculations: [] })), {
+      snapshot: (id) => Promise.resolve({ contestId: id, odds: { moneyline: moneylineOdds(-110, -110), spread: null, total: null } }),
+    });
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    expect(submit.calls).toHaveLength(4); // two seeds, two sides each — both fit the budget
+    expect(readEvents().some((e) => e.kind === 'candidate' && e.skipReason === 'fee-budget-exhausted')).toBe(false);
+    expect(Object.keys(StateStore.at(stateDir).load().state.seedFeeBySpecKey)).toHaveLength(2);
   });
 
   // ── line-consistency gate (spread/total: never quote a mispriced line) ──────────

@@ -1682,7 +1682,22 @@ export class Runner {
     const cutoff = this.deps.now() - Math.max(3600, 10 * this.config.orders.expirySeconds);
     for (const [hash, record] of Object.entries(this.state.commitments)) {
       const terminal = record.lifecycle === 'expired' || record.lifecycle === 'filled' || record.lifecycle === 'authoritativelyInvalidated';
-      if (terminal && record.updatedAtUnixSec < cutoff) delete this.state.commitments[hash];
+      if (terminal && record.updatedAtUnixSec < cutoff) {
+        delete this.state.commitments[hash];
+        // If this was an UNCHARGED seed leg (it never matched, so its `speculationId`
+        // is still the placeholder = the marker key), drop its hash from the marker;
+        // when the last leg is pruned, delete the marker entirely. The seed expired
+        // without ever creating a speculation, so its fee will never be charged —
+        // releasing the marker bounds `seedFeeBySpecKey` growth. (Budget correctness
+        // doesn't depend on this — the fee gate already filters to live legs — this is
+        // memory hygiene. A `charged` marker's lookup misses, since its record migrated
+        // to the real id, so a paid fee is never disturbed.)
+        const marker = this.state.seedFeeBySpecKey[record.speculationId];
+        if (marker !== undefined && !marker.charged) {
+          marker.hashes = marker.hashes.filter((h) => h !== hash);
+          if (marker.hashes.length === 0) delete this.state.seedFeeBySpecKey[record.speculationId];
+        }
+      }
     }
   }
 
@@ -2387,9 +2402,12 @@ export class Runner {
     // `getSpeculation` re-confirm (which would throw on the placeholder) and the
     // orderbook-based competitiveness check; its existence is established by the POST, not
     // a read. A seed STILL passes the line-consistency gate just below — its minted
-    // `lineTicks` must still equal the oracle line (else the line moved off it; refuse
-    // until the discovery refresh re-mints at the new line, or a real spec appears and
-    // `selectRefreshSpec` re-binds `m.speculationId` to it).
+    // `lineTicks` must still equal the oracle line. If the oracle moves off the minted
+    // line, a PURE seed does NOT chase it: `selectRefreshSpec` finds no open spec to
+    // re-bind to (that's what makes it a seed) and `isMarketTracked` blocks minting a
+    // fresh seed at the new line, so it simply refuses (`reference-line-mismatch`) at the
+    // old line until either a real speculation appears at a line and `selectRefreshSpec`
+    // re-binds `m.speculationId` to it, or the contest leaves discovery and is re-seeded.
     const isSeed = isSeedSpeculationId(m.speculationId);
     // Gate (spread / total): the tracked speculation's ON-CHAIN line must match the line
     // the reference odds are priced for. `m.lineTicks` is the spec's away-perspective,
@@ -2901,18 +2919,38 @@ export class Runner {
     // posting, confirm the per-day fee budget can absorb that fee — `canSpendFee`
     // refuses unless `risk.maxDailyFeeUSDC > 0` (the seeding fee opt-in) and today's
     // fee spend + this fee stays within it. The fee lands at MATCH, not post, so this
-    // is a soft pre-flight (the same fee checked per side is conservative, not
-    // double-charged — it is attributed exactly once at the fill via `seedFeeBySpecKey`,
-    // §C2a). A denial skips the side this tick with `fee-budget-exhausted`. Applies in
-    // dry-run too (so a dry-run preview reflects the gate). The boot-time
-    // `applyTreasuryAutoApproval` ensures the `TreasuryModule` allowance covers it.
+    // is attributed exactly once at the fill via `seedFeeBySpecKey` (§C2a). To make the
+    // per-day budget a real cap (not just a realized-spend gate), count the LATENT fee
+    // of every OTHER posted-but-unmatched seed too (mirroring the conservative latent-
+    // USDC-risk rule): each such seed will owe its fee at match, so N concurrent seeds
+    // must not each see only the realized counter (0 until a match) and collectively
+    // blow past the budget. A marker counts only while a seed leg of it is still a live
+    // (non-terminal) commitment, so an expired/unfilled seed (whose fee will never be
+    // charged) doesn't permanently consume the budget across UTC days. This seed's own
+    // marker is excluded — `seedFeeWei6` (the requested side) already counts it. A
+    // denial skips the side this tick with `fee-budget-exhausted`. Applies in dry-run
+    // too (so a preview reflects the gate). Boot `applyTreasuryAutoApproval` ensures the
+    // `TreasuryModule` allowance covers it.
     const isSeed = isSeedSpeculationId(m.speculationId);
     const seedFeeWei6 = isSeed ? this.adapter.makerCreationFeeWei6() : 0n;
     if (isSeed) {
       const today = todayUTCDateString(this.deps.now());
       const todayFeeSpentUsdcWei6 = BigInt(this.state.dailyCounters[today]?.feeUsdcWei6 ?? '0');
+      // Latent (committed-but-unmatched) seed-fee exposure. A leg is live unless it has
+      // reached a terminal lifecycle (`expired` / `filled` / `authoritativelyInvalidated`
+      // — same set as `pruneTerminalCommitments`); `filled` implies the marker is already
+      // `charged` and so is skipped anyway.
+      let pendingSeedFeeWei6 = 0n;
+      for (const [key, marker] of Object.entries(this.state.seedFeeBySpecKey)) {
+        if (key === m.speculationId || marker.charged) continue;
+        const hasLiveLeg = marker.hashes.some((h) => {
+          const c = this.state.commitments[h];
+          return c !== undefined && c.lifecycle !== 'expired' && c.lifecycle !== 'filled' && c.lifecycle !== 'authoritativelyInvalidated';
+        });
+        if (hasLiveLeg) pendingSeedFeeWei6 += BigInt(marker.feeUsdcWei6);
+      }
       const maxDailyFeeUsdcWei6 = BigInt(Math.round(this.config.risk.maxDailyFeeUSDC * 1_000_000));
-      const verdict = canSpendFee({ todayFeeSpentUsdcWei6, requestedFeeUsdcWei6: seedFeeWei6, maxDailyFeeUsdcWei6 });
+      const verdict = canSpendFee({ todayFeeSpentUsdcWei6: todayFeeSpentUsdcWei6 + pendingSeedFeeWei6, requestedFeeUsdcWei6: seedFeeWei6, maxDailyFeeUsdcWei6 });
       if (!verdict.allowed) {
         this.eventLog.emit('candidate', { contestId: m.contestId, skipReason: 'fee-budget-exhausted', ...marketTag(m.marketType) });
         return null;
@@ -2968,11 +3006,18 @@ export class Runner {
     // Mark the seed's creation fee PENDING at POST (live only — a dry-run seed never
     // matches, so it never incurs a fee). Keyed by the seed placeholder
     // (= `seedSpeculationId(contestId, marketType, lineTicks)`); the fill reducer
-    // reconstructs the same key from the commitment's stable identity and charges the
-    // fee exactly once (§C2a). Guarded by absence so the second side of a two-sided
-    // seed (the same key) doesn't reset an already-recorded marker.
-    if (isSeed && !this.config.mode.dryRun && !(m.speculationId in this.state.seedFeeBySpecKey)) {
-      this.state.seedFeeBySpecKey[m.speculationId] = { feeUsdcWei6: seedFeeWei6.toString(), charged: false };
+    // reconstructs the same key from the commitment's stable identity. We record THIS
+    // leg's commitment hash in the marker so the reducer charges the fee ONLY when a
+    // seed leg's own hash fills — a later non-seed commitment at the same line can't
+    // trip a stale marker (§C2a). The first side creates the marker; the second side of
+    // a two-sided seed shares it (same fee, append its hash) without resetting it.
+    if (isSeed && !this.config.mode.dryRun) {
+      const existing = this.state.seedFeeBySpecKey[m.speculationId];
+      if (existing === undefined) {
+        this.state.seedFeeBySpecKey[m.speculationId] = { feeUsdcWei6: seedFeeWei6.toString(), charged: false, hashes: [record.hash] };
+      } else if (!existing.hashes.includes(record.hash)) {
+        existing.hashes.push(record.hash);
+      }
     }
     return record;
   }

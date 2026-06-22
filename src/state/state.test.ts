@@ -291,14 +291,21 @@ describe('StateStore.load', () => {
     if (status.kind === 'lost') expect(status.reason).toMatch(/present together/);
   });
 
-  it('seedFeeBySpecKey: a populated map round-trips, a pre-field state migrates to {}, a malformed entry is `lost`', () => {
+  it('seedFeeBySpecKey: a populated map round-trips, a pre-field/pre-hashes state migrates, a malformed entry is `lost`', () => {
     const store = StateStore.at(dir);
-    // (1) a populated map round-trips losslessly.
-    store.flush(stateWith({ seedFeeBySpecKey: { 'seed:1:spread:-15': { feeUsdcWei6: '250000', charged: false }, 'seed:2:total:75': { feeUsdcWei6: '250000', charged: true } } }));
+    // (1) a populated map (with the bound seed-leg `hashes`) round-trips losslessly.
+    store.flush(stateWith({ seedFeeBySpecKey: { 'seed:1:spread:-15': { feeUsdcWei6: '250000', charged: false, hashes: ['0xaa', '0xbb'] }, 'seed:2:total:75': { feeUsdcWei6: '250000', charged: true, hashes: ['0xcc'] } } }));
     let loaded = store.load();
     expect(loaded.status.kind).toBe('loaded');
-    expect(loaded.state.seedFeeBySpecKey['seed:1:spread:-15']).toEqual({ feeUsdcWei6: '250000', charged: false });
-    expect(loaded.state.seedFeeBySpecKey['seed:2:total:75']).toEqual({ feeUsdcWei6: '250000', charged: true });
+    expect(loaded.state.seedFeeBySpecKey['seed:1:spread:-15']).toEqual({ feeUsdcWei6: '250000', charged: false, hashes: ['0xaa', '0xbb'] });
+    expect(loaded.state.seedFeeBySpecKey['seed:2:total:75']).toEqual({ feeUsdcWei6: '250000', charged: true, hashes: ['0xcc'] });
+
+    // (1b) a persisted entry predating the `hashes` field migrates to `hashes: []` (a marker
+    //      with no bound leg can never charge — the conservative direction) and is NOT `lost`.
+    writeFileSync(join(dir, STATE_FILE), JSON.stringify({ ...stateWith({}), seedFeeBySpecKey: { 'seed:1:spread:-15': { feeUsdcWei6: '250000', charged: false } } }), 'utf8');
+    loaded = store.load();
+    expect(loaded.status.kind).toBe('loaded');
+    expect(loaded.state.seedFeeBySpecKey['seed:1:spread:-15']).toEqual({ feeUsdcWei6: '250000', charged: false, hashes: [] });
 
     // (2) migration: a state file predating the field (no `seedFeeBySpecKey` key) loads with
     //     `{}` — no seeds tracked is the conservative default — and is NOT `lost`.
@@ -323,6 +330,12 @@ describe('StateStore.load', () => {
 
     // (5) a non-object `seedFeeBySpecKey` value fails closed.
     writeFileSync(join(dir, STATE_FILE), JSON.stringify({ ...stateWith({}), seedFeeBySpecKey: 'nope' }), 'utf8');
+    status = store.load().status;
+    expect(status.kind).toBe('lost');
+    if (status.kind === 'lost') expect(status.reason).toMatch(/seedFeeBySpecKey/);
+
+    // (6) a malformed `hashes` (not a string[]) fails closed.
+    writeFileSync(join(dir, STATE_FILE), JSON.stringify({ ...stateWith({}), seedFeeBySpecKey: { 'seed:1:spread:-15': { feeUsdcWei6: '250000', charged: false, hashes: [1, 2] } } }), 'utf8');
     status = store.load().status;
     expect(status.kind).toBe('lost');
     if (status.kind === 'lost') expect(status.reason).toMatch(/seedFeeBySpecKey/);

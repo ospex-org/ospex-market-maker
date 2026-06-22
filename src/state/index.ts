@@ -426,17 +426,29 @@ export interface DailyCounters {
  * {@link MakerState.seedFeeBySpecKey} by the seed placeholder
  * `seed:${contestId}:${marketType}:${lineTicks}` (see `seedSpeculationId`).
  *
- * Written when the MM posts a seed whose submit preview reports a lazy creation —
- * the protocol charges the maker creation-fee share on-chain at the seed's FIRST
- * match, not at post. `feeUsdcWei6` is the maker's share (USDC wei6 decimal
- * string) taken from that preview — the authoritative runtime amount, not a
- * hardcoded constant. `charged` flips to `true` when the fee-incurring first fill
- * is observed (own-state), so the fee is attributed exactly ONCE per speculation,
- * regardless of which side fills first or a re-delivered fill.
+ * Written when the MM posts a seed — the protocol charges the maker creation-fee
+ * share on-chain at the seed's FIRST match, not at post. `feeUsdcWei6` is the
+ * maker's share (USDC wei6 decimal string). `charged` flips to `true` when the
+ * fee-incurring first fill is observed (own-state), so the fee is attributed
+ * exactly ONCE per speculation, regardless of which side fills first or a
+ * re-delivered fill.
+ *
+ * `hashes` lists the EIP-712 commitment hashes of the MM's OWN seed legs at this
+ * line (one per side actually posted). It binds the fee to the seed commitments
+ * that incur it: the fill reducer charges the fee ONLY when the FILLING
+ * commitment's hash is in this list — so a later, ordinary (non-seed) commitment
+ * that happens to land at the same `(contestId, marketType, lineTicks)` (e.g. a
+ * real speculation appearing at a line the MM once seeded; moneyline collapses
+ * every line to `0`) can never trip a stale marker and incur a phantom fee. The
+ * hash is server-stable, so this binding survives an own-state rebaseline (which
+ * a local record flag would not — the rebaseline rebuilds records from the
+ * server). A legacy entry with no `hashes` loads as `[]` (never charges — the
+ * conservative direction).
  */
 export interface SeedFeeEntry {
   feeUsdcWei6: string;
   charged: boolean;
+  hashes: string[];
 }
 
 export const MAKER_STATE_VERSION = 1;
@@ -694,7 +706,17 @@ function validateMakerState(parsed: unknown): Validated {
       if (!isPlainObject(value) || !isDecimalString(value.feeUsdcWei6) || typeof value.charged !== 'boolean') {
         return fail(`seedFeeBySpecKey["${key}"] is malformed`);
       }
-      seedFeeBySpecKey[key] = { feeUsdcWei6: value.feeUsdcWei6, charged: value.charged };
+      // `hashes` is additive (added with seed-posting activation). A legacy entry
+      // predating it migrates to `[]` (a marker with no bound seed hash can never
+      // charge — the conservative direction). A present value must be a string[].
+      let hashes: string[] = [];
+      if (value.hashes !== undefined) {
+        if (!Array.isArray(value.hashes) || value.hashes.some((h) => typeof h !== 'string')) {
+          return fail(`seedFeeBySpecKey["${key}"].hashes is malformed`);
+        }
+        hashes = value.hashes as string[];
+      }
+      seedFeeBySpecKey[key] = { feeUsdcWei6: value.feeUsdcWei6, charged: value.charged, hashes };
     }
   }
 

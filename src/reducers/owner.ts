@@ -291,21 +291,24 @@ export function reduceOwnerFill(
 
   const cumulativeRiskWei6 = state.positions[posKey]!.riskAmountWei6;
 
-  // Seed creation-fee attribution. If THIS commitment's speculation was seeded by
-  // us (a lazy creation we posted), the protocol charges the maker creation-fee
-  // share at the FIRST match. Reconstruct the durable seed key from the
-  // commitment's stable `(contestId, marketType, lineTicks)` — NOT `body.speculationId`
-  // (the real, post-match id) nor the commitment's `speculationId` (which the
-  // own-state observation may already have migrated placeholder → real) — and
-  // attribute the fee exactly once: the `charged` flip below plus the fill-dedup
-  // gate above both guard a re-delivery from double-counting. A fill whose key is
-  // absent (every existing-speculation match, all moneyline) is untouched —
-  // `seedFeeBySpecKey` is empty unless the seed-posting path wrote it, so this is
-  // byte-identical when seeding is off.
+  // Seed creation-fee attribution. If THIS commitment is one of the MM's own seed
+  // legs (a lazy creation we posted), the protocol charges the maker creation-fee
+  // share at the FIRST match. Reconstruct the durable seed key from the commitment's
+  // stable `(contestId, marketType, lineTicks)` — NOT `body.speculationId` (the real,
+  // post-match id) nor the commitment's `speculationId` (which the own-state
+  // observation may already have migrated placeholder → real). Then charge ONLY when
+  // the FILLING commitment's hash is one of the marker's bound seed-leg hashes: this
+  // binds the fee to the seed commitments that incur it, so a later ORDINARY (non-seed)
+  // commitment that lands at the same line — e.g. a real speculation appearing where
+  // the MM once seeded; moneyline collapses every line to `0` — can never trip a stale
+  // marker and incur a PHANTOM fee. The `charged` flip plus the fill-dedup gate above
+  // both guard a re-delivery from double-counting. A fill with no marker, or whose hash
+  // isn't bound, is untouched — `seedFeeBySpecKey` is empty unless the seed-posting path
+  // wrote it, so this is byte-identical when seeding is off.
   let feeUsdcWei6: string | undefined;
   const seedFeeKey = seedSpeculationId(commitment.contestId, commitment.marketType, commitment.lineTicks);
   const seedFee = state.seedFeeBySpecKey[seedFeeKey];
-  if (seedFee !== undefined && !seedFee.charged) {
+  if (seedFee !== undefined && !seedFee.charged && seedFee.hashes.includes(body.commitmentHash)) {
     seedFee.charged = true;
     feeUsdcWei6 = seedFee.feeUsdcWei6;
   }

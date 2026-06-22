@@ -230,7 +230,7 @@ export type OspexClientLike = {
   speculations: Pick<OspexClient['speculations'], 'list' | 'get'>;
   commitments: Pick<
     OspexClient['commitments'],
-    'list' | 'get' | 'submitRaw' | 'cancel' | 'cancelOnchain' | 'raiseMinNonce' | 'approve' | 'getNonceFloor'
+    'list' | 'get' | 'submitRaw' | 'cancel' | 'cancelOnchain' | 'raiseMinNonce' | 'approve' | 'getNonceFloor' | 'prepareSubmit' | 'checkSubmitFundability' | 'submitPrepared' | 'approveCreationFee'
   >;
   positions: Pick<OspexClient['positions'], 'status' | 'byAddress' | 'settleSpeculation' | 'ensureSpeculationSettled' | 'claim' | 'ensurePositionClaimed' | 'claimAll'>;
   balances: Pick<OspexClient['balances'], 'read'>;
@@ -264,6 +264,20 @@ export type NonceFloorArgs = Parameters<OspexClientLike['commitments']['getNonce
 export type ApproveUSDCAmount = Parameters<OspexClientLike['commitments']['approve']>[0];
 /** `approveUSDC` result — tx hash, receipt, spender, token, and the amount set. */
 export type ApproveResult = Awaited<ReturnType<OspexClientLike['commitments']['approve']>>;
+/** `prepareSubmit` args — the high-level submit shape `{ parent, side, odds, riskUsdc, expiry?, … }`. For a SEED, `parent: { kind: 'contest', contestId, market, line? }` drives lazy-mode resolution (the speculation doesn't exist yet). */
+export type PrepareSubmitArgs = Parameters<OspexClientLike['commitments']['prepareSubmit']>[0];
+/** `prepareSubmit` result — a `SubmitPreview` with full economics + the `market.speculation` `existing` / `lazy` discriminator (a seed resolves `lazy`, carrying the maker's creation-fee share). */
+export type SubmitPreview = Awaited<ReturnType<OspexClientLike['commitments']['prepareSubmit']>>;
+/** `checkSubmitFundability` args — `{ preview, bookScope? }` (`'visible-book-only'` default | `'whole-book'`). */
+export type CheckSubmitFundabilityArgs = Parameters<OspexClientLike['commitments']['checkSubmitFundability']>[0];
+/** `checkSubmitFundability` result — advisory `{ fundableNow, outcome, requirement?, … }`; `requirement.lazyCreationFeeWei6` / `treasuryAllowanceRequiredWei6` drive the seed fee + approval math. */
+export type CheckSubmitFundabilityResult = Awaited<ReturnType<OspexClientLike['commitments']['checkSubmitFundability']>>;
+/** `submitPrepared` result — same `{ hash, commitment, signedPayload }` as `submitRaw`; signs the preview's `raw` exactly (no `beforePost` hook). */
+export type SubmitPreparedResult = Awaited<ReturnType<OspexClientLike['commitments']['submitPrepared']>>;
+/** `approveCreationFee` amount — an exact wei6 `TreasuryModule` allowance ceiling, or the literal `'max'` (only with explicit operator opt-in). */
+export type ApproveCreationFeeAmount = Parameters<OspexClientLike['commitments']['approveCreationFee']>[0];
+/** `approveCreationFee` result — tx hash, receipt, spender (`TreasuryModule`), token, and the amount set. */
+export type ApproveCreationFeeResult = Awaited<ReturnType<OspexClientLike['commitments']['approveCreationFee']>>;
 /** `settleSpeculation` args — `{ speculationId }`. */
 export type SettleSpeculationArgs = Parameters<OspexClientLike['positions']['settleSpeculation']>[0];
 /** `settleSpeculation` result — tx hash, block, receipt, and the decoded `winSide`. */
@@ -576,11 +590,64 @@ export class OspexAdapter {
    * `approve()` *sets* (not adds), so the caller passes the absolute target — in
    * `mode: exact` this is `min(risk-cap ceiling, current wallet USDC)` (DESIGN §6);
    * `'max'` only with explicit operator opt-in (DESIGN §6 — never unlimited by
-   * default). The lazy-creation-fee allowance (`TreasuryModule`) is intentionally
-   * not wrapped — v0 quotes only existing open speculations, so it's never pulled.
+   * default). The separate lazy-creation-fee allowance (`TreasuryModule`) is
+   * wrapped by {@link approveCreationFee} — only the seed path needs it; a
+   * moneyline / existing-speculation maker never pulls it.
    */
   async approveUSDC(amount: ApproveUSDCAmount): Promise<ApproveResult> {
     return this.client.commitments.approve(amount);
+  }
+
+  /**
+   * Build a high-level submit preview (`commitments.prepareSubmit`) — resolves the
+   * domain-language args (`parent` / `side` / `odds` / `riskUsdc`) to a `SubmitPreview`
+   * with full economics and the `market.speculation` `existing` / `lazy` discriminator.
+   * For a SEED, pass `parent: { kind: 'contest', contestId, market, line? }`: the contest
+   * parent drives lazy-mode resolution (the speculation doesn't exist yet), so the
+   * preview reports `mode: 'lazy'` + the maker's creation-fee share — the seed path reads
+   * that fee off the preview before committing to a post.
+   */
+  async prepareSubmit(args: PrepareSubmitArgs): Promise<SubmitPreview> {
+    return this.client.commitments.prepareSubmit(args);
+  }
+
+  /**
+   * Advisory fundability check for a prepared submit (`commitments.checkSubmitFundability`):
+   * given a `SubmitPreview`, reports whether the maker's wallet + allowances cover the new
+   * commitment risk (and, for a lazy seed, the `TreasuryModule` creation-fee allowance).
+   * `bookScope` defaults to `'visible-book-only'` (the cheaper scope, aligned with the MM's
+   * own funding guard); `'whole-book'` additionally folds hidden open exposure. Advisory
+   * only — never blocks; the seed path uses it as a belt-and-braces preflight on top of
+   * `canSpendFee` + the funding guard.
+   */
+  async checkSubmitFundability(args: CheckSubmitFundabilityArgs): Promise<CheckSubmitFundabilityResult> {
+    return this.client.commitments.checkSubmitFundability(args);
+  }
+
+  /**
+   * Sign + POST a prepared submit (`commitments.submitPrepared`) — signs the preview's
+   * `raw` EIP-712 commitment exactly (no silent re-resolution) and POSTs to
+   * `ospex-core-api`, returning the real commitment hash + persisted row + signed bundle
+   * (same shape as {@link submitCommitment}). Unlike `submitRaw` it has NO `beforePost`
+   * hook, so the caller must run any pre-POST gate (e.g. the §5.1 own-state-health
+   * re-check) synchronously immediately before this call. Used by the SEED post path; the
+   * moneyline / existing-speculation path stays on {@link submitCommitment}.
+   */
+  async submitPrepared(preview: SubmitPreview): Promise<SubmitPreparedResult> {
+    return this.client.commitments.submitPrepared(preview);
+  }
+
+  /**
+   * Set the maker's USDC allowance for `TreasuryModule` (costs POL) — the maker's share of
+   * a lazy speculation's creation fee is pulled from this at the seed's FIRST match
+   * (`TreasuryModule.processSplitFee`). Like {@link approveUSDC} it *sets* (not adds), so
+   * the caller passes the absolute target; `'max'` only with explicit operator opt-in.
+   * Only relevant when seeding is enabled — a moneyline / existing-speculation maker never
+   * incurs a creation fee, so this allowance stays unset (the SEED post path approves it at
+   * boot, before any seed can match).
+   */
+  async approveCreationFee(amount: ApproveCreationFeeAmount): Promise<ApproveCreationFeeResult> {
+    return this.client.commitments.approveCreationFee(amount);
   }
 
   /**

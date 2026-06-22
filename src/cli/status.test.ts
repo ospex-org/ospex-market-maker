@@ -106,6 +106,8 @@ function adapterWithLivePositions(totals: PositionStatus['totals']): OspexAdapte
       submitRaw: notStubbed('commitments.submitRaw'), cancel: notStubbed('commitments.cancel'),
       cancelOnchain: notStubbed('commitments.cancelOnchain'), raiseMinNonce: notStubbed('commitments.raiseMinNonce'),
       approve: notStubbed('commitments.approve'), getNonceFloor: notStubbed('commitments.getNonceFloor'),
+      prepareSubmit: notStubbed('commitments.prepareSubmit'), checkSubmitFundability: notStubbed('commitments.checkSubmitFundability'),
+      submitPrepared: notStubbed('commitments.submitPrepared'), approveCreationFee: notStubbed('commitments.approveCreationFee'),
     },
     positions: {
       status: () => Promise.resolve(ps),
@@ -137,6 +139,8 @@ function adapterWithLivePositionsThrowing(err: Error): OspexAdapter {
       submitRaw: notStubbed('commitments.submitRaw'), cancel: notStubbed('commitments.cancel'),
       cancelOnchain: notStubbed('commitments.cancelOnchain'), raiseMinNonce: notStubbed('commitments.raiseMinNonce'),
       approve: notStubbed('commitments.approve'), getNonceFloor: notStubbed('commitments.getNonceFloor'),
+      prepareSubmit: notStubbed('commitments.prepareSubmit'), checkSubmitFundability: notStubbed('commitments.checkSubmitFundability'),
+      submitPrepared: notStubbed('commitments.submitPrepared'), approveCreationFee: notStubbed('commitments.approveCreationFee'),
     },
     positions: {
       status: () => Promise.reject(err),

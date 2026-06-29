@@ -31,9 +31,7 @@ const SAMPLE_BALANCES: BalancesSnapshot = {
   chainId: 137,
   native: 1_000_000_000_000_000_000n, // 1 POL
   usdc: 50_000_000n, // 50 USDC
-  link: 0n,
   usdcAddress: '0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359',
-  linkAddress: '0xb0897686c545045aFc77CF20eC7A532E3120E0F1',
 };
 function approvalsWith(positionModuleRaw: bigint): ApprovalsSnapshot {
   return {
@@ -46,11 +44,6 @@ function approvalsWith(positionModuleRaw: bigint): ApprovalsSnapshot {
         positionModule: { spender: '0xPM', spenderModule: 'positionModule', raw: positionModuleRaw },
         treasuryModule: { spender: '0xTM', spenderModule: 'treasuryModule', raw: 0n },
       },
-    },
-    link: {
-      address: '0xb0897686c545045aFc77CF20eC7A532E3120E0F1',
-      decimals: 18,
-      allowances: { oracleModule: { spender: '0xOM', spenderModule: 'oracleModule', raw: 0n } },
     },
   };
 }

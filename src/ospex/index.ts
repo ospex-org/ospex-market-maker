@@ -43,10 +43,8 @@ import {
   OspexClient,
   OspexConfigError,
   OspexError,
-  OspexScriptApprovalError,
   OspexSigningError,
   OspexStreamError,
-  OspexSubscriptionError,
   OspexValidationError,
   getAddresses,
   type ApprovalsSnapshot,
@@ -146,10 +144,8 @@ export {
   OspexChainError,
   OspexConfigError,
   OspexError,
-  OspexScriptApprovalError,
   OspexSigningError,
   OspexStreamError,
-  OspexSubscriptionError,
   OspexValidationError,
 };
 

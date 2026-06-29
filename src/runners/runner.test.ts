@@ -429,7 +429,7 @@ function liveSpiedAdapter(
     getCommitment?: (hash: Hex) => Promise<Commitment>;
     getPositionStatus?: (owner: string) => Promise<PositionStatus>;
     readApprovals?: (owner: Hex) => Promise<ApprovalsSnapshot>;
-    readBalances?: (owner: Hex) => Promise<{ owner: Hex; chainId: number; native: bigint; usdc: bigint; link: bigint; usdcAddress: Hex; linkAddress: Hex }>;
+    readBalances?: (owner: Hex) => Promise<{ owner: Hex; chainId: number; native: bigint; usdc: bigint; usdcAddress: Hex }>;
     getOwnStateHealth?: () => Promise<OwnStateHealth>;
   },
 ): OspexAdapter {
@@ -456,7 +456,7 @@ function liveSpiedAdapter(
   vi.spyOn(adapter, 'readApprovals').mockImplementation(reads?.readApprovals ?? (() => Promise.resolve(approvalsSnapshotWith(2n ** 255n))));
   // Default `readBalances` returns saturated USDC so exact-mode auto-approve isn't wallet-bound below the cap ceiling
   // unless a test explicitly underfunds the wallet. Other balances are non-zero placeholders.
-  vi.spyOn(adapter, 'readBalances').mockImplementation(reads?.readBalances ?? ((owner: Hex) => Promise.resolve({ owner, chainId: 137, native: 1_000_000_000_000_000_000n, usdc: 2n ** 255n, link: 0n, usdcAddress: '0xusdc' as Hex, linkAddress: '0xlink' as Hex })));
+  vi.spyOn(adapter, 'readBalances').mockImplementation(reads?.readBalances ?? ((owner: Hex) => Promise.resolve({ owner, chainId: 137, native: 1_000_000_000_000_000_000n, usdc: 2n ** 255n, usdcAddress: '0xusdc' as Hex })));
   // Default the indexer-lag probe (latch 6, PR2c-i) to healthy so a live
   // test doesn't fail-closed on the per-tick health poll; latch-6 tests override it.
   vi.spyOn(adapter, 'getOwnStateHealth').mockImplementation(reads?.getOwnStateHealth ?? (() => Promise.resolve(MOCK_OWN_STATE_HEALTH)));
@@ -477,13 +477,6 @@ function approvalsSnapshotWith(positionModuleRaw: bigint): ApprovalsSnapshot {
       allowances: {
         positionModule: { spender: '0xPositionModule' as Hex, spenderModule: 'positionModule', raw: positionModuleRaw },
         treasuryModule: { spender: '0xTreasuryModule' as Hex, spenderModule: 'treasuryModule', raw: 0n },
-      },
-    },
-    link: {
-      address: '0xlink' as Hex,
-      decimals: 18,
-      allowances: {
-        oracleModule: { spender: '0xOracleModule' as Hex, spenderModule: 'oracleModule', raw: 0n },
       },
     },
   };
@@ -2069,7 +2062,7 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
         config, () => Promise.resolve([]), undefined, undefined, undefined,
         {
           listOpenCommitments: () => Promise.resolve([orderbookEntry({ commitmentHash: record.hash, maker: DEFAULT_FAKE_MAKER_ADDRESS as Hex, status: 'open', storedStatus: 'open', isLive: true, riskAmount: '250000', filledRiskAmount: '0', remainingRiskAmount: '250000' })]),
-          readBalances: (owner: Hex) => Promise.resolve({ owner, chainId: 137, native: 10n ** 18n, usdc: 100_000n, link: 0n, usdcAddress: '0xusdc' as Hex, linkAddress: '0xlink' as Hex }), // 0.10 USDC < required 0.25 → fundingHold
+          readBalances: (owner: Hex) => Promise.resolve({ owner, chainId: 137, native: 10n ** 18n, usdc: 100_000n, usdcAddress: '0xusdc' as Hex }), // 0.10 USDC < required 0.25 → fundingHold
         },
       );
       vi.spyOn(adapter, 'subscribeOwnState').mockImplementation(recorder.subscribe); // no events → own-state unhealthy
@@ -4738,7 +4731,7 @@ describe('Runner — live execution', () => {
       { approveCreationFee },
       undefined, undefined,
       // Default readApprovals has treasuryModule allowance 0n; give a finite wallet so the wallet-bounded target is legible.
-      { readBalances: (owner: Hex) => Promise.resolve({ owner, chainId: 137, native: 1_000_000_000_000_000_000n, usdc: 100_000_000n, link: 0n, usdcAddress: '0xusdc' as Hex, linkAddress: '0xlink' as Hex }) },
+      { readBalances: (owner: Hex) => Promise.resolve({ owner, chainId: 137, native: 1_000_000_000_000_000_000n, usdc: 100_000_000n, usdcAddress: '0xusdc' as Hex }) },
     );
     await makeRunner({ config, adapter, maxTicks: 1, makerAddress: DEFAULT_FAKE_MAKER_ADDRESS as Hex }).run();
 
@@ -6701,7 +6694,7 @@ describe('Runner — boot-time auto-approve (Phase 3 d-i)', () => {
     // scoped to the maker, so the prior log must carry it to count).
     writeFileSync(join(logDir, 'run-prior.ndjson'), `{"ts":"x","runId":"prior","maker":"${DEFAULT_FAKE_MAKER_ADDRESS}","kind":"tick-start","tick":1}\n`, 'utf8');
     const readApprovals = vi.fn(() => Promise.resolve(approvalsSnapshotWith(0n)));
-    const readBalances = vi.fn(() => Promise.resolve({ owner: '0xowner' as Hex, chainId: 137, native: 10n ** 18n, usdc: 2n ** 255n, link: 0n, usdcAddress: '0xusdc' as Hex, linkAddress: '0xlink' as Hex }));
+    const readBalances = vi.fn(() => Promise.resolve({ owner: '0xowner' as Hex, chainId: 137, native: 10n ** 18n, usdc: 2n ** 255n, usdcAddress: '0xusdc' as Hex }));
     const approve = approveRecorder();
     const config = cfg({ mode: { dryRun: false }, approvals: { autoApprove: true, mode: 'exact' } });
     const adapter = liveSpiedAdapter(
@@ -6729,7 +6722,7 @@ describe('Runner — boot-time auto-approve (Phase 3 d-i)', () => {
       {
         readApprovals: () => Promise.resolve(approvalsSnapshotWith(0n)),
         // Underfund the wallet: 1 USDC vs whatever the default risk-cap ceiling computes to (much larger).
-        readBalances: (owner: Hex) => Promise.resolve({ owner, chainId: 137, native: 10n ** 18n, usdc: 1_000_000n, link: 0n, usdcAddress: '0xusdc' as Hex, linkAddress: '0xlink' as Hex }),
+        readBalances: (owner: Hex) => Promise.resolve({ owner, chainId: 137, native: 10n ** 18n, usdc: 1_000_000n, usdcAddress: '0xusdc' as Hex }),
       },
     );
     await makeRunner({ config, adapter, maxTicks: 1 }).run();
@@ -8007,8 +8000,8 @@ describe('Runner — funding guard', () => {
   }
 
   /** A `readBalances` stub with the given wallet USDC (other balances are safe non-zero placeholders). */
-  function balances(usdc: bigint): (owner: Hex) => Promise<{ owner: Hex; chainId: number; native: bigint; usdc: bigint; link: bigint; usdcAddress: Hex; linkAddress: Hex }> {
-    return (owner) => Promise.resolve({ owner, chainId: 137, native: 10n ** 18n, usdc, link: 0n, usdcAddress: '0xusdc' as Hex, linkAddress: '0xlink' as Hex });
+  function balances(usdc: bigint): (owner: Hex) => Promise<{ owner: Hex; chainId: number; native: bigint; usdc: bigint; usdcAddress: Hex }> {
+    return (owner) => Promise.resolve({ owner, chainId: 137, native: 10n ** 18n, usdc, usdcAddress: '0xusdc' as Hex });
   }
 
   function todayUTC(): string {
@@ -8099,7 +8092,7 @@ describe('Runner — funding guard', () => {
     let balanceReads = 0;
     let approvalReads = 0;
     const adapter = liveSpiedAdapter(config, () => Promise.resolve([]), undefined, undefined, undefined, {
-      readBalances: (o) => { balanceReads += 1; return Promise.resolve({ owner: o, chainId: 137, native: 0n, usdc: 0n, link: 0n, usdcAddress: '0xusdc' as Hex, linkAddress: '0xlink' as Hex }); },
+      readBalances: (o) => { balanceReads += 1; return Promise.resolve({ owner: o, chainId: 137, native: 0n, usdc: 0n, usdcAddress: '0xusdc' as Hex }); },
       readApprovals: () => { approvalReads += 1; return Promise.resolve(approvalsSnapshotWith(0n)); },
     });
     await makeRunner({ config, adapter, maxTicks: 1 }).run();
@@ -8264,7 +8257,7 @@ describe('Runner — funding guard', () => {
     let reads = 0;
     const config = cfg({ mode: { dryRun: true }, fundingGuard: { underfundedCancelMode: 'onchain' } });
     const adapter = liveSpiedAdapter(config, () => Promise.resolve([]), undefined, undefined, undefined, {
-      readBalances: (o) => { reads += 1; return Promise.resolve({ owner: o, chainId: 137, native: 0n, usdc: 0n, link: 0n, usdcAddress: '0xusdc' as Hex, linkAddress: '0xlink' as Hex }); },
+      readBalances: (o) => { reads += 1; return Promise.resolve({ owner: o, chainId: 137, native: 0n, usdc: 0n, usdcAddress: '0xusdc' as Hex }); },
     });
     await makeRunner({ config, adapter, maxTicks: 1 }).run();
     expect(reads).toBe(0);
@@ -8482,7 +8475,7 @@ describe('Runner — §5.1 stream-health active cancel-sweep (PR3b-ii)', () => {
       config, () => Promise.resolve([]),
       { cancelCommitmentOffchain: () => Promise.resolve(), cancelCommitmentOnchain: cancelOnchain.fn },
       undefined, undefined,
-      { listOpenCommitments: () => Promise.resolve([openFixture(record)]), readBalances: (owner: Hex) => Promise.resolve({ owner, chainId: 137, native: 10n ** 18n, usdc: 0n, link: 0n, usdcAddress: '0xusdc' as Hex, linkAddress: '0xlink' as Hex }) }, // 0 USDC → fundingHold too
+      { listOpenCommitments: () => Promise.resolve([openFixture(record)]), readBalances: (owner: Hex) => Promise.resolve({ owner, chainId: 137, native: 10n ** 18n, usdc: 0n, usdcAddress: '0xusdc' as Hex }) }, // 0 USDC → fundingHold too
     );
     holdOwnStateUnhealthy(adapter);
     await makeRunner({ config, adapter, maxTicks: 1 }).run();

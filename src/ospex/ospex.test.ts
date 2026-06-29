@@ -191,9 +191,7 @@ const SAMPLE_BALANCES: BalancesSnapshot = {
   chainId: 137,
   native: 1_000_000_000_000_000_000n,
   usdc: 50_000_000n,
-  link: 0n,
   usdcAddress: '0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359',
-  linkAddress: '0xb0897686c545045aFc77CF20eC7A532E3120E0F1',
 };
 
 const SAMPLE_APPROVALS: ApprovalsSnapshot = {
@@ -205,13 +203,6 @@ const SAMPLE_APPROVALS: ApprovalsSnapshot = {
     allowances: {
       positionModule: { spender: '0xpos', spenderModule: 'positionModule', raw: 0n },
       treasuryModule: { spender: '0xtre', spenderModule: 'treasuryModule', raw: 0n },
-    },
-  },
-  link: {
-    address: '0xb0897686c545045aFc77CF20eC7A532E3120E0F1',
-    decimals: 18,
-    allowances: {
-      oracleModule: { spender: '0xora', spenderModule: 'oracleModule', raw: 0n },
     },
   },
 };

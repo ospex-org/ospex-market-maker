@@ -13,7 +13,7 @@ This file is the **machine surface**: command JSON envelopes, telemetry NDJSON v
 
 ## 1. The MM in one paragraph
 
-`ospex-market-maker` is a long-running TypeScript worker that quotes both sides of a sports speculation on the Ospex protocol (Polygon mainnet, R4 contracts). It posts EIP-712 commitments off-chain via `@ospex/sdk` → `ospex-core-api`, watches takers match them, and auto-settles + auto-claims winning positions on chain. There is **no HTTP surface**. Everything an external observer consumes is one of three artifacts:
+`ospex-market-maker` is a long-running TypeScript worker that quotes both sides of a sports speculation on the Ospex protocol (Polygon mainnet, R5 contracts). It posts EIP-712 commitments off-chain via `@ospex/sdk` → `ospex-core-api`, watches takers match them, and auto-settles + auto-claims winning positions on chain. There is **no HTTP surface**. Everything an external observer consumes is one of three artifacts:
 
 1. **Per-CLI-command stdout** — `--json` envelopes shaped `{ schemaVersion: 1, <command>: <Report> }`. Stable contract.
 2. **NDJSON event log** — one file per run under `telemetry.logDir/run-<runId>.ndjson`. Stable contract; the source the `summary` aggregator and any future external scorecard read.

@@ -24,7 +24,7 @@ yarn install
 yarn build
 ```
 
-`yarn install` pulls `@ospex/sdk` from its pinned GitHub Release tarball — `package.json` / `yarn.lock` are the source of truth for the pinned version (v0.6.2 at the time of writing); there is nothing SDK-related to install separately.
+`yarn install` pulls `@ospex/sdk` from its pinned GitHub Release tarball — `package.json` / `yarn.lock` are the source of truth for the pinned version; there is nothing SDK-related to install separately.
 
 Then run the CLI as `yarn mm <command>` (which is `node dist/cli/index.js`), or `yarn dev <command>` to run it via `tsx` without a build. To put the `ospex-mm` binary on your PATH instead: `yarn link` (or `npm link`) after `yarn build`, then `ospex-mm <command>`.
 

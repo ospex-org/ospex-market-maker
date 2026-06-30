@@ -6577,7 +6577,7 @@ describe('Runner — boot-time auto-approve (Phase 3 d-i)', () => {
     expect(readEvents().some((e) => e.kind === 'approval')).toBe(false);
   });
 
-  it('live + approvals.autoApprove=false skips the flow — no readApprovals call, no approveUSDC call, no `approval` event', async () => {
+  it('live + approvals.autoApprove=false never WRITES an approval (no approveUSDC, no `approval` event) — it only READS the allowance for the boot advisory', async () => {
     const readApprovals = vi.fn(() => Promise.resolve(approvalsSnapshotWith(0n)));
     const approve = approveRecorder();
     const config = cfg({ mode: { dryRun: false }, approvals: { autoApprove: false, mode: 'exact' } });
@@ -6588,9 +6588,49 @@ describe('Runner — boot-time auto-approve (Phase 3 d-i)', () => {
       { readApprovals },
     );
     await makeRunner({ config, adapter, maxTicks: 1 }).run();
-    expect(readApprovals).not.toHaveBeenCalled();
+    expect(readApprovals).toHaveBeenCalled(); // the boot allowance advisory reads it — but never raises it (no write)
     expect(approve.calls).toHaveLength(0);
     expect(readEvents().some((e) => e.kind === 'approval')).toBe(false);
+  });
+
+  it('live + autoApprove=false + PositionModule allowance below the required ceiling → loud boot WARNING (advisory only; still no write)', async () => {
+    const approve = approveRecorder();
+    const config = cfg({ mode: { dryRun: false }, approvals: { autoApprove: false, mode: 'exact' } });
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]),
+      { approveUSDC: approve.fn },
+      undefined, undefined,
+      { readApprovals: () => Promise.resolve(approvalsSnapshotWith(0n)) }, // zero allowance — can't back any matchable risk
+    );
+    const lines: string[] = [];
+    await makeRunner({ config, adapter, maxTicks: 1, deps: { log: (l) => lines.push(l) } }).run();
+    expect(lines.some((l) => /approvals\.autoApprove=false/.test(l) && /allowance is 0\.000000 USDC/.test(l) && /REVERT at the USDC pull/.test(l))).toBe(true);
+    expect(approve.calls).toHaveLength(0); // advisory only — it warns, it does not raise the allowance itself
+    expect(readEvents().some((e) => e.kind === 'approval')).toBe(false);
+    // …and a machine-readable `position-allowance-short` event mirrors the stderr warning (so agent tooling sees the posture).
+    const shortEvent = readEvents().find((e) => e.kind === 'position-allowance-short');
+    expect(shortEvent).toMatchObject({ currentAllowanceWei6: '0' });
+    expect(typeof shortEvent?.requiredWei6).toBe('string');
+    expect(BigInt(shortEvent?.requiredWei6 as string) > 0n).toBe(true);
+  });
+
+  it('live + autoApprove=false + allowance already ≥ the required ceiling → NO boot warning, NO event (a pre-approved operator stays silent)', async () => {
+    const config = cfg({ mode: { dryRun: false }, approvals: { autoApprove: false, mode: 'exact' } });
+    // Default `liveSpiedAdapter.readApprovals` returns a saturated allowance (2^255) — well above any required ceiling.
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([]));
+    const lines: string[] = [];
+    await makeRunner({ config, adapter, maxTicks: 1, deps: { log: (l) => lines.push(l) } }).run();
+    expect(lines.some((l) => /approvals\.autoApprove=false/.test(l) && /allowance/.test(l))).toBe(false);
+    expect(readEvents().some((e) => e.kind === 'position-allowance-short')).toBe(false);
+  });
+
+  it('dry-run + autoApprove=false + zero allowance → NO boot warning, NO event (the allowance advisory is live-only)', async () => {
+    const config = cfg({ mode: { dryRun: true }, approvals: { autoApprove: false, mode: 'exact' } });
+    // Dry-run uses the read-only adapter (`makeRunner` default); `applyAutoApprovals` is never reached, so neither is the advisory.
+    const lines: string[] = [];
+    await makeRunner({ config, maxTicks: 1, deps: { log: (l) => lines.push(l) } }).run();
+    expect(lines.some((l) => /approvals\.autoApprove=false/.test(l) && /allowance/.test(l))).toBe(false);
+    expect(readEvents().some((e) => e.kind === 'position-allowance-short')).toBe(false);
   });
 
   it('live + autoApprove=true + current allowance already meets the required ceiling → silent no-op (readApprovals called, no approveUSDC, no `approval` event)', async () => {
@@ -8086,7 +8126,7 @@ describe('Runner — funding guard', () => {
     expect(events.some((e) => e.kind === 'error' && e.phase === 'funding-check')).toBe(true);
   });
 
-  it('C1a — no matchable exposure (required = 0) skips the balance/allowance reads entirely', async () => {
+  it('C1a — no matchable exposure (required = 0): the funding guard skips its balance/allowance reads (only the boot allowance advisory reads, once)', async () => {
     StateStore.at(stateDir).flush(emptyMakerState()); // no commitments → required 0
     const config = cfg({ mode: { dryRun: false }, fundingGuard: { underfundedCancelMode: 'none' } });
     let balanceReads = 0;
@@ -8096,8 +8136,8 @@ describe('Runner — funding guard', () => {
       readApprovals: () => { approvalReads += 1; return Promise.resolve(approvalsSnapshotWith(0n)); },
     });
     await makeRunner({ config, adapter, maxTicks: 1 }).run();
-    expect(balanceReads).toBe(0); // required-first short-circuit (autoApprove:false → no other reader)
-    expect(approvalReads).toBe(0);
+    expect(balanceReads).toBe(0); // funding guard's required-first short-circuit reads no balance (the advisory reads only approvals)
+    expect(approvalReads).toBe(1); // the autoApprove:false boot allowance advisory reads once; the funding guard then adds none (required 0)
     expect(readEvents().some((e) => e.kind === 'funding-hold')).toBe(false);
   });
 

@@ -4640,7 +4640,17 @@ export class Runner {
    */
   private async applyAutoApprovals(): Promise<void> {
     if (this.makerAddress === null) return; // live-mode invariant — caller (`run()`) already gated on `!dryRun`
-    if (!this.config.approvals.autoApprove) return; // operator opted out — leave allowances as-is
+    if (!this.config.approvals.autoApprove) {
+      // Operator opted out of auto-approve — leave allowances as-is. But if the
+      // PositionModule USDC allowance can't cover the configured risk, the FIRST
+      // live submit's match would REVERT at the USDC pull with nothing in the
+      // boot log to explain it (the approve flow is skipped, so it stays silent).
+      // Read the current allowance once and WARN loudly so the operator approves
+      // before quoting — `doctor`'s `allowance` check, brought to the one moment
+      // doctor can't cover (operators skip the readiness command): live boot.
+      await this.warnIfPositionModuleAllowanceShort();
+      return;
+    }
 
     let snapshot: ApprovalsSnapshot;
     try {
@@ -4732,6 +4742,51 @@ export class Runner {
     };
     if (walletUSDCWei6 !== undefined) payload.walletBalanceWei6 = walletUSDCWei6.toString();
     this.eventLog.emit('approval', payload);
+  }
+
+  /**
+   * Boot advisory for the `approvals.autoApprove: false` path (DESIGN §6). With
+   * auto-approve OFF the MM never raises the PositionModule USDC allowance, so an
+   * operator who also hasn't approved manually (`ospex approvals setup`) would
+   * post commitments whose FIRST match REVERTS at the USDC pull — and, because the
+   * approve flow is skipped, nothing in the boot log would say why. This mirrors
+   * `doctor`'s `allowance` check (`src/cli/doctor.ts`) at the one moment doctor
+   * can't cover (operators skip the readiness command): right before live quoting.
+   * Best-effort + read-only — a read failure is swallowed (the funding guard and
+   * the first match surface a genuine RPC outage loudly, so the advisory adds no
+   * noise), and a sufficient allowance stays silent so a pre-approved operator
+   * sees no spurious warning. Uses the SAME required-allowance function AND `floor`
+   * rounding as `doctor`'s `allowance` check ({@link requiredPositionModuleAllowanceUSDC};
+   * `floor`, not the auto-approve path's `ceil` target rounding), so `doctor` and
+   * `run --live` agree on what "sufficient" means down to the wei6. Emits a
+   * `position-allowance-short` telemetry event alongside the stderr WARNING (so an
+   * agent/scorecard parsing the NDJSON sees the degraded live-boot posture),
+   * mirroring the sibling `foreign-maker-commitments` boot diagnostic.
+   */
+  private async warnIfPositionModuleAllowanceShort(): Promise<void> {
+    if (this.makerAddress === null) return; // live-mode invariant — caller gated on `!dryRun`
+    let currentAllowance: bigint;
+    try {
+      currentAllowance = (await this.adapter.readApprovals(this.makerAddress)).usdc.allowances.positionModule.raw;
+    } catch {
+      return; // advisory only — never break boot on a read hiccup
+    }
+    const requiredUSDC = requiredPositionModuleAllowanceUSDC(this.config.risk);
+    // `Math.floor` (NOT the auto-approve path's `Math.ceil` target rounding): a `≥`
+    // sufficiency check must round the threshold DOWN to match `doctor`'s
+    // `buildAllowanceCheck` exactly, so a float-noise required value (e.g.
+    // 0.1 × 3 = 0.30000000000000004) can't trip a 1-wei6 spurious warning on an
+    // allowance `doctor` reports as OK. Over-approving (ceil) is harmless; over-warning isn't.
+    const requiredWei6 = BigInt(Math.floor(requiredUSDC * 1_000_000));
+    if (currentAllowance >= requiredWei6) return; // sufficient — silent
+    this.eventLog.emit('position-allowance-short', {
+      currentAllowanceWei6: currentAllowance.toString(),
+      requiredWei6: requiredWei6.toString(),
+    });
+    const currentUSDC = `${currentAllowance / 1_000_000n}.${(currentAllowance % 1_000_000n).toString().padStart(6, '0')}`;
+    this.deps.log(
+      `[runner] WARNING: live mode with approvals.autoApprove=false, but the PositionModule USDC allowance is ${currentUSDC} USDC (need ≥ ${requiredUSDC.toFixed(6)}). Commitments will POST, but the first match will REVERT at the USDC pull until you approve. Fix: set it yourself (\`ospex approvals setup\` / \`ospex commitments approve\`), or set approvals.autoApprove=true.`,
+    );
   }
 
   /**

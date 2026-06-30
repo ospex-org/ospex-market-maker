@@ -69,6 +69,8 @@ Live requires **both**:
 
 With only one of the two, the MM runs dry and tells you why. The `--dry-run` flag always forces dry-run regardless of config. This is deliberate: it takes two intentional acts to put real money on the table; neither a stray config edit nor a stray flag can do it alone.
 
+**Approve the `PositionModule` before you post.** A matched commitment pulls USDC via the `PositionModule` allowance (see *Funding* above). With `approvals.autoApprove: true` the MM raises that allowance for you at boot (wallet-bounded `exact` mode by default). With `approvals.autoApprove: false` (the default) you must approve it yourself first — `ospex approvals setup` (or `ospex commitments approve`) — otherwise your **first match reverts at the USDC pull**. As a guardrail, a live boot with `autoApprove: false` reads the allowance and logs a loud `[runner] WARNING` (and a `position-allowance-short` telemetry event) if it can't cover your configured risk; `ospex-mm doctor` reports the same check before you start.
+
 ## Caps
 
 - The example config is conservative. Start there or tighter. Caps bind **worst-case USDC loss by outcome** — they account for filled positions, your visible quotes, *and* latent quotes (see below).

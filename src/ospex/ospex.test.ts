@@ -49,6 +49,9 @@ const SAMPLE_SPECULATION_MONEYLINE: Speculation = {
   lineTicks: null,
   line: null,
   speculationStatus: 0,
+  winSide: null,
+  settledAt: null,
+  voided: false,
 };
 
 const SAMPLE_SPECULATION_CLOSED: Speculation = {
@@ -58,6 +61,9 @@ const SAMPLE_SPECULATION_CLOSED: Speculation = {
   lineTicks: -35,
   line: -3.5,
   speculationStatus: 1,
+  winSide: 'away',
+  settledAt: '2026-07-01T00:00:00+00:00',
+  voided: false,
 };
 
 const SAMPLE_CONTEST: Contest = {

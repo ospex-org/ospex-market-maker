@@ -47,6 +47,9 @@ function moneylineSpec(contestId: string, open = true): Speculation {
     lineTicks: null,
     line: null,
     speculationStatus: open ? 0 : 1,
+    winSide: open ? null : 'away',
+    settledAt: open ? null : '2026-07-01T00:00:00+00:00',
+    voided: false,
   };
 }
 
@@ -58,6 +61,9 @@ function spreadSpec(contestId: string): Speculation {
     lineTicks: -35,
     line: -3.5,
     speculationStatus: 0,
+    winSide: null,
+    settledAt: null,
+    voided: false,
   };
 }
 

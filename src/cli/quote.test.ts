@@ -21,8 +21,16 @@ const MONEYLINE_OPEN: Speculation = {
   lineTicks: null,
   line: null,
   speculationStatus: 0,
+  winSide: null,
+  settledAt: null,
+  voided: false,
 };
-const MONEYLINE_CLOSED: Speculation = { ...MONEYLINE_OPEN, speculationStatus: 1 };
+const MONEYLINE_CLOSED: Speculation = {
+  ...MONEYLINE_OPEN,
+  speculationStatus: 1,
+  winSide: 'away',
+  settledAt: '2026-07-01T00:00:00+00:00',
+};
 const SPREAD_OPEN: Speculation = {
   speculationId: 'spec-sp',
   contestId: 'contest-1',
@@ -30,6 +38,9 @@ const SPREAD_OPEN: Speculation = {
   lineTicks: -35,
   line: -3.5,
   speculationStatus: 0,
+  winSide: null,
+  settledAt: null,
+  voided: false,
 };
 
 function contestWith(overrides: Partial<Contest> = {}): Contest {

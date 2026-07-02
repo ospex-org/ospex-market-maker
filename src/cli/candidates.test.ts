@@ -146,13 +146,18 @@ function adapterFor(games: Game[], contests: Contest[], odds: Record<string, Con
 
 const cfg = (overrides: Record<string, unknown> = {}): Config => parseConfig({ rpcUrl: 'http://localhost:8545', ...overrides });
 
-function run(adapter: OspexAdapter, config = cfg(), opts: { sports?: Config['marketSelection']['sports']; hours?: number } = {}): Promise<CandidatesReport> {
+function run(
+  adapter: OspexAdapter,
+  config = cfg(),
+  opts: { sports?: Config['marketSelection']['sports']; hours?: number; allowlistOnly?: boolean } = {},
+): Promise<CandidatesReport> {
   return runCandidates({
     config,
     adapter,
     sports: opts.sports ?? config.marketSelection.sports,
     hours: opts.hours ?? 24,
     now: NOW,
+    ...(opts.allowlistOnly !== undefined ? { allowlistOnly: opts.allowlistOnly } : {}),
   });
 }
 
@@ -494,6 +499,7 @@ describe('runCandidates — report envelope + determinism', () => {
       maxTrackedMarkets: 5,
       requireReferenceOdds: true,
       contestAllowListSize: 0,
+      allowlistOnly: false,
     });
     expect(text()).not.toContain('externalIds');
   });
@@ -623,6 +629,55 @@ describe('runCandidates — allow-list annotation', () => {
     const item = report.items[0];
     expect(item).toBeDefined();
     expect(item && 'inContestAllowList' in item).toBe(false);
+  });
+
+  it('--allowlist-only restricts the listing to allow-listed contests (mirrors the run loop) — drops setup + off-allow-list rows', async () => {
+    const config = cfg({ marketSelection: { contestAllowList: ['c-ready'] } });
+    const report = await run(
+      adapterFor(
+        [
+          gameWith({ gameId: 'g-1', contestCreated: true, contestId: 'c-ready' }),
+          gameWith({ gameId: 'g-2', contestCreated: true, contestId: 'c-other' }), // off allow-list — dropped
+          gameWith({ gameId: 'g-3' }), // setup (no contest id) — dropped
+        ],
+        [
+          contestWith({ contestId: 'c-ready', speculations: [moneylineSpec('c-ready')] }),
+          contestWith({ contestId: 'c-other', speculations: [moneylineSpec('c-other')] }),
+        ],
+        { 'c-ready': oddsSnapshot('c-ready'), 'c-other': oddsSnapshot('c-other') },
+      ),
+      config,
+      { allowlistOnly: true },
+    );
+    expect(report.items).toHaveLength(1); // only the allow-listed contest survives
+    expect(report.items[0]).toMatchObject({ kind: 'quote_ready', contestId: 'c-ready', inContestAllowList: true });
+    expect(report.config.allowlistOnly).toBe(true);
+    expect(report.summary.quoteReady).toBe(1);
+    expect(report.summary.gamesAvailableToCreate).toBe(0); // the setup row was dropped, not merely annotated
+    expect(candidatesExitCode(report)).toBe(0);
+  });
+
+  it('--allowlist-only refuses (throws) when the allow-list is empty — an empty scope would masquerade as an empty board', async () => {
+    await expect(run(adapterFor([], []), cfg(), { allowlistOnly: true })).rejects.toThrow(
+      /--allowlist-only requires a non-empty/,
+    );
+  });
+
+  it('--allowlist-only text header marks the listing SCOPED (not "annotated, never filtered")', async () => {
+    const config = cfg({ marketSelection: { contestAllowList: ['c-ready'] } });
+    const report = await run(
+      adapterFor(
+        [gameWith({ gameId: 'g-1', contestCreated: true, contestId: 'c-ready' })],
+        [contestWith({ contestId: 'c-ready', speculations: [moneylineSpec('c-ready')] })],
+        { 'c-ready': oddsSnapshot('c-ready') },
+      ),
+      config,
+      { allowlistOnly: true },
+    );
+    const { sink, text } = collect();
+    renderCandidatesReportText(report, sink);
+    expect(text()).toMatch(/SCOPED/);
+    expect(text()).not.toContain('annotated, never filtered');
   });
 });
 

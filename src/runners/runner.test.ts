@@ -1299,6 +1299,88 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
     await runPromise;
   });
 
+  describe('own-state re-grounding makes a dedicated adopt-foreign-on-boot step unnecessary (regression)', () => {
+    // A commitment posted then lost to a hard kill BEFORE the per-tick flush is
+    // never persisted — yet it is live on the wallet book. Two mechanisms make a
+    // dedicated "adopt the wallet's foreign open commitments on boot" step
+    // redundant, and this block guards both:
+    //   (leg 1, here) the owner snapshot returns the WHOLE book and onReady
+    //     WHOLESALE-adopts the orphan into canonical state + open exposure; and
+    //   (leg 2, the "§5.1 live gate" tests below) no new quote can post while the
+    //     stream is not ready — so there is no window where the orphan is
+    //     uncounted AND posting is allowed.
+    // The second test also shows a naive pre-stream injection would be futile:
+    // the onReady swap is a wholesale replace, so it drops anything the snapshot
+    // omits.
+
+    it('adopts an owner-snapshot commitment absent from the loaded state (crash-orphan) and counts it toward open exposure', async () => {
+      const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner({
+        seedState: emptyMakerState(), // the orphan was never flushed — hard kill before the per-tick flush
+      });
+
+      // Precondition: the loaded book is empty and open exposure is zero.
+      expect(runner.stateForTest().commitments).toEqual({});
+      expect(computeOpenExposureWei6(runner.stateForTest(), T0, 0)).toBe(0n);
+
+      // The owner snapshot returns the whole wallet book, including the orphan.
+      // Signature-less here (signedPayload: null → missing-legacy) — the harder
+      // case for adoption; a POSTed orphan whose signature core-api kept would
+      // adopt as 'present' and is strictly easier.
+      recorder.fire('onSnapshot', {
+        cursor: 'c1',
+        commitments: [mappableOwnerCommitment('0xorphan', { riskAmount: '250000' })],
+        positions: [],
+        truncated: false,
+        positionsTruncated: false,
+      });
+      recorder.fire('onReady');
+
+      // Adopted as a tracked, exposure-bearing record — with NO adopt-on-boot code.
+      const state = runner.stateForTest();
+      expect(state.commitments['0xorphan']).toMatchObject({
+        hash: '0xorphan',
+        speculationId: 'spec-1',
+        makerSide: 'away', // positionType 0
+        lifecycle: 'visibleOpen',
+        riskAmountWei6: '250000',
+        signedPayloadStatus: 'missing-legacy',
+      });
+      // …and it now counts toward open exposure (which feeds the risk caps and the
+      // same-side double-post guard), so the under-count a dedicated adopt-on-boot
+      // step was meant to fix cannot occur.
+      expect(computeOpenExposureWei6(state, T0, 0)).toBe(250000n);
+
+      triggerKill();
+      await runPromise;
+    });
+
+    it('onReady wholesale-replaces the book, so a loaded record the snapshot omits is dropped (pre-stream injection would not survive)', async () => {
+      const seeded = commitmentRecord({ hash: '0xloaded' });
+      const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner({
+        seedState: { ...emptyMakerState(), commitments: { [seeded.hash]: seeded } },
+      });
+      expect(Object.keys(runner.stateForTest().commitments)).toEqual(['0xloaded']);
+
+      // The snapshot omits 0xloaded and carries a different row.
+      recorder.fire('onSnapshot', {
+        cursor: 'c1',
+        commitments: [mappableOwnerCommitment('0xfromstream')],
+        positions: [],
+        truncated: false,
+        positionsTruncated: false,
+      });
+      recorder.fire('onReady');
+
+      // Own-state is authoritative: the book is now EXACTLY the snapshot. This is
+      // why injecting the orphan into state.commitments before the stream opens
+      // would buy nothing — the onReady swap drops anything the snapshot omits.
+      expect(Object.keys(runner.stateForTest().commitments)).toEqual(['0xfromstream']);
+
+      triggerKill();
+      await runPromise;
+    });
+  });
+
   it('onStatus(\'resync\') drops pendingBaseline + sets ready=false so a partial pre-resync snapshot does not swap in', async () => {
     const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
 

@@ -127,8 +127,9 @@ program
   .option('-c, --config <path>', 'path to the config YAML', DEFAULT_CONFIG_PATH)
   .option('--sport <sport>', 'restrict to one sport (default: config marketSelection.sports)')
   .option('--hours <n>', 'look-ahead window in hours, integer 1-720 (default: config marketSelection.maxStartsWithinHours). The games leg uses the full window; the contests leg is capped at 168h — the contests API max')
+  .option('--allowlist-only', 'restrict the listing to marketSelection.contestAllowList — mirrors what `run` would actually quote (drops off-allow-list contests and setup rows); requires a non-empty allow-list')
   .option('--json', 'emit a JSON envelope { schemaVersion: 2, candidates: … } on stdout')
-  .action(async (opts: { config: string; sport?: string; hours?: string; json?: boolean }) => {
+  .action(async (opts: { config: string; sport?: string; hours?: string; allowlistOnly?: boolean; json?: boolean }) => {
     const config = loadConfigOrExit(opts.config);
     let sports: Sport[];
     let hours: number;
@@ -139,7 +140,7 @@ program
       return fail((e as Error).message);
     }
     const adapter = createOspexAdapter(config);
-    const report = await runCandidates({ config, adapter, sports, hours }).catch((e: unknown): never =>
+    const report = await runCandidates({ config, adapter, sports, hours, allowlistOnly: opts.allowlistOnly === true }).catch((e: unknown): never =>
       fail(`candidates failed: ${(e as Error).message}`),
     );
     if (opts.json === true) renderCandidatesReportJson(report, stdout);

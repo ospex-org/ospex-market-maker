@@ -35,7 +35,7 @@ Numeric values that can exceed `Number.MAX_SAFE_INTEGER` (USDC wei6, POL wei18, 
 |---|---|---|---|---|---|
 | `doctor [--address <0x…>] [--json]` | config, keystore, API/RPC reachability, wallet balances + allowance, state file | — (read-only) | `{schemaVersion:1, doctor: DoctorReport}` | no FAIL checks | any FAIL (config invalid, API/RPC unreachable, keystore set but missing, …); a WARN does NOT fail |
 | `quote --dry-run <contestId> [--json]` | config, contest + reference odds | — (read-only) | `{schemaVersion:1, quote: QuoteReport}` | `pipeline:'computed' && canQuote:true` | refused (closed, no open speculation, no reference odds, etc.) |
-| `candidates [--sport <sport>] [--hours <n>] [--json]` | config, games schedule, contests, per-candidate odds snapshots | — (read-only, signer-free) | `{schemaVersion:2, candidates: CandidatesReport}` | listing succeeded — an **empty result is a valid answer** (exit 0) | operational throw only (config invalid, API unreachable, bad flag) |
+| `candidates [--sport <sport>] [--hours <n>] [--allowlist-only] [--json]` | config, games schedule, contests, per-candidate odds snapshots | — (read-only, signer-free) | `{schemaVersion:2, candidates: CandidatesReport}` | listing succeeded — an **empty result is a valid answer** (exit 0) | operational throw only (config invalid, API unreachable, bad flag, `--allowlist-only` with an empty allow-list) |
 | `run --dry-run [--address <0x…>] [--keystore <p>] [--ignore-missing-state]` | config, state, contests, odds | state, telemetry log | (no `--json`) | graceful shutdown (KILL file / SIGTERM/SIGINT) | startup refusal (config invalid, state-loss without override, …) |
 | `run --live [--keystore <p>] [--ignore-missing-state] [--yes]` | same + signed adapter | state, telemetry log, **on chain** | (no `--json`) | graceful shutdown | refusal (`mode.dryRun:true` + `--live` mismatch, no keystore, prompt rejected, `--yes`-requiring config without it, ...) |
 | `cancel-stale [--authoritative] [--keystore <p>] [--ignore-missing-state] [--json]` | config, state | state (lifecycle stamps), telemetry log, **off-chain DELETE; on-chain cancelCommitment if `--authoritative`** | `{schemaVersion:1, cancelStale: CancelStaleReport}` | clean cleanup | any `errored > 0`, `gasDenied > 0`, or `blockedMissingPayload > 0` (incomplete sweep); refusal (`mode.dryRun:true`, no keystore, state-loss without override, dry: synthetic hash in state, ...) |
@@ -199,7 +199,7 @@ The `summary` command threads `config.gas.nativeTokenUSDCPrice` into `summarize`
 
 ### 2.7 CandidatesReport (envelope: `{schemaVersion:2, candidates: …}`)
 
-The quote-target / setup-target preflight. Read-only and signer-free (no keystore, no writes). **Market-aware:** a *verified* contest yields one item **per configured market** (`marketSelection.markets`, default `['moneyline']`) — the per-market kinds (`quote_ready` / `needs_speculation`, and a per-market `no-reference-odds` skip) carry `market`; the contest-level kinds (`needs_verification` / `setup` / contest-level skips) carry `market: null` and appear once. The allow-list **annotates** (`inContestAllowList`) but never hides; the deny-list skips (`skipReason: 'deny-list'`). **v2** (was v1): per-market items + `market` field, `needs_moneyline_speculation`→`needs_speculation`, `moneylineSpeculationId`→`speculationId`, `referenceOdds` is now the market-typed `ReferenceOdds`, `config.markets` added.
+The quote-target / setup-target preflight. Read-only and signer-free (no keystore, no writes). **Market-aware:** a *verified* contest yields one item **per configured market** (`marketSelection.markets`, default `['moneyline']`) — the per-market kinds (`quote_ready` / `needs_speculation`, and a per-market `no-reference-odds` skip) carry `market`; the contest-level kinds (`needs_verification` / `setup` / contest-level skips) carry `market: null` and appear once. The allow-list **annotates** (`inContestAllowList`) but never hides (the opt-in `--allowlist-only` is the exception — it subsets the listing to the allow-listed contests, i.e. the run loop's effective quoting scope, dropping `setup` rows and off-allow-list contests, and sets `config.allowlistOnly: true`; it requires a non-empty allow-list or the command throws); the deny-list skips (`skipReason: 'deny-list'`). **v2** (was v1): per-market items + `market` field, `needs_moneyline_speculation`→`needs_speculation`, `moneylineSpeculationId`→`speculationId`, `referenceOdds` is now the market-typed `ReferenceOdds`, `config.markets` added.
 
 ```typescript
 interface CandidatesReport {
@@ -212,7 +212,8 @@ interface CandidatesReport {
                                         //   game rows are visible, so a created game out there classifies
                                         //   needs_verification with contestStatus: null
             maxTrackedMarkets: number;  // hard cap on tracked (contest, market, line) entries (renamed from maxTrackedContests)
-            requireReferenceOdds: boolean; contestAllowListSize: number };
+            requireReferenceOdds: boolean; contestAllowListSize: number;
+            allowlistOnly: boolean };   // true when --allowlist-only scoped the listing to contestAllowList (items + summary then reflect only allow-listed contests)
   summary: {
     gamesAvailableToCreate: number;      // == count of kind 'setup'
     quoteReady: number;                  // count of quote_ready items == (contest, market) pairs quotable now

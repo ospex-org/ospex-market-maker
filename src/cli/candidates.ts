@@ -17,7 +17,11 @@
  * writes, never touches a keystore, and never prompts. Discovery shows the
  * whole window — unlike the run loop it does NOT hide anything by allow-list
  * (items are annotated with `inContestAllowList` instead so the operator can
- * see what a live run would actually quote); the deny-list DOES skip.
+ * see what a live run would actually quote); the deny-list DOES skip. The
+ * opt-in `allowlistOnly` is the one exception: it subsets the listing to the
+ * configured `contestAllowList` — the run loop's effective quoting scope (drops
+ * off-allow-list contests and setup rows) — for an unambiguous strict-canary
+ * preflight, and requires a non-empty allow-list.
  *
  * An empty listing is a valid answer (exit 0) — contests exist only after
  * someone creates and verifies them on chain, and an off-season board is
@@ -172,6 +176,8 @@ export interface CandidatesReport {
     maxTrackedMarkets: number;
     requireReferenceOdds: boolean;
     contestAllowListSize: number;
+    /** True when `allowlistOnly` scoped the listing to `contestAllowList` — `items` + `summary` then reflect only allow-listed contests, not the full window. */
+    allowlistOnly: boolean;
   };
   summary: CandidatesSummary;
   /** True iff a pagination bound was hit (games or contests) — the listing may be incomplete; never let a bound read as a complete answer. */
@@ -230,6 +236,13 @@ export interface CandidatesOpts {
   sports: Sport[];
   /** Resolved look-ahead window in hours ({@link resolveHours}). */
   hours: number;
+  /**
+   * Restrict the listing to `marketSelection.contestAllowList` — the run loop's
+   * effective quoting scope (contest-backed, allow-listed rows only; setup rows
+   * and off-allow-list contests dropped). Default `false` (full-window
+   * discovery). Requires a non-empty allow-list — {@link runCandidates} throws otherwise.
+   */
+  allowlistOnly?: boolean | undefined;
   /** Injectable clock for tests. Default: `() => new Date()`. */
   now?: (() => Date) | undefined;
 }
@@ -297,6 +310,13 @@ async function fetchContestsWindow(
 
 export async function runCandidates(opts: CandidatesOpts): Promise<CandidatesReport> {
   const { config, adapter, sports, hours } = opts;
+  const allowlistOnly = opts.allowlistOnly ?? false;
+  if (allowlistOnly && config.marketSelection.contestAllowList.length === 0) {
+    // A strict-canary scoping with nothing to scope to would silently render an
+    // empty board — and an empty board is a valid `candidates` answer, so it
+    // would masquerade as "nothing to quote." Refuse loudly instead.
+    throw new Error('--allowlist-only requires a non-empty marketSelection.contestAllowList (it is empty)');
+  }
   const now = opts.now ?? ((): Date => new Date());
   const generated = now();
   const nowMs = generated.getTime();
@@ -452,8 +472,16 @@ export async function runCandidates(opts: CandidatesOpts): Promise<CandidatesRep
     }),
   );
 
-  // 5. Deterministic order: kind priority, then matchTime, then id.
-  items.sort(compareItems);
+  // 5. In `allowlistOnly` mode, subset to the run loop's effective quoting
+  //    scope — contest-backed, allow-listed rows only. A setup row carries no
+  //    contest id (an uncreated game can't be on a contest-id allow-list), so
+  //    it drops. The allow-list is guaranteed non-empty here (guard above).
+  const scoped = allowlistOnly
+    ? items.filter((item) => item.contestId !== null && allowSet.has(item.contestId))
+    : items;
+
+  // 6. Deterministic order: kind priority, then matchTime, then id.
+  scoped.sort(compareItems);
 
   return {
     generatedAt: generated.toISOString(),
@@ -465,10 +493,11 @@ export async function runCandidates(opts: CandidatesOpts): Promise<CandidatesRep
       maxTrackedMarkets: config.marketSelection.maxTrackedMarkets,
       requireReferenceOdds: config.marketSelection.requireReferenceOdds,
       contestAllowListSize: config.marketSelection.contestAllowList.length,
+      allowlistOnly,
     },
-    summary: summarize(items),
+    summary: summarize(scoped),
     truncated: gamesResult.truncated || contestsResult.truncated,
-    items,
+    items: scoped,
   };
 }
 
@@ -584,10 +613,14 @@ export function renderCandidatesReportText(report: CandidatesReport, out: { writ
   const c = report.config;
   out.write(`ospex-mm candidates — generated ${report.generatedAt}\n`);
   const windowNote = c.contestsHours < c.hours ? ` (contests leg capped at ${c.contestsHours}h — the contests API max)` : '';
+  const allowListNote =
+    c.contestAllowListSize === 0
+      ? '(empty)'
+      : c.allowlistOnly
+        ? `${c.contestAllowListSize} id(s) — SCOPED (only allow-listed contests shown; setup / off-list hidden)`
+        : `${c.contestAllowListSize} id(s) — annotated, never filtered`;
   out.write(
-    `Sports: ${c.sports.join(', ')}   Markets: ${c.markets.join(', ')}   Window: next ${c.hours}h${windowNote}   requireReferenceOdds: ${c.requireReferenceOdds}   allow-list: ${
-      c.contestAllowListSize === 0 ? '(empty)' : `${c.contestAllowListSize} id(s) — annotated, never filtered`
-    }\n\n`);
+    `Sports: ${c.sports.join(', ')}   Markets: ${c.markets.join(', ')}   Window: next ${c.hours}h${windowNote}   requireReferenceOdds: ${c.requireReferenceOdds}   allow-list: ${allowListNote}\n\n`);
 
   const s = report.summary;
   out.write(`Quote-ready: ${s.quoteReady}   Needs speculation: ${s.needsSpeculation}   Needs verification: ${s.needsVerification}   Setup (creatable games): ${s.gamesAvailableToCreate}   Skipped: ${skippedTotal(s)}\n`);

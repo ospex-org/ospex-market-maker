@@ -95,7 +95,7 @@ import { existsSync } from 'node:fs';
 
 import { DEFAULT_PER_IP_OWNER_RESERVE, DEFAULT_PER_IP_STREAM_CAP, RESERVED_OWN_STATE_STREAMS, type Config } from '../config/index.js';
 import { buildDesiredQuote, inventoryFromState, isExpiredForRelease, isSeedSpeculationId, matchableCommitmentRiskWei6, oracleLineTicks, reconcileBook, referenceOddsEqual, referenceOddsFromSdk, seedSpeculationId, type BookReconciliation, type DesiredQuote, type ReferenceOdds, type RetainedPartial, type RetainedPartialReason, type SoftCancelReason } from '../orders/index.js';
-import { OspexStreamError } from '../ospex/index.js';
+import { OspexChainError, OspexStreamError } from '../ospex/index.js';
 import type {
   ApproveResult,
   ApproveUSDCAmount,
@@ -149,6 +149,17 @@ import { assessStateLoss, dispatchCancel, emptyMakerState, isTerminalPositionSta
 import { EventLog, eventLogsExist, marketTag } from '../telemetry/index.js';
 
 // ── injectable seams (the defaults are the real impls; tests override) ───────
+
+/**
+ * Approval self-heal reconcile poll ({@link Runner.pollAllowanceReachesTarget}): on a
+ * broadcast-but-unconfirmed approve (the UNKNOWN case), read the on-chain allowance this
+ * many times, this far apart, before concluding the tx dropped rather than merely pending.
+ * ~6 × 5s ≈ 25s — long enough for a transport-drop tx to surface on-chain (the SDK already
+ * waited out its own receipt timeout), short enough not to stall boot; only runs in the
+ * rare lost-receipt path.
+ */
+const APPROVAL_RECONCILE_ATTEMPTS = 6;
+const APPROVAL_RECONCILE_INTERVAL_MS = 5_000;
 
 export interface RunnerDeps {
   /** Wall clock — unix seconds. Default: `Math.floor(Date.now() / 1000)`. */
@@ -4632,15 +4643,18 @@ export class Runner {
    * `autoApprove: false` skips the whole flow (the operator approves manually).
    * A `readApprovals` (or the pre-approve `readBalances`) failure is logged
    * (`error` `phase: 'approve'`) and the boot proceeds. An `approveUSDC` failure
-   * — most importantly a broadcast whose receipt is never observed (the UNKNOWN
-   * case in `broadcastSignedTx`; the tx MAY have landed) — triggers a bounded
-   * self-heal ({@link healApprovalOnce}): re-read the allowance, and if it's
-   * still short, do exactly ONE re-approve, then re-read once more. If it heals
-   * (or the lost tx is found already landed) an `approval` event fires
-   * (`gasAccountingGap: true` when the landed tx's gas can't be billed, else
-   * `healed: 're-approved'`); if it's still short after the one retry, an
-   * `approval-heal-failed` event plus a loud stderr WARNING fire and boot
-   * proceeds — the first failed match still surfaces the gap.
+   * triggers a bounded, shape-aware self-heal ({@link healApprovalOnce}) that
+   * branches on the SDK's `OspexChainError` shape so a retry can't double-spend a
+   * still-pending tx nor skip accounting one that spent gas: a broadcast-but-
+   * unconfirmed approve (the UNKNOWN case) is reconciled by a bounded on-chain
+   * allowance poll (landed → record it; dropped → one re-approve), a reverted tx
+   * has its gas debited before a re-verdict + re-approve, and a pre-broadcast
+   * failure re-approves immediately. Every re-approve re-runs the gas verdict. If
+   * it heals (or the lost tx is found already landed) an `approval` event fires
+   * (`gasAccountingGap: true` when a landed tx's gas can't be billed, else
+   * `healed: 're-approved'`); if it can't, an `approval-heal-failed` event plus a
+   * loud stderr WARNING fire and boot proceeds — the first failed match still
+   * surfaces the gap.
    *
    * The `approval` event payload carries `walletBalanceWei6` (exact mode only),
    * `txHash`, and `gasPolWei` (`gasUsed × effectiveGasPrice`); the gas-budget
@@ -4702,20 +4716,9 @@ export class Runner {
     // are NOT gated here. The daily counter (state.dailyCounters) persists
     // across restarts so the same UTC day's spend is honored.
     const today = todayUTCDateString(this.deps.now());
-    const todayCounter = this.state.dailyCounters[today];
-    const todayGasSpentPolWei = todayCounter !== undefined ? BigInt(todayCounter.gasPolWei) : 0n;
-    const maxDailyGasPolWei = polFloatToWei18(this.config.gas.maxDailyGasPOL);
-    const emergencyReservePolWei = polFloatToWei18(this.config.gas.emergencyReservePOL);
-    const verdict = canSpendGas({ todayGasSpentPolWei, maxDailyGasPolWei, emergencyReservePolWei });
-    if (!verdict.allowed) {
-      this.eventLog.emit('candidate', {
-        skipReason: 'gas-budget-blocks-reapproval',
-        purpose: 'positionModule-approve',
-        todayGasSpentPolWei: todayGasSpentPolWei.toString(),
-        maxDailyGasPolWei: maxDailyGasPolWei.toString(),
-        emergencyReservePolWei: emergencyReservePolWei.toString(),
-        detail: verdict.reason,
-      });
+    const gasVerdict = this.approvalGasVerdict(today);
+    if (!gasVerdict.allowed) {
+      this.emitReapprovalGasBlocked('positionModule', gasVerdict.counters, gasVerdict.reason);
       return;
     }
 
@@ -4730,14 +4733,16 @@ export class Runner {
       result = await this.adapter.approveUSDC(amount);
     } catch (err) {
       this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'approve' });
-      // The approve may have been broadcast but its receipt never observed (the
-      // UNKNOWN case in `broadcastSignedTx` — it MAY have landed). Re-read the
-      // allowance and, if still short, do ONE bounded re-approve so a lost
-      // receipt doesn't resurface later as a match-revert at the USDC pull.
+      // The approve failed — but HOW matters (it may have been broadcast and be
+      // pending, reverted, or never have left). Hand the error to the shape-aware
+      // self-heal so a retry can't double-spend a pending tx or skip accounting a
+      // reverted one, and a lost-but-landed approve doesn't resurface later as a
+      // match-revert at the USDC pull.
       await this.healApprovalOnce({
         purpose: 'positionModule',
         target: targetAllowance,
         today,
+        error: err,
         approvalPayloadBase: {
           purpose: 'positionModule',
           spender: positionModule.spender,
@@ -4861,20 +4866,9 @@ export class Runner {
 
     // Gas-budget verdict (DESIGN §6) — mirror the PositionModule approve gate.
     const today = todayUTCDateString(this.deps.now());
-    const todayCounter = this.state.dailyCounters[today];
-    const todayGasSpentPolWei = todayCounter !== undefined ? BigInt(todayCounter.gasPolWei) : 0n;
-    const maxDailyGasPolWei = polFloatToWei18(this.config.gas.maxDailyGasPOL);
-    const emergencyReservePolWei = polFloatToWei18(this.config.gas.emergencyReservePOL);
-    const verdict = canSpendGas({ todayGasSpentPolWei, maxDailyGasPolWei, emergencyReservePolWei });
-    if (!verdict.allowed) {
-      this.eventLog.emit('candidate', {
-        skipReason: 'gas-budget-blocks-reapproval',
-        purpose: 'treasuryModule-approve',
-        todayGasSpentPolWei: todayGasSpentPolWei.toString(),
-        maxDailyGasPolWei: maxDailyGasPolWei.toString(),
-        emergencyReservePolWei: emergencyReservePolWei.toString(),
-        detail: verdict.reason,
-      });
+    const gasVerdict = this.approvalGasVerdict(today);
+    if (!gasVerdict.allowed) {
+      this.emitReapprovalGasBlocked('treasuryModule', gasVerdict.counters, gasVerdict.reason);
       return;
     }
 
@@ -4883,12 +4877,12 @@ export class Runner {
       result = await this.adapter.approveCreationFee(target);
     } catch (err) {
       this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'approve' });
-      // Same self-heal as the PositionModule path: a broadcast-but-unconfirmed
-      // approve may have landed; re-read and, if still short, one bounded re-approve.
+      // Same shape-aware self-heal as the PositionModule path.
       await this.healApprovalOnce({
         purpose: 'treasuryModule',
         target,
         today,
+        error: err,
         approvalPayloadBase: {
           purpose: 'treasuryModule',
           spender: treasuryModule.spender,
@@ -4917,24 +4911,74 @@ export class Runner {
   }
 
   /**
-   * One bounded self-heal for a boot auto-approve whose tx was broadcast but
-   * whose receipt was never observed (the UNKNOWN case in `broadcastSignedTx` —
-   * a receipt-wait timeout or transport drop; the tx MAY have landed). Called
-   * from the `approve` catch in {@link applyAutoApprovals} /
-   * {@link applyTreasuryAutoApproval}. Re-reads the on-chain allowance:
-   *   - already at/above `target` → the lost tx actually landed; emit `approval`
-   *     with `gasAccountingGap: true` (the landed tx's gas can't be billed — no
-   *     receipt — mirroring the settle/claim recovered-revert convention).
-   *   - still short → do EXACTLY ONE re-approve (never a loop; ≤ 2 approve calls
-   *     total across the whole boot path), then re-read once more: healed → emit
-   *     `approval` `healed: 're-approved'`; still short, or a read/re-approve
-   *     failure → emit `approval-heal-failed` plus a loud stderr WARNING and let
-   *     boot proceed (the first failed match still surfaces the gap).
+   * Shared gas-budget verdict for the boot-time approve paths (DESIGN §6): the
+   * PositionModule / TreasuryModule approve gate AND the self-heal's re-approve.
+   * Re-reads today's persisted POL-gas spend on each call, so the self-heal's
+   * re-check sees any gas a failed/reverted first attempt debited, and returns the
+   * counter values every caller needs for the `gas-budget-blocks-reapproval` event.
+   */
+  private approvalGasVerdict(today: string): {
+    allowed: boolean;
+    reason: string | undefined;
+    counters: { todayGasSpentPolWei: bigint; maxDailyGasPolWei: bigint; emergencyReservePolWei: bigint };
+  } {
+    const todayCounter = this.state.dailyCounters[today];
+    const todayGasSpentPolWei = todayCounter !== undefined ? BigInt(todayCounter.gasPolWei) : 0n;
+    const maxDailyGasPolWei = polFloatToWei18(this.config.gas.maxDailyGasPOL);
+    const emergencyReservePolWei = polFloatToWei18(this.config.gas.emergencyReservePOL);
+    const verdict = canSpendGas({ todayGasSpentPolWei, maxDailyGasPolWei, emergencyReservePolWei });
+    return {
+      allowed: verdict.allowed,
+      reason: verdict.allowed ? undefined : verdict.reason,
+      counters: { todayGasSpentPolWei, maxDailyGasPolWei, emergencyReservePolWei },
+    };
+  }
+
+  /** Emit the `gas-budget-blocks-reapproval` candidate for an approve/re-approve the gas verdict refused. */
+  private emitReapprovalGasBlocked(
+    purpose: 'positionModule' | 'treasuryModule',
+    counters: { todayGasSpentPolWei: bigint; maxDailyGasPolWei: bigint; emergencyReservePolWei: bigint },
+    reason: string | undefined,
+  ): void {
+    this.eventLog.emit('candidate', {
+      skipReason: 'gas-budget-blocks-reapproval',
+      purpose: `${purpose}-approve`,
+      todayGasSpentPolWei: counters.todayGasSpentPolWei.toString(),
+      maxDailyGasPolWei: counters.maxDailyGasPolWei.toString(),
+      emergencyReservePolWei: counters.emergencyReservePolWei.toString(),
+      detail: reason,
+    });
+  }
+
+  /**
+   * One bounded self-heal for a boot auto-approve whose FIRST attempt threw
+   * ({@link applyAutoApprovals} / {@link applyTreasuryAutoApproval}). The throw
+   * carries one of the SDK's `OspexChainError` shapes (see the SDK `errors.ts` /
+   * `broadcastSignedTx`), and we branch on it so a retry can't double-spend a tx
+   * that is merely PENDING, nor skip accounting one that spent gas:
    *
-   * No second gas-budget gate here: the caller's initial verdict already
-   * authorized this write, and the thrown approve billed no gas we recorded, so
-   * today's counter is unchanged — a re-check would always return the same
-   * verdict. The re-approve is one retry of that already-authorized write.
+   *   - `receipt.status === 'success'` — the tx CONFIRMED (a post-send step threw);
+   *     the allowance is set and, uniquely, we HOLD the receipt → bill the gas,
+   *     emit `approval`, no retry.
+   *   - `receipt.status === 'reverted'` — the tx reverted on-chain: gas WAS spent
+   *     (debit it) and the allowance is unchanged → re-run the gas verdict, then
+   *     one re-approve.
+   *   - `txHash` set, no receipt — the UNKNOWN case: broadcast, but the receipt
+   *     wait failed, so the tx MAY still be mining. Do NOT blindly re-approve —
+   *     reconcile via a bounded on-chain allowance poll ({@link pollAllowanceReachesTarget}):
+   *     if the allowance reaches `target` the pending tx landed (record it with
+   *     `gasAccountingGap: true` — no receipt to bill — and no retry); if it stays
+   *     short the tx dropped → one re-approve.
+   *   - no `txHash` — pre-broadcast (nonce/fee/gas-estimate/sign/RPC-reject): the tx
+   *     never left, the allowance is unchanged, no gas was spent → one immediate
+   *     re-read, then one re-approve if still short.
+   *
+   * Bounded to at most ONE re-approve (≤ 2 approve calls total). Every re-approve is
+   * gated by a FRESH gas verdict — a reverted first tx (or any concurrent spend) may
+   * have moved today's counter, so the retry honours the same POL reserve/budget the
+   * initial write did. If it heals (or the lost tx is found already landed) an
+   * `approval` fires; otherwise `approval-heal-failed` + a loud stderr WARNING and
+   * boot proceeds (the first failed match still surfaces the gap).
    */
   private async healApprovalOnce(args: {
     purpose: 'positionModule' | 'treasuryModule';
@@ -4943,21 +4987,67 @@ export class Runner {
     approvalPayloadBase: Record<string, unknown>;
     readCurrentAllowance: () => Promise<bigint>;
     approve: () => Promise<ApproveResult>;
+    error: unknown;
   }): Promise<void> {
-    const { purpose, target, today, approvalPayloadBase, readCurrentAllowance, approve } = args;
+    const { purpose, target, today, approvalPayloadBase, readCurrentAllowance, approve, error } = args;
+    const chainErr = error instanceof OspexChainError ? error : null;
+    const txHash = chainErr?.txHash;
+    const receipt = chainErr?.receipt;
 
-    let current: bigint;
+    // (1) Confirmed-with-receipt: the tx landed (a post-send step threw). The
+    // allowance is set and — uniquely on this branch — we hold the receipt, so the
+    // gas is billable. Record + emit; no retry.
+    if (receipt !== undefined && receipt.status === 'success') {
+      const gasPolWei = BigInt(receipt.gasUsed) * BigInt(receipt.effectiveGasPrice);
+      this.recordGasSpentToday(today, gasPolWei);
+      this.eventLog.emit('approval', {
+        ...approvalPayloadBase,
+        ...(txHash !== undefined ? { txHash } : {}),
+        gasPolWei: gasPolWei.toString(),
+        healed: 'landed',
+      });
+      return;
+    }
+
+    // (2) Reverted-with-receipt: the tx reverted but STILL spent gas — debit it now,
+    // before the verdict below (the reverted spend may push today's counter over budget).
+    if (receipt !== undefined && receipt.status === 'reverted') {
+      this.recordGasSpentToday(today, BigInt(receipt.gasUsed) * BigInt(receipt.effectiveGasPrice));
+    }
+
+    // (3) Did the lost tx land? Only the UNKNOWN case (txHash, no receipt) can be a
+    // still-mining tx, so reconcile it with a bounded on-chain allowance poll; every
+    // other shape (pre-broadcast / reverted) has a SETTLED allowance, so a single
+    // read decides. This is what prevents a second, double-spending approve of a tx
+    // that was merely pending.
+    let landed: boolean;
     try {
-      current = await readCurrentAllowance();
+      landed =
+        txHash !== undefined && receipt === undefined
+          ? await this.pollAllowanceReachesTarget(readCurrentAllowance, target)
+          : (await readCurrentAllowance()) >= target;
     } catch (err) {
       this.emitApprovalHealFailed(purpose, target, undefined, `allowance re-read failed: ${errMessage(err)}`);
       return;
     }
+    if (landed) {
+      // The lost tx actually landed. On the UNKNOWN branch we hold no receipt, so its
+      // gas can't be billed — flag the accounting gap and carry the txHash so an
+      // operator can reconcile the exact POL spent.
+      this.eventLog.emit('approval', {
+        ...approvalPayloadBase,
+        ...(txHash !== undefined ? { txHash } : {}),
+        gasAccountingGap: true,
+      });
+      return;
+    }
 
-    if (current >= target) {
-      // The broadcast whose receipt we never saw actually landed — nothing to do
-      // but record it. No receipt in hand, so the gas can't be billed (flag the gap).
-      this.eventLog.emit('approval', { ...approvalPayloadBase, gasAccountingGap: true });
+    // (4) Still short → the tx dropped / reverted. Re-run the gas verdict (a reverted
+    // first tx debited gas above) BEFORE the one bounded re-approve.
+    const gas = this.approvalGasVerdict(today);
+    if (!gas.allowed) {
+      this.emitReapprovalGasBlocked(purpose, gas.counters, gas.reason);
+      this.emitApprovalHealFailed(purpose, target, undefined, `re-approve gas-blocked: ${gas.reason ?? 'gas budget exhausted'}`);
       return;
     }
 
@@ -4966,7 +5056,7 @@ export class Runner {
       healResult = await approve();
     } catch (err) {
       this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'approve' });
-      this.emitApprovalHealFailed(purpose, target, current, `re-approve threw: ${errMessage(err)}`);
+      this.emitApprovalHealFailed(purpose, target, undefined, `re-approve threw: ${errMessage(err)}`);
       return;
     }
 
@@ -4993,6 +5083,32 @@ export class Runner {
       gasPolWei: gasPolWei.toString(),
       healed: 're-approved',
     });
+  }
+
+  /**
+   * Bounded on-chain allowance poll used by {@link healApprovalOnce} to reconcile the
+   * UNKNOWN post-broadcast case: read `read()` up to {@link APPROVAL_RECONCILE_ATTEMPTS}
+   * times, {@link APPROVAL_RECONCILE_INTERVAL_MS} apart, returning `true` as soon as the
+   * allowance reaches `target` (the pending broadcast landed) and `false` if the window
+   * elapses with it still short (the tx dropped). A single read failure is tolerated
+   * (retried next interval). The sleep is the runner's interruptible one, so a shutdown
+   * cuts it short. The allowance is authoritative on-chain state, so this distinguishes a
+   * slow/pending approve from a truly-dropped one WITHOUT sending a second, double-spending tx.
+   */
+  private async pollAllowanceReachesTarget(read: () => Promise<bigint>, target: bigint): Promise<boolean> {
+    for (let attempt = 0; attempt < APPROVAL_RECONCILE_ATTEMPTS; attempt++) {
+      if (attempt > 0) {
+        await this.deps.sleep(APPROVAL_RECONCILE_INTERVAL_MS, this.abortController.signal);
+      }
+      let current: bigint;
+      try {
+        current = await read();
+      } catch {
+        continue; // transient read failure — try again next interval
+      }
+      if (current >= target) return true;
+    }
+    return false;
   }
 
   /**

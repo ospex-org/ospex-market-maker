@@ -6982,6 +6982,28 @@ describe('Runner — boot-time auto-approve (Phase 3 d-i)', () => {
     expect(sleeps.filter((s) => s === 5000)).toHaveLength(5);
   });
 
+  it('UNKNOWN approve failure (txHash, no receipt) + EVERY reconcile allowance read fails → INCONCLUSIVE: `approval-heal-failed` + stderr WARNING, EXACTLY ONE approveUSDC call (never re-approves a possibly-still-pending tx, per Hermes PR146 re-review)', async () => {
+    const approve = approveThrowsThenRecorder(UNKNOWN_ERR, 'success'); // the second (re-approve) call must NOT happen
+    const config = cfg({ mode: { dryRun: false }, approvals: { autoApprove: true, mode: 'exact' } });
+    // The DECISION read (before any approve) succeeds short; EVERY read during the
+    // reconcile poll rejects → the on-chain allowance is NEVER observed → inconclusive,
+    // NOT "definitively short". A blind re-approve here could double-spend the pending tx.
+    const readApprovals = vi.fn(() =>
+      approve.calls.length === 0
+        ? Promise.resolve(approvalsSnapshotWith(0n)) // decision read: short → attempt approve
+        : Promise.reject(new Error('rpc 503')), // every reconcile read fails
+    );
+    const sleeps: number[] = [];
+    const lines: string[] = [];
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([]), { approveUSDC: approve.fn }, undefined, undefined, { readApprovals });
+    await makeRunner({ config, adapter, maxTicks: 1, deps: { sleep: (ms: number) => { sleeps.push(ms); return Promise.resolve(); }, log: (l) => lines.push(l) } }).run();
+    expect(approve.calls).toHaveLength(1); // NOT re-approved — the pending tx's fate is unknown, so it fails closed
+    expect(readEvents().find((e) => e.kind === 'approval-heal-failed')).toMatchObject({ purpose: 'positionModule' });
+    expect(readEvents().some((e) => e.kind === 'approval')).toBe(false);
+    expect(lines.some((l) => /WARNING/.test(l) && /failed to self-heal/.test(l))).toBe(true);
+    expect(sleeps).toContain(5000); // it DID run the reconcile poll (didn't blindly re-approve on an unread allowance)
+  });
+
   it('reverted approve (receipt.status reverted) debits the reverted tx\'s gas before the retry, and if that pushes today\'s spend over budget the re-verdict BLOCKS the re-approve → `candidate` gas-budget-blocks-reapproval + `approval-heal-failed`, EXACTLY ONE approveUSDC call (proves the reverted gas was accounted, per Hermes PR146 blocker 1)', async () => {
     const approve = approveThrowsThenRecorder(REVERTED_ERR, 'success'); // the reverted first call spent 50000 * 30gwei = 0.0015 POL
     const config = cfg({ mode: { dryRun: false }, approvals: { autoApprove: true, mode: 'exact' } });

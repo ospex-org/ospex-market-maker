@@ -161,6 +161,15 @@ import { EventLog, eventLogsExist, marketTag } from '../telemetry/index.js';
 const APPROVAL_RECONCILE_ATTEMPTS = 6;
 const APPROVAL_RECONCILE_INTERVAL_MS = 5_000;
 
+/**
+ * Outcome of the UNKNOWN-tx reconcile poll ({@link Runner.pollAllowanceReachesTarget}):
+ * `'landed'` (a read observed the allowance at target — the pending broadcast landed),
+ * `'short'` (≥1 read succeeded and the allowance stayed below target — the tx dropped, safe
+ * to re-approve), or `'inconclusive'` (NO read succeeded across the window — the on-chain state
+ * was never observed, so the pending tx's fate is UNKNOWN and re-approving could double-spend it).
+ */
+type ReconcileOutcome = 'landed' | 'short' | 'inconclusive';
+
 export interface RunnerDeps {
   /** Wall clock — unix seconds. Default: `Math.floor(Date.now() / 1000)`. */
   now: () => number;
@@ -4965,10 +4974,12 @@ export class Runner {
    *     one re-approve.
    *   - `txHash` set, no receipt — the UNKNOWN case: broadcast, but the receipt
    *     wait failed, so the tx MAY still be mining. Do NOT blindly re-approve —
-   *     reconcile via a bounded on-chain allowance poll ({@link pollAllowanceReachesTarget}):
-   *     if the allowance reaches `target` the pending tx landed (record it with
-   *     `gasAccountingGap: true` — no receipt to bill — and no retry); if it stays
-   *     short the tx dropped → one re-approve.
+   *     reconcile via a bounded on-chain allowance poll ({@link pollAllowanceReachesTarget})
+   *     returning a TRI-STATE: `'landed'` (allowance reached `target` → record it with
+   *     `gasAccountingGap: true`, no retry), `'short'` (observed below target across the
+   *     window → the tx dropped → one re-approve), or `'inconclusive'` (EVERY read failed →
+   *     the state was never observed → `approval-heal-failed`, NO re-approve, since re-approving
+   *     could double-spend a still-pending tx).
    *   - no `txHash` — pre-broadcast (nonce/fee/gas-estimate/sign/RPC-reject): the tx
    *     never left, the allowance is unchanged, no gas was spent → one immediate
    *     re-read, then one re-approve if still short.
@@ -5015,31 +5026,54 @@ export class Runner {
       this.recordGasSpentToday(today, BigInt(receipt.gasUsed) * BigInt(receipt.effectiveGasPrice));
     }
 
-    // (3) Did the lost tx land? Only the UNKNOWN case (txHash, no receipt) can be a
-    // still-mining tx, so reconcile it with a bounded on-chain allowance poll; every
-    // other shape (pre-broadcast / reverted) has a SETTLED allowance, so a single
-    // read decides. This is what prevents a second, double-spending approve of a tx
-    // that was merely pending.
-    let landed: boolean;
-    try {
-      landed =
-        txHash !== undefined && receipt === undefined
-          ? await this.pollAllowanceReachesTarget(readCurrentAllowance, target)
-          : (await readCurrentAllowance()) >= target;
-    } catch (err) {
-      this.emitApprovalHealFailed(purpose, target, undefined, `allowance re-read failed: ${errMessage(err)}`);
-      return;
-    }
-    if (landed) {
-      // The lost tx actually landed. On the UNKNOWN branch we hold no receipt, so its
-      // gas can't be billed — flag the accounting gap and carry the txHash so an
-      // operator can reconcile the exact POL spent.
-      this.eventLog.emit('approval', {
-        ...approvalPayloadBase,
-        ...(txHash !== undefined ? { txHash } : {}),
-        gasAccountingGap: true,
-      });
-      return;
+    // (3) Did the lost tx land? For the UNKNOWN case (txHash, no receipt) the tx may
+    // still be mining → a bounded on-chain reconcile poll returning a TRI-STATE so an
+    // all-reads-failed window is NOT mistaken for a definitively-short allowance
+    // (re-approving then could double-spend a still-pending tx). Every other shape
+    // (pre-broadcast / reverted) has a SETTLED allowance → a single read decides.
+    if (txHash !== undefined && receipt === undefined) {
+      const outcome = await this.pollAllowanceReachesTarget(readCurrentAllowance, target);
+      if (outcome === 'landed') {
+        // The lost tx actually landed. No receipt in hand, so its gas can't be
+        // billed — flag the accounting gap and carry the txHash for reconciliation.
+        this.eventLog.emit('approval', { ...approvalPayloadBase, txHash, gasAccountingGap: true });
+        return;
+      }
+      if (outcome === 'inconclusive') {
+        // EVERY allowance read failed across the whole reconcile window, so the
+        // on-chain state was NEVER observed — the broadcast tx may still be mining.
+        // Re-approving now could double-spend it, so fail loudly and do NOT retry.
+        this.emitApprovalHealFailed(
+          purpose,
+          target,
+          undefined,
+          'UNKNOWN-tx reconcile inconclusive: every allowance read failed across the window; the broadcast tx may still be pending — not re-approving',
+        );
+        return;
+      }
+      // outcome === 'short' — observed short across the window → the tx dropped;
+      // fall through to the one bounded re-approve.
+    } else {
+      // pre-broadcast / reverted: the allowance is authoritatively settled, so a
+      // single read decides (a read failure here is fail-closed → heal-failed).
+      let current: bigint;
+      try {
+        current = await readCurrentAllowance();
+      } catch (err) {
+        this.emitApprovalHealFailed(purpose, target, undefined, `allowance re-read failed: ${errMessage(err)}`);
+        return;
+      }
+      if (current >= target) {
+        // The lost tx actually landed (or a prior/concurrent approve already set it).
+        // No receipt to bill → flag the accounting gap.
+        this.eventLog.emit('approval', {
+          ...approvalPayloadBase,
+          ...(txHash !== undefined ? { txHash } : {}),
+          gasAccountingGap: true,
+        });
+        return;
+      }
+      // current < target → fall through to the one bounded re-approve.
     }
 
     // (4) Still short → the tx dropped / reverted. Re-run the gas verdict (a reverted
@@ -5088,14 +5122,21 @@ export class Runner {
   /**
    * Bounded on-chain allowance poll used by {@link healApprovalOnce} to reconcile the
    * UNKNOWN post-broadcast case: read `read()` up to {@link APPROVAL_RECONCILE_ATTEMPTS}
-   * times, {@link APPROVAL_RECONCILE_INTERVAL_MS} apart, returning `true` as soon as the
-   * allowance reaches `target` (the pending broadcast landed) and `false` if the window
-   * elapses with it still short (the tx dropped). A single read failure is tolerated
-   * (retried next interval). The sleep is the runner's interruptible one, so a shutdown
-   * cuts it short. The allowance is authoritative on-chain state, so this distinguishes a
-   * slow/pending approve from a truly-dropped one WITHOUT sending a second, double-spending tx.
+   * times, {@link APPROVAL_RECONCILE_INTERVAL_MS} apart. Returns a {@link ReconcileOutcome}:
+   *   - `'landed'` — a read observed the allowance at/above `target` (the pending tx landed).
+   *   - `'short'` — at least one read SUCCEEDED and the allowance stayed below `target` across
+   *     the window (the tx dropped — safe to re-approve).
+   *   - `'inconclusive'` — NO read succeeded (every attempt threw), so the on-chain state was
+   *     never observed. The pending tx's fate is UNKNOWN, so the caller must NOT re-approve
+   *     (that could double-spend a still-mining tx) — this is the sentinel-avoidance discipline
+   *     ([[feedback_defensive_bounds_unknown_not_null]]): a bound hit without a definitive
+   *     answer is UNKNOWN, never a "short" verdict.
+   * A single read failure is tolerated (retried next interval); the sleep is the runner's
+   * interruptible one, so a shutdown cuts it short. The allowance is authoritative on-chain
+   * state, so an OBSERVED-short distinguishes a truly-dropped approve from a slow/pending one.
    */
-  private async pollAllowanceReachesTarget(read: () => Promise<bigint>, target: bigint): Promise<boolean> {
+  private async pollAllowanceReachesTarget(read: () => Promise<bigint>, target: bigint): Promise<ReconcileOutcome> {
+    let sawSuccessfulRead = false;
     for (let attempt = 0; attempt < APPROVAL_RECONCILE_ATTEMPTS; attempt++) {
       if (attempt > 0) {
         await this.deps.sleep(APPROVAL_RECONCILE_INTERVAL_MS, this.abortController.signal);
@@ -5106,9 +5147,12 @@ export class Runner {
       } catch {
         continue; // transient read failure — try again next interval
       }
-      if (current >= target) return true;
+      sawSuccessfulRead = true;
+      if (current >= target) return 'landed';
     }
-    return false;
+    // No read reached target. If we never got ONE successful read, the on-chain
+    // allowance was never observed → inconclusive; else we observed it short.
+    return sawSuccessfulRead ? 'short' : 'inconclusive';
   }
 
   /**

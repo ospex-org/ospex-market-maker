@@ -4630,9 +4630,17 @@ export class Runner {
    * `MaxUint256`, silent no-op.
    *
    * `autoApprove: false` skips the whole flow (the operator approves manually).
-   * A `readApprovals` or `approveUSDC` failure is logged (`error`
-   * `phase: 'approve'`) and the boot proceeds — the first failed match will
-   * surface the gap loudly, and the operator can retry.
+   * A `readApprovals` (or the pre-approve `readBalances`) failure is logged
+   * (`error` `phase: 'approve'`) and the boot proceeds. An `approveUSDC` failure
+   * — most importantly a broadcast whose receipt is never observed (the UNKNOWN
+   * case in `broadcastSignedTx`; the tx MAY have landed) — triggers a bounded
+   * self-heal ({@link healApprovalOnce}): re-read the allowance, and if it's
+   * still short, do exactly ONE re-approve, then re-read once more. If it heals
+   * (or the lost tx is found already landed) an `approval` event fires
+   * (`gasAccountingGap: true` when the landed tx's gas can't be billed, else
+   * `healed: 're-approved'`); if it's still short after the one retry, an
+   * `approval-heal-failed` event plus a loud stderr WARNING fire and boot
+   * proceeds — the first failed match still surfaces the gap.
    *
    * The `approval` event payload carries `walletBalanceWei6` (exact mode only),
    * `txHash`, and `gasPolWei` (`gasUsed × effectiveGasPrice`); the gas-budget
@@ -4640,6 +4648,7 @@ export class Runner {
    */
   private async applyAutoApprovals(): Promise<void> {
     if (this.makerAddress === null) return; // live-mode invariant — caller (`run()`) already gated on `!dryRun`
+    const makerAddress = this.makerAddress; // captured for the self-heal closures (narrowing doesn't survive into an async callback)
     if (!this.config.approvals.autoApprove) {
       // Operator opted out of auto-approve — leave allowances as-is. But if the
       // PositionModule USDC allowance can't cover the configured risk, the FIRST
@@ -4665,15 +4674,17 @@ export class Runner {
     const requiredCapWei6 = BigInt(Math.ceil(requiredUSDC * 1_000_000));
 
     let amount: ApproveUSDCAmount;
+    let targetAllowance: bigint; // the allowance the self-heal re-checks the on-chain value against
     let walletUSDCWei6: bigint | undefined;
     if (this.config.approvals.mode === 'unlimited') {
       const MAX_UINT256 = 2n ** 256n - 1n;
       if (currentAllowance >= MAX_UINT256) return; // already at max — idempotent
       amount = 'max';
+      targetAllowance = MAX_UINT256;
     } else {
       // exact mode: bound the target by current wallet USDC balance.
       try {
-        walletUSDCWei6 = (await this.adapter.readBalances(this.makerAddress)).usdc;
+        walletUSDCWei6 = (await this.adapter.readBalances(makerAddress)).usdc;
       } catch (err) {
         this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'approve' });
         return; // fail closed — the wallet bound is part of the safety contract
@@ -4681,6 +4692,7 @@ export class Runner {
       const target = walletUSDCWei6 < requiredCapWei6 ? walletUSDCWei6 : requiredCapWei6;
       if (currentAllowance >= target) return; // already sufficient — silent
       amount = target;
+      targetAllowance = target;
     }
 
     // Gas-budget verdict (DESIGN §6): right before an on-chain write, confirm
@@ -4718,6 +4730,25 @@ export class Runner {
       result = await this.adapter.approveUSDC(amount);
     } catch (err) {
       this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'approve' });
+      // The approve may have been broadcast but its receipt never observed (the
+      // UNKNOWN case in `broadcastSignedTx` — it MAY have landed). Re-read the
+      // allowance and, if still short, do ONE bounded re-approve so a lost
+      // receipt doesn't resurface later as a match-revert at the USDC pull.
+      await this.healApprovalOnce({
+        purpose: 'positionModule',
+        target: targetAllowance,
+        today,
+        approvalPayloadBase: {
+          purpose: 'positionModule',
+          spender: positionModule.spender,
+          currentAllowance: currentAllowance.toString(),
+          requiredAggregateAllowance: requiredCapWei6.toString(),
+          ...(walletUSDCWei6 !== undefined ? { walletBalanceWei6: walletUSDCWei6.toString() } : {}),
+        },
+        readCurrentAllowance: async () =>
+          (await this.adapter.readApprovals(makerAddress)).usdc.allowances.positionModule.raw,
+        approve: () => this.adapter.approveUSDC(amount),
+      });
       return;
     }
 
@@ -4809,6 +4840,7 @@ export class Runner {
    */
   private async applyTreasuryAutoApproval(): Promise<void> {
     if (this.makerAddress === null) return; // live-mode invariant — caller gated on `!dryRun`
+    const makerAddress = this.makerAddress; // captured for the self-heal closures (narrowing doesn't survive into an async callback)
     if (!this.config.approvals.autoApprove) return; // operator opted out
     if (!this.config.marketSelection.seedSpeculations) return; // seeding opt-in
     if (this.config.risk.maxDailyFeeUSDC <= 0) return; // no fee budget → canSpendFee refuses every seed → no allowance needed
@@ -4851,6 +4883,23 @@ export class Runner {
       result = await this.adapter.approveCreationFee(target);
     } catch (err) {
       this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'approve' });
+      // Same self-heal as the PositionModule path: a broadcast-but-unconfirmed
+      // approve may have landed; re-read and, if still short, one bounded re-approve.
+      await this.healApprovalOnce({
+        purpose: 'treasuryModule',
+        target,
+        today,
+        approvalPayloadBase: {
+          purpose: 'treasuryModule',
+          spender: treasuryModule.spender,
+          currentAllowance: currentAllowance.toString(),
+          requiredAggregateAllowance: target.toString(),
+          walletBalanceWei6: walletUsdcWei6.toString(),
+        },
+        readCurrentAllowance: async () =>
+          (await this.adapter.readApprovals(makerAddress)).usdc.allowances.treasuryModule.raw,
+        approve: () => this.adapter.approveCreationFee(target),
+      });
       return;
     }
     const gasPolWei = BigInt(result.receipt.gasUsed) * BigInt(result.receipt.effectiveGasPrice);
@@ -4865,6 +4914,112 @@ export class Runner {
       txHash: result.txHash,
       gasPolWei: gasPolWei.toString(),
     });
+  }
+
+  /**
+   * One bounded self-heal for a boot auto-approve whose tx was broadcast but
+   * whose receipt was never observed (the UNKNOWN case in `broadcastSignedTx` —
+   * a receipt-wait timeout or transport drop; the tx MAY have landed). Called
+   * from the `approve` catch in {@link applyAutoApprovals} /
+   * {@link applyTreasuryAutoApproval}. Re-reads the on-chain allowance:
+   *   - already at/above `target` → the lost tx actually landed; emit `approval`
+   *     with `gasAccountingGap: true` (the landed tx's gas can't be billed — no
+   *     receipt — mirroring the settle/claim recovered-revert convention).
+   *   - still short → do EXACTLY ONE re-approve (never a loop; ≤ 2 approve calls
+   *     total across the whole boot path), then re-read once more: healed → emit
+   *     `approval` `healed: 're-approved'`; still short, or a read/re-approve
+   *     failure → emit `approval-heal-failed` plus a loud stderr WARNING and let
+   *     boot proceed (the first failed match still surfaces the gap).
+   *
+   * No second gas-budget gate here: the caller's initial verdict already
+   * authorized this write, and the thrown approve billed no gas we recorded, so
+   * today's counter is unchanged — a re-check would always return the same
+   * verdict. The re-approve is one retry of that already-authorized write.
+   */
+  private async healApprovalOnce(args: {
+    purpose: 'positionModule' | 'treasuryModule';
+    target: bigint;
+    today: string;
+    approvalPayloadBase: Record<string, unknown>;
+    readCurrentAllowance: () => Promise<bigint>;
+    approve: () => Promise<ApproveResult>;
+  }): Promise<void> {
+    const { purpose, target, today, approvalPayloadBase, readCurrentAllowance, approve } = args;
+
+    let current: bigint;
+    try {
+      current = await readCurrentAllowance();
+    } catch (err) {
+      this.emitApprovalHealFailed(purpose, target, undefined, `allowance re-read failed: ${errMessage(err)}`);
+      return;
+    }
+
+    if (current >= target) {
+      // The broadcast whose receipt we never saw actually landed — nothing to do
+      // but record it. No receipt in hand, so the gas can't be billed (flag the gap).
+      this.eventLog.emit('approval', { ...approvalPayloadBase, gasAccountingGap: true });
+      return;
+    }
+
+    let healResult: ApproveResult;
+    try {
+      healResult = await approve();
+    } catch (err) {
+      this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'approve' });
+      this.emitApprovalHealFailed(purpose, target, current, `re-approve threw: ${errMessage(err)}`);
+      return;
+    }
+
+    const gasPolWei = BigInt(healResult.receipt.gasUsed) * BigInt(healResult.receipt.effectiveGasPrice);
+    this.recordGasSpentToday(today, gasPolWei);
+
+    // Confirm the re-approve took. `approve()` only resolves on a success receipt
+    // (`broadcastSignedTx` throws otherwise), so a failed confirm-read is not
+    // fatal — the receipt is authoritative. Only a definitive still-short read fails.
+    let confirmed: bigint | undefined;
+    try {
+      confirmed = await readCurrentAllowance();
+    } catch {
+      confirmed = undefined;
+    }
+    if (confirmed !== undefined && confirmed < target) {
+      this.emitApprovalHealFailed(purpose, target, confirmed, 'allowance still short after one bounded re-approve');
+      return;
+    }
+    this.eventLog.emit('approval', {
+      ...approvalPayloadBase,
+      amountSetTo: healResult.amount.toString(),
+      txHash: healResult.txHash,
+      gasPolWei: gasPolWei.toString(),
+      healed: 're-approved',
+    });
+  }
+
+  /**
+   * Loud terminal diagnostic when a boot auto-approve exhausts its one bounded
+   * self-heal and the allowance may still be short: a machine `approval-heal-failed`
+   * event PLUS a human stderr WARNING (mirrors {@link warnIfPositionModuleAllowanceShort}).
+   * Boot proceeds — the first failed match still surfaces the gap.
+   */
+  private emitApprovalHealFailed(
+    purpose: 'positionModule' | 'treasuryModule',
+    target: bigint,
+    current: bigint | undefined,
+    detail: string,
+  ): void {
+    const payload: Record<string, unknown> = { purpose, targetWei6: target.toString(), detail };
+    if (current !== undefined) payload.currentAllowanceWei6 = current.toString();
+    this.eventLog.emit('approval-heal-failed', payload);
+    const label = purpose === 'positionModule' ? 'PositionModule' : 'TreasuryModule';
+    const consequence =
+      purpose === 'positionModule'
+        ? 'the first match will REVERT at the USDC pull'
+        : "the first seed's match will REVERT at the TreasuryModule fee pull";
+    this.deps.log(
+      `[runner] WARNING: boot auto-approve for the ${label} USDC allowance failed to self-heal (${detail}). ` +
+        `If the allowance is short, ${consequence}. ` +
+        `Fix: approve it yourself (\`ospex approvals setup\` / \`ospex commitments approve\`) or restart the MM to retry.`,
+    );
   }
 
   /**

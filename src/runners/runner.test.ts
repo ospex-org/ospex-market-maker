@@ -8,6 +8,7 @@ import { inverseOddsTick } from '../pricing/index.js';
 import {
   createLiveOspexAdapter,
   createOspexAdapter,
+  OspexChainError,
   OspexStreamError,
   type Commitment,
   type PublicVisibleCommitment,
@@ -4826,6 +4827,54 @@ describe('Runner — live execution', () => {
     });
   });
 
+  it('TreasuryModule self-heal: approveCreationFee throws + re-read still short + one re-approve succeeds → `approval` healed:\'re-approved\' (treasuryModule), bounded to TWO approveCreationFee calls', async () => {
+    StateStore.at(stateDir).flush(emptyMakerState());
+    const config = withMarkets(cfg({ mode: { dryRun: false }, approvals: { autoApprove: true, mode: 'exact' }, marketSelection: { seedSpeculations: true } }), ['spread']);
+    config.risk.maxDailyFeeUSDC = 5;
+    // A snapshot factory that sets BOTH module allowances (the shared `approvalsSnapshotWith` fixes treasury at 0n).
+    const snap = (pos: bigint, tre: bigint): ApprovalsSnapshot => ({
+      owner: '0xowner' as Hex,
+      chainId: 137,
+      usdc: {
+        address: '0xusdc' as Hex,
+        decimals: 6,
+        allowances: {
+          positionModule: { spender: '0xPositionModule' as Hex, spenderModule: 'positionModule', raw: pos },
+          treasuryModule: { spender: '0xTreasuryModule' as Hex, spenderModule: 'treasuryModule', raw: tre },
+        },
+      },
+    });
+    const calls: Array<bigint | 'max'> = [];
+    const approveCreationFee: OspexAdapter['approveCreationFee'] = (amount) => {
+      calls.push(amount);
+      if (calls.length === 1) return Promise.reject(new OspexChainError('Pre-send chain reads failed (nonce read): rpc down')); // pre-broadcast (no txHash) → settled single-read heal path
+      const receipt = { status: 'success', gasUsed: 50_000n, effectiveGasPrice: 30_000_000_000n } as unknown as ApproveResult['receipt'];
+      const onChainAmount = amount === 'max' ? 2n ** 256n - 1n : amount;
+      return Promise.resolve({ txHash: '0xtreasuryheal', receipt, spender: '0xTreasuryModule' as Hex, token: '0xusdc' as Hex, amount: onChainAmount });
+    };
+    // PositionModule saturated (silent no-op); TreasuryModule short until the confirm read.
+    const readApprovals = vi
+      .fn()
+      .mockResolvedValueOnce(snap(2n ** 255n, 0n)) //           #1 position decision: saturated → no-op
+      .mockResolvedValueOnce(snap(2n ** 255n, 0n)) //           #2 treasury decision: short → attempt approve (throws)
+      .mockResolvedValueOnce(snap(2n ** 255n, 0n)) //           #3 heal re-read: still short → re-approve
+      .mockResolvedValueOnce(snap(2n ** 255n, 100_000_000n)) // #4 confirm read: healed (>= wallet-bounded target)
+      .mockResolvedValue(snap(2n ** 255n, 100_000_000n));
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]),
+      { approveCreationFee },
+      undefined, undefined,
+      { readApprovals, readBalances: (owner: Hex) => Promise.resolve({ owner, chainId: 137, native: 10n ** 18n, usdc: 100_000_000n, usdcAddress: '0xusdc' as Hex }) },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1, makerAddress: DEFAULT_FAKE_MAKER_ADDRESS as Hex }).run();
+    expect(calls).toHaveLength(2); // initial + EXACTLY ONE bounded re-approve
+    const approval = readEvents().find((e) => e.kind === 'approval' && e.purpose === 'treasuryModule');
+    expect(approval).toMatchObject({ purpose: 'treasuryModule', healed: 're-approved', txHash: '0xtreasuryheal' });
+    expect(readEvents().some((e) => e.kind === 'approval-heal-failed')).toBe(false);
+    // the PositionModule path stayed a silent no-op (saturated) — no positionModule approval
+    expect(readEvents().some((e) => e.kind === 'approval' && e.purpose === 'positionModule')).toBe(false);
+  });
+
   it('double-opt-in diagnostic: seeding ON with a ZERO fee budget logs a WARNING at construction; a positive budget does not', () => {
     StateStore.at(stateDir).flush(emptyMakerState());
     const warned: string[] = [];
@@ -6649,6 +6698,36 @@ describe('Runner — boot-time auto-approve (Phase 3 d-i)', () => {
     };
   }
 
+  /** A minimal viem `TransactionReceipt` carrying just the fields the heal reads (status + gas). */
+  const mkReceipt = (status: 'success' | 'reverted') =>
+    ({ status, gasUsed: 50_000n, effectiveGasPrice: 30_000_000_000n }) as unknown as ApproveResult['receipt'];
+
+  /** The four SDK error shapes the shape-aware self-heal branches on (see the SDK `errors.ts` / `broadcastSignedTx`). */
+  const PRE_BROADCAST_ERR = new OspexChainError('Pre-send chain reads failed (nonce read): rpc down'); // no txHash → tx never left
+  const UNKNOWN_ERR = new OspexChainError('broadcast but receipt wait failed', { txHash: '0xpending' }); // txHash, no receipt → may be mining
+  const REVERTED_ERR = new OspexChainError('Transaction reverted on-chain.', { txHash: '0xrev', receipt: mkReceipt('reverted') });
+  const CONFIRMED_ERR = new OspexChainError('confirmed but post-send parse failed', { txHash: '0xok', receipt: mkReceipt('success') });
+
+  /**
+   * An `approveUSDC` stub that THROWS `firstError` on the first call (the self-heal's
+   * trigger) and, on a second call (the heal's one bounded re-approve), either succeeds
+   * or throws again. Records every call so a test can assert the heal never exceeds 2
+   * approve calls.
+   */
+  function approveThrowsThenRecorder(firstError: unknown, secondCall: 'success' | 'throw'): { fn: (amount: ApproveUSDCAmount) => Promise<ApproveResult>; calls: ApproveUSDCAmount[] } {
+    const calls: ApproveUSDCAmount[] = [];
+    return {
+      calls,
+      fn: (amount) => {
+        calls.push(amount);
+        if (calls.length === 1) return Promise.reject(firstError);
+        if (secondCall === 'throw') return Promise.reject(new Error('re-approve also failed'));
+        const onChainAmount = amount === 'max' ? 2n ** 256n - 1n : amount;
+        return Promise.resolve({ txHash: '0xheal', receipt: mkReceipt('success'), spender: '0xPositionModule' as Hex, token: '0xusdc' as Hex, amount: onChainAmount });
+      },
+    };
+  }
+
   it('dry-run skips the auto-approve flow entirely — no readApprovals call, no approveUSDC call, no `approval` event', async () => {
     const readApprovals = vi.fn(() => Promise.resolve(approvalsSnapshotWith(0n)));
     const approve = approveRecorder();
@@ -6795,19 +6874,165 @@ describe('Runner — boot-time auto-approve (Phase 3 d-i)', () => {
     expect(events.some((e) => e.kind === 'approval')).toBe(false);
   });
 
-  it('approveUSDC throws → `error` event phase \'approve\' is logged, the tick continues, no `approval` event', async () => {
+  it('pre-broadcast approve failure (no txHash) + re-read still short + the one re-approve also throws → two `error` phase \'approve\' events + `approval-heal-failed` + stderr WARNING, tick continues, no `approval`, bounded to TWO approve calls', async () => {
+    const approve = approveThrowsThenRecorder(PRE_BROADCAST_ERR, 'throw');
     const config = cfg({ mode: { dryRun: false }, approvals: { autoApprove: true, mode: 'exact' } });
     const adapter = liveSpiedAdapter(
       config, () => Promise.resolve([]),
-      { approveUSDC: () => Promise.reject(new Error('insufficient POL')) },
+      { approveUSDC: approve.fn },
       undefined, undefined,
-      { readApprovals: () => Promise.resolve(approvalsSnapshotWith(0n)) },
+      { readApprovals: () => Promise.resolve(approvalsSnapshotWith(0n)) }, // short on every read → the heal re-approves, then is still short
     );
-    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    const lines: string[] = [];
+    await makeRunner({ config, adapter, maxTicks: 1, deps: { log: (l) => lines.push(l) } }).run();
     const events = readEvents();
-    expect(events.find((e) => e.kind === 'error' && e.phase === 'approve')).toMatchObject({ detail: 'insufficient POL' });
-    expect(events.filter((e) => e.kind === 'tick-start')).toHaveLength(1);
+    expect(approve.calls).toHaveLength(2); // initial + EXACTLY ONE bounded re-approve — never a third
+    expect(events.filter((e) => e.kind === 'error' && e.phase === 'approve')).toHaveLength(2);
+    expect(events.find((e) => e.kind === 'approval-heal-failed')).toMatchObject({ purpose: 'positionModule' });
+    expect(lines.some((l) => /WARNING/.test(l) && /failed to self-heal/.test(l))).toBe(true);
+    expect(events.filter((e) => e.kind === 'tick-start')).toHaveLength(1); // tick still ran
     expect(events.some((e) => e.kind === 'approval')).toBe(false);
+  });
+
+  it('pre-broadcast approve failure (no txHash) but the re-read shows the allowance already at target (a prior/concurrent approve) → single `approval` with gasAccountingGap:true, EXACTLY ONE approveUSDC call', async () => {
+    const approve = approveThrowsThenRecorder(PRE_BROADCAST_ERR, 'success'); // second-call behavior irrelevant — it is never invoked
+    const config = cfg({ mode: { dryRun: false }, approvals: { autoApprove: true, mode: 'exact' } });
+    // Sequenced so the HEAL re-read (not the stale first snapshot) decides — non-vacuity.
+    const readApprovals = vi
+      .fn()
+      .mockResolvedValueOnce(approvalsSnapshotWith(0n)) //          #1 decision read: short → attempt approve
+      .mockResolvedValueOnce(approvalsSnapshotWith(2n ** 255n)) //  #2 heal re-read: already at target
+      .mockResolvedValue(approvalsSnapshotWith(2n ** 255n));
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([]), { approveUSDC: approve.fn }, undefined, undefined, { readApprovals });
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    expect(approve.calls).toHaveLength(1); // NOT re-approved — the re-read proved it landed
+    const approval = readEvents().find((e) => e.kind === 'approval');
+    expect(approval).toMatchObject({ purpose: 'positionModule', gasAccountingGap: true });
+    expect(readEvents().some((e) => e.kind === 'approval-heal-failed')).toBe(false);
+  });
+
+  it('pre-broadcast approve failure (no txHash) + re-read still short + one re-approve succeeds → `approval` healed:\'re-approved\', EXACTLY TWO approveUSDC calls', async () => {
+    const approve = approveThrowsThenRecorder(PRE_BROADCAST_ERR, 'success');
+    const config = cfg({ mode: { dryRun: false }, approvals: { autoApprove: true, mode: 'exact' } });
+    const readApprovals = vi
+      .fn()
+      .mockResolvedValueOnce(approvalsSnapshotWith(0n)) //          #1 decision read: short
+      .mockResolvedValueOnce(approvalsSnapshotWith(0n)) //          #2 heal re-read: still short → re-approve
+      .mockResolvedValueOnce(approvalsSnapshotWith(2n ** 255n)) //  #3 confirm read: healed
+      .mockResolvedValue(approvalsSnapshotWith(2n ** 255n));
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([]), { approveUSDC: approve.fn }, undefined, undefined, { readApprovals });
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    expect(approve.calls).toHaveLength(2);
+    const approval = readEvents().find((e) => e.kind === 'approval');
+    expect(approval).toMatchObject({ purpose: 'positionModule', healed: 're-approved', txHash: '0xheal', gasPolWei: (50_000n * 30_000_000_000n).toString() });
+    expect(readEvents().some((e) => e.kind === 'approval-heal-failed')).toBe(false);
+  });
+
+  it('pre-broadcast approve failure (no txHash) + re-read still short + one re-approve succeeds but the confirm read is STILL short → `approval-heal-failed` (not `approval`), EXACTLY TWO approveUSDC calls', async () => {
+    const approve = approveThrowsThenRecorder(PRE_BROADCAST_ERR, 'success');
+    const config = cfg({ mode: { dryRun: false }, approvals: { autoApprove: true, mode: 'exact' } });
+    const readApprovals = vi
+      .fn()
+      .mockResolvedValueOnce(approvalsSnapshotWith(0n)) // #1 decision read
+      .mockResolvedValueOnce(approvalsSnapshotWith(0n)) // #2 heal re-read → re-approve
+      .mockResolvedValueOnce(approvalsSnapshotWith(0n)) // #3 confirm read: still short
+      .mockResolvedValue(approvalsSnapshotWith(0n));
+    const lines: string[] = [];
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([]), { approveUSDC: approve.fn }, undefined, undefined, { readApprovals });
+    await makeRunner({ config, adapter, maxTicks: 1, deps: { log: (l) => lines.push(l) } }).run();
+    expect(approve.calls).toHaveLength(2);
+    expect(readEvents().find((e) => e.kind === 'approval-heal-failed')).toMatchObject({ purpose: 'positionModule', currentAllowanceWei6: '0' });
+    expect(readEvents().some((e) => e.kind === 'approval')).toBe(false);
+    expect(lines.some((l) => /WARNING/.test(l) && /failed to self-heal/.test(l))).toBe(true);
+  });
+
+  it('UNKNOWN approve failure (txHash, no receipt) + the reconcile poll sees the allowance reach target (the pending tx landed) → single `approval` gasAccountingGap:true + txHash, NO re-approve (EXACTLY ONE approveUSDC call) — a pending tx is reconciled, never double-spent (Hermes PR146 blocker 1)', async () => {
+    const approve = approveThrowsThenRecorder(UNKNOWN_ERR, 'success'); // the second (re-approve) call must NOT happen
+    const config = cfg({ mode: { dryRun: false }, approvals: { autoApprove: true, mode: 'exact' } });
+    // decision short → approve throws UNKNOWN → poll: attempt 0 still pending → attempt 1 landed.
+    const readApprovals = vi
+      .fn()
+      .mockResolvedValueOnce(approvalsSnapshotWith(0n)) //          #1 decision read
+      .mockResolvedValueOnce(approvalsSnapshotWith(0n)) //          #2 poll attempt 0: tx still mining
+      .mockResolvedValueOnce(approvalsSnapshotWith(2n ** 255n)) //  #3 poll attempt 1: pending tx landed
+      .mockResolvedValue(approvalsSnapshotWith(2n ** 255n));
+    const sleeps: number[] = [];
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([]), { approveUSDC: approve.fn }, undefined, undefined, { readApprovals });
+    await makeRunner({ config, adapter, maxTicks: 1, deps: { sleep: (ms: number) => { sleeps.push(ms); return Promise.resolve(); } } }).run();
+    expect(approve.calls).toHaveLength(1); // reconciled, NOT re-approved — a merely-pending tx is never double-spent
+    const approval = readEvents().find((e) => e.kind === 'approval');
+    expect(approval).toMatchObject({ purpose: 'positionModule', gasAccountingGap: true, txHash: '0xpending' });
+    expect(approval?.amountSetTo).toBeUndefined(); // no re-approve → no amountSetTo
+    expect(readEvents().some((e) => e.kind === 'approval-heal-failed')).toBe(false);
+    expect(sleeps).toContain(5000); // it reconciled via the bounded allowance poll (not a blind immediate re-approve)
+  });
+
+  it('UNKNOWN approve failure (txHash, no receipt) + the reconcile poll stays short through the window (the tx dropped) → one bounded re-approve → `approval` healed:\'re-approved\', EXACTLY TWO approveUSDC calls, and the poll ran the full window before concluding "dropped"', async () => {
+    const approve = approveThrowsThenRecorder(UNKNOWN_ERR, 'success');
+    const config = cfg({ mode: { dryRun: false }, approvals: { autoApprove: true, mode: 'exact' } });
+    // Short on every read until the SECOND approve (the re-approve) lands — so the whole poll window sees short, then the confirm read sees target.
+    const readApprovals = vi.fn(() => Promise.resolve(approvalsSnapshotWith(approve.calls.length >= 2 ? 2n ** 255n : 0n)));
+    const sleeps: number[] = [];
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([]), { approveUSDC: approve.fn }, undefined, undefined, { readApprovals });
+    await makeRunner({ config, adapter, maxTicks: 1, deps: { sleep: (ms: number) => { sleeps.push(ms); return Promise.resolve(); } } }).run();
+    expect(approve.calls).toHaveLength(2); // dropped → exactly one bounded re-approve
+    expect(readEvents().find((e) => e.kind === 'approval')).toMatchObject({ purpose: 'positionModule', healed: 're-approved' });
+    expect(readEvents().some((e) => e.kind === 'approval-heal-failed')).toBe(false);
+    // 6 poll attempts → 5 inter-attempt 5000ms sleeps: the reconcile ran the full window before re-approving.
+    expect(sleeps.filter((s) => s === 5000)).toHaveLength(5);
+  });
+
+  it('UNKNOWN approve failure (txHash, no receipt) + EVERY reconcile allowance read fails → INCONCLUSIVE: `approval-heal-failed` + stderr WARNING, EXACTLY ONE approveUSDC call (never re-approves a possibly-still-pending tx, per Hermes PR146 re-review)', async () => {
+    const approve = approveThrowsThenRecorder(UNKNOWN_ERR, 'success'); // the second (re-approve) call must NOT happen
+    const config = cfg({ mode: { dryRun: false }, approvals: { autoApprove: true, mode: 'exact' } });
+    // The DECISION read (before any approve) succeeds short; EVERY read during the
+    // reconcile poll rejects → the on-chain allowance is NEVER observed → inconclusive,
+    // NOT "definitively short". A blind re-approve here could double-spend the pending tx.
+    const readApprovals = vi.fn(() =>
+      approve.calls.length === 0
+        ? Promise.resolve(approvalsSnapshotWith(0n)) // decision read: short → attempt approve
+        : Promise.reject(new Error('rpc 503')), // every reconcile read fails
+    );
+    const sleeps: number[] = [];
+    const lines: string[] = [];
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([]), { approveUSDC: approve.fn }, undefined, undefined, { readApprovals });
+    await makeRunner({ config, adapter, maxTicks: 1, deps: { sleep: (ms: number) => { sleeps.push(ms); return Promise.resolve(); }, log: (l) => lines.push(l) } }).run();
+    expect(approve.calls).toHaveLength(1); // NOT re-approved — the pending tx's fate is unknown, so it fails closed
+    expect(readEvents().find((e) => e.kind === 'approval-heal-failed')).toMatchObject({ purpose: 'positionModule' });
+    expect(readEvents().some((e) => e.kind === 'approval')).toBe(false);
+    expect(lines.some((l) => /WARNING/.test(l) && /failed to self-heal/.test(l))).toBe(true);
+    expect(sleeps).toContain(5000); // it DID run the reconcile poll (didn't blindly re-approve on an unread allowance)
+  });
+
+  it('reverted approve (receipt.status reverted) debits the reverted tx\'s gas before the retry, and if that pushes today\'s spend over budget the re-verdict BLOCKS the re-approve → `candidate` gas-budget-blocks-reapproval + `approval-heal-failed`, EXACTLY ONE approveUSDC call (proves the reverted gas was accounted, per Hermes PR146 blocker 1)', async () => {
+    const approve = approveThrowsThenRecorder(REVERTED_ERR, 'success'); // the reverted first call spent 50000 * 30gwei = 0.0015 POL
+    const config = cfg({ mode: { dryRun: false }, approvals: { autoApprove: true, mode: 'exact' } });
+    // Headroom = maxDaily - reserve = 0.001 POL. The initial verdict passes (0 spent), but after debiting the
+    // reverted 0.0015 POL the re-verdict is denied — so WITHOUT the debit the heal would re-approve (2 calls); WITH it, it blocks (1 call).
+    config.gas.emergencyReservePOL = 0.2;
+    config.gas.maxDailyGasPOL = 0.201;
+    const readApprovals = vi.fn(() => Promise.resolve(approvalsSnapshotWith(0n)));
+    const lines: string[] = [];
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([]), { approveUSDC: approve.fn }, undefined, undefined, { readApprovals });
+    await makeRunner({ config, adapter, maxTicks: 1, deps: { log: (l) => lines.push(l) } }).run();
+    expect(approve.calls).toHaveLength(1); // the reverted-gas debit tightened the budget → re-verdict blocked the retry (no double approve)
+    expect(readEvents().find((e) => e.kind === 'candidate' && e.skipReason === 'gas-budget-blocks-reapproval')).toMatchObject({ purpose: 'positionModule-approve' });
+    expect(readEvents().find((e) => e.kind === 'approval-heal-failed')).toMatchObject({ purpose: 'positionModule' });
+    expect(readEvents().some((e) => e.kind === 'approval')).toBe(false);
+    expect(lines.some((l) => /WARNING/.test(l) && /failed to self-heal/.test(l))).toBe(true);
+  });
+
+  it('confirmed-with-receipt approve failure (receipt.status success — a post-send step threw) → the tx landed and its gas IS billable → `approval` healed:\'landed\' + gasPolWei + txHash, NO re-approve (EXACTLY ONE approveUSDC call)', async () => {
+    const approve = approveThrowsThenRecorder(CONFIRMED_ERR, 'success');
+    const config = cfg({ mode: { dryRun: false }, approvals: { autoApprove: true, mode: 'exact' } });
+    const readApprovals = vi.fn(() => Promise.resolve(approvalsSnapshotWith(0n)));
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([]), { approveUSDC: approve.fn }, undefined, undefined, { readApprovals });
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+    expect(approve.calls).toHaveLength(1); // the tx confirmed — no retry
+    const approval = readEvents().find((e) => e.kind === 'approval');
+    expect(approval).toMatchObject({ purpose: 'positionModule', healed: 'landed', txHash: '0xok', gasPolWei: (50_000n * 30_000_000_000n).toString() });
+    expect(approval?.amountSetTo).toBeUndefined(); // no re-approve was sent → no amountSetTo
+    expect(readEvents().some((e) => e.kind === 'approval-heal-failed')).toBe(false);
   });
 
   it('live + autoApprove=true + boot-time state-loss hold ACTIVE → auto-approve is deferred (no readApprovals, no approveUSDC) — raising the allowance would risk re-activating latent soft-cancelled commitments (Hermes review-PR25 §1)', async () => {

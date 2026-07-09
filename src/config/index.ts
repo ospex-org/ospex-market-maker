@@ -430,6 +430,18 @@ export function parseConfig(raw: unknown, env: EnvLike = {}): Config {
     replaceOnLineMoveTicks: def(ord.replaceOnLineMoveTicks, 0, (v) => asNonNegativeInt(v, 'orders.replaceOnLineMoveTicks')),
     cancelMode: def<CancelMode>(ord.cancelMode, 'offchain', (v) => asEnum(v, 'orders.cancelMode', CANCEL_MODES)),
   };
+  // Cross-field invariant (fixed-seconds expiry only): a quote is rolled forward once it ages
+  // past `staleAfterSeconds`, and it must outlive that age to be refreshed before it expires —
+  // otherwise it lapses on chain before the replacement posts, leaving a gap in visible
+  // liquidity. So `staleAfterSeconds` must be strictly less than `expirySeconds`. Under
+  // `match-time` expiry the quote lifetime is the game start (`expirySeconds` is then only the
+  // pre-game cutoff window, not the quote's lifetime), so the relationship doesn't apply.
+  if (orders.expiryMode === 'fixed-seconds' && orders.staleAfterSeconds >= orders.expirySeconds) {
+    fail(
+      'orders.staleAfterSeconds',
+      `(${orders.staleAfterSeconds}) must be less than \`orders.expirySeconds\` (${orders.expirySeconds}) under \`expiryMode: fixed-seconds\` — a quote is rolled forward once it ages past \`staleAfterSeconds\`, so it must outlive that to be refreshed before it expires; otherwise it lapses on chain and leaves a gap in visible liquidity`,
+    );
+  }
 
   const fg = section(root, 'fundingGuard', FUNDING_GUARD_KEYS);
   const fundingGuard: FundingGuardConfig = {

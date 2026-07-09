@@ -1107,6 +1107,13 @@ export function summarize(logPaths: readonly string[], opts: { sinceIso?: string
         addGas('onchainCancel', readGas(p.gasPolWei));
         break;
       }
+      case 'nonce-floor-raise': {
+        // The `bulk-nonce` authoritative-cancel path (one `raiseMinNonce` per speculation) spends
+        // gas for the same purpose as a per-record `onchain-cancel`, so its gas folds into the same
+        // `onchainCancel` bucket — the summary's per-kind gas breakdown stays a stable 4-key contract.
+        addGas('onchainCancel', readGas(p.gasPolWei));
+        break;
+      }
       case 'settle': {
         settleCount += 1;
         addGas('settle', readGas(p.gasPolWei));

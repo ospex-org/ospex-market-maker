@@ -102,7 +102,7 @@
  */
 
 import type { Config } from '../config/index.js';
-import { isExpiredForRelease } from '../orders/index.js';
+import { isExpiredForRelease, planNonceInvalidation } from '../orders/index.js';
 import {
   createLiveOspexAdapter,
   readKeystoreAddress,
@@ -511,7 +511,89 @@ async function runCancelStaleLocked(opts: CancelStaleOpts, deps: CancelStaleDeps
     // `totalGasPolWei` + the gas-budget consts are hoisted above (Hermes #63
     // pre-pass needed them too) — share between pre-pass and this regular pass.
 
-    for (const r of stale) {
+    // ── bulk-nonce leg (`orders.onchainCancelStrategy: bulk-nonce`, opt-in) ──
+    // Collapse same-speculation stale cancels into one `MatchingModule.raiseMinNonce`.
+    // `--authoritative` is operator-explicit → `mayUseReserve: true`. Under the
+    // `per-commitment` default the planner returns every stale record in `perCommitment`,
+    // so the per-record loop below is byte-identical to before. A group whose keep-alive
+    // (a non-stale commitment on the same speculation) would be caught by the raise, or that
+    // carries an unknown-nonce record, falls back to per-record automatically.
+    const plan = planNonceInvalidation(stale, Object.values(state.commitments), opts.config.orders.onchainCancelStrategy, wallNow);
+    let bulkGasDenied = false;
+    for (const group of plan.bulk) {
+      const contestId = BigInt(group.contestId);
+      const scorer = group.scorer as Hex;
+      const today = todayUTCDateString(wallNow);
+      let floor: bigint;
+      try {
+        floor = await adapter.readMinNonceFloor({ maker: makerAddress as Hex, contestId, scorer, lineTicks: group.lineTicks });
+      } catch (err) {
+        report.errored += 1;
+        eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'onchain-cancel', contestId: group.contestId });
+        continue;
+      }
+      const emitRaise = (extra: Record<string, unknown>): void => {
+        eventLog.emit('nonce-floor-raise', {
+          contestId: group.contestId,
+          speculationId: group.records[0]?.speculationId,
+          scorer: group.scorer,
+          lineTicks: group.lineTicks,
+          newMinNonce: group.newMinNonce.toString(),
+          onchainFloor: floor.toString(),
+          invalidatedCount: group.records.length,
+          ...extra,
+        });
+      };
+      const terminalize = (): void => {
+        for (const r of group.records) {
+          r.lifecycle = 'authoritativelyInvalidated';
+          r.updatedAtUnixSec = wallNow;
+          report.onchainCancelled += 1;
+        }
+      };
+      // Already invalidated by an earlier raise (every target nonce < newMinNonce <= floor): no tx.
+      if (group.newMinNonce <= floor) {
+        terminalize();
+        emitRaise({ alreadyAtFloor: true });
+        continue;
+      }
+      const todayGasSpentPolWei = BigInt(state.dailyCounters[today]?.gasPolWei ?? '0');
+      const verdict = canSpendGas({ todayGasSpentPolWei, maxDailyGasPolWei, emergencyReservePolWei, mayUseReserve: true });
+      if (!verdict.allowed) {
+        report.gasDenied += 1;
+        eventLog.emit('candidate', {
+          skipReason: 'gas-budget-blocks-onchain-cancel',
+          speculationId: group.records[0]?.speculationId,
+          contestId: group.contestId,
+          makerSide: group.records[0]?.makerSide,
+          todayGasSpentPolWei: todayGasSpentPolWei.toString(),
+          maxDailyGasPolWei: maxDailyGasPolWei.toString(),
+          emergencyReservePolWei: emergencyReservePolWei.toString(),
+          detail: verdict.reason,
+        });
+        bulkGasDenied = true;
+        break; // subsequent raises would deny the same way; operator tops up POL and re-runs
+      }
+      let raiseResult: Awaited<ReturnType<OspexAdapter['raiseMinNonce']>>;
+      try {
+        raiseResult = await adapter.raiseMinNonce({ contestId, scorer, lineTicks: group.lineTicks, newMinNonce: group.newMinNonce });
+      } catch (err) {
+        report.errored += 1;
+        eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'onchain-cancel', contestId: group.contestId });
+        continue;
+      }
+      const gasPolWei = BigInt(raiseResult.receipt.gasUsed) * BigInt(raiseResult.receipt.effectiveGasPrice);
+      recordGasSpentToday(state, today, gasPolWei);
+      totalGasPolWei += gasPolWei;
+      terminalize();
+      emitRaise({ txHash: raiseResult.txHash, gasPolWei: gasPolWei.toString() });
+    }
+
+    // ── per-record leg ──────────────────────────────────────────────────────
+    // The bulk-ineligible remainder (every stale record under `per-commitment`). Skipped after a
+    // gas-denied bulk pass — a per-record cancel would deny identically.
+    const perRecord = bulkGasDenied ? [] : plan.perCommitment;
+    for (const r of perRecord) {
       // Skip already-authoritatively-cancelled records (paranoia — only
       // possible via state edits while we run; the stale filter above only
       // admits `visibleOpen` / `softCancelled` / `partiallyFilled`).

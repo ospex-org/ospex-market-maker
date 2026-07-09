@@ -30,7 +30,7 @@
  * `would-soft-cancel` and mutates the persisted (hypothetical) inventory instead.
  */
 
-import type { Config } from '../config/index.js';
+import type { Config, OnchainCancelStrategy } from '../config/index.js';
 import {
   americanToDecimal,
   computeQuote,
@@ -620,6 +620,133 @@ export function reconcileBook(
 
 function newestFirst(a: MakerCommitmentRecord, b: MakerCommitmentRecord): number {
   return b.postedAtUnixSec - a.postedAtUnixSec;
+}
+
+// ── nonce-invalidation planning (bulk-nonce authoritative cancel) ──────────────
+
+/** The `(contestId, scorer, lineTicks)` key `MatchingModule.raiseMinNonce` invalidates against — BOTH maker sides of the line at once (it excludes `positionType` / `oddsTick`). */
+export interface NonceInvalidationKey {
+  contestId: string;
+  scorer: string;
+  lineTicks: number;
+}
+
+/** One speculation's worth of the maker's commitments to invalidate with a single `raiseMinNonce`. */
+export interface NonceInvalidationGroup extends NonceInvalidationKey {
+  /** The target records this raise invalidates (every one has a locally-known nonce — the eligibility gate below guarantees it). */
+  records: MakerCommitmentRecord[];
+  /**
+   * The floor to raise to: `max(target nonce) + 1`, so every target (nonce ≤ max) ends up below
+   * it and thus unmatchable. Derived from local state; the executor still reads the ON-CHAIN
+   * floor before sending — to assert a strict increase (`raiseMinNonce` reverts otherwise) and to
+   * detect targets already below an existing floor (no tx needed). uint256.
+   */
+  newMinNonce: bigint;
+}
+
+/** Split of an authoritative-cancel target set into single-tx `raiseMinNonce` groups + a per-commitment fallback (`bulk` is always empty under `per-commitment`). */
+export interface NonceInvalidationPlan {
+  bulk: NonceInvalidationGroup[];
+  perCommitment: MakerCommitmentRecord[];
+}
+
+/** The commitment's EIP-712 nonce, or `null` when not locally known (a `missing-legacy` signed-payload record — dry-run synthetic or a pre-M6/A state file). */
+export function commitmentNonce(record: MakerCommitmentRecord): bigint | null {
+  if (record.signedPayloadStatus !== 'present' || record.signedPayload === undefined) return null;
+  return BigInt(record.signedPayload.commitment.nonce);
+}
+
+/** Space-delimited `(contestId, scorer, lineTicks)` group key — scorer lower-cased (the on-chain key hashes the raw address bytes, case-insensitive). None of the three fields (decimal string / 0x-hex / integer) contains a space, so the delimiter is unambiguous. */
+function nonceGroupKey(r: NonceInvalidationKey): string {
+  return `${r.contestId} ${r.scorer.toLowerCase()} ${r.lineTicks}`;
+}
+
+/** Is a commitment still matchable on chain right now — a candidate cancel target or a keeper the raise must not burn? Non-terminal lifecycle AND not past its strict on-chain expiry. */
+function isStillMatchable(record: MakerCommitmentRecord, nowUnixSec: number): boolean {
+  if (record.lifecycle === 'filled' || record.lifecycle === 'expired' || record.lifecycle === 'authoritativelyInvalidated') return false;
+  return record.expiryUnixSec > nowUnixSec;
+}
+
+/**
+ * Plan how to authoritatively invalidate `targets` on chain under `strategy` — the shared
+ * decision behind the `bulk-nonce` option (DESIGN §7). `per-commitment` (the default) is a
+ * pass-through: every target goes to `perCommitment` and `bulk` is empty, so callers keep their
+ * existing one-`cancelCommitment`-per-record loop unchanged.
+ *
+ * Under `bulk-nonce`, targets are grouped by their `raiseMinNonce` speculation key
+ * `(contestId, scorer, lineTicks)` — which invalidates BOTH sides of the line at once. A group is
+ * emitted as a single-tx `bulk` entry ONLY when it is provably safe:
+ *
+ *   1. **Every target has a locally-known nonce** ({@link commitmentNonce}). `raiseMinNonce` picks
+ *      `newMinNonce = max(target nonce) + 1`; a `missing-legacy` target has no local nonce, so a
+ *      floor computed without it could sit below that target and leave it matchable — the whole
+ *      group falls back to per-commitment instead.
+ *   2. **No keeper is caught by the raise.** A keeper is any of the maker's OTHER still-matchable
+ *      commitments on the same speculation (not in the target set). If any keeper has `nonce <
+ *      newMinNonce` — or an unknown nonce we can't prove is safe — the raise would burn it, so the
+ *      group falls back to per-commitment. (For a "cancel everything on the speculation" sweep
+ *      there are no keepers, so this is trivially satisfied; it only bites the age-scoped
+ *      `cancel-stale` path and the like.)
+ *
+ * `allCommitments` is the maker's full commitment set (`state.commitments` values) — the keeper
+ * scan reads it. Pure: no state mutation, no chain read; the executor reads the on-chain floor and
+ * sends the tx.
+ */
+export function planNonceInvalidation(
+  targets: readonly MakerCommitmentRecord[],
+  allCommitments: Iterable<MakerCommitmentRecord>,
+  strategy: OnchainCancelStrategy,
+  nowUnixSec: number,
+): NonceInvalidationPlan {
+  if (strategy !== 'bulk-nonce' || targets.length === 0) {
+    return { bulk: [], perCommitment: [...targets] };
+  }
+
+  // Group targets by the raiseMinNonce speculation key.
+  const groups = new Map<string, { key: NonceInvalidationKey; records: MakerCommitmentRecord[] }>();
+  for (const r of targets) {
+    const gk = nonceGroupKey(r);
+    const g = groups.get(gk);
+    if (g === undefined) groups.set(gk, { key: { contestId: r.contestId, scorer: r.scorer, lineTicks: r.lineTicks }, records: [r] });
+    else g.records.push(r);
+  }
+
+  // Index the maker's still-matchable commitments by the same key, to find keepers per group.
+  const matchableByKey = new Map<string, MakerCommitmentRecord[]>();
+  for (const r of allCommitments) {
+    if (!isStillMatchable(r, nowUnixSec)) continue;
+    const gk = nonceGroupKey(r);
+    const arr = matchableByKey.get(gk);
+    if (arr === undefined) matchableByKey.set(gk, [r]);
+    else arr.push(r);
+  }
+
+  const bulk: NonceInvalidationGroup[] = [];
+  const perCommitment: MakerCommitmentRecord[] = [];
+  for (const [gk, g] of groups) {
+    // (1) every target must have a known nonce.
+    const nonces = g.records.map(commitmentNonce);
+    if (nonces.some((n) => n === null)) {
+      perCommitment.push(...g.records);
+      continue;
+    }
+    const newMinNonce = (nonces as bigint[]).reduce((max, n) => (n > max ? n : max)) + 1n;
+
+    // (2) no keeper (a still-matchable record on this spec not in the target set) may be caught.
+    const targetHashes = new Set(g.records.map((r) => r.hash));
+    const keepers = (matchableByKey.get(gk) ?? []).filter((r) => !targetHashes.has(r.hash));
+    const keeperCaught = keepers.some((kp) => {
+      const n = commitmentNonce(kp);
+      return n === null || n < newMinNonce; // unknown → can't prove safe; below the floor → would be burned
+    });
+    if (keeperCaught) {
+      perCommitment.push(...g.records);
+      continue;
+    }
+
+    bulk.push({ ...g.key, records: g.records, newMinNonce });
+  }
+  return { bulk, perCommitment };
 }
 
 /** Have the odds moved more than `thresholdBps` basis points (of implied probability) from `fromTick` to `toTick`? Both are protocol *maker* ticks — the caller converts a taker-facing quote tick via `inverseOddsTick` before passing it here, so the comparison is apples-to-apples. */

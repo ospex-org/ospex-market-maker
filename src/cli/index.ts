@@ -15,7 +15,8 @@
  * `status` (read-only state snapshot + optional live `positions.status(maker)`
  * totals), and `summary` (the NDJSON-log aggregator). The full command surface
  * is now wired; the remaining Phase-3 work is the live-mode `summary` metrics
- * + P&L and the `raiseMinNonce` bulk-invalidate optimization (see DESIGN §14).
+ * + P&L. The `raiseMinNonce` bulk-invalidate path has shipped (DESIGN §7) —
+ * opt-in via `orders.onchainCancelStrategy: bulk-nonce`.
  *
  * CLI conventions (mirroring the SDK's AGENT_CONTRACT):
  *   - `--json` prints a `{ schemaVersion: N, … }` envelope on stdout (N is 1 for

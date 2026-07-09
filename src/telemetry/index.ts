@@ -108,7 +108,7 @@ export const CANDIDATE_SKIP_REASONS = [
   'tracking-cap-reached',
   'gas-budget-blocks-reapproval',
   'gas-budget-blocks-settlement', // on-chain settleSpeculation / claimPosition denied by canSpendGas (mayUseReserve = settlement.continueOnGasBudgetExhausted); `purpose` distinguishes `settleSpeculation` vs `claimPosition`
-  'gas-budget-blocks-onchain-cancel', // on-chain cancelCommitment denied by canSpendGas. Two emit shapes: the automatic, reserve-preserving cancels (mayUseReserve: false, carry `contestId` — all via `onchainCancelCommitment`: the routine `cancelMode: onchain` partial-remainder / recovered-soft-cancel, the funding-guard `underfundedCancelMode: onchain` sweep, and the §5.1 own-state-health active cancel-sweep) vs the operator-explicit shutdown kill / cancel-stale --authoritative paths (mayUseReserve: true, no `contestId`); the candidate's `commitmentHash` identifies the record that couldn't be cancelled
+  'gas-budget-blocks-onchain-cancel', // an authoritative on-chain invalidation denied by canSpendGas — either a per-record `cancelCommitment` (candidate carries `commitmentHash`) or, under `orders.onchainCancelStrategy: bulk-nonce`, a per-speculation `raiseMinNonce` (candidate carries `speculationId`, no `commitmentHash`). Producers: the reserve-preserving automatic paths (`mayUseReserve: false` — the routine `cancelMode: onchain` partial-remainder / recovered-soft-cancel [always per-record via `onchainCancelCommitment`], the funding-guard `underfundedCancelMode: onchain` sweep, and the §5.1 own-state-health active cancel-sweep) and the operator-explicit shutdown kill / `cancel-stale --authoritative` paths (`mayUseReserve: true`). NOTE: `contestId` is present on the automatic per-record paths AND on ANY `bulk-nonce` denial (grouped by speculation, incl. the operator-explicit paths), so it no longer discriminates automatic vs operator-explicit — use `mayUseReserve` for that
   'fee-budget-exhausted', //           a SEED market reached the per-market reconcile post gate but `canSpendFee` refused — the daily creation-fee budget (`risk.maxDailyFeeUSDC`) is exhausted or disabled (the default `0`, so seeding with no fee budget refuses every seed here — the second opt-in). The fee lands at the seed's first match, not at post, so the per-side check is a conservative soft gate. Carries `contestId` + the `market` tag (spread/total; omitted for moneyline).
   'partial-remainder-retained', //     a `partiallyFilled` remainder left in place (never off-chain-cancelled, never reposted over): it occupies its maker side until expiry / authoritative on-chain cancel. Carries `commitmentHash` / `contestId` / `speculationId` / `makerSide` / `takerSide` and a `reason` (`side-not-quoted` / `stale` / `mispriced` / `duplicate` / `shutdown`)
   'already-settled', //                ensureSpeculationSettled found the speculation already settled (pre-flight) or recovered from a concurrent settle — a boring skip, not an error. Emitted by the auto-settle path with `purpose: 'settleSpeculation'`; `outcome` distinguishes `alreadySettled` vs `recovered`. A `recovered` race that broadcast a settle which reverted on inclusion DID spend gas: `revertedTxHash` + `gasPolWei` are present and that gas IS billed (state daily counter + the run summary under `settle`); if the reverted receipt couldn't be fetched, `gasAccountingGap: true` flags the gap. `alreadySettled` / pre-send recovery send no tx → no gas, no faked txHash.
@@ -506,7 +506,7 @@ export function listRunLogs(logDir: string): string[] {
  * candidate-skip and error histograms) are fully computed; the **live-mode**
  * ones (fill rate, gas, fees, settlement outcomes, realized P&L — DESIGN §2.3)
  * are also computed by the live-event walk (`submit` / `replace` / `fill` /
- * `settle` / `claim` / `approval` / `onchain-cancel`) and exposed on
+ * `settle` / `claim` / `approval` / `onchain-cancel` / `nonce-floor-raise`) and exposed on
  * {@link RunSummary.liveMetrics}; only unrealized P&L over still-active
  * positions remains as a Phase-3 follow-up.
  *
@@ -566,7 +566,7 @@ export interface RunSummary {
    * Live-mode metrics — fill rate / gas / fees / settlement outcomes /
    * realized P&L (DESIGN §2.3, §11). Always populated, but zero-valued under
    * a pure dry-run log (the live events — `submit` / `replace` / `fill` /
-   * `settle` / `claim` / `approval` / `onchain-cancel` — only get emitted
+   * `settle` / `claim` / `approval` / `onchain-cancel` / `nonce-floor-raise` — only get emitted
    * in live mode). Unrealized P&L over still-active positions lands in a
    * later Phase-3 slice (requires `summarize` to accept an `OspexAdapter`).
    */
@@ -580,7 +580,7 @@ export interface RunSummary {
 export interface LiveGasByKind {
   /** Boot-time `PositionModule` USDC allowance bumps — `approval` events. */
   approval: string;
-  /** `cancelCommitmentOnchain` — `onchain-cancel` events (the routine `cancelMode: onchain` partial-remainder cancel, the funding-guard `underfundedCancelMode: onchain` sweep, the §5.1 own-state-health active cancel-sweep, the shutdown kill, or `cancel-stale --authoritative`). */
+  /** Authoritative on-chain cancellation gas — `onchain-cancel` events (per-record `cancelCommitmentOnchain`) AND `nonce-floor-raise` events (the `orders.onchainCancelStrategy: bulk-nonce` `raiseMinNonce` path folds its gas into this same bucket). Producers: the routine `cancelMode: onchain` partial-remainder cancel (always per-record), the funding-guard `underfundedCancelMode: onchain` sweep, the §5.1 own-state-health active cancel-sweep, the shutdown kill, and `cancel-stale --authoritative`. */
   onchainCancel: string;
   /** Auto-settle's `settleSpeculation` calls — `settle` events. */
   settle: string;
@@ -659,7 +659,7 @@ export interface RealizedPnl extends RealizedPnlAmounts {
 /**
  * Live-mode run metrics (DESIGN §2.3 / §11). The fill / settlement / gas /
  * fees / realized-P&L aggregators populated by the `submit` / `replace` /
- * `fill` / `settle` / `claim` / `approval` / `onchain-cancel` walk. Wei
+ * `fill` / `settle` / `claim` / `approval` / `onchain-cancel` / `nonce-floor-raise` walk. Wei
  * amounts are decimal strings — the AGENT_CONTRACT numeric rule.
  */
 export interface LiveMetrics {
@@ -867,8 +867,8 @@ export function summarize(logPaths: readonly string[], opts: { sinceIso?: string
   // Live-mode metric accumulators (DESIGN §2.3 / §11). `submit` + `replace`
   // contribute to `quotedUsdcWei6` (USDC the maker committed); `fill` events
   // contribute to `filledUsdcWei6`. The on-chain ops (`approval` /
-  // `onchain-cancel` / `settle` / `claim`) sum `gasPolWei` into the per-kind
-  // gas attribution. `settle` / `claim` contribute to the settlement counts;
+  // `onchain-cancel` / `nonce-floor-raise` / `settle` / `claim`) sum `gasPolWei` into the per-kind
+  // gas attribution (`nonce-floor-raise` folds into the `onchainCancel` bucket). `settle` / `claim` contribute to the settlement counts;
   // `claim.payoutWei6` sums into `totalClaimedPayoutWei6`. All zero under a
   // pure dry-run log (those events don't get emitted).
   let quotedWei6 = 0n;
@@ -1107,6 +1107,13 @@ export function summarize(logPaths: readonly string[], opts: { sinceIso?: string
         addGas('onchainCancel', readGas(p.gasPolWei));
         break;
       }
+      case 'nonce-floor-raise': {
+        // The `bulk-nonce` authoritative-cancel path (one `raiseMinNonce` per speculation) spends
+        // gas for the same purpose as a per-record `onchain-cancel`, so its gas folds into the same
+        // `onchainCancel` bucket — the summary's per-kind gas breakdown stays a stable 4-key contract.
+        addGas('onchainCancel', readGas(p.gasPolWei));
+        break;
+      }
       case 'settle': {
         settleCount += 1;
         addGas('settle', readGas(p.gasPolWei));
@@ -1143,7 +1150,7 @@ export function summarize(logPaths: readonly string[], opts: { sinceIso?: string
         break;
       }
       default:
-        break; // `fair-value` / `risk-verdict` / `soft-cancel` / `nonce-floor-raise` / `position-transition` — counted in `eventCounts` only (no derived metric here in g-i)
+        break; // `fair-value` / `risk-verdict` / `soft-cancel` / `position-transition` — counted in `eventCounts` only (no derived metric here in g-i). (`nonce-floor-raise` has its own case above — its gas folds into the `onchainCancel` bucket.)
     }
   }
 

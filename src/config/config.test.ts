@@ -40,6 +40,7 @@ describe('parseConfig', () => {
     expect(c.orders.expiryReleaseGraceSeconds).toBe(60);
     expect(c.orders.replaceOnLineMoveTicks).toBe(0); // follow every oracle line move by default (no debounce)
     expect(c.orders.cancelMode).toBe('offchain');
+    expect(c.orders.onchainCancelStrategy).toBe('per-commitment'); // default: unchanged per-commitment behaviour
     expect(c.fundingGuard.enabled).toBe(true);
     expect(c.fundingGuard.checkIntervalMs).toBe(30_000);
     expect(c.fundingGuard.underfundedCancelMode).toBe('offchain');
@@ -140,6 +141,9 @@ describe('parseConfig', () => {
     expect(() => parseConfig({ rpcUrl: 'x', orders: { replaceOnLineMoveTicks: -1 } }, {})).toThrow(/replaceOnLineMoveTicks/);
     expect(() => parseConfig({ rpcUrl: 'x', orders: { replaceOnLineMoveTicks: 2.5 } }, {})).toThrow(/replaceOnLineMoveTicks/);
     expect(parseConfig({ rpcUrl: 'x', orders: { replaceOnLineMoveTicks: 5 } }, {}).orders.replaceOnLineMoveTicks).toBe(5);
+    // orders.onchainCancelStrategy — a known enum; a bad value is rejected, a good one parses.
+    expect(() => parseConfig({ rpcUrl: 'x', orders: { onchainCancelStrategy: 'whatever' } }, {})).toThrow(/onchainCancelStrategy/);
+    expect(parseConfig({ rpcUrl: 'x', orders: { onchainCancelStrategy: 'bulk-nonce' } }, {}).orders.onchainCancelStrategy).toBe('bulk-nonce');
   });
 
   it('orders: rejects staleAfterSeconds >= expirySeconds under fixed-seconds expiry (a quote would lapse before refresh); exempt under match-time', () => {

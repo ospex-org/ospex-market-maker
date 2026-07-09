@@ -4,7 +4,7 @@ import { parseConfig, type Config } from '../config/index.js';
 import { decimalToAmerican, decimalToImpliedProb, tickToDecimal, toProtocolQuote, type QuoteSide } from '../pricing/index.js';
 import { contestWorstCaseUSDC, type ExposureItem, type Inventory, type Market } from '../risk/index.js';
 import { emptyMakerState, type MakerCommitmentRecord, type MakerPositionRecord, type MakerState } from '../state/index.js';
-import { breakdownReferenceOdds, buildDesiredQuote, inventoryFromState, isExpiredForRelease, matchableCommitmentRiskWei6, reconcileBook, toRiskCaps, type BookReconciliation, type DesiredQuote, type ReferenceOdds } from './index.js';
+import { breakdownReferenceOdds, buildDesiredQuote, commitmentNonce, inventoryFromState, isExpiredForRelease, matchableCommitmentRiskWei6, planNonceInvalidation, reconcileBook, toRiskCaps, type BookReconciliation, type DesiredQuote, type ReferenceOdds } from './index.js';
 
 const cfg = (overrides: Record<string, unknown> = {}): Config => parseConfig({ rpcUrl: 'http://localhost:8545', ...overrides });
 
@@ -665,5 +665,110 @@ describe('reconcileBook', () => {
     expect(r.toReplace).toEqual([{ stale: staleAway, reason: 'stale', replacement: replAway }]);
     expect(r.toSubmit).toEqual([]);
     expect(r.deferredSides).toEqual(['home']);
+  });
+});
+
+// ── planNonceInvalidation (bulk-nonce authoritative cancel) ────────────────────
+
+/** A record with a captured signed payload carrying `nonce` (so `commitmentNonce` returns it). */
+function withNonce(nonce: string, overrides: Partial<MakerCommitmentRecord> = {}): MakerCommitmentRecord {
+  const base = commitmentRecord({ signedPayloadStatus: 'present', ...overrides });
+  return {
+    ...base,
+    signedPayload: {
+      commitmentHash: base.hash,
+      commitment: {
+        maker: '0xmaker',
+        contestId: base.contestId,
+        scorer: base.scorer,
+        lineTicks: base.lineTicks,
+        positionType: base.makerSide === 'away' ? 1 : 0,
+        oddsTick: base.oddsTick,
+        riskAmount: base.riskAmountWei6,
+        nonce,
+        expiry: String(base.expiryUnixSec),
+      },
+      signature: '0xsig',
+    },
+  };
+}
+
+describe('commitmentNonce', () => {
+  it('reads the nonce from a present signed payload; null for a missing-legacy record', () => {
+    expect(commitmentNonce(withNonce('7'))).toBe(7n);
+    expect(commitmentNonce(commitmentRecord({ signedPayloadStatus: 'missing-legacy' }))).toBeNull();
+  });
+});
+
+describe('planNonceInvalidation', () => {
+  const KEY = { contestId: 'C1', scorer: '0xSCORER', lineTicks: 0 };
+
+  it('per-commitment strategy is a pass-through: bulk empty, every target per-commitment', () => {
+    const a = withNonce('3', { hash: 'a', ...KEY });
+    const b = withNonce('5', { hash: 'b', ...KEY });
+    const plan = planNonceInvalidation([a, b], [a, b], 'per-commitment', NOW);
+    expect(plan.bulk).toEqual([]);
+    expect(plan.perCommitment.map((r) => r.hash)).toEqual(['a', 'b']);
+  });
+
+  it('bulk: one group per speculation, newMinNonce = max(target nonce) + 1, both sides folded in', () => {
+    const over = withNonce('3', { hash: 'a', makerSide: 'away', ...KEY });
+    const under = withNonce('5', { hash: 'b', makerSide: 'home', ...KEY }); // same (contestId, scorer, lineTicks) — the raiseMinNonce key ignores side
+    const plan = planNonceInvalidation([over, under], [over, under], 'bulk-nonce', NOW);
+    expect(plan.bulk).toHaveLength(1);
+    expect(plan.bulk[0]).toMatchObject({ contestId: 'C1', scorer: '0xSCORER', lineTicks: 0, newMinNonce: 6n });
+    expect(plan.bulk[0]!.records.map((r) => r.hash).sort()).toEqual(['a', 'b']);
+    expect(plan.perCommitment).toEqual([]);
+  });
+
+  it('bulk: two speculations → two groups; case-insensitive scorer / line separate them', () => {
+    const s1 = withNonce('2', { hash: 'a', contestId: 'C1', scorer: '0xAAA', lineTicks: 0 });
+    const s2 = withNonce('4', { hash: 'b', contestId: 'C1', scorer: '0xAAA', lineTicks: 15 }); // different line
+    const plan = planNonceInvalidation([s1, s2], [s1, s2], 'bulk-nonce', NOW);
+    expect(plan.bulk).toHaveLength(2);
+    expect(plan.perCommitment).toEqual([]);
+  });
+
+  it('GUARD: a keeper on the speculation with nonce < newMinNonce forces per-commitment (it would be burned)', () => {
+    const target = withNonce('5', { hash: 't', ...KEY });
+    const keeper = withNonce('2', { hash: 'k', ...KEY }); // nonce 2 < newMinNonce 6 → would be caught by the raise
+    const plan = planNonceInvalidation([target], [target, keeper], 'bulk-nonce', NOW);
+    expect(plan.bulk).toEqual([]);
+    expect(plan.perCommitment.map((r) => r.hash)).toEqual(['t']);
+  });
+
+  it('bulk survives a keeper with nonce >= newMinNonce (it is not in the group, stays matchable)', () => {
+    const target = withNonce('5', { hash: 't', ...KEY });
+    const keeper = withNonce('10', { hash: 'k', ...KEY }); // nonce 10 >= newMinNonce 6 → survives the raise
+    const plan = planNonceInvalidation([target], [target, keeper], 'bulk-nonce', NOW);
+    expect(plan.bulk).toHaveLength(1);
+    expect(plan.bulk[0]!.records.map((r) => r.hash)).toEqual(['t']); // only the target is invalidated
+    expect(plan.perCommitment).toEqual([]);
+  });
+
+  it('GUARD: a target with an unknown nonce (missing-legacy) forces the whole group per-commitment', () => {
+    const known = withNonce('5', { hash: 't1', ...KEY });
+    const unknown = commitmentRecord({ hash: 't2', signedPayloadStatus: 'missing-legacy', ...KEY });
+    const plan = planNonceInvalidation([known, unknown], [known, unknown], 'bulk-nonce', NOW);
+    expect(plan.bulk).toEqual([]);
+    expect(plan.perCommitment.map((r) => r.hash).sort()).toEqual(['t1', 't2']);
+  });
+
+  it('GUARD: a keeper with an unknown nonce forces per-commitment (can not prove it is safe)', () => {
+    const target = withNonce('5', { hash: 't', ...KEY });
+    const keeper = commitmentRecord({ hash: 'k', signedPayloadStatus: 'missing-legacy', ...KEY });
+    const plan = planNonceInvalidation([target], [target, keeper], 'bulk-nonce', NOW);
+    expect(plan.bulk).toEqual([]);
+    expect(plan.perCommitment.map((r) => r.hash)).toEqual(['t']);
+  });
+
+  it('a terminal / expired record on the speculation is NOT a keeper (it can not match), so bulk proceeds', () => {
+    const target = withNonce('5', { hash: 't', ...KEY });
+    const filled = withNonce('1', { hash: 'f', lifecycle: 'filled', ...KEY }); // low nonce but terminal
+    const expired = withNonce('1', { hash: 'e', lifecycle: 'visibleOpen', expiryUnixSec: NOW - 1, ...KEY }); // low nonce but past expiry
+    const plan = planNonceInvalidation([target], [target, filled, expired], 'bulk-nonce', NOW);
+    expect(plan.bulk).toHaveLength(1);
+    expect(plan.bulk[0]!.records.map((r) => r.hash)).toEqual(['t']);
+    expect(plan.perCommitment).toEqual([]);
   });
 });

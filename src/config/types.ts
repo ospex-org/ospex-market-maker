@@ -27,6 +27,24 @@ export const CANCEL_MODES = ['offchain', 'onchain'] as const;
 export type CancelMode = (typeof CANCEL_MODES)[number];
 
 /**
+ * How the AUTHORITATIVE on-chain cancel paths (the funding-guard `underfundedCancelMode: onchain`
+ * sweep, the §5.1 own-state-health cancel-sweep, the shutdown on-chain kill under
+ * `killCancelOnChain`, and `cancel-stale --authoritative`) invalidate a group of the maker's
+ * commitments on one speculation. `per-commitment` (default, unchanged behaviour) sends one
+ * `MatchingModule.cancelCommitment` per commitment. `bulk-nonce` sends a single
+ * `MatchingModule.raiseMinNonce` per `(contestId, scorer, lineTicks)` speculation — one tx that
+ * invalidates every one of the maker's commitments on that line (BOTH sides) with `nonce <
+ * newMinNonce`. It is applied only where it is SAFE: a group falls back to `per-commitment` when
+ * any commitment on the speculation the maker wants to KEEP would be caught by the raised floor
+ * (`nonce < newMinNonce`), or when any commitment on the speculation lacks a locally-known nonce
+ * (a `missing-legacy` signed-payload record). Does NOT affect the routine `orders.cancelMode:
+ * onchain` partial-remainder / recovered-soft-cancel paths (those cancel a specific subset, never
+ * "all on the speculation", so they stay per-commitment).
+ */
+export const ONCHAIN_CANCEL_STRATEGIES = ['per-commitment', 'bulk-nonce'] as const;
+export type OnchainCancelStrategy = (typeof ONCHAIN_CANCEL_STRATEGIES)[number];
+
+/**
  * What the funding guard does to EXISTING visible quotes while it holds. Distinct from
  * `orders.cancelMode` (the routine partial-fill cancel policy, which ALSO drives the §5.1
  * own-state-health active cancel-sweep) — the funding guard adds a `none` option (just
@@ -286,6 +304,15 @@ export interface OrdersConfig {
    * opt-out — see `fundingGuard.underfundedCancelMode` for the guard that has one.)
    */
   cancelMode: CancelMode;
+  /**
+   * Strategy for the AUTHORITATIVE on-chain cancel paths (the funding / stream-health cancel
+   * sweeps, the shutdown on-chain kill, and `cancel-stale --authoritative`): `per-commitment`
+   * (default — one `cancelCommitment` per record, unchanged) or `bulk-nonce` (one
+   * `raiseMinNonce` per speculation, with a per-group safety fallback). See
+   * {@link OnchainCancelStrategy}. Distinct from {@link cancelMode}, which decides whether those
+   * paths use on-chain cancels at all; this decides HOW they do it.
+   */
+  onchainCancelStrategy: OnchainCancelStrategy;
 }
 
 export interface FundingGuardConfig {

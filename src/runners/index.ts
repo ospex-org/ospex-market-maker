@@ -67,10 +67,8 @@
  *
  * Still TODO follow-ups: P&L (realized over settled / claimed; unrealized over
  * active marked to fair — natural home is the `summary` aggregator that walks
- * `fill` / `position-transition` / `settle` / `claim` events), the
- * `raiseMinNonce` per-speculation invalidation optimization (both for the
- * on-chain kill path here and `cancel-stale --authoritative` — both currently
- * per-commitment), and the `status` CLI command. (`cancel-stale` is a separate
+ * `fill` / `position-transition` / `settle` / `claim` events) and the `status`
+ * CLI command. (`cancel-stale` is a separate
  * one-shot CLI under `src/cli/cancel-stale.ts` — already wired.) Auto-settle +
  * auto-claim are wired here — they walk
  * `state.positions` each tick after the position poll, gas-gated by
@@ -78,10 +76,11 @@
  * and emit `settle` / `claim` events; the `claim` path stamps the local
  * `MakerPositionStatus` to `claimed`. The kill switch's on-chain path
  * (`killCancelOnChain: true`) is wired too: on actual shutdown
- * (`shutdownReason !== null`), `onchainKillCancel` iterates every non-terminal
- * commitment and calls `cancelCommitmentOnchain` (gas-gated with
- * `mayUseReserve: true` — operator-explicit "burn the reserve"), stamping
- * each cancelled record `authoritativelyInvalidated`.
+ * (`shutdownReason !== null`), `onchainKillCancel` invalidates every non-terminal
+ * commitment on chain — one `cancelCommitment` per record, or (under
+ * `orders.onchainCancelStrategy: bulk-nonce`) one `raiseMinNonce` per speculation —
+ * gas-gated with `mayUseReserve: true` (operator-explicit "burn the reserve"),
+ * stamping each affected record `authoritativelyInvalidated`.
  *
  * No `@ospex/sdk` import — all chain/API access goes through the `OspexAdapter`. The
  * clock, sleep, kill-switch probe, OS-signal registration, and randomness are
@@ -94,7 +93,7 @@
 import { existsSync } from 'node:fs';
 
 import { DEFAULT_PER_IP_OWNER_RESERVE, DEFAULT_PER_IP_STREAM_CAP, RESERVED_OWN_STATE_STREAMS, type Config } from '../config/index.js';
-import { buildDesiredQuote, inventoryFromState, isExpiredForRelease, isSeedSpeculationId, matchableCommitmentRiskWei6, oracleLineTicks, reconcileBook, referenceOddsEqual, referenceOddsFromSdk, seedSpeculationId, type BookReconciliation, type DesiredQuote, type ReferenceOdds, type RetainedPartial, type RetainedPartialReason, type SoftCancelReason } from '../orders/index.js';
+import { buildDesiredQuote, inventoryFromState, isExpiredForRelease, isSeedSpeculationId, matchableCommitmentRiskWei6, oracleLineTicks, planNonceInvalidation, reconcileBook, referenceOddsEqual, referenceOddsFromSdk, seedSpeculationId, type BookReconciliation, type DesiredQuote, type NonceInvalidationGroup, type ReferenceOdds, type RetainedPartial, type RetainedPartialReason, type SoftCancelReason } from '../orders/index.js';
 import { OspexChainError, OspexStreamError } from '../ospex/index.js';
 import type {
   ApproveResult,
@@ -899,8 +898,11 @@ export class Runner {
    *                  off-chain pull is visibility-only — the signed payload stays matchable on
    *                  chain until expiry, so {@link matchableCommitmentRiskWei6} keeps counting
    *                  it. The hold therefore persists until those commitments expire.
-   *   - `onchain`  — the off-chain pull above, THEN an authoritative on-chain `cancelCommitment`
-   *                  for every still-matchable non-terminal record. Each landed cancel stamps
+   *   - `onchain`  — the off-chain pull above, THEN an authoritative on-chain invalidation of
+   *                  every still-matchable non-terminal record: one `cancelCommitment` per record
+   *                  under the default `orders.onchainCancelStrategy: per-commitment`, or (under
+   *                  `bulk-nonce`) one `raiseMinNonce` per speculation with a per-record fallback.
+   *                  Each landed invalidation stamps
    *                  the record `authoritativelyInvalidated`, which DOES drop it from `required`
    *                  — so this is the only mode that actively shrinks the exposure and lets the
    *                  hold clear (once funding ≥ the remaining required). Gas-gated via
@@ -997,19 +999,34 @@ export class Runner {
     // retry via the regular dispatch (which returns `use-hash` while visible).
     let onchainCancelled = 0;
     if (mode === 'onchain') {
-      for (const r of Object.values(this.state.commitments)) {
-        if (r.lifecycle !== 'visibleOpen' && r.lifecycle !== 'softCancelled' && r.lifecycle !== 'partiallyFilled') continue;
-        if (isExpiredForRelease(r.expiryUnixSec, now, grace)) continue;
-        const result = await this.onchainCancelCommitment(r, now, { emitGasDenied: !this.fundingOnchainGasDeniedWarned });
-        if (result === 'gas-denied') {
-          this.fundingOnchainGasDeniedWarned = true; // warned once for this hold episode
-          break; // today's spend only grows — the rest would deny identically; retry next tick (budget frees at the UTC daily reset)
+      // The still-matchable non-terminal candidate set (what a per-record loop would cancel).
+      const candidates = Object.values(this.state.commitments).filter(
+        (r) => (r.lifecycle === 'visibleOpen' || r.lifecycle === 'softCancelled' || r.lifecycle === 'partiallyFilled') && !isExpiredForRelease(r.expiryUnixSec, now, grace),
+      );
+      // `orders.onchainCancelStrategy: bulk-nonce` (opt-in) collapses same-speculation cancels into
+      // one `raiseMinNonce`; the `per-commitment` default returns every candidate for the per-record
+      // loop below (bulk-ineligible groups fall back here too). `mayUseReserve: false` — this sweep
+      // preserves the emergency reserve.
+      const bulk = await this.bulkNonceCancel(candidates, now, { mayUseReserve: false, emitGasDenied: !this.fundingOnchainGasDeniedWarned });
+      onchainCancelled += bulk.invalidated;
+      if (bulk.outcome === 'gas-denied') this.fundingOnchainGasDeniedWarned = true; // warned once for this hold episode
+      else if (bulk.invalidated > 0) this.fundingOnchainGasDeniedWarned = false; // a raise landed — re-warn if a later denial occurs
+      // Per-record fallback (every candidate under `per-commitment`; only the bulk-ineligible ones
+      // under `bulk-nonce`). Skip after a gas-denied bulk pass — a per-record cancel would deny
+      // identically (today's spend only grows; retry next held tick, budget frees at the UTC reset).
+      if (bulk.outcome !== 'gas-denied') {
+        for (const r of bulk.perCommitment) {
+          const result = await this.onchainCancelCommitment(r, now, { emitGasDenied: !this.fundingOnchainGasDeniedWarned });
+          if (result === 'gas-denied') {
+            this.fundingOnchainGasDeniedWarned = true;
+            break;
+          }
+          if (result === 'cancelled') {
+            this.fundingOnchainGasDeniedWarned = false;
+            onchainCancelled += 1;
+          }
+          // 'transient-failure' / 'blocked-missing-payload': record left as-is, retried next held tick
         }
-        if (result === 'cancelled') {
-          this.fundingOnchainGasDeniedWarned = false; // a cancel landed — re-warn if a later denial occurs this episode
-          onchainCancelled += 1;
-        }
-        // 'transient-failure': the adapter threw — record left as-is, retried next held tick
       }
     }
 
@@ -1039,9 +1056,11 @@ export class Runner {
    *                 persist until then. There is no `none` opt-out (unlike the funding
    *                 guard): a degraded own-state view is a safety event, and pulling the
    *                 relay quotes is the minimum response — it can't make things worse.
-   *   - `onchain`  — the off-chain pull above, THEN an authoritative on-chain
-   *                 `cancelCommitment` for every still-matchable non-terminal record →
-   *                 `authoritativelyInvalidated`, which DROPS it from the exposure. The
+   *   - `onchain`  — the off-chain pull above, THEN an authoritative on-chain invalidation of
+   *                 every still-matchable non-terminal record — one `cancelCommitment` per record
+   *                 under the default `orders.onchainCancelStrategy: per-commitment`, or (under
+   *                 `bulk-nonce`) one `raiseMinNonce` per speculation with a per-record fallback —
+   *                 → `authoritativelyInvalidated`, which DROPS it from the exposure. The
    *                 only mode that actively shrinks the at-risk USDC. Gas-gated via
    *                 {@link onchainCancelCommitment} (`mayUseReserve: false` — an
    *                 automatic guard must not burn the emergency reserve); a gas denial
@@ -1122,17 +1141,26 @@ export class Runner {
     // ── on-chain authoritative cancel (`onchain` mode only) ────────────────────
     let onchainCancelled = 0;
     if (mode === 'onchain') {
-      for (const r of Object.values(this.state.commitments)) {
-        if (r.lifecycle !== 'visibleOpen' && r.lifecycle !== 'softCancelled' && r.lifecycle !== 'partiallyFilled') continue;
-        if (isExpiredForRelease(r.expiryUnixSec, now, grace)) continue;
-        const result = await this.onchainCancelCommitment(r, now, { emitGasDenied: !this.streamHealthOnchainGasDeniedWarned });
-        if (result === 'gas-denied') {
-          this.streamHealthOnchainGasDeniedWarned = true; // warned once for this hold episode
-          break; // today's spend only grows — the rest would deny identically; retry next tick (budget frees at the UTC daily reset)
-        }
-        if (result === 'cancelled') {
-          this.streamHealthOnchainGasDeniedWarned = false; // a cancel landed — re-warn if a later denial occurs this episode
-          onchainCancelled += 1;
+      const candidates = Object.values(this.state.commitments).filter(
+        (r) => (r.lifecycle === 'visibleOpen' || r.lifecycle === 'softCancelled' || r.lifecycle === 'partiallyFilled') && !isExpiredForRelease(r.expiryUnixSec, now, grace),
+      );
+      // `bulk-nonce` (opt-in) → one raiseMinNonce per speculation; `per-commitment` (default) →
+      // every candidate goes to the per-record loop below. Reserve-preserving (`mayUseReserve: false`).
+      const bulk = await this.bulkNonceCancel(candidates, now, { mayUseReserve: false, emitGasDenied: !this.streamHealthOnchainGasDeniedWarned });
+      onchainCancelled += bulk.invalidated;
+      if (bulk.outcome === 'gas-denied') this.streamHealthOnchainGasDeniedWarned = true; // warned once for this hold episode
+      else if (bulk.invalidated > 0) this.streamHealthOnchainGasDeniedWarned = false; // a raise landed — re-warn if a later denial occurs
+      if (bulk.outcome !== 'gas-denied') {
+        for (const r of bulk.perCommitment) {
+          const result = await this.onchainCancelCommitment(r, now, { emitGasDenied: !this.streamHealthOnchainGasDeniedWarned });
+          if (result === 'gas-denied') {
+            this.streamHealthOnchainGasDeniedWarned = true;
+            break; // today's spend only grows — the rest would deny identically; retry next tick (budget frees at the UTC daily reset)
+          }
+          if (result === 'cancelled') {
+            this.streamHealthOnchainGasDeniedWarned = false; // a cancel landed — re-warn if a later denial occurs this episode
+            onchainCancelled += 1;
+          }
         }
       }
     }
@@ -2845,6 +2873,145 @@ export class Runner {
     // carry their market identity for a precise lookup.
     for (const m of this.marketsForContest(record.contestId)) m.dirty = true;
     return 'cancelled';
+  }
+
+  /**
+   * The `orders.onchainCancelStrategy: bulk-nonce` executor (DESIGN §7). Given a set of `targets`
+   * to authoritatively cancel, split them via {@link planNonceInvalidation} into single-tx
+   * `raiseMinNonce` groups + a per-commitment remainder, run the bulk groups, and return the
+   * records that still need a per-record `cancelCommitment` (the caller's existing loop handles
+   * those). Under `per-commitment` (the default) the planner returns every target as
+   * `perCommitment`, so this is a no-op pass-through that returns `targets` unchanged.
+   *
+   * `mayUseReserve` mirrors the per-record paths: the funding / stream-health sweeps preserve the
+   * emergency reserve (`false`) and skip-and-retry a gas-denied group; the shutdown kill and
+   * `cancel-stale --authoritative` spend it (`true`) and stop on the first denial (today's spend
+   * only grows). A gas-denied group's records are returned in the fallback list only when
+   * `mayUseReserve` is `false` (the reserve-preserving sweeps still can't afford a per-record
+   * cancel either, but returning them keeps their retry on the normal cadence); for the
+   * spend-it-all paths a denial breaks the whole sweep, so nothing further is attempted.
+   */
+  private async bulkNonceCancel(
+    targets: readonly MakerCommitmentRecord[],
+    now: number,
+    opts: { mayUseReserve: boolean; emitGasDenied?: boolean },
+  ): Promise<{ perCommitment: MakerCommitmentRecord[]; outcome: 'done' | 'gas-denied' | 'transient-failure'; invalidated: number }> {
+    const plan = planNonceInvalidation(targets, Object.values(this.state.commitments), this.config.orders.onchainCancelStrategy, now);
+    if (plan.bulk.length === 0) return { perCommitment: plan.perCommitment, outcome: 'done', invalidated: 0 };
+    const { outcome, invalidated } = await this.raiseMinNonceForGroups(plan.bulk, now, opts);
+    return { perCommitment: plan.perCommitment, outcome, invalidated };
+  }
+
+  /**
+   * Send one `MatchingModule.raiseMinNonce` per {@link NonceInvalidationGroup}. For each group:
+   * read the canonical on-chain floor; short-circuit a group already below an existing floor
+   * (terminalize locally, no tx); gas-gate (`mayUseReserve` per the caller); send the raise; on
+   * success account the receipt gas, stamp every affected record `authoritativelyInvalidated`
+   * (which IS the exposure release — `inventoryFromState` / `matchableCommitmentRiskWei6` drop that
+   * lifecycle, DESIGN §6), and emit `nonce-floor-raise`. Returns `'gas-denied'` (a group was
+   * refused — a `mayUseReserve` caller then breaks), `'transient-failure'` (a floor read or a raise
+   * threw — retry next cadence), else `'done'`. `makerAddress` is guaranteed non-null on the live
+   * paths that call this.
+   */
+  private async raiseMinNonceForGroups(
+    groups: readonly NonceInvalidationGroup[],
+    now: number,
+    opts: { mayUseReserve: boolean; emitGasDenied?: boolean },
+  ): Promise<{ outcome: 'done' | 'gas-denied' | 'transient-failure'; invalidated: number }> {
+    if (groups.length === 0 || this.makerAddress === null) return { outcome: 'done', invalidated: 0 };
+    const maker = this.makerAddress;
+    const maxDailyGasPolWei = polFloatToWei18(this.config.gas.maxDailyGasPOL);
+    const emergencyReservePolWei = polFloatToWei18(this.config.gas.emergencyReservePOL);
+    const today = todayUTCDateString(now);
+    let outcome: 'done' | 'gas-denied' | 'transient-failure' = 'done';
+    let invalidated = 0;
+    for (const group of groups) {
+      const contestId = BigInt(group.contestId);
+      const scorer = group.scorer as Hex;
+      // The canonical floor (MatchingModule.s_minNonces) — needed to assert a strict increase and
+      // to detect a group already invalidated by an earlier raise.
+      let floor: bigint;
+      try {
+        floor = await this.adapter.readMinNonceFloor({ maker, contestId, scorer, lineTicks: group.lineTicks });
+      } catch (err) {
+        this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'onchain-cancel', contestId: group.contestId });
+        outcome = 'transient-failure';
+        continue;
+      }
+      // Already invalidated: every target nonce < newMinNonce <= floor, so they're already
+      // unmatchable on chain (a prior raise covered them). Terminalize locally; no tx, no gas.
+      if (group.newMinNonce <= floor) {
+        this.terminalizeNonceGroup(group, now);
+        this.emitNonceFloorRaise(group, floor, { alreadyAtFloor: true });
+        invalidated += group.records.length;
+        continue;
+      }
+      const todayGasSpentPolWei = BigInt(this.state.dailyCounters[today]?.gasPolWei ?? '0');
+      const verdict = canSpendGas({ todayGasSpentPolWei, maxDailyGasPolWei, emergencyReservePolWei, mayUseReserve: opts.mayUseReserve });
+      if (!verdict.allowed) {
+        if (opts.emitGasDenied !== false) {
+          this.eventLog.emit('candidate', {
+            skipReason: 'gas-budget-blocks-onchain-cancel',
+            speculationId: group.records[0]?.speculationId,
+            contestId: group.contestId,
+            makerSide: group.records[0]?.makerSide,
+            todayGasSpentPolWei: todayGasSpentPolWei.toString(),
+            maxDailyGasPolWei: maxDailyGasPolWei.toString(),
+            emergencyReservePolWei: emergencyReservePolWei.toString(),
+            detail: verdict.reason,
+          });
+        }
+        // Today's spend only grows within a pass, so every later group would deny identically —
+        // stop here regardless of `mayUseReserve` (the verdict already reflects it). The caller
+        // retries on its cadence; the budget frees at the UTC daily reset.
+        outcome = 'gas-denied';
+        break;
+      }
+      let result: Awaited<ReturnType<OspexAdapter['raiseMinNonce']>>;
+      try {
+        result = await this.adapter.raiseMinNonce({ contestId, scorer, lineTicks: group.lineTicks, newMinNonce: group.newMinNonce });
+      } catch (err) {
+        this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'onchain-cancel', contestId: group.contestId });
+        outcome = 'transient-failure';
+        continue;
+      }
+      const gasPolWei = BigInt(result.receipt.gasUsed) * BigInt(result.receipt.effectiveGasPrice);
+      this.recordGasSpentToday(today, gasPolWei);
+      this.terminalizeNonceGroup(group, now);
+      this.emitNonceFloorRaise(group, floor, { txHash: result.txHash, gasPolWei });
+      invalidated += group.records.length;
+    }
+    return { outcome, invalidated };
+  }
+
+  /** Stamp every record in a raised group `authoritativelyInvalidated` (the exposure release) and re-quote the freed contest next tick. */
+  private terminalizeNonceGroup(group: NonceInvalidationGroup, now: number): void {
+    for (const r of group.records) {
+      r.lifecycle = 'authoritativelyInvalidated';
+      r.updatedAtUnixSec = now;
+    }
+    for (const m of this.marketsForContest(group.contestId)) m.dirty = true;
+  }
+
+  /** Emit the `nonce-floor-raise` telemetry for a raised (or already-at-floor) group. NEVER carries a field named `nonce` (the telemetry writer denies it). */
+  private emitNonceFloorRaise(
+    group: NonceInvalidationGroup,
+    onchainFloor: bigint,
+    extra: { txHash?: Hex; gasPolWei?: bigint; alreadyAtFloor?: boolean },
+  ): void {
+    const payload: Record<string, unknown> = {
+      contestId: group.contestId,
+      speculationId: group.records[0]?.speculationId,
+      scorer: group.scorer,
+      lineTicks: group.lineTicks,
+      newMinNonce: group.newMinNonce.toString(),
+      onchainFloor: onchainFloor.toString(),
+      invalidatedCount: group.records.length,
+    };
+    if (extra.txHash !== undefined) payload.txHash = extra.txHash;
+    if (extra.gasPolWei !== undefined) payload.gasPolWei = extra.gasPolWei.toString();
+    if (extra.alreadyAtFloor === true) payload.alreadyAtFloor = true;
+    this.eventLog.emit('nonce-floor-raise', payload);
   }
 
   /**
@@ -5582,12 +5749,17 @@ export class Runner {
    * SIGTERM/SIGINT — `shutdownReason !== null`). Runs AFTER the unconditional
    * off-chain sweep above so the soft-cancelled records (the on-chain
    * sweep's input set includes them via the `softCancelled` lifecycle) are
-   * also authoritatively cancelled. Iterates every non-terminal tracked
-   * commitment (`visibleOpen` / `softCancelled` / `partiallyFilled`) and
-   * calls `adapter.cancelCommitmentOnchain(hash)` for each — the
-   * authoritative cancel (`MatchingModule.cancelCommitment`) sets
-   * `s_cancelledCommitments[hash]` on chain, after which `matchCommitment`
-   * reverts. Without this, a taker holding the signed payload can still match
+   * also authoritatively cancelled. Invalidates every non-terminal tracked
+   * commitment (`visibleOpen` / `softCancelled` / `partiallyFilled`) on chain:
+   * under the default `orders.onchainCancelStrategy: per-commitment` it calls
+   * `adapter.cancelCommitmentOnchain(hash)` for each — `MatchingModule.cancelCommitment`
+   * sets `s_cancelledCommitments[hash]`, after which `matchCommitment` reverts;
+   * under `bulk-nonce` it first runs {@link bulkNonceCancel}, sending one
+   * `MatchingModule.raiseMinNonce` per `(contest, scorer, lineTicks)` speculation
+   * (raising a per-maker nonce floor so `matchCommitment` reverts `NonceTooLow` for
+   * every sub-floor commitment — no `s_cancelledCommitments` flip), with the
+   * per-record path as the fallback for the bulk-ineligible remainder. Without this,
+   * a taker holding the signed payload can still match
    * the commitment until its expiry — the off-chain DELETE only stops the
    * relay from rebroadcasting.
    *
@@ -5612,7 +5784,16 @@ export class Runner {
     const maxDailyGasPolWei = polFloatToWei18(this.config.gas.maxDailyGasPOL);
     const emergencyReservePolWei = polFloatToWei18(this.config.gas.emergencyReservePOL);
 
-    for (const r of records) {
+    // `orders.onchainCancelStrategy: bulk-nonce` (opt-in) collapses the "cancel everything" kill
+    // into one `raiseMinNonce` per speculation. Operator-explicit shutdown → `mayUseReserve: true`.
+    // A gas-denied bulk pass aborts the kill (a per-record cancel would deny identically); otherwise
+    // the bulk-ineligible remainder (unknown-nonce / mixed) falls to the per-record loop below.
+    // Under the `per-commitment` default the planner returns every record here, so the loop is
+    // byte-identical to before.
+    const bulk = await this.bulkNonceCancel(records, this.deps.now(), { mayUseReserve: true, emitGasDenied: true });
+    if (bulk.outcome === 'gas-denied') return;
+
+    for (const r of bulk.perCommitment) {
       const now = this.deps.now();
       const today = todayUTCDateString(now);
       const todayGasSpentPolWei = BigInt(this.state.dailyCounters[today]?.gasPolWei ?? '0');

@@ -7812,6 +7812,49 @@ describe('Runner — on-chain kill path / killCancelOnChain (Phase 3 e-ii)', () 
     expect(events.find((e) => e.kind === 'kill')?.reason).toBe('kill-file'); // kill event still fires AFTER on-chain cancels
   });
 
+  it('killCancelOnChain=true + orders.onchainCancelStrategy=bulk-nonce → N commitments on one speculation collapse to ONE raiseMinNonce (not N cancels); all → authoritativelyInvalidated (exposure released)', async () => {
+    // Three non-terminal legs on the SAME (contestId, scorer, lineTicks), nonces 2 / 5 / 3.
+    const bulkRec = (hash: string, nonce: number, overrides: Partial<MakerCommitmentRecord> = {}): MakerCommitmentRecord => {
+      const base = commitmentRecord({ hash, contestId: '1234', speculationId: 'spec-1234', scorer: '0xscorer', lineTicks: 0, expiryUnixSec: T0 + 1000, ...overrides });
+      return { ...base, signedPayload: { ...base.signedPayload!, commitment: { ...base.signedPayload!.commitment, contestId: '1234', nonce: String(nonce) } } };
+    };
+    StateStore.at(stateDir).flush({
+      ...emptyMakerState(),
+      commitments: {
+        '0xa': bulkRec('0xa', 2, { makerSide: 'away', lifecycle: 'visibleOpen' }),
+        '0xb': bulkRec('0xb', 5, { makerSide: 'home', lifecycle: 'softCancelled' }),
+        '0xc': bulkRec('0xc', 3, { makerSide: 'home', lifecycle: 'partiallyFilled', filledRiskWei6: '100000' }),
+      },
+    });
+    const receipt = { gasUsed: 60_000n, effectiveGasPrice: 30_000_000_000n } as unknown as CancelOnchainResult['receipt'];
+    const raiseCalls: { newMinNonce: bigint; lineTicks: number }[] = [];
+    const cancel = cancelOnchainRecorder();
+    const config = cfg({ mode: { dryRun: false }, killCancelOnChain: true, orders: { onchainCancelStrategy: 'bulk-nonce' } });
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([]), { cancelCommitmentOnchain: cancel.fn });
+    vi.spyOn(adapter, 'raiseMinNonce').mockImplementation((args) => { raiseCalls.push(args); return Promise.resolve({ txHash: '0xraise' as Hex, receipt } as unknown as Awaited<ReturnType<OspexAdapter['raiseMinNonce']>>); });
+    vi.spyOn(adapter, 'readMinNonceFloor').mockResolvedValue(0n);
+    await makeRunner({ config, adapter, maxTicks: 5, deps: { killFileExists: killFileAfterTick(2) } }).run();
+
+    // One raise (newMinNonce = max(2,5,3)+1 = 6), zero per-record cancels.
+    expect(raiseCalls).toHaveLength(1);
+    expect(raiseCalls[0]).toMatchObject({ newMinNonce: 6n, lineTicks: 0 });
+    expect(cancel.calls).toHaveLength(0);
+
+    const reloaded = StateStore.at(stateDir).load().state;
+    expect(reloaded.commitments['0xa']?.lifecycle).toBe('authoritativelyInvalidated');
+    expect(reloaded.commitments['0xb']?.lifecycle).toBe('authoritativelyInvalidated');
+    expect(reloaded.commitments['0xc']?.lifecycle).toBe('authoritativelyInvalidated');
+    // All three land in `authoritativelyInvalidated`, which `inventoryFromState` /
+    // `matchableCommitmentRiskWei6` drop (RELEASED_LIFECYCLES) — so the exposure is released, the
+    // same terminal state a per-commitment on-chain cancel produces (covered in orders.test.ts).
+
+    const events = readEvents();
+    const raises = events.filter((e) => e.kind === 'nonce-floor-raise');
+    expect(raises).toHaveLength(1);
+    expect(raises[0]).toMatchObject({ contestId: '1234', invalidatedCount: 3, newMinNonce: '6', txHash: '0xraise' });
+    expect(events.filter((e) => e.kind === 'onchain-cancel')).toHaveLength(0); // no per-record cancels
+  });
+
   it('dry-run mode: killCancelOnChain=true is IGNORED (dry-run never writes to chain)', async () => {
     const cancel = cancelOnchainRecorder();
     StateStore.at(stateDir).flush({

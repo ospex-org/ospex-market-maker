@@ -12,10 +12,11 @@
  * USDC)`, deferred while the state-loss hold is active), the daily POL
  * gas-budget verdict (`canSpendGas` gates every on-chain write, denials emit
  * `candidate` `gas-budget-blocks-reapproval`), auto-settle / auto-claim, and
- * the kill switch's on-chain cancel (`killCancelOnChain: true`). The
- * `raiseMinNonce` bulk-invalidate optimization is still future work; the
- * `status` CLI is still landing in a later Phase-3 slice (`cancel-stale` ships
- * as a separate one-shot CLI under `src/cli/cancel-stale.ts`). Either mode
+ * the kill switch's on-chain cancel (`killCancelOnChain: true`), and — opt-in via
+ * `orders.onchainCancelStrategy: bulk-nonce` — the `raiseMinNonce` bulk-invalidate
+ * path (one tx per speculation) for the on-chain cancel sweeps + the kill.
+ * (`cancel-stale` ships as a separate one-shot CLI under
+ * `src/cli/cancel-stale.ts`, and honours the same strategy.) Either mode
  * runs until a kill-switch file appears or a SIGTERM / SIGINT arrives.
  *
  * The two-key model (DESIGN §8): live requires *both* `mode.dryRun: false` in the

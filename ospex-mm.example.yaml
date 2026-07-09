@@ -148,6 +148,15 @@ orders:
                                     # ALSO governs the §5.1 own-state-health active cancel-sweep (live mode):
                                     #   on a high-severity stream-health hold the MM pulls its quotes off the relay ("offchain")
                                     #   and, under "onchain", authoritatively cancels them too. No "none" opt-out there.
+  onchainCancelStrategy: per-commitment  # HOW the "cancel everything I hold on a speculation" on-chain paths (the funding /
+                                    #   stream-health cancel sweeps, the shutdown on-chain kill, and `cancel-stale --authoritative`)
+                                    #   invalidate. "per-commitment" (default, unchanged) sends one cancelCommitment per record.
+                                    #   "bulk-nonce" sends ONE raiseMinNonce per (contest, scorer, line) speculation — one tx that
+                                    #   invalidates every commitment of yours on that line (BOTH sides) below a chosen nonce floor,
+                                    #   far cheaper when you hold several. It falls back to per-commitment for a speculation whose
+                                    #   nonce floor would also catch a commitment you're keeping, or any record with an unknown
+                                    #   local nonce (a legacy record without a captured signed payload). Does NOT change the routine
+                                    #   `cancelMode: onchain` partial-remainder cancel (that's a targeted subset, always per-commitment).
 
 fundingGuard:                       # solvency guard (DESIGN §6): halt NEW posting when the wallet can no longer back its
                                     #   outstanding fill obligations. funding = min(wallet USDC, PositionModule allowance);

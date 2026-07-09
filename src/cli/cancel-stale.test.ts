@@ -831,3 +831,83 @@ describe('cancelStaleExitCode', () => {
     expect(cancelStaleExitCode({ ...baseReport, gasDenied: 1 })).toBe(1);
   });
 });
+
+describe('runCancelStale — bulk-nonce authoritative cancel (orders.onchainCancelStrategy: bulk-nonce)', () => {
+  const receipt = { gasUsed: 100_000n, effectiveGasPrice: 30_000_000_000n } as unknown as CancelOnchainResult['receipt'];
+  const raiseOk = (txHash: string): Awaited<ReturnType<OspexAdapter['raiseMinNonce']>> => ({ txHash: txHash as Hex, receipt });
+  const onchainOk = (txHash: string): CancelOnchainResult => ({ txHash: txHash as Hex, commitmentHash: '0xdead' as Hex, receipt });
+
+  /** A record at `postedAt` on the shared speculation carrying a specific EIP-712 `nonce`. `contestId` is a numeric uint256 string (as on chain) so `raiseMinNonce`'s `BigInt(contestId)` is valid. */
+  function withNonce(hash: string, postedAt: number, nonce: number, overrides: Partial<MakerCommitmentRecord> = {}): MakerCommitmentRecord {
+    const r = rec(hash, postedAt, { contestId: '1', ...overrides });
+    return { ...r, signedPayload: { ...r.signedPayload!, commitment: { ...r.signedPayload!.commitment, nonce: String(nonce) } } };
+  }
+
+  it('N commitments on one speculation → exactly ONE raiseMinNonce (not N cancels); all → authoritativelyInvalidated (exposure released)', async () => {
+    // over + under of the same (contestId, scorer, lineTicks), nonces 3 and 7 — both stale.
+    seedState([
+      withNonce('0xa', T0 - 200, 3, { makerSide: 'away' }),
+      withNonce('0xb', T0 - 200, 7, { makerSide: 'home' }),
+    ]);
+    const raiseCalls: { newMinNonce: bigint; lineTicks: number }[] = [];
+    let cancelCount = 0;
+    const createLiveAdapter = (cfg: Config, signer: Signer): OspexAdapter => {
+      const a = liveAdapter(cfg, signer);
+      vi.spyOn(a, 'raiseMinNonce').mockImplementation((args) => { raiseCalls.push(args); return Promise.resolve(raiseOk('0xraise')); });
+      vi.spyOn(a, 'readMinNonceFloor').mockResolvedValue(0n); // never raised yet
+      vi.spyOn(a, 'cancelCommitmentOnchain').mockImplementation(() => { cancelCount += 1; return Promise.resolve(onchainOk('0xcancel')); });
+      return a;
+    };
+    const report = await runCancelStale(
+      { config: liveConfig({ orders: { onchainCancelStrategy: 'bulk-nonce' } }), authoritative: true, ignoreMissingState: false },
+      { ...baseDeps(), createLiveAdapter },
+    );
+    // Exactly one raise (newMinNonce = max(3,7)+1), zero per-record cancels.
+    expect(raiseCalls).toHaveLength(1);
+    expect(raiseCalls[0]).toMatchObject({ lineTicks: 0, newMinNonce: 8n });
+    expect(cancelCount).toBe(0);
+    expect(report).toMatchObject({ onchainCancelled: 2, gasDenied: 0, errored: 0 });
+    // Both records terminalized — authoritativelyInvalidated is in RELEASED_LIFECYCLES, so exposure drops.
+    const state = StateStore.at(stateDir).load().state;
+    expect(state.commitments['0xa']!.lifecycle).toBe('authoritativelyInvalidated');
+    expect(state.commitments['0xb']!.lifecycle).toBe('authoritativelyInvalidated');
+    // One nonce-floor-raise event (invalidatedCount 2), and NO per-record onchain-cancel events.
+    const events = readEvents('cs-run');
+    const raises = events.filter((e) => e.kind === 'nonce-floor-raise');
+    expect(raises).toHaveLength(1);
+    expect(raises[0]).toMatchObject({ invalidatedCount: 2, newMinNonce: '8', txHash: '0xraise', lineTicks: 0 });
+    expect(events.filter((e) => e.kind === 'onchain-cancel')).toHaveLength(0);
+    // Gas: a single raise receipt (100_000 × 30 gwei = 3e15), not two cancels.
+    expect(report.gasPolWei).toBe('3000000000000000');
+  });
+
+  it('MIXED keep/cancel: a keep-alive on the same speculation with a sub-floor nonce forces per-record fallback — the keeper survives', async () => {
+    // Stale target nonce 5 → newMinNonce would be 6. A FRESH keeper (age 10s < staleAfterSeconds) with
+    // nonce 2 sits on the same speculation: raising the floor to 6 would burn it (2 < 6), so the group
+    // must fall back to a per-record cancel of the target only.
+    seedState([
+      withNonce('0xtarget', T0 - 200, 5),
+      withNonce('0xkeeper', T0 - 10, 2), // not stale → a keeper, never in the cancel set
+    ]);
+    const raiseCalls: unknown[] = [];
+    let cancelCount = 0;
+    const createLiveAdapter = (cfg: Config, signer: Signer): OspexAdapter => {
+      const a = liveAdapter(cfg, signer);
+      vi.spyOn(a, 'raiseMinNonce').mockImplementation((args) => { raiseCalls.push(args); return Promise.resolve(raiseOk('0xraise')); });
+      vi.spyOn(a, 'readMinNonceFloor').mockResolvedValue(0n);
+      vi.spyOn(a, 'cancelCommitmentOnchain').mockImplementation(() => { cancelCount += 1; return Promise.resolve(onchainOk('0xcancel')); });
+      return a;
+    };
+    const report = await runCancelStale(
+      { config: liveConfig({ orders: { onchainCancelStrategy: 'bulk-nonce' } }), authoritative: true, ignoreMissingState: false },
+      { ...baseDeps(), createLiveAdapter },
+    );
+    // The guard tripped: no bulk raise; the stale target was cancelled per-record.
+    expect(raiseCalls).toHaveLength(0);
+    expect(cancelCount).toBe(1);
+    expect(report).toMatchObject({ onchainCancelled: 1, inspected: 1 });
+    const state = StateStore.at(stateDir).load().state;
+    expect(state.commitments['0xtarget']!.lifecycle).toBe('authoritativelyInvalidated'); // cancelled per-record
+    expect(state.commitments['0xkeeper']!.lifecycle).toBe('visibleOpen'); // SURVIVES — never touched by cancel-stale or the raise
+  });
+});

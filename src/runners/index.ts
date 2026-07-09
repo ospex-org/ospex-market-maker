@@ -1815,13 +1815,36 @@ export class Runner {
       // independently (matched on its own `marketType`).
       const spec = this.selectRefreshSpec(c, m);
       if (spec !== undefined && spec.speculationId !== m.speculationId) {
+        // Pull our visible quotes off the DEPARTING speculation BEFORE re-pointing the market.
+        // After the re-point no tracked market keys on the old spec, so the per-market
+        // reference-line-mismatch gate — and every pull site, which all filter on
+        // `m.speculationId` — can no longer reach its quotes. Because `discover()` runs BEFORE
+        // `reconcileMarkets()` in a tick, a re-bind landing on the first tick the oracle reads
+        // the new line means the gate never fired for the old spec, so its `visibleOpen` quotes
+        // would strand visible + matchable on the relay book until on-chain expiry (the
+        // same-tick-rebind orphan). Pull here, while `m` still keys on the OLD spec — mirrors the
+        // untrack path above. Skip a SEED placeholder source: it has no separate on-chain book to
+        // orphan, and its records migrate placeholder→real via own-state and are meant to carry
+        // over — pulling them would churn and transiently double the side's matchable exposure.
+        if (!isSeedSpeculationId(m.speculationId)) {
+          const pulled = await this.pullVisibleQuotes(m, now);
+          if (pulled === 'transient-failure') {
+            // The off-chain (or cancelMode:onchain) cancel threw. Re-pointing now would strand the
+            // un-pulled quotes with nothing tracking the old spec to retry. Keep the market on the
+            // OLD spec and re-arm `dirty`: the reference-line-mismatch gate retries the pull next
+            // tick and the next discovery cycle retries the re-bind once it clears — never re-point
+            // over un-pulled quotes. Mirrors the untrack path's transient-failure retain-and-retry.
+            m.dirty = true;
+            continue;
+          }
+        }
         const fromLineTicks = m.lineTicks;
         const toLineTicks = spec.lineTicks ?? 0; // moneyline: null → 0 (never changes)
         m.speculationId = spec.speculationId;
         m.lineTicks = toLineTicks;
-        // A re-point binds the market to a NEW on-chain speculation (any visible quotes were
-        // on the old one): re-quote it promptly rather than wait out the `staleAfterSeconds`
-        // throttle. Mirrors the match-time-moved-earlier dirty above.
+        // A re-point binds the market to a NEW on-chain speculation (any visible quotes were on
+        // the old one — pulled just above): re-quote it promptly rather than wait out the
+        // `staleAfterSeconds` throttle. Mirrors the match-time-moved-earlier dirty above.
         m.dirty = true;
         if (toLineTicks !== fromLineTicks) {
           // The line moved (spread / total): the entry is keyed under the OLD line, so

@@ -898,8 +898,11 @@ export class Runner {
    *                  off-chain pull is visibility-only — the signed payload stays matchable on
    *                  chain until expiry, so {@link matchableCommitmentRiskWei6} keeps counting
    *                  it. The hold therefore persists until those commitments expire.
-   *   - `onchain`  — the off-chain pull above, THEN an authoritative on-chain `cancelCommitment`
-   *                  for every still-matchable non-terminal record. Each landed cancel stamps
+   *   - `onchain`  — the off-chain pull above, THEN an authoritative on-chain invalidation of
+   *                  every still-matchable non-terminal record: one `cancelCommitment` per record
+   *                  under the default `orders.onchainCancelStrategy: per-commitment`, or (under
+   *                  `bulk-nonce`) one `raiseMinNonce` per speculation with a per-record fallback.
+   *                  Each landed invalidation stamps
    *                  the record `authoritativelyInvalidated`, which DOES drop it from `required`
    *                  — so this is the only mode that actively shrinks the exposure and lets the
    *                  hold clear (once funding ≥ the remaining required). Gas-gated via
@@ -1053,9 +1056,11 @@ export class Runner {
    *                 persist until then. There is no `none` opt-out (unlike the funding
    *                 guard): a degraded own-state view is a safety event, and pulling the
    *                 relay quotes is the minimum response — it can't make things worse.
-   *   - `onchain`  — the off-chain pull above, THEN an authoritative on-chain
-   *                 `cancelCommitment` for every still-matchable non-terminal record →
-   *                 `authoritativelyInvalidated`, which DROPS it from the exposure. The
+   *   - `onchain`  — the off-chain pull above, THEN an authoritative on-chain invalidation of
+   *                 every still-matchable non-terminal record — one `cancelCommitment` per record
+   *                 under the default `orders.onchainCancelStrategy: per-commitment`, or (under
+   *                 `bulk-nonce`) one `raiseMinNonce` per speculation with a per-record fallback —
+   *                 → `authoritativelyInvalidated`, which DROPS it from the exposure. The
    *                 only mode that actively shrinks the at-risk USDC. Gas-gated via
    *                 {@link onchainCancelCommitment} (`mayUseReserve: false` — an
    *                 automatic guard must not burn the emergency reserve); a gas denial
@@ -5744,12 +5749,17 @@ export class Runner {
    * SIGTERM/SIGINT — `shutdownReason !== null`). Runs AFTER the unconditional
    * off-chain sweep above so the soft-cancelled records (the on-chain
    * sweep's input set includes them via the `softCancelled` lifecycle) are
-   * also authoritatively cancelled. Iterates every non-terminal tracked
-   * commitment (`visibleOpen` / `softCancelled` / `partiallyFilled`) and
-   * calls `adapter.cancelCommitmentOnchain(hash)` for each — the
-   * authoritative cancel (`MatchingModule.cancelCommitment`) sets
-   * `s_cancelledCommitments[hash]` on chain, after which `matchCommitment`
-   * reverts. Without this, a taker holding the signed payload can still match
+   * also authoritatively cancelled. Invalidates every non-terminal tracked
+   * commitment (`visibleOpen` / `softCancelled` / `partiallyFilled`) on chain:
+   * under the default `orders.onchainCancelStrategy: per-commitment` it calls
+   * `adapter.cancelCommitmentOnchain(hash)` for each — `MatchingModule.cancelCommitment`
+   * sets `s_cancelledCommitments[hash]`, after which `matchCommitment` reverts;
+   * under `bulk-nonce` it first runs {@link bulkNonceCancel}, sending one
+   * `MatchingModule.raiseMinNonce` per `(contest, scorer, lineTicks)` speculation
+   * (raising a per-maker nonce floor so `matchCommitment` reverts `NonceTooLow` for
+   * every sub-floor commitment — no `s_cancelledCommitments` flip), with the
+   * per-record path as the fallback for the bulk-ineligible remainder. Without this,
+   * a taker holding the signed payload can still match
    * the commitment until its expiry — the off-chain DELETE only stops the
    * relay from rebroadcasting.
    *

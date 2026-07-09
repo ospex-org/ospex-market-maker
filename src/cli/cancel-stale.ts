@@ -184,7 +184,7 @@ export interface CancelStaleReport {
   offchainSkippedAlready: number;
   /** `partiallyFilled` records skipped off-chain — the API rejects a DELETE once a commitment has matched (409 `COMMITMENT_MATCHED`). They still flow to the on-chain leg under `--authoritative`; without it they're left to ride to expiry. */
   offchainSkippedPartial: number;
-  /** Records that successfully had their on-chain `cancelCommitment` land. Always `0` when `--authoritative` was not passed. */
+  /** Records successfully invalidated on chain — via a per-record `cancelCommitment`, or (under `orders.onchainCancelStrategy: bulk-nonce`) via a `raiseMinNonce` nonce-floor raise that covered them. Always `0` when `--authoritative` was not passed. */
   onchainCancelled: number;
   /** Records the gas-budget verdict refused (only meaningful with `--authoritative`). */
   gasDenied: number;

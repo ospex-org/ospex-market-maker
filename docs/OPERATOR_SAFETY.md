@@ -47,7 +47,7 @@ If the stream degrades — it goes silent, overflows, lags the indexer, fails to
 - Under **`orders.cancelMode: onchain`** it *also* authoritatively cancels them on chain — this **spends POL gas** (gas-gated, and it will **not** touch your emergency reserve), and is the only mode that actually clears the exposure.
 - There is **no `none` opt-out** (unlike the funding guard): a degraded own-state view is treated as a safety event, and pulling your relay quotes is the minimum response. To avoid the on-chain gas spend, leave `orders.cancelMode` at its default `offchain`.
 
-So before you go live with `orders.cancelMode: onchain`, know that a flaky stream can trigger automatic, gas-spending on-chain cancels. Keep POL funded, and watch for `stream-health-hold` / `onchain-cancel` telemetry.
+So before you go live with `orders.cancelMode: onchain`, know that a flaky stream can trigger automatic, gas-spending on-chain cancels. Keep POL funded, and watch for `stream-health-hold` / `onchain-cancel` telemetry (or `nonce-floor-raise` if you've set `orders.onchainCancelStrategy: bulk-nonce` — the stream-health sweep then invalidates by raising the nonce floor per speculation rather than one `cancelCommitment` per record).
 
 ## Dry-run first
 

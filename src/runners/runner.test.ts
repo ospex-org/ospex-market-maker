@@ -657,7 +657,7 @@ describe('Runner — boot', () => {
     writeFileSync(join(logDir, 'run-prior.ndjson'), '{"ts":"x","runId":"prior","kind":"tick-start","tick":1}\n', 'utf8');
     const now = 1_900_000_000;
     const lines: string[] = [];
-    const runner = makeRunner({ config: cfg({ orders: { expirySeconds: 90 } }), deps: { now: () => now, log: (l) => lines.push(l) } });
+    const runner = makeRunner({ config: cfg({ orders: { expirySeconds: 90, staleAfterSeconds: 60 } }), deps: { now: () => now, log: (l) => lines.push(l) } }); // staleAfterSeconds < expirySeconds (the loader enforces it); this test only exercises the 90s expiry hold
     expect(runner.bootAssessment.holdQuoting).toBe(true);
     expect(runner.bootAssessment.suggestedWaitSeconds).toBe(90);
     expect(runner.isHoldingQuoting()).toBe(true);

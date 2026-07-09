@@ -142,6 +142,20 @@ describe('parseConfig', () => {
     expect(parseConfig({ rpcUrl: 'x', orders: { replaceOnLineMoveTicks: 5 } }, {}).orders.replaceOnLineMoveTicks).toBe(5);
   });
 
+  it('orders: rejects staleAfterSeconds >= expirySeconds under fixed-seconds expiry (a quote would lapse before refresh); exempt under match-time', () => {
+    // fixed-seconds (the default mode): stale must be strictly less than expiry, and the error names BOTH fields.
+    expect(() => parseConfig({ rpcUrl: 'x', orders: { expirySeconds: 60, staleAfterSeconds: 90 } }, {})).toThrow(/staleAfterSeconds/);
+    expect(() => parseConfig({ rpcUrl: 'x', orders: { expirySeconds: 60, staleAfterSeconds: 90 } }, {})).toThrow(/expirySeconds/);
+    // equal is rejected too — they'd race at the same instant, so the quote can still lapse before the refresh posts.
+    expect(() => parseConfig({ rpcUrl: 'x', orders: { expirySeconds: 90, staleAfterSeconds: 90 } }, {})).toThrow(/staleAfterSeconds/);
+    // a valid combo — and the defaults (90 < 120) — parse fine.
+    expect(parseConfig({ rpcUrl: 'x', orders: { expirySeconds: 120, staleAfterSeconds: 90 } }, {}).orders.staleAfterSeconds).toBe(90);
+    expect(parseConfig({ rpcUrl: 'x' }, {}).orders.staleAfterSeconds).toBe(90);
+    // match-time mode: `expirySeconds` is the pre-game cutoff window, NOT the quote's lifetime (that's the game start),
+    // so the invariant does not apply — an otherwise-rejected combo is accepted here.
+    expect(parseConfig({ rpcUrl: 'x', orders: { expiryMode: 'match-time', expirySeconds: 60, staleAfterSeconds: 90 } }, {}).orders.staleAfterSeconds).toBe(90);
+  });
+
   it('ownState PR2 health-gate knobs accept in-range values (and recoveryHoldMs accepts 0)', () => {
     const c = parseConfig({ rpcUrl: 'x', ownState: { auditPollIntervalMs: 10000, indexerLagMaxSeconds: 5, staleMaxMs: 30000, recoveryHoldMs: 0 } }, {});
     expect(c.ownState.auditPollIntervalMs).toBe(10000);

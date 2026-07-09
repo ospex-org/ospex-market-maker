@@ -125,7 +125,9 @@ orders:
                                     #   expiry, and the host / core-api clock can lead the chain clock — so freeing (and
                                     #   reposting over) the side exactly at local expiry can briefly double exposure. Book
                                     #   hygiene still treats the quote as expired at expiry; only headroom release waits. 0 = off.
-  staleAfterSeconds: 90             # pull-and-repost a quote this old (< expirySeconds, so it never just lapses)
+  staleAfterSeconds: 90             # pull-and-repost a quote this old. MUST be < expirySeconds under expiryMode:
+                                    #   fixed-seconds (rejected at load otherwise) — else a quote lapses before the
+                                    #   refresh fires, leaving a gap in liquidity. (No effect under match-time expiry.)
   staleReferenceAfterSeconds: 300   # treat reference odds as stale (pull quotes, don't repost) if nothing heard this long
   replaceOnOddsMoveBps: 50          # pull-and-repost when fair value moves more than this since posting
   replaceOnLineMoveTicks: 0         # spread/total only — re-bind a tracked market to the open speculation at the

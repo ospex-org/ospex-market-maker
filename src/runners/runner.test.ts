@@ -5091,6 +5091,62 @@ describe('Runner — live execution', () => {
     expect(readEvents().some((e) => e.kind === 'quote-intent' && e.contestId === '1')).toBe(true);
   });
 
+  it('same-tick re-bind pulls the departing line quotes — 9.5 total legs are soft-cancelled (not orphaned) when the oracle jumps to 10 on the same tick discovery re-binds', async () => {
+    // Regression for the same-tick-rebind orphan: because discover() runs BEFORE reconcileMarkets()
+    // in a tick, if the oracle first reads the new line on a discovery tick, the market re-binds
+    // 9.5 -> 10 before the reference-line-mismatch gate can fire for the 9.5 spec — leaving the old
+    // 9.5 legs stranded (visible + matchable) on a speculation no tracked market manages. The fix
+    // pulls the departing spec's visible quotes as part of the re-bind. Without it, the two 9.5 legs
+    // stay `visibleOpen` and this test's soft-cancel assertions fail.
+    StateStore.at(stateDir).flush(emptyMakerState()); // clean baseline → no boot state-loss hold; the runner quotes at tick 1
+    const config = withMarkets(cfg({ discovery: { everyNTicks: 1 } }), ['total']); // subscription mode (default) so an onChange can move the oracle between ticks
+    const totalSpecAt = (lineTicks: number, id: string): SpeculationView => ({ speculationId: id, contestId: '1', marketType: 'total', lineTicks, line: lineTicks / 10, open: true });
+    const recorder = makeSubscribeRecorder();
+    let listCount = 0;
+    let sleeps = 0;
+    const adapter = spiedAdapter(
+      config,
+      // tick-1 listing: only the 9.5 spec (the market binds + quotes it). tick-2 listing: adds the
+      // 10.0 spec, so `selectRefreshSpec` can FOLLOW the now-10 oracle to it in the same discover().
+      () => { listCount += 1; return Promise.resolve([contestView({ contestId: '1', speculations: listCount === 1 ? [totalSpecAt(95, 'to-95')] : [totalSpecAt(95, 'to-95'), totalSpecAt(100, 'to-100')] })]); },
+      (id) => Promise.resolve(contestView({ contestId: id, referenceGameId: 'GAME-1', speculations: [totalSpecAt(95, 'to-95')] })), // newcomer confirm (cycle 1)
+      {
+        subscribe: recorder.subscribe,
+        // Seed the oracle at total 9.5 so tick-1 reconcile QUOTES both legs on the 9.5 spec
+        // (oracle 95 == line 95). The move to 10 arrives via the onChange below, NOT the snapshot.
+        snapshot: (id) => Promise.resolve({ contestId: id, odds: { moneyline: null, spread: null, total: totalOdds(9.5) } }),
+        getSpeculation: (id) => Promise.resolve({ speculationId: id, contestId: '1', marketType: 'total', lineTicks: id === 'to-100' ? 100 : 95, line: id === 'to-100' ? 10 : 9.5, open: true, orderbook: [] }),
+      },
+    );
+    // Between tick 1 and tick 2 the feed jumps the total to 10 via onChange. At tick-2 discover()
+    // (before reconcile) the oracle already reads 10, so the market re-binds 9.5 -> 10 and the
+    // reference-line-mismatch gate never fires for the 9.5 spec (the orphan window).
+    const runner = makeRunner({
+      config,
+      adapter,
+      maxTicks: 2,
+      deps: { sleep: () => { sleeps += 1; if (sleeps === 1) recorder.handlersFor('1')?.onChange(totalOdds(10) as unknown as MoneylineOdds); return Promise.resolve(); } },
+    });
+    await runner.run();
+
+    // Sanity: tick 1 actually quoted (so there were 9.5 legs to orphan).
+    const events = readEvents();
+    expect(events.some((e) => e.kind === 'would-submit')).toBe(true);
+
+    // The market followed the oracle to the 10.0 spec and re-keyed under the new line.
+    expect(runner.trackedMarketView('1', 'total')).toMatchObject({ speculationId: 'to-100', lineTicks: 100 });
+    expect(runner.trackedMarketKeysForTest()).toEqual(['1:total:100']);
+
+    // THE FIX: the two 9.5 legs were pulled during the re-bind — soft-cancelled, not left orphaned.
+    const reloaded = StateStore.at(stateDir).load().state.commitments;
+    const on95 = Object.values(reloaded).filter((r) => r.speculationId === 'to-95');
+    expect(on95).toHaveLength(2);
+    expect(on95.every((r) => r.lifecycle === 'softCancelled')).toBe(true);
+    // …each pull surfaced a would-soft-cancel (dry-run) for a 9.5 leg, reason 'side-not-quoted'.
+    const pulled = events.filter((e) => e.kind === 'would-soft-cancel' && e.reason === 'side-not-quoted');
+    expect(pulled.map((e) => e.commitmentHash).sort()).toEqual(on95.map((r) => r.hash).sort());
+  });
+
   it('follow-the-oracle: a sub-threshold line move is debounced — the market holds its line and the gate keeps refusing', async () => {
     let listCount = 0;
     const config = withMarkets(cfg({ discovery: { everyNTicks: 1 }, orders: { replaceOnLineMoveTicks: 5 } }), ['spread']);

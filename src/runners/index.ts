@@ -67,10 +67,8 @@
  *
  * Still TODO follow-ups: P&L (realized over settled / claimed; unrealized over
  * active marked to fair — natural home is the `summary` aggregator that walks
- * `fill` / `position-transition` / `settle` / `claim` events), the
- * `raiseMinNonce` per-speculation invalidation optimization (both for the
- * on-chain kill path here and `cancel-stale --authoritative` — both currently
- * per-commitment), and the `status` CLI command. (`cancel-stale` is a separate
+ * `fill` / `position-transition` / `settle` / `claim` events) and the `status`
+ * CLI command. (`cancel-stale` is a separate
  * one-shot CLI under `src/cli/cancel-stale.ts` — already wired.) Auto-settle +
  * auto-claim are wired here — they walk
  * `state.positions` each tick after the position poll, gas-gated by
@@ -78,10 +76,11 @@
  * and emit `settle` / `claim` events; the `claim` path stamps the local
  * `MakerPositionStatus` to `claimed`. The kill switch's on-chain path
  * (`killCancelOnChain: true`) is wired too: on actual shutdown
- * (`shutdownReason !== null`), `onchainKillCancel` iterates every non-terminal
- * commitment and calls `cancelCommitmentOnchain` (gas-gated with
- * `mayUseReserve: true` — operator-explicit "burn the reserve"), stamping
- * each cancelled record `authoritativelyInvalidated`.
+ * (`shutdownReason !== null`), `onchainKillCancel` invalidates every non-terminal
+ * commitment on chain — one `cancelCommitment` per record, or (under
+ * `orders.onchainCancelStrategy: bulk-nonce`) one `raiseMinNonce` per speculation —
+ * gas-gated with `mayUseReserve: true` (operator-explicit "burn the reserve"),
+ * stamping each affected record `authoritativelyInvalidated`.
  *
  * No `@ospex/sdk` import — all chain/API access goes through the `OspexAdapter`. The
  * clock, sleep, kill-switch probe, OS-signal registration, and randomness are

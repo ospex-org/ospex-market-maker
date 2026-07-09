@@ -15,10 +15,15 @@
  *     engine until the record expires or is on-chain-cancelled.
  *
  *   - `--authoritative` — same off-chain step (or a skip for already-softCancelled
- *     records), then an on-chain `cancelCommitmentOnchain` per non-terminal record.
- *     `MatchingModule.cancelCommitment` flips `s_cancelledCommitments[hash]`, after
- *     which a `matchCommitment` call against that hash reverts. Records move to
- *     `authoritativelyInvalidated` (headroom released). Each on-chain cancel is
+ *     records), then an authoritative on-chain invalidation of every non-terminal
+ *     record: one `cancelCommitmentOnchain` per record by default, or — under
+ *     `orders.onchainCancelStrategy: bulk-nonce` — one `raiseMinNonce` per
+ *     `(contest, scorer, line)` speculation (falling back to per-record for a
+ *     speculation whose floor would catch a keeper, or a record with no
+ *     locally-known nonce). `MatchingModule.cancelCommitment` flips
+ *     `s_cancelledCommitments[hash]` (and `raiseMinNonce` a per-maker nonce floor),
+ *     after which a `matchCommitment` call against that record reverts. Records move
+ *     to `authoritativelyInvalidated` (headroom released). Each on-chain write is
  *     gas-gated by the same `canSpendGas` verdict the runner uses, with
  *     `mayUseReserve: true` — `--authoritative` is operator-explicit "burn the
  *     reserve to make sure latent exposure is killed", just like the shutdown's
@@ -93,7 +98,7 @@
  * on-chain-cancelled / gas-denied / errored records) so the CLI can render it
  * (`--json` envelope or human text), and so tests can assert on the outcome.
  *
- * **Exit code**: `0` on a clean cleanup; `1` if any per-record write errored
+ * **Exit code**: `0` on a clean cleanup; `1` if any on-chain write errored
  * (`errored > 0`), a gas-budget verdict denied an on-chain cancel
  * (`gasDenied > 0`), or a legacy book-hidden record had no recoverable signed
  * payload so the authoritative cancel was blocked (`blockedMissingPayload > 0`).
@@ -122,7 +127,7 @@ export interface CancelStaleOpts {
   config: Config;
   /** Path the config was loaded from — recorded in the `state.dir` lock identity (diagnostics only). Optional: tests omit it. */
   configPath?: string;
-  /** `--authoritative` — also issue on-chain `cancelCommitment` per record (costs POL gas, gas-gated with `mayUseReserve: true`). Default `false` — off-chain DELETE only (gasless). */
+  /** `--authoritative` — also authoritatively invalidate on chain: one `cancelCommitment` per record, or one `raiseMinNonce` per speculation under `orders.onchainCancelStrategy: bulk-nonce` (costs POL gas, gas-gated with `mayUseReserve: true`). Default `false` — off-chain DELETE only (gasless). */
   authoritative: boolean;
   /** `--ignore-missing-state` — the operator attests no prior run left an open / soft-cancelled commitment that could still match on chain. Lifts the state-loss refusal (same semantics as the runner — DESIGN §12). */
   ignoreMissingState: boolean;
@@ -675,7 +680,7 @@ async function runCancelStaleLocked(opts: CancelStaleOpts, deps: CancelStaleDeps
 // ── renderers ────────────────────────────────────────────────────────────────
 
 /**
- * Exit code policy. `0` on a clean cleanup; `1` if any per-record write
+ * Exit code policy. `0` on a clean cleanup; `1` if any on-chain write
  * errored (`errored > 0`), a gas-budget verdict denied an on-chain cancel
  * (`gasDenied > 0`), or a legacy book-hidden record's authoritative cancel was
  * blocked for a missing signed payload (`blockedMissingPayload > 0`). Operators

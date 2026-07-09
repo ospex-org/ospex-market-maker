@@ -100,7 +100,7 @@ interface CancelStaleReport {
   onchainCancelled: number;       // 0 unless --authoritative was passed
   gasDenied: number;              // records the gas-budget verdict refused (on-chain leg)
   blockedMissingPayload: number;  // 0 unless --authoritative; records whose on-chain cancel was BLOCKED — pre-M6/A (`signedPayloadStatus: 'missing-legacy'`) AND book-hidden (`softCancelled`), so the API redacts the signed payload and `cancelOnchain` has no recovery path. Counts toward exit 1 (incomplete sweep); recover via owner-auth own-state or wait for expiry
-  errored: number;                // per-record adapter throws
+  errored: number;                // on-chain write adapter throws (a per-record cancel or a bulk raiseMinNonce)
   gasPolWei: string;              // total POL gas spent on the on-chain leg (wei18 decimal)
   runId: string;                  // filename suffix of this command's event log
 }

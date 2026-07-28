@@ -16,7 +16,7 @@ import { oppositeSide, positionTypeForSide, sideForPositionType, toProtocolQuote
 import { stripVig } from './vig.js';
 import { deriveSpreadDirect, deriveSpreadEconomics, expectedMonthlyFilledVolumeUSDC } from './spread.js';
 import { clampSkewDelta, computeQuote, SKEW_PROB_CEIL, SKEW_PROB_FLOOR } from './quote.js';
-import type { EconomicsInputs, QuoteCommonInputs } from './types.js';
+import type { EconomicsInputs, QuoteCommonInputs, QuoteInputs } from './types.js';
 
 // ── odds conversions ──────────────────────────────────────────────────────────
 
@@ -327,6 +327,104 @@ const COMMON: QuoteCommonInputs = {
   awayHeadroomUSDC: 1000,
   homeHeadroomUSDC: 1000,
 };
+
+describe('computeQuote — notes[0] is ALWAYS the refusal when canQuote is false', () => {
+  // Seeding the wider-spread advisory into `notes` broke this invariant once:
+  // the exposure-cap refusal is appended after advisories already exist, so it
+  // landed at the END and the advisory took notes[0]. Consumers join all notes,
+  // but the function's contract (and callers reading a single reason) depend on
+  // the ordering, so it is asserted across EVERY refusal path rather than only
+  // the one that regressed.
+  const WIDE = { spreadBps: 400 } as const; // 4% vs overround ≈3.17% → advisory present
+
+  const REFUSALS: Array<{ name: string; inputs: QuoteInputs }> = [
+    {
+      name: 'both sides at exposure caps (the path that regressed)',
+      inputs: { ...COMMON, awayHeadroomUSDC: 0, homeHeadroomUSDC: 0, mode: 'direct', direct: WIDE },
+    },
+    {
+      name: 'quoteBothSides=false',
+      inputs: { ...COMMON, quoteBothSides: false, mode: 'direct', direct: WIDE },
+    },
+    {
+      name: 'bad reference data (implied probs sum ≤ 1)',
+      inputs: {
+        ...COMMON,
+        consensusAwayDecimal: 3.0,
+        consensusHomeDecimal: 3.0,
+        mode: 'direct',
+        direct: WIDE,
+      },
+    },
+    {
+      name: 'spread below minEdgeBps',
+      inputs: { ...COMMON, minEdgeBps: 500, mode: 'direct', direct: { spreadBps: 100 } },
+    },
+    {
+      name: 'non-positive spreadBps',
+      inputs: { ...COMMON, mode: 'direct', direct: { spreadBps: 0 } },
+    },
+    {
+      name: 'economics above maxReasonableSpread',
+      inputs: { ...COMMON, mode: 'economics', economics: { ...ECON, targetMonthlyReturnPct: 1 } },
+    },
+    {
+      name: 'spread drives a quote probability to ≥ 1',
+      inputs: { ...COMMON, mode: 'direct', direct: { spreadBps: 9900 } },
+    },
+  ];
+
+  for (const c of REFUSALS) {
+    it(`${c.name} → notes[0] is REFUSE-prefixed`, () => {
+      const r = computeQuote(c.inputs);
+      expect(r.canQuote).toBe(false);
+      expect(r.notes.length).toBeGreaterThan(0);
+      expect(r.notes[0]!.startsWith('REFUSE:')).toBe(true);
+      // Exactly one terminal refusal — advisories must never be REFUSE-prefixed.
+      expect(r.notes.filter((n) => n.startsWith('REFUSE:'))).toHaveLength(1);
+    });
+  }
+
+  it('the wide-spread advisory SURVIVES alongside the refusal, it is not dropped', () => {
+    // The fix must reorder, not discard — the advisory is what tells the
+    // operator their own spread contributed, rather than blaming the line.
+    const r = computeQuote({
+      ...COMMON,
+      awayHeadroomUSDC: 0,
+      homeHeadroomUSDC: 0,
+      mode: 'direct',
+      direct: WIDE,
+    });
+    expect(r.canQuote).toBe(false);
+    expect(r.notes[0]!.startsWith('REFUSE:')).toBe(true);
+    expect(r.notes[0]).toMatch(/exposure caps/);
+    expect(r.notes.some((n) => /wider than the consensus overround/.test(n))).toBe(true);
+    // Per-side headroom advisories survive too.
+    expect(r.notes.some((n) => /away side: no exposure headroom/.test(n))).toBe(true);
+    expect(r.notes.some((n) => /home side: no exposure headroom/.test(n))).toBe(true);
+  });
+
+  it('a sub-lot headroom (rounds to zero risk) refuses the same way', () => {
+    // Not literally zero headroom — an amount that survives to sizing and then
+    // quantizes to zero wei6, which is the likelier live shape.
+    const r = computeQuote({
+      ...COMMON,
+      awayHeadroomUSDC: 0.00001,
+      homeHeadroomUSDC: 0.00001,
+      mode: 'direct',
+      direct: WIDE,
+    });
+    expect(r.canQuote).toBe(false);
+    expect(r.notes[0]!.startsWith('REFUSE:')).toBe(true);
+    expect(r.notes.some((n) => /wider than the consensus overround/.test(n))).toBe(true);
+  });
+
+  it('a SUCCESSFUL quote carries no REFUSE note at all', () => {
+    const r = computeQuote({ ...COMMON, mode: 'direct', direct: WIDE });
+    expect(r.canQuote).toBe(true);
+    expect(r.notes.some((n) => n.startsWith('REFUSE:'))).toBe(false);
+  });
+});
 
 describe('computeQuote — quoting wider than the reference market', () => {
   it('quotes a wider-than-market spread and surfaces the advisory in notes', () => {

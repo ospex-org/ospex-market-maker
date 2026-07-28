@@ -206,7 +206,10 @@ describe('runQuote — refusals (exit 1)', () => {
 });
 
 describe('runQuote — computed-but-canQuote-false (exit 1)', () => {
-  it('the math refuses (direct spread far exceeds the consensus overround)', async () => {
+  // 9000 bps no longer refuses for exceeding the consensus overround (that is an
+  // advisory now) — it refuses at the protocol probability/tick ceiling, which is
+  // the real remaining bound in direct mode.
+  it('the math refuses (direct spread hits the protocol probability/tick ceiling)', async () => {
     const report = await runQuote({
       contestId: 'contest-1',
       config: cfg({ pricing: { mode: 'direct', direct: { spreadBps: 9000 } } }),

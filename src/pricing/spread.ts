@@ -63,8 +63,13 @@ const pct = (x: number): string => `${(x * 100).toFixed(2)}%`;
 
 /**
  * Economics mode: solve `targetSpread = targetReturn / (expectedMonthlyFilled / 2)`,
- * then refuse if it's too wide (vs `maxReasonableSpread` or the consensus overround)
- * or too thin (below `minEdgeBps`). The refusal message names which input to change.
+ * then refuse if it's too wide (vs `maxReasonableSpread`) or too thin (below
+ * `minEdgeBps`). The refusal message names which input to change.
+ *
+ * `maxReasonableSpread` is a consistency check on the operator's own inputs —
+ * the return they asked for needs a wider spread than they called reasonable —
+ * not a cap on what may be quoted. Exceeding the *consensus overround* is NOT
+ * a refusal; it returns an advisory `note`. See {@link widerThanOverroundNote}.
  */
 export function deriveSpreadEconomics(
   capitalUSDC: number,

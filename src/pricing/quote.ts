@@ -217,8 +217,11 @@ export function computeQuote(inputs: QuoteInputs): QuoteResult {
   // pushed a quote probability to ≥ 1 or a tick out of range, the refusal
   // alone blames the line and hides the actual cause.
   //
-  // Refusals stay FIRST in `notes` so `notes[0]` remains the reason whenever
-  // `canQuote` is false.
+  // INVARIANT: whenever `canQuote` is false, `notes[0]` is the refusal reason
+  // (`REFUSE:`-prefixed). Refusals from here on are placed FIRST — see the
+  // prepend at the end of this function for the one refusal that is only
+  // discovered after these advisories exist. Covered by the "notes[0] is always
+  // the refusal" battery in pricing.test.ts.
   const notes: string[] = [];
   if (spreadResult.note !== undefined) notes.push(spreadResult.note);
 
@@ -290,16 +293,26 @@ export function computeQuote(inputs: QuoteInputs): QuoteResult {
   const quoteHome = home.sizeWei6 > 0;
   if (!quoteAway) notes.push('away side: no exposure headroom (or size rounds to zero) — not quoting away');
   if (!quoteHome) notes.push('home side: no exposure headroom (or size rounds to zero) — not quoting home');
-  if (!quoteAway && !quoteHome) notes.push(refusePrefix('both sides are at their exposure caps — nothing to quote'));
+
+  const canQuote = quoteAway || quoteHome;
+  // `notes[0]` is the refusal reason whenever `canQuote` is false. Every earlier
+  // refusal returns through `refused(...)` with the reason already first; this is
+  // the one refusal discovered AFTER advisories have accumulated, so it is
+  // PREPENDED rather than appended. Appending is what silently broke the
+  // invariant once the wide-spread advisory started being seeded above — the
+  // advisory landed at notes[0] on this path and the refusal at the end.
+  const finalNotes = canQuote
+    ? notes
+    : [refusePrefix('both sides are at their exposure caps — nothing to quote'), ...notes];
 
   return {
-    canQuote: quoteAway || quoteHome,
+    canQuote,
     away: quoteAway ? buildSide('away', awayQuoteProb, away.sizeUSDC, away.sizeWei6) : null,
     home: quoteHome ? buildSide('home', homeQuoteProb, home.sizeUSDC, home.sizeWei6) : null,
     fair,
     spread,
     targetMonthlyReturnUSDC: targetReturnUSDC,
     expectedMonthlyFilledVolumeUSDC: expectedFilledUSDC,
-    notes,
+    notes: finalNotes,
   };
 }

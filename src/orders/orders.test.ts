@@ -186,10 +186,13 @@ describe('buildDesiredQuote', () => {
     expect(d.result.home).not.toBeNull();
   });
 
-  it('reports canQuote: false when the math refuses (direct spread far exceeds the consensus overround)', () => {
+  // 9000 bps no longer refuses for exceeding the consensus overround (that is an
+  // advisory now) — it refuses at the protocol probability/tick ceiling.
+  it('reports canQuote: false when the math refuses (direct spread hits the protocol probability/tick ceiling)', () => {
     const d = buildDesiredQuote(cfg({ pricing: { mode: 'direct', direct: { spreadBps: 9000 } } }), MARKET, ml(150, -180), EMPTY);
     expect(d.result.canQuote).toBe(false);
-    expect(d.result.notes.some((n) => n.startsWith('REFUSE:'))).toBe(true);
+    expect(d.result.notes[0]!.startsWith('REFUSE:')).toBe(true);
+    expect(d.result.notes.some((n) => /quote probability|tick is outside/.test(n))).toBe(true);
   });
 
   it('refuses (both sides null) when the open-commitment count cap is hit — even with positive exposure headroom', () => {

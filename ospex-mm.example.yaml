@@ -74,7 +74,11 @@ ownState:                          # The owner-authenticated own-state SSE strea
                                    #   posting gate on a brief recovery blip.
 
 pricing:
-  mode: economics                  # "economics" (derive spread from your return target) or "direct"
+  # "economics" derives the spread from your return target (the vig is emergent);
+  # "direct" lets you state the vig outright. See README "Pricing modes".
+  # Quoting WIDER than the reference market is allowed in both modes — it emits an
+  # advisory note (expect fewer fills), not a refusal.
+  mode: economics
   economics:
     capitalUSDC: "50"
     targetMonthlyReturnPct: 0.005   # 0.5% / month on capital
@@ -82,9 +86,14 @@ pricing:
     estGamesPerDay: 8.0             # rough count across your configured sports
     fillRateAssumption: 0.30        # FLAGGED ASSUMPTION — replace with measured data later
     capitalTurnoverPerDay: 1.0      # FLAGGED ASSUMPTION
-    maxReasonableSpread: 0.05       # refuse to start if the math wants a wider spread than this
+    maxReasonableSpread: 0.05       # consistency check on the inputs above, not a cap on what you may
+                                    #   quote: refuses when your target return needs a wider spread than
+                                    #   you called reasonable. Raise it if you mean it.
   direct:
-    spreadBps: 300                  # only used when mode: direct (3.00%)
+    spreadBps: 300                  # only used when mode: direct. TOTAL two-sided overround, not per
+                                    #   side: 300 = 3.00% total (~1.5%/side); ~10%/side is 2000.
+                                    #   No upper bound — the protocol tick range [101, 10100] is the
+                                    #   only ceiling. Check this number; an extra zero quotes a 30% vig.
   quoteBothSides: true
   minEdgeBps: 0                     # require at least this much edge vs fair to bother quoting
   maxPerQuotePctOfCapital: 0.05     # FLAGGED ASSUMPTION — per-quote concentration cap

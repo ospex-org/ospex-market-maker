@@ -98,6 +98,34 @@ See **[`docs/QUICKSTART.md`](docs/QUICKSTART.md)** for the walkthrough and **[`d
 
 The annotated reference config is **[`ospex-mm.example.yaml`](ospex-mm.example.yaml)** — copy it, fill in rpc / pricing / risk (wallet only when you go live), run. A novice typically touches only `rpcUrl`, `pricing.economics`, and maybe `risk` — plus `wallet` when going live. The full schema and the rationale for every field are in `docs/DESIGN.md §7`. Defaults are conservative and `dryRun: true`.
 
+### Pricing modes — `economics` vs `direct`
+
+Both modes price the same way: strip the vig off the reference odds to recover fair probabilities summing to 1.0, then add **your** margin back on top. They differ only in where that margin comes from.
+
+| | `economics` (default) | `direct` |
+|---|---|---|
+| You configure | a target return (`targetMonthlyReturnPct`) plus volume assumptions | the margin itself (`spreadBps`) |
+| The vig is | **emergent** — solved from `targetReturn / (expectedFilledVolume / 2)` | **explicit** — exactly what you set |
+| Use it when | you think in returns on bankroll and want the spread implied by your targets | you have a view on what the market should pay and want to state it directly |
+
+`spreadBps` is the **total two-sided overround**, not per side. `spreadBps: 300` is a 3% total book (≈1.5% per side). ~10% per side is `spreadBps: 2000`.
+
+**You may quote wider than the reference market.** If your spread exceeds the books' overround, the quote is produced anyway and an advisory lands in `notes`:
+
+```
+spread 4.00% is wider than the consensus overround 3.17% —
+quoting worse than the reference market, so expect a lower fill rate
+```
+
+That is information, not a veto. Reference odds are an input, not an authority, and Ospex is a peer-to-peer orderbook with no "inside the market" to quote against — a taker either likes your price or doesn't. A market whose pricing is genuinely uncertain and whose interest is thin is exactly where a wide quote is the right quote.
+
+Note the deliberate asymmetry with `minEdgeBps`, which **does** refuse. Quoting too *thin* can lose money — your edge goes negative, and a tight spread maximizes adverse selection, filling you precisely when the true price has moved against you. Quoting too *wide* cannot: per fill it is strictly better, and it reduces adverse-selection cost. The only cost is a lower fill rate, which the market applies on its own. So the thin side is guarded and the wide side is not.
+
+The ceilings that remain:
+
+- **`direct` mode** — none beyond the protocol's own odds-tick range `[101, 10100]`, enforced in `computeQuote`. Your number is your number. In practice a spread has to approach ~9800 bps before a tick leaves range on an even line.
+- **`economics` mode** — `maxReasonableSpread` (default `0.05`) still refuses. Read it as a consistency check on your *inputs* rather than a cap on what you may quote: it means the return you asked for needs a wider spread than you yourself called reasonable. Raise it if you mean it.
+
 ## Architecture (brief — full design in `docs/DESIGN.md`)
 
 A single long-running **worker** process. No HTTP surface. Runs locally (`ospex-mm run`) or as a worker dyno. Layers under `src/`: `config/` (load + validate), `ospex/` (the only module that imports `@ospex/sdk`), `pricing/` (vig strip → fair value → spread → quote prices), `risk/` (worst-case-loss-by-outcome accounting + cap enforcement + the allowance target), `orders/` (the order lifecycle), `state/` (persistent inventory, JSON, single-process), `telemetry/` (NDJSON event log + the `summary` aggregator), `runners/` (the event loop), `cli/` (`doctor | quote | run | cancel-stale | status | summary`).

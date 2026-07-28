@@ -211,6 +211,17 @@ export function computeQuote(inputs: QuoteInputs): QuoteResult {
   }
   const spread = spreadResult.spread;
 
+  // Advisories accumulate from here. Seeded with the spread-derivation note
+  // (currently: quoting wider than the reference market) so it also rides
+  // along on the two downstream refusals below — when a wide spread is what
+  // pushed a quote probability to ≥ 1 or a tick out of range, the refusal
+  // alone blames the line and hides the actual cause.
+  //
+  // Refusals stay FIRST in `notes` so `notes[0]` remains the reason whenever
+  // `canQuote` is false.
+  const notes: string[] = [];
+  if (spreadResult.note !== undefined) notes.push(spreadResult.note);
+
   // Step 3 — build quote probabilities. The symmetric half-spread split (DESIGN §5), plus an
   // optional inventory skew: `skewSignal ∈ [-1,1]` leans the away quote UP and the home quote
   // DOWN by `skewDelta = skewSignal × halfSpread` (clamped so neither side leaves the protocol
@@ -229,8 +240,9 @@ export function computeQuote(inputs: QuoteInputs): QuoteResult {
     return refused(
       [
         refusePrefix(
-          'the spread pushed a quote probability to ≥ 1.0 — extremely lopsided line; an asymmetric vig split would handle this (future work)',
+          'the spread pushed a quote probability to ≥ 1.0 — extremely lopsided line, or a spread wide enough to exhaust the remaining probability; an asymmetric vig split would handle the former (future work)',
         ),
+        ...notes,
       ],
       fair,
       spread,
@@ -244,7 +256,10 @@ export function computeQuote(inputs: QuoteInputs): QuoteResult {
   const homeTick = decimalToTick(1 / homeQuoteProb);
   if (!isTickInRange(awayTick) || !isTickInRange(homeTick)) {
     return refused(
-      [refusePrefix(`a quote tick is outside the protocol's [101, 10100] range (away=${awayTick}, home=${homeTick})`)],
+      [
+        refusePrefix(`a quote tick is outside the protocol's [101, 10100] range (away=${awayTick}, home=${homeTick})`),
+        ...notes,
+      ],
       fair,
       spread,
       targetReturnUSDC,
@@ -253,7 +268,6 @@ export function computeQuote(inputs: QuoteInputs): QuoteResult {
   }
 
   // Step 5 — size each side: min(perQuoteCap, headroom); upsize the open side if the other is capped.
-  const notes: string[] = [];
   const perQuoteCap = inputs.capitalUSDC * inputs.maxPerQuotePctOfCapital;
   let away = sizeSide(perQuoteCap, inputs.awayHeadroomUSDC);
   let home = sizeSide(perQuoteCap, inputs.homeHeadroomUSDC);

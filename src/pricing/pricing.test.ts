@@ -221,12 +221,31 @@ describe('deriveSpreadEconomics', () => {
     expect(r.reason).toMatch(/maxReasonableSpread/);
   });
 
-  it('refuses when the implied spread is wider than the consensus overround', () => {
+  it('ALLOWS a spread wider than the consensus overround, with an advisory note', () => {
     // targetReturn 180 → targetSpread 0.04: > overround (≈0.0317) but < maxReasonableSpread (0.05).
+    // Quoting worse than the reference market is an operator choice, not an error.
     const r = deriveSpreadEconomics(1000, 0.05, { ...ECON, targetMonthlyReturnPct: 0.18 }, fair, 0);
+    expect(r.ok).toBe(true);
+    if (!r.ok) throw new Error('unreachable');
+    expect(r.spread).toBeCloseTo(0.04, 12);
+    expect(r.note).toMatch(/wider than the consensus overround/);
+    expect(r.note).toMatch(/lower fill rate/);
+  });
+
+  it('emits NO note when the spread is inside the consensus overround', () => {
+    const r = deriveSpreadEconomics(1000, 0.05, ECON, fair, 0);
+    expect(r.ok).toBe(true);
+    if (!r.ok) throw new Error('unreachable');
+    expect(r.note).toBeUndefined();
+  });
+
+  it('still refuses above maxReasonableSpread — that bound is unchanged', () => {
+    // The input-consistency check survives: it says the return you asked for
+    // needs a wider spread than you yourself called reasonable.
+    const r = deriveSpreadEconomics(1000, 0.05, { ...ECON, targetMonthlyReturnPct: 1 }, fair, 0);
     expect(r.ok).toBe(false);
     if (r.ok) throw new Error('unreachable');
-    expect(r.reason).toMatch(/consensus overround/);
+    expect(r.reason).toMatch(/maxReasonableSpread/);
   });
 
   it('refuses when the implied spread is below minEdgeBps', () => {
@@ -247,11 +266,40 @@ describe('deriveSpreadDirect', () => {
     expect(r.spread).toBe(0.02);
   });
 
-  it('refuses when wider than the consensus overround', () => {
-    const r = deriveSpreadDirect(400, fair, 0);
+  it('ALLOWS a spread wider than the consensus overround, with an advisory note', () => {
+    const r = deriveSpreadDirect(400, fair, 0); // 4% vs overround ≈3.17%
+    expect(r.ok).toBe(true);
+    if (!r.ok) throw new Error('unreachable');
+    expect(r.spread).toBe(0.04);
+    expect(r.note).toMatch(/wider than the consensus overround/);
+  });
+
+  it('emits NO note when inside the consensus overround', () => {
+    const r = deriveSpreadDirect(200, fair, 0);
+    expect(r.ok).toBe(true);
+    if (!r.ok) throw new Error('unreachable');
+    expect(r.note).toBeUndefined();
+  });
+
+  it('honours a deliberately wide spread — direct mode has no upper bound', () => {
+    // 30% total. Absurd as a typo, legitimate on a market whose pricing is
+    // genuinely uncertain and whose interest is thin. The operator's number
+    // is the operator's number; only the protocol tick range bounds it, and
+    // that is enforced downstream in computeQuote.
+    const r = deriveSpreadDirect(3000, fair, 0);
+    expect(r.ok).toBe(true);
+    if (!r.ok) throw new Error('unreachable');
+    expect(r.spread).toBe(0.3);
+    expect(r.note).toMatch(/wider than the consensus overround/);
+  });
+
+  it('still refuses below minEdgeBps — the thin side keeps its guard', () => {
+    // Asymmetry by design: too thin can lose money (negative edge + adverse
+    // selection), too wide cannot.
+    const r = deriveSpreadDirect(10, fair, 50);
     expect(r.ok).toBe(false);
     if (r.ok) throw new Error('unreachable');
-    expect(r.reason).toMatch(/consensus overround/);
+    expect(r.reason).toMatch(/minEdgeBps/);
   });
 
   it('refuses non-positive spreadBps', () => {
@@ -279,6 +327,63 @@ const COMMON: QuoteCommonInputs = {
   awayHeadroomUSDC: 1000,
   homeHeadroomUSDC: 1000,
 };
+
+describe('computeQuote — quoting wider than the reference market', () => {
+  it('quotes a wider-than-market spread and surfaces the advisory in notes', () => {
+    // 4% total vs a consensus overround of ≈3.17%. Previously refused.
+    const r = computeQuote({ ...COMMON, mode: 'direct', direct: { spreadBps: 400 } });
+    expect(r.canQuote).toBe(true);
+    expect(r.away).not.toBeNull();
+    expect(r.home).not.toBeNull();
+    expect(r.spread).toBe(0.04);
+    expect(r.notes.some((n) => /wider than the consensus overround/.test(n))).toBe(true);
+    // Advisory, not a refusal — nothing in notes carries the REFUSE prefix.
+    expect(r.notes.some((n) => n.startsWith('REFUSE:'))).toBe(false);
+    // The quoted book really does embed the operator's spread, not the market's.
+    expect(r.away!.quoteProb + r.home!.quoteProb).toBeCloseTo(1.04, 12);
+  });
+
+  it('honours a deliberately huge spread — the operator decides, not the books', () => {
+    const r = computeQuote({ ...COMMON, mode: 'direct', direct: { spreadBps: 3000 } });
+    expect(r.canQuote).toBe(true);
+    expect(r.spread).toBe(0.3);
+    expect(r.away!.quoteProb + r.home!.quoteProb).toBeCloseTo(1.3, 12);
+    // Still inside the protocol's tick range — that bound is the only ceiling.
+    expect(isTickInRange(r.away!.quoteTick)).toBe(true);
+    expect(isTickInRange(r.home!.quoteTick)).toBe(true);
+  });
+
+  it('the protocol tick range is the real ceiling, and it refuses when reached', () => {
+    // A spread big enough to drive a quote probability to ≥ 1 still refuses —
+    // that is a protocol constraint, not a market-consensus opinion.
+    const r = computeQuote({ ...COMMON, mode: 'direct', direct: { spreadBps: 9900 } });
+    expect(r.canQuote).toBe(false);
+    expect(r.notes[0]).toMatch(/^REFUSE:/);
+    // The advisory rides along so the operator can see the spread was the cause
+    // rather than reading "lopsided line" and going to look at the odds feed.
+    expect(r.notes.some((n) => /wider than the consensus overround/.test(n))).toBe(true);
+  });
+
+  it('economics mode also quotes wide, still bounded by maxReasonableSpread', () => {
+    const wide = computeQuote({
+      ...COMMON,
+      mode: 'economics',
+      economics: { ...ECON, targetMonthlyReturnPct: 0.18 },
+    });
+    expect(wide.canQuote).toBe(true);
+    expect(wide.spread).toBeCloseTo(0.04, 12);
+    expect(wide.notes.some((n) => /wider than the consensus overround/.test(n))).toBe(true);
+
+    const absurd = computeQuote({
+      ...COMMON,
+      mode: 'economics',
+      economics: { ...ECON, targetMonthlyReturnPct: 1 },
+    });
+    expect(absurd.canQuote).toBe(false);
+    expect(absurd.notes[0]).toMatch(/^REFUSE:/);
+    expect(absurd.notes[0]).toMatch(/maxReasonableSpread/);
+  });
+});
 
 describe('computeQuote', () => {
   it('economics mode — produces a sane two-sided quote', () => {

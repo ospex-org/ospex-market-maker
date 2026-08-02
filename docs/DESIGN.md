@@ -500,7 +500,7 @@ A small set of JSON files under `state.dir`: each posted commitment by hash with
 
 ## 13. Distribution, deployment, license, disclaimers
 
-- **Stack.** Node 20+, TypeScript strict (`exactOptionalPropertyTypes`), yarn, `vitest`. Deps minimal: `@ospex/sdk` (exact GitHub Release tarball — §4; never a committed tarball), a YAML parser, `pino`, a CLI lib (match the `ospex` CLI's), and whatever `@ospex/sdk` pulls transitively (`viem`; `ethers` only via the keystore subpath).
+- **Stack.** Node 20.19+, TypeScript strict (`exactOptionalPropertyTypes`), yarn, `vitest`. Deps minimal: `@ospex/sdk` (exact GitHub Release tarball — §4; never a committed tarball), a YAML parser, `pino`, a CLI lib (match the `ospex` CLI's), and whatever `@ospex/sdk` pulls transitively (`viem`; `ethers` only via the keystore subpath).
 - **Deployment.** A worker process. Local: `ospex-mm run` (or `yarn mm run` from a clone). Heroku: a `worker` dyno (`Procfile: worker: node dist/cli/index.js run ...`) — **never `web`**. An `app.json` with the worker formation and the `Procfile` ship alongside `ospex-mm run` in Phase 3 (not in the genesis scaffold).
 - **License — MIT.** Matches `@ospex/sdk`. Only the smart contracts stay BUSL.
 - **Public README + `docs/OPERATOR_SAFETY.md` must carry, prominently:**

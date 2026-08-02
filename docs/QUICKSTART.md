@@ -4,7 +4,7 @@
 
 ## 1. Prerequisites
 
-- Node 20+, [Yarn](https://classic.yarnpkg.com/) 1.x.
+- Node 20.19+, [Yarn](https://classic.yarnpkg.com/) 1.x.
 - An RPC URL for Polygon (Alchemy / Infura / QuickNode). No public-RPC default — the public Polygon endpoints are rate-limited and unreliable.
 - **For live mode only** — everything below `run --live` is read-only / signs nothing, so you can skip these for a dry-run:
   - A [Foundry](https://book.getfoundry.sh/) keystore for the wallet the maker will use:

@@ -344,8 +344,20 @@ export function parseConfig(raw: unknown, env: EnvLike = {}): Config {
     auditPollIntervalMs: def(ownStateObj.auditPollIntervalMs, 60000, (v) =>
       asNumberInRange(v, 'ownState.auditPollIntervalMs', 10000, 300000, { minInclusive: true, maxInclusive: true }),
     ),
+    // Floor is 30, 2x the indexer's cursor-advance cadence: when caught up, the
+    // indexer advances its liveness cursor about once per ~15s poll cycle, so
+    // the published /v1/health/own-state indexerLagSeconds sawtooths roughly
+    // 0 → 15s on a healthy indexer (see the SDK's OwnStateHealth docs).
+    // checkIndexerLag is a single-sample >= compare with a sticky latch, so a
+    // threshold inside or near that band can latch posting held on a healthy
+    // indexer. 30 (= the default) absorbs one slow/missed indexer cycle plus
+    // measurement noise; for faster detection of a genuinely stuck indexer,
+    // lower auditPollIntervalMs instead (note: it paces the whole runner tick —
+    // audit probes, reconcile, and the sweeps — so lowering it raises API/RPC
+    // volume, not just the health poll). If the indexer cadence changes,
+    // revisit this floor.
     indexerLagMaxSeconds: def(ownStateObj.indexerLagMaxSeconds, 30, (v) =>
-      asNumberInRange(v, 'ownState.indexerLagMaxSeconds', 5, 300, { minInclusive: true, maxInclusive: true }),
+      asNumberInRange(v, 'ownState.indexerLagMaxSeconds', 30, 300, { minInclusive: true, maxInclusive: true }),
     ),
     // Floor is 30000, NOT below the server's own-state SSE heartbeat cadence
     // (~20s): `transportFresh` requires a frame within `staleMaxMs`, and on a

@@ -64,8 +64,12 @@ ownState:                          # The owner-authenticated own-state SSE strea
   auditPollIntervalMs: 60000       # the runner's single tick cadence (10000-300000ms): paces the audit cross-check, the
                                    #   own-state health poll (indexerLagDegraded latch), and the reconcile/settle/funding sweep.
                                    #   Fills arrive in real time over the stream — nothing trading-critical waits on this.
-  indexerLagMaxSeconds: 30         # /v1/health/own-state indexerLagSeconds threshold (5-300s) at/above which the
-                                   #   indexerLagDegraded latch trips and gates posting.
+  indexerLagMaxSeconds: 30         # /v1/health/own-state indexerLagSeconds threshold (30-300s) at/above which the
+                                   #   indexerLagDegraded latch trips and gates posting. Floor = 2x the indexer's ~15s
+                                   #   cursor-advance cadence (the published lag sawtooths roughly 0 → 15s when caught
+                                   #   up), so lower values can read a healthy indexer as degraded. For faster detection
+                                   #   of a stuck indexer, lower auditPollIntervalMs above instead — it paces the whole
+                                   #   runner tick, so that raises API/RPC volume.
   staleMaxMs: 60000                # transport-freshness window (30000-300000ms): the composite health predicate
                                    #   requires a frame (onFrame, incl. heartbeats) within this window. Floor stays above the
                                    #   server's ~20s heartbeat so a quiet wallet's heartbeats keep it fresh.

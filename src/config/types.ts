@@ -172,7 +172,12 @@ export interface OwnStateConfig {
   /**
    * The `/v1/health/own-state` `indexerLagSeconds` threshold at/above which the
    * `indexerLagDegraded` latch trips, gating posting (own-state SSE plan §5,
-   * latch 6). Range 5-300s; default 30s. (Knob ships in PR2; latch in PR2c.)
+   * latch 6). Range 30-300s; default 30s. The floor is 2x the indexer's ~15s
+   * cursor-advance cadence — when caught up, the published lag sawtooths
+   * roughly 0 → 15s, and the compare is a single sample against a sticky
+   * latch, so a lower threshold can read a healthy indexer as degraded. Lag
+   * also grows, correctly, when no new block has finalized — a genuine
+   * fail-closed hold, not a false trip. (Knob ships in PR2; latch in PR2c.)
    */
   indexerLagMaxSeconds: number;
   /**

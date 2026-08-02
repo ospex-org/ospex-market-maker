@@ -133,7 +133,10 @@ describe('parseConfig', () => {
     expect(() => parseConfig({ rpcUrl: 'x', ownState: { wrong: 1 } }, {})).toThrow(/wrong/);
     // Phase 3 PR2 health-gate knobs — out-of-range rejected.
     expect(() => parseConfig({ rpcUrl: 'x', ownState: { auditPollIntervalMs: 9999 } }, {})).toThrow(/auditPollIntervalMs/);
-    expect(() => parseConfig({ rpcUrl: 'x', ownState: { indexerLagMaxSeconds: 4 } }, {})).toThrow(/indexerLagMaxSeconds/);
+    expect(() => parseConfig({ rpcUrl: 'x', ownState: { indexerLagMaxSeconds: 29 } }, {})).toThrow(/indexerLagMaxSeconds/);
+    // Pin the exact floor: just-below (29) must name the [30, 300] range — the floor is 2x the
+    // indexer's ~15s cursor-advance cadence, so values below it can read a healthy indexer as degraded.
+    expect(() => parseConfig({ rpcUrl: 'x', ownState: { indexerLagMaxSeconds: 29 } }, {})).toThrow(/\[30, 300\]/);
     expect(() => parseConfig({ rpcUrl: 'x', ownState: { indexerLagMaxSeconds: 301 } }, {})).toThrow(/indexerLagMaxSeconds/);
     expect(() => parseConfig({ rpcUrl: 'x', ownState: { staleMaxMs: 29999 } }, {})).toThrow(/staleMaxMs/); // floor is 30000 (above the ~20s server heartbeat)
     expect(() => parseConfig({ rpcUrl: 'x', ownState: { recoveryHoldMs: 300001 } }, {})).toThrow(/recoveryHoldMs/);
@@ -161,11 +164,16 @@ describe('parseConfig', () => {
   });
 
   it('ownState PR2 health-gate knobs accept in-range values (and recoveryHoldMs accepts 0)', () => {
-    const c = parseConfig({ rpcUrl: 'x', ownState: { auditPollIntervalMs: 10000, indexerLagMaxSeconds: 5, staleMaxMs: 30000, recoveryHoldMs: 0 } }, {});
+    // 30 is the floor (= default; 2x the indexer's ~15s cursor cadence).
+    const c = parseConfig({ rpcUrl: 'x', ownState: { auditPollIntervalMs: 10000, indexerLagMaxSeconds: 30, staleMaxMs: 30000, recoveryHoldMs: 0 } }, {});
     expect(c.ownState.auditPollIntervalMs).toBe(10000);
-    expect(c.ownState.indexerLagMaxSeconds).toBe(5);
+    expect(c.ownState.indexerLagMaxSeconds).toBe(30);
     expect(c.ownState.staleMaxMs).toBe(30000); // floor (≥ the ~20s server heartbeat)
     expect(c.ownState.recoveryHoldMs).toBe(0);
+    // Pass-through pins: the at-floor accept equals the default, so it alone can't catch a
+    // silently dropped/defaulted key — a mid-band value and the max discriminate pass-through.
+    expect(parseConfig({ rpcUrl: 'x', ownState: { indexerLagMaxSeconds: 45 } }, {}).ownState.indexerLagMaxSeconds).toBe(45);
+    expect(parseConfig({ rpcUrl: 'x', ownState: { indexerLagMaxSeconds: 300 } }, {}).ownState.indexerLagMaxSeconds).toBe(300);
   });
 
   it('ownState.debounceMs accepts in-range values', () => {

@@ -9,10 +9,14 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
-          node-version: 20
+          # Pinned to the declared engines floor (quoted — unquoted 20.19 is a
+          # YAML float) so install/build/test run on the lowest Node the tree
+          # claims to support; a transitive dep raising the true floor turns
+          # the frozen install red instead of drifting silently.
+          node-version: '20.19'
       # NOTE: once `@ospex/sdk` is added as a dependency (Phase 1, on a feature
       # branch), this install step requires `@ospex/sdk` to be publicly
       # installable — i.e. the `ospex-org/ospex-sdk` repo made public so its

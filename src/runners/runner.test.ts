@@ -8969,6 +8969,11 @@ describe('Runner — funding guard sweep confirmation (issue #160)', () => {
     expect(tick4StartIdx).toBeGreaterThan(-1);
     expect(firstCancelIdx).toBeGreaterThan(tick4StartIdx); // the sweep waited out the window rather than firing on tick 1
 
+    const armed = events.filter((e) => e.kind === 'funding-hold' && e.state === 'sweep-armed');
+    expect(armed).toHaveLength(1); // once per hold episode, not per tick
+    expect(armed[0]).toMatchObject({ reason: 'funding-shortfall', shortfallHeldForSeconds: (MAX_TICKS - 1) * TICK_SECONDS });
+    expect(events.indexOf(armed[0] as Record<string, unknown>)).toBeLessThan(firstCancelIdx); // the marker precedes the cancels it authorises
+
     const reloaded = StateStore.at(stateDir).load().state;
     expect(reloaded.commitments['0xmoneyline']?.lifecycle).toBe('softCancelled');
     expect(reloaded.commitments['0xtotal']?.lifecycle).toBe('softCancelled');
@@ -9014,6 +9019,41 @@ describe('Runner — funding guard sweep confirmation (issue #160)', () => {
     const holds = readEvents().filter((e) => e.kind === 'funding-hold');
     expect(holds.map((h) => h.state)).toEqual(['entered', 'cleared', 'entered']); // the recovery really happened
     expect(s.offchainCancels).toEqual([]);
+  });
+
+  it('an ALREADY-ARMED sweep is disarmed by a recovery — the next episode waits out its own window before the sweep may run again', async () => {
+    // The companion to the case above: that one pins the first-observation stamp,
+    // this one pins the ARM itself. Episode 1 runs long enough to arm and sweep
+    // (ticks 1–4), funding recovers (tick 5), a fresh shortfall opens (tick 6), and
+    // the sweep must be disarmed until THAT episode's own window elapses (tick 9).
+    //
+    // Rule 3b — the obvious observable does NOT discriminate here: episode 1 already
+    // soft-cancelled both records, and `softCancelRecord` only acts on `visibleOpen`,
+    // so a wrongly-still-armed sweep in episode 2 makes no relay call at all. What
+    // separates the two builds is the `sweep-armed` MARKER, which is edge-triggered:
+    // a sweep that was never disarmed can never re-arm, so it emits once instead of
+    // twice.
+    const MAX_TICKS = 9;
+    const RECOVERY_TICK = 5;
+    const SECOND_EPISODE_FIRST_TICK = 6;
+    expect((MAX_TICKS - SECOND_EPISODE_FIRST_TICK) * TICK_SECONDS).toBe(CONFIRM_SECONDS); // tick 9 is exactly one window past tick 6
+
+    const s = scenario({
+      sweepConfirmSeconds: CONFIRM_SECONDS,
+      maxTicks: MAX_TICKS,
+      positionAllowanceAtTick: (tick) => (tick === RECOVERY_TICK ? BigInt(GROSS_REQUIRED_WEI6) : ALLOWANCE_WEI6),
+    });
+    await s.runner.run();
+
+    expect(s.ticksRun).toBe(MAX_TICKS);
+    const events = readEvents();
+    const holds = events.filter((e) => e.kind === 'funding-hold');
+    expect(holds.map((h) => h.state)).toEqual(['entered', 'sweep-armed', 'cleared', 'entered', 'sweep-armed']);
+    // Both arms measured their OWN episode: 45s from tick 1, then 45s from tick 6.
+    expect(holds.filter((h) => h.state === 'sweep-armed').map((h) => h.shortfallHeldForSeconds)).toEqual([CONFIRM_SECONDS, CONFIRM_SECONDS]);
+    // ...and the second arm landed on tick 9, not on the tick the shortfall reopened.
+    const secondArmIdx = events.lastIndexOf(holds[holds.length - 1] as Record<string, unknown>);
+    expect(secondArmIdx).toBeGreaterThan(events.findIndex((e) => e.kind === 'tick-start' && e.tick === MAX_TICKS));
   });
 });
 

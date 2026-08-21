@@ -178,6 +178,16 @@ fundingGuard:                       # solvency guard (DESIGN §6): halt NEW post
                                     #   pulled on chain at fill). Trips when funding < required.
   enabled: true                     # master switch. false = never read funding, never hold.
   checkIntervalMs: 30000            # min interval between on-chain funding re-reads (balance + allowance); funding moves slowly.
+  sweepConfirmSeconds: 45           # how long an apparent shortfall must PERSIST before the active cancel sweep below may run.
+                                    #   NEW posting is halted on the FIRST observed shortfall regardless — this gates only the
+                                    #   destructive half. Why: a match pulls USDC on chain immediately, but the MM learns the fill
+                                    #   from its own-state stream seconds later, so in between it compares fill-reduced funding
+                                    #   against pre-fill exposure — a shortfall that is not real and clears itself. The sweep is a
+                                    #   GLOBAL scan (every speculation, not just the one that filled), so it waits for the
+                                    #   shortfall to still be there on a later successful read. Range 0..300. Derived from
+                                    #   ownState.indexerLagMaxSeconds (30 — the indexer lag already tolerated) plus one re-read
+                                    #   cadence. 0 = no wait (hold and sweep from the same single comparison). A failed funding
+                                    #   READ is never subject to this — it arms the sweep at once (see failClosedOnReadError).
   underfundedCancelMode: offchain   # what to do with EXISTING visible quotes when underfunded (active cancel response):
                                     #   "offchain" pull off the relay (gasless) / "onchain" also authoritatively cancel on chain
                                     #   (gas) / "none" hold only (ride to expiry). NEW posting is ALWAYS halted while underfunded,

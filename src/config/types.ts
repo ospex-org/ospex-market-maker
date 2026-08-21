@@ -45,11 +45,12 @@ export const ONCHAIN_CANCEL_STRATEGIES = ['per-commitment', 'bulk-nonce'] as con
 export type OnchainCancelStrategy = (typeof ONCHAIN_CANCEL_STRATEGIES)[number];
 
 /**
- * What the funding guard does to EXISTING visible quotes while it holds. Distinct from
- * `orders.cancelMode` (the routine partial-fill cancel policy, which ALSO drives the §5.1
- * own-state-health active cancel-sweep) — the funding guard adds a `none` option (just
- * hold; let quotes ride to expiry). The guard ALWAYS halts new
- * posting while held regardless of this value; this only governs the active cancel sweep:
+ * What the funding guard does to EXISTING visible quotes once its cancel sweep is armed.
+ * Distinct from `orders.cancelMode` (the routine partial-fill cancel policy, which ALSO
+ * drives the §5.1 own-state-health active cancel-sweep) — the funding guard adds a `none`
+ * option (just hold; let quotes ride to expiry). The guard ALWAYS halts new posting for as
+ * long as it holds, regardless of this value, and does so on the FIRST observed shortfall;
+ * the sweep this governs waits out `fundingGuard.sweepConfirmSeconds` first:
  * `offchain` pulls visible quotes off the relay (gasless, doesn't reduce on-chain exposure),
  * `onchain` also authoritatively cancels on chain (the only mode that shrinks `required` so
  * the hold can clear), `none` leaves quotes up to ride to expiry.
@@ -329,6 +330,31 @@ export interface FundingGuardConfig {
    * changes slowly and the reads cost RPC. Independent of `ownState.auditPollIntervalMs`.
    */
   checkIntervalMs: number;
+  /**
+   * How long an apparent shortfall must PERSIST before the active cancel sweep may
+   * run. The posting halt is unaffected — it is entered on the first observed
+   * shortfall, because refusing to add exposure is free and reversible. The sweep is
+   * not: it is a global scan that pulls every matchable commitment across every
+   * speculation, so it waits for the shortfall to still be there on a LATER
+   * SUCCESSFUL read, at least this many seconds after it was first seen.
+   *
+   * The gap this covers is the own-state fill latency: between a match landing on
+   * chain and the own-state stream delivering the fill, `funding` is already
+   * fill-reduced while `required` still counts the filled commitment at full size,
+   * so with thin allowance headroom the comparison reads as a shortfall that is not
+   * real (issue #160).
+   *
+   * Default `45` is derived from a guard the MM already carries:
+   * `ownState.indexerLagMaxSeconds` (default and floor `30`) is how much indexer lag
+   * it tolerates before calling own-state degraded, and 45 sits above that with room
+   * for one funding re-read cadence. Range `0..300`; `0` restores the pre-#160
+   * behaviour exactly (hold and sweep from the same single comparison).
+   *
+   * A balance/allowance READ FAILURE is NOT subject to this window — under
+   * `failClosedOnReadError` it arms the sweep on the spot. Funding the MM cannot read
+   * is not a transient it can wait out.
+   */
+  sweepConfirmSeconds: number;
   /**
    * What to do with EXISTING visible quotes when underfunded: `offchain` (soft-cancel —
    * pull them off the relay, gasless) / `onchain` (also authoritatively cancel on chain) /

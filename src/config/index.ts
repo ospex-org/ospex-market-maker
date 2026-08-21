@@ -246,7 +246,7 @@ const APPROVALS_KEYS = ['autoApprove', 'mode'] as const;
 const ORDERS_KEYS = [
   'expiryMode', 'expirySeconds', 'expiryReleaseGraceSeconds', 'staleAfterSeconds', 'staleReferenceAfterSeconds', 'replaceOnOddsMoveBps', 'replaceOnLineMoveTicks', 'cancelMode', 'onchainCancelStrategy',
 ] as const;
-const FUNDING_GUARD_KEYS = ['enabled', 'checkIntervalMs', 'underfundedCancelMode', 'failClosedOnReadError'] as const;
+const FUNDING_GUARD_KEYS = ['enabled', 'checkIntervalMs', 'sweepConfirmSeconds', 'underfundedCancelMode', 'failClosedOnReadError'] as const;
 const SETTLEMENT_KEYS = ['autoSettleOwn', 'autoClaimOwn', 'continueOnGasBudgetExhausted'] as const;
 const TELEMETRY_KEYS = ['logDir', 'logLevel'] as const;
 const STATE_KEYS = ['dir'] as const;
@@ -462,6 +462,19 @@ export function parseConfig(raw: unknown, env: EnvLike = {}): Config {
   const fundingGuard: FundingGuardConfig = {
     enabled: def(fg.enabled, true, (v) => asBoolean(v, 'fundingGuard.enabled')),
     checkIntervalMs: def(fg.checkIntervalMs, 30_000, (v) => asPositiveInt(v, 'fundingGuard.checkIntervalMs')),
+    // Default 45 is DERIVED, not picked: the gap this window covers is the
+    // own-state fill latency (indexer poll cadence + SSE delivery), and the MM
+    // already tolerates up to `ownState.indexerLagMaxSeconds` (default + floor
+    // 30) of indexer lag before it calls own-state degraded. 45 sits above that
+    // 30s with room for one funding re-read cadence on top, so a shortfall that
+    // is only the own-state pipeline running late is normally gone before the
+    // sweep may run. It is a WAIT, not a weakening: the posting halt is still
+    // entered on the first observed shortfall, and a read FAILURE still arms the
+    // sweep immediately (see `checkFunding`). `0` restores the pre-#160
+    // behaviour exactly — hold and sweep from the same single comparison.
+    sweepConfirmSeconds: def(fg.sweepConfirmSeconds, 45, (v) =>
+      asNumberInRange(v, 'fundingGuard.sweepConfirmSeconds', 0, 300, { minInclusive: true, maxInclusive: true }),
+    ),
     underfundedCancelMode: def<UnderfundedCancelMode>(
       fg.underfundedCancelMode,
       'offchain',

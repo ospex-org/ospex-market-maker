@@ -73,7 +73,7 @@ export const TELEMETRY_KINDS = [
   'nonce-floor-raise',
   'expire', //                     a tracked commitment hit expiry — headroom released
   'approval', //                   { purpose, spender, currentAllowance, requiredAggregateAllowance, amountSetTo }
-  'funding-hold', //               funding guard (C1a) tripped/cleared — { state: 'entered'|'cleared', reason, fundingWei6, requiredWei6, walletUsdcWei6, positionModuleAllowanceWei6 }
+  'funding-hold', //               funding guard (C1a) tripped/cleared/sweep-armed — { state: 'entered'|'cleared'|'sweep-armed', reason, fundingWei6, requiredWei6, walletUsdcWei6, positionModuleAllowanceWei6, shortfallHeldForSeconds? }. 'sweep-armed' fires at most once per hold episode, when a shortfall has persisted `fundingGuard.sweepConfirmSeconds` past its first observation (or immediately on a read failure) and the C1b cancel sweep may now run — see DESIGN §6.
   'fill',
   'position-transition', //         a tracked position's status moved forward (active → pendingSettle → claimable; claimed is set by the auto-claim path, not by the poll)
   'settle',

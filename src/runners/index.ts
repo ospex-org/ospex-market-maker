@@ -433,6 +433,30 @@ export class Runner {
   /** Unix-seconds of the last funding re-read; throttles `checkFunding` to `fundingGuard.checkIntervalMs`. `null` = never read. */
   private lastFundingCheckAtSec: number | null = null;
   /**
+   * Funding guard (issue #160): unix-seconds at which the CURRENT run of apparent
+   * shortfalls was first observed, or `null` when the last successful check saw
+   * funding covering `required` (or there was no exposure to back). Reset on every
+   * recovery, so a second episode is timed from its OWN first observation rather
+   * than inheriting an earlier one. Read only by {@link checkFunding}.
+   */
+  private shortfallFirstObservedAtSec: number | null = null;
+  /**
+   * Funding guard (issue #160): may {@link fundingCancelSweep} run? The posting halt
+   * ({@link fundingHold}) is entered on the FIRST observed shortfall — refusing to add
+   * exposure is free and reversible. The sweep is not: it is a global scan that pulls
+   * every matchable commitment across every speculation, so it additionally requires
+   * the shortfall to still be present on a LATER successful read, at least
+   * `fundingGuard.sweepConfirmSeconds` after {@link shortfallFirstObservedAtSec}. The
+   * window exists because the two sides of the comparison see a fill at different
+   * times: `funding` at chain latency, `required` at own-state stream latency, so a
+   * just-landed fill can read as a shortfall that clears itself.
+   *
+   * A READ FAILURE arms this immediately under `failClosedOnReadError` — unreadable
+   * funding is not a transient to wait out, and that path keeps its pre-#160
+   * same-tick sweep.
+   */
+  private fundingSweepArmed = false;
+  /**
    * Funding guard (C1b): under `underfundedCancelMode: onchain`, whether the active-cancel
    * sweep has already emitted a `gas-budget-blocks-onchain-cancel` candidate for the *current*
    * hold episode — so a sustained gas shortfall during a hold doesn't spam the log every tick
@@ -820,6 +844,8 @@ export class Runner {
     // until the MM actually has outstanding commitments to back.
     const requiredWei6 = matchableCommitmentRiskWei6(this.state, nowSec, this.config.orders.expiryReleaseGraceSeconds);
     if (requiredWei6 === 0n) {
+      this.shortfallFirstObservedAtSec = null; // nothing to back — a later episode times from its own first observation
+      this.fundingSweepArmed = false;
       this.setFundingHold(false, { reason: 'funding-shortfall', requiredWei6 });
       return;
     }
@@ -839,18 +865,64 @@ export class Runner {
       positionAllowanceWei6 = (await this.adapter.readApprovals(this.makerAddress)).usdc.allowances.positionModule.raw;
     } catch (err) {
       this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'funding-check' });
-      if (fg.failClosedOnReadError) this.setFundingHold(true, { reason: 'read-failed' });
+      if (fg.failClosedOnReadError) {
+        this.setFundingHold(true, { reason: 'read-failed' });
+        // Fail-closed keeps its pre-#160 SAME-TICK sweep. The confirmation window
+        // below exists to let an own-state fill catch up; a read we could not
+        // complete tells us nothing that waiting will resolve, and `required` is
+        // real either way. Deliberately NOT routed through
+        // `shortfallFirstObservedAtSec` — that counter only measures observed
+        // shortfalls, and a run of read failures must not be one tick of it.
+        this.armFundingSweep({ reason: 'read-failed' });
+      }
       return;
     }
 
     const fundingWei6 = walletUsdcWei6 < positionAllowanceWei6 ? walletUsdcWei6 : positionAllowanceWei6;
-    this.setFundingHold(fundingWei6 < requiredWei6, {
+    const shortfall = fundingWei6 < requiredWei6;
+    this.setFundingHold(shortfall, {
       reason: 'funding-shortfall',
       fundingWei6,
       requiredWei6,
       walletUsdcWei6,
       positionAllowanceWei6,
     });
+    if (!shortfall) {
+      // Funding covers `required` again — end the episode. The next shortfall is
+      // timed from ITS first observation, not from this one.
+      this.shortfallFirstObservedAtSec = null;
+      this.fundingSweepArmed = false;
+      return;
+    }
+    if (this.shortfallFirstObservedAtSec === null) this.shortfallFirstObservedAtSec = nowSec;
+    if (nowSec - this.shortfallFirstObservedAtSec >= fg.sweepConfirmSeconds) {
+      this.armFundingSweep({ reason: 'funding-shortfall', fundingWei6, requiredWei6, firstObservedAtSec: this.shortfallFirstObservedAtSec, nowSec });
+    }
+  }
+
+  /**
+   * Arm {@link fundingCancelSweep} (issue #160) and emit the `funding-hold`
+   * `state: 'sweep-armed'` marker on the false→true edge only — so an operator
+   * reading the NDJSON can tell "held, waiting out the confirmation window" from
+   * "held, and the sweep is now live", once per hold episode rather than per tick.
+   * Idempotent: re-arming an already-armed sweep is silent.
+   */
+  private armFundingSweep(ctx: {
+    reason: 'funding-shortfall' | 'read-failed';
+    fundingWei6?: bigint;
+    requiredWei6?: bigint;
+    firstObservedAtSec?: number;
+    nowSec?: number;
+  }): void {
+    if (this.fundingSweepArmed) return;
+    this.fundingSweepArmed = true;
+    const payload: Record<string, unknown> = { state: 'sweep-armed', reason: ctx.reason };
+    if (ctx.fundingWei6 !== undefined) payload.fundingWei6 = ctx.fundingWei6.toString();
+    if (ctx.requiredWei6 !== undefined) payload.requiredWei6 = ctx.requiredWei6.toString();
+    if (ctx.firstObservedAtSec !== undefined && ctx.nowSec !== undefined) {
+      payload.shortfallHeldForSeconds = ctx.nowSec - ctx.firstObservedAtSec;
+    }
+    this.eventLog.emit('funding-hold', payload);
   }
 
   /**
@@ -886,8 +958,11 @@ export class Runner {
   }
 
   /**
-   * Funding-guard active-cancel response (C1b, DESIGN §6). Runs each live tick while
-   * {@link fundingHold} is set, per `config.fundingGuard.underfundedCancelMode`:
+   * Funding-guard active-cancel response (C1b, DESIGN §6). Runs each live tick on
+   * which {@link fundingHold} is set AND {@link fundingSweepArmed} — i.e. from the
+   * point the shortfall has been confirmed (`fundingGuard.sweepConfirmSeconds` past
+   * its first observation, or immediately on a read failure), not from the point the
+   * posting halt was entered. Behaves per `config.fundingGuard.underfundedCancelMode`:
    *
    *   - `none`     — no active cancel; the C1a hold (halt NEW posting) is the whole
    *                  response. Existing quotes ride to expiry, so the hold persists until
@@ -924,8 +999,8 @@ export class Runner {
    * toward `required`, so the sweep must reach it. Live-only — `fundingHold` is only ever set in
    * live mode (`checkFunding` is dry-run-gated) and the per-record primitives never write to chain
    * in dry-run. Per-record failures self-heal: a thrown off-chain cancel leaves the record
-   * `visibleOpen` and a thrown on-chain cancel leaves it as-is, both retried on the next held tick
-   * (the sweep runs every tick while held).
+   * `visibleOpen` and a thrown on-chain cancel leaves it as-is, both retried on the next
+   * armed-and-held tick (once armed, the sweep runs every such tick until the hold clears).
    */
   private async fundingCancelSweep(): Promise<void> {
     const mode = this.config.fundingGuard.underfundedCancelMode;
@@ -1664,7 +1739,14 @@ export class Runner {
         await this.reconcileSoftCancelledFills();
         await this.settleAndClaim();
         await this.checkFunding(); // funding guard (C1a) — sets fundingHold before the posting decision below
-        if (this.fundingHold) await this.fundingCancelSweep(); // funding guard (C1b) — actively pull/cancel existing quotes while underfunded, per underfundedCancelMode (reconcileMarkets below is gated by fundingHold anyway)
+        // Funding guard (C1b) — actively pull/cancel existing quotes while underfunded,
+        // per underfundedCancelMode. The sweep needs BOTH the hold and the confirmation
+        // arm (issue #160): the posting halt above is immediate on the first observed
+        // shortfall, but this sweep is a global scan across every speculation, so it
+        // waits until the shortfall is still there `fundingGuard.sweepConfirmSeconds`
+        // after it was first seen (a read failure arms it on the spot). Posting stays
+        // halted throughout — reconcileMarkets below is gated by fundingHold alone.
+        if (this.fundingHold && this.fundingSweepArmed) await this.fundingCancelSweep();
       }
       if (this.makerAddress !== null) await this.checkIndexerLag(); // §5 latch 6 (PR2c-i) — poll own-state health, set indexerLagDegraded BEFORE reconcileMarkets' §5.1 posting gate reads it (address-gated like the subscription itself, not dryRun: runs for observability in a dry-run that carries an owner identity, gate dormant there)
       // §5.1 active cancel-sweep (PR3b-ii) — derive the own-state-health hold ONCE per tick

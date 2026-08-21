@@ -43,6 +43,7 @@ describe('parseConfig', () => {
     expect(c.orders.onchainCancelStrategy).toBe('per-commitment'); // default: unchanged per-commitment behaviour
     expect(c.fundingGuard.enabled).toBe(true);
     expect(c.fundingGuard.checkIntervalMs).toBe(30_000);
+    expect(c.fundingGuard.sweepConfirmSeconds).toBe(45); // derived from ownState.indexerLagMaxSeconds (30) plus one re-read cadence — see the loader comment
     expect(c.fundingGuard.underfundedCancelMode).toBe('offchain');
     expect(c.fundingGuard.failClosedOnReadError).toBe(true);
     expect(c.settlement.autoSettleOwn).toBe(true);
@@ -55,13 +56,14 @@ describe('parseConfig', () => {
     const c = parseConfig(
       {
         rpcUrl: 'https://rpc',
-        fundingGuard: { enabled: true, checkIntervalMs: 15_000, underfundedCancelMode: 'onchain', failClosedOnReadError: false },
+        fundingGuard: { enabled: true, checkIntervalMs: 15_000, sweepConfirmSeconds: 90, underfundedCancelMode: 'onchain', failClosedOnReadError: false },
       },
       {},
     );
     expect(c.fundingGuard).toEqual({
       enabled: true,
       checkIntervalMs: 15_000,
+      sweepConfirmSeconds: 90,
       underfundedCancelMode: 'onchain',
       failClosedOnReadError: false,
     });
@@ -69,6 +71,17 @@ describe('parseConfig', () => {
     expect(parseConfig({ rpcUrl: 'https://rpc', fundingGuard: { underfundedCancelMode: 'none' } }, {}).fundingGuard.underfundedCancelMode).toBe('none');
     expect(() => parseConfig({ rpcUrl: 'https://rpc', fundingGuard: { underfundedCancelMode: 'sometimes' } }, {})).toThrow(/underfundedCancelMode/);
     expect(() => parseConfig({ rpcUrl: 'https://rpc', fundingGuard: { bogus: true } }, {})).toThrow(/fundingGuard\.bogus/);
+  });
+
+  it('fundingGuard.sweepConfirmSeconds: accepts the 0 escape hatch and the 300 ceiling, refuses outside [0, 300] and a non-number', () => {
+    // 0 is the documented opt-out (sweep from the same single comparison, the
+    // pre-#160 behaviour); 300 is the ceiling. Both ENDS are accepted — the range
+    // is inclusive at both, so an off-by-one at either bound reddens here.
+    expect(parseConfig({ rpcUrl: 'https://rpc', fundingGuard: { sweepConfirmSeconds: 0 } }, {}).fundingGuard.sweepConfirmSeconds).toBe(0);
+    expect(parseConfig({ rpcUrl: 'https://rpc', fundingGuard: { sweepConfirmSeconds: 300 } }, {}).fundingGuard.sweepConfirmSeconds).toBe(300);
+    expect(() => parseConfig({ rpcUrl: 'https://rpc', fundingGuard: { sweepConfirmSeconds: -1 } }, {})).toThrow(/sweepConfirmSeconds/);
+    expect(() => parseConfig({ rpcUrl: 'https://rpc', fundingGuard: { sweepConfirmSeconds: 301 } }, {})).toThrow(/sweepConfirmSeconds/);
+    expect(() => parseConfig({ rpcUrl: 'https://rpc', fundingGuard: { sweepConfirmSeconds: '45' } }, {})).toThrow(/sweepConfirmSeconds/);
   });
 
   it('rpcUrl is required (here or via OSPEX_RPC_URL)', () => {

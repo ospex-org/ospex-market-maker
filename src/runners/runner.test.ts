@@ -8548,10 +8548,18 @@ describe('Runner — funding guard', () => {
   });
 
   // ── C1b: active cancel response per underfundedCancelMode ────────────────────
-
+  //
+  // Every case below sets `sweepConfirmSeconds: 0` EXPLICITLY — it is NOT the
+  // default (45, see `fundingGuard.sweepConfirmSeconds`). These cases run one or
+  // two ticks on a frozen clock, so under the shipped default the confirmation
+  // window would never elapse and the sweep would never run: each case would then
+  // pass or fail on the window rather than on the cancel-mode behaviour it was
+  // written to pin. `0` is the documented escape hatch that reproduces the
+  // pre-#160 single-comparison sweep, which is what these cases are about. The
+  // window itself is covered in 'Runner — funding guard sweep confirmation'.
   it('C1b — offchain: pulls visible quotes off the relay (soft-cancel reason "funding"), no on-chain cancel, exposure still counted', async () => {
     const record = seedOne();
-    const config = cfg({ mode: { dryRun: false }, fundingGuard: { underfundedCancelMode: 'offchain' } });
+    const config = cfg({ mode: { dryRun: false }, fundingGuard: { underfundedCancelMode: 'offchain', sweepConfirmSeconds: 0 } });
     const offchainCancels: Hex[] = [];
     const cancelOnchain = cancelOnchainRecorder();
     const adapter = liveSpiedAdapter(
@@ -8574,7 +8582,7 @@ describe('Runner — funding guard', () => {
 
   it('C1b — onchain: soft-cancels then authoritatively cancels on chain → authoritativelyInvalidated (drops from required)', async () => {
     const record = seedOne();
-    const config = cfg({ mode: { dryRun: false }, fundingGuard: { underfundedCancelMode: 'onchain' } });
+    const config = cfg({ mode: { dryRun: false }, fundingGuard: { underfundedCancelMode: 'onchain', sweepConfirmSeconds: 0 } });
     const offchainCancels: Hex[] = [];
     const cancelOnchain = cancelOnchainRecorder();
     const adapter = liveSpiedAdapter(
@@ -8608,7 +8616,7 @@ describe('Runner — funding guard', () => {
       // Daily cap exhausted → canSpendGas denies on the FIRST candidate.
       dailyCounters: { [todayKey]: { gasPolWei: '2000000000000000000', feeUsdcWei6: '0' } },
     });
-    const config = cfg({ mode: { dryRun: false }, fundingGuard: { underfundedCancelMode: 'onchain' } });
+    const config = cfg({ mode: { dryRun: false }, fundingGuard: { underfundedCancelMode: 'onchain', sweepConfirmSeconds: 0 } });
     const offchainCancels: Hex[] = [];
     const cancelOnchain = cancelOnchainRecorder();
     const adapter = liveSpiedAdapter(
@@ -8635,7 +8643,7 @@ describe('Runner — funding guard', () => {
     const record: MakerCommitmentRecord = commitmentRecord({ hash: '0xfund', contestId: 'contest-fund', speculationId: 'spec-fund', makerSide: 'away', riskAmountWei6: '250000', filledRiskWei6: '0', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 10, updatedAtUnixSec: T0 - 10, signedPayloadStatus: 'missing-legacy' });
     delete record.signedPayload;
     StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { [record.hash]: record } });
-    const config = cfg({ mode: { dryRun: false }, fundingGuard: { underfundedCancelMode: 'onchain' } });
+    const config = cfg({ mode: { dryRun: false }, fundingGuard: { underfundedCancelMode: 'onchain', sweepConfirmSeconds: 0 } });
     const offchainCancels: Hex[] = [];
     const cancelOnchain = cancelOnchainRecorder();
     const adapter = liveSpiedAdapter(
@@ -8655,7 +8663,7 @@ describe('Runner — funding guard', () => {
 
   it('C1b — none: holds but performs NO active cancel (quote rides to expiry)', async () => {
     const record = seedOne();
-    const config = cfg({ mode: { dryRun: false }, fundingGuard: { underfundedCancelMode: 'none' } });
+    const config = cfg({ mode: { dryRun: false }, fundingGuard: { underfundedCancelMode: 'none', sweepConfirmSeconds: 0 } });
     const offchainCancels: Hex[] = [];
     const cancelOnchain = cancelOnchainRecorder();
     const adapter = liveSpiedAdapter(
@@ -8677,7 +8685,7 @@ describe('Runner — funding guard', () => {
     const POL = 10n ** 18n;
     const record = commitmentRecord({ hash: '0xfund', contestId: 'contest-fund', speculationId: 'spec-fund', makerSide: 'away', riskAmountWei6: '250000', filledRiskWei6: '0', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 10_000, postedAtUnixSec: T0 - 10, updatedAtUnixSec: T0 - 10 });
     StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { '0xfund': record }, dailyCounters: { [todayUTC()]: { gasPolWei: POL.toString(), feeUsdcWei6: '0' } } }); // today's spend already at the full cap
-    const config = cfg({ mode: { dryRun: false }, fundingGuard: { underfundedCancelMode: 'onchain' }, gas: { maxDailyGasPOL: 1, emergencyReservePOL: 0 } });
+    const config = cfg({ mode: { dryRun: false }, fundingGuard: { underfundedCancelMode: 'onchain', sweepConfirmSeconds: 0 }, gas: { maxDailyGasPOL: 1, emergencyReservePOL: 0 } });
     const cancelOnchain = cancelOnchainRecorder();
     const adapter = liveSpiedAdapter(
       config, () => Promise.resolve([]),
@@ -8701,13 +8709,311 @@ describe('Runner — funding guard', () => {
   it('C1b — dry-run: the funding guard never reads or holds (live-only)', async () => {
     seedOne();
     let reads = 0;
-    const config = cfg({ mode: { dryRun: true }, fundingGuard: { underfundedCancelMode: 'onchain' } });
+    const config = cfg({ mode: { dryRun: true }, fundingGuard: { underfundedCancelMode: 'onchain', sweepConfirmSeconds: 0 } });
     const adapter = liveSpiedAdapter(config, () => Promise.resolve([]), undefined, undefined, undefined, {
       readBalances: (o) => { reads += 1; return Promise.resolve({ owner: o, chainId: 137, native: 0n, usdc: 0n, usdcAddress: '0xusdc' as Hex }); },
     });
     await makeRunner({ config, adapter, maxTicks: 1 }).run();
     expect(reads).toBe(0);
     expect(readEvents().some((e) => e.kind === 'funding-hold')).toBe(false);
+  });
+});
+
+// ── funding guard: sweep confirmation window (issue #160) ─────────────────────
+// The destructive half of the funding guard — `fundingCancelSweep`, a GLOBAL scan
+// that pulls every matchable commitment across every speculation — used to fire
+// from the same single sampled comparison that entered the posting halt. Between
+// a match landing on chain and the own-state stream delivering the fill, `funding`
+// is already fill-reduced while `required` still counts the filled commitment at
+// full size, so with thin allowance headroom that comparison reads as a shortfall
+// that is not real. On 2026-08-05 (contest 86) that cancelled the TOTAL market
+// because the MONEYLINE filled.
+//
+// The fix splits the two responses: the posting halt stays immediate (refusing to
+// add exposure is free and reversible), while the sweep additionally requires the
+// shortfall to still be present on a LATER successful read, at least
+// `fundingGuard.sweepConfirmSeconds` after it was first seen.
+describe('Runner — funding guard sweep confirmation (issue #160)', () => {
+  const MAKER = DEFAULT_FAKE_MAKER_ADDRESS as Hex;
+
+  // The observed mainnet instance, in wei6 (see the issue's "Observed" section).
+  const MONEYLINE_RISK_WEI6 = '869500'; //   0.869500 USDC — the leg that filled
+  const TOTAL_RISK_WEI6 = '3130500'; //      3.130500 USDC — the leg the sweep cancelled
+  const GROSS_REQUIRED_WEI6 = '4000000'; //  0.869500 + 3.130500, i.e. what `required` still counts until own-state catches up
+  const WALLET_USDC_WEI6 = 282_325_870n; //  282.325870 USDC — never the binding side
+  const ALLOWANCE_WEI6 = 3_130_500n; //      3.130500 USDC — the allowance BINDS, and it is ALREADY fill-reduced
+
+  // The three knobs whose disagreement makes these cases discriminating: 15s
+  // between ticks is PAST the funding re-read throttle (so a second tick really
+  // re-reads) but INSIDE the confirmation window (so a build that confused the two
+  // knobs would sweep on tick 2 anyway). Asserted inline below so a later fixture
+  // edit cannot quietly un-discriminate them.
+  const CHECK_INTERVAL_MS = 10_000;
+  const CONFIRM_SECONDS = 45;
+  const TICK_SECONDS = 15;
+
+  /** The moneyline + total legs of the observed instance, flushed as canonical state before boot. */
+  function seedTwoLegs(): { moneyline: MakerCommitmentRecord; total: MakerCommitmentRecord } {
+    const moneyline = commitmentRecord({
+      hash: '0xmoneyline', contestId: '86', speculationId: 'spec-moneyline', marketType: 'moneyline', lineTicks: 0,
+      makerSide: 'away', riskAmountWei6: MONEYLINE_RISK_WEI6, filledRiskWei6: '0', lifecycle: 'visibleOpen',
+      expiryUnixSec: T0 + 10_000, postedAtUnixSec: T0 - 10, updatedAtUnixSec: T0 - 10,
+    });
+    const total = commitmentRecord({
+      hash: '0xtotal', contestId: '86', speculationId: 'spec-total', marketType: 'total', lineTicks: 95,
+      makerSide: 'home', riskAmountWei6: TOTAL_RISK_WEI6, filledRiskWei6: '0', lifecycle: 'visibleOpen',
+      expiryUnixSec: T0 + 10_000, postedAtUnixSec: T0 - 10, updatedAtUnixSec: T0 - 10,
+    });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { [moneyline.hash]: moneyline, [total.hash]: total } });
+    return { moneyline, total };
+  }
+
+  /** The `listOpenCommitments` row that keeps a seeded record "live" through the audit probe (still on the book, no new fill). */
+  function openRow(record: MakerCommitmentRecord): Commitment {
+    return orderbookEntry({
+      commitmentHash: record.hash, maker: MAKER, status: 'open', storedStatus: 'open', isLive: true,
+      riskAmount: record.riskAmountWei6, filledRiskAmount: record.filledRiskWei6,
+      remainingRiskAmount: (BigInt(record.riskAmountWei6) - BigInt(record.filledRiskWei6)).toString(),
+    });
+  }
+
+  /** The own-state commitment delta the stream delivers ~15s after the match lands: the moneyline leg, fully filled. */
+  function moneylineFilledDelta(): Record<string, unknown> {
+    return mappableOwnerCommitment('0xmoneyline', {
+      contestId: '86', speculationId: 'spec-moneyline', marketType: 'moneyline', lineTicks: 0, positionType: 0,
+      riskAmount: MONEYLINE_RISK_WEI6, filledRiskAmount: MONEYLINE_RISK_WEI6, remainingRiskAmount: '0',
+      status: 'filled', storedStatus: 'filled', expiry: '2099-01-01T00:00:00.000Z',
+      updatedAtUnixSec: T0 + TICK_SECONDS, // recent: a stale stamp would let `pruneTerminalCommitments` delete the record before it can be asserted on
+    });
+  }
+
+  /** A `cancelCommitmentOnchain` spy — `offchain` mode must never reach it, and a rejection would only surface as an `error` event. */
+  function onchainCancelRecorder(): { fn: OspexAdapter['cancelCommitmentOnchain']; calls: Hex[] } {
+    const calls: Hex[] = [];
+    return {
+      calls,
+      fn: (arg) => {
+        const hash = ('hash' in arg ? arg.hash : arg.signedCommitment.commitmentHash) as Hex;
+        calls.push(hash);
+        const receipt = { gasUsed: 60_000n, effectiveGasPrice: 30_000_000_000n } as unknown as CancelOnchainResult['receipt'];
+        return Promise.resolve({ txHash: '0xkilltx' as Hex, receipt, commitmentHash: hash });
+      },
+    };
+  }
+
+  /**
+   * A `subscribeOwnState` stub that (a) drives the §5 composite health to HEALTHY at
+   * boot exactly like {@link autoHealthyOwnStateStub} — heartbeat frame → ready (no
+   * snapshot, so state seeded via `StateStore.flush` survives as canonical) →
+   * connected — and (b) hands the case the captured handlers, so it can deliver an
+   * own-state delta BETWEEN ticks the way a real fill arrives (handler → queue →
+   * the loop's pre-tick `drainOwnState` → canonical state).
+   */
+  function healthyOwnStateRecorder(): {
+    subscribe: OspexAdapter['subscribeOwnState'];
+    frame: () => void;
+    commitment: (body: Record<string, unknown>) => void;
+  } {
+    let handlers: Record<string, ((...args: unknown[]) => void) | undefined> = {};
+    const subscribe = ((_opts: unknown, h: unknown) => {
+      handlers = h as Record<string, (...args: unknown[]) => void>;
+      queueMicrotask(() => {
+        handlers.onFrame?.({ receivedAtMs: 0, kind: 'heartbeat' });
+        handlers.onReady?.({ cursor: '' });
+        handlers.onStatus?.('connected');
+      });
+      return { unsubscribe: () => Promise.resolve() };
+    }) as unknown as OspexAdapter['subscribeOwnState'];
+    return {
+      subscribe,
+      frame: (): void => { handlers.onFrame?.({ receivedAtMs: 0, kind: 'heartbeat' }); },
+      commitment: (body): void => {
+        const h = handlers.onCommitment;
+        // Reach assertion: a delta the runner never received would make every
+        // "the hold cleared on its own" case pass for the wrong reason.
+        if (h === undefined) throw new Error('own-state recorder: the runner never registered an onCommitment handler');
+        h(body, { cursor: '' });
+      },
+    };
+  }
+
+  /**
+   * The shared live-mode wiring for these cases. The injected clock advances
+   * `TICK_SECONDS` per tick, driven off `killFileExists` — the one dep the runner
+   * calls exactly once per loop iteration, immediately before `tick()` — so the
+   * clock is TICK-aligned rather than sleep-aligned (a wake outcome makes an extra
+   * `deps.sleep` call within the same between-ticks wait).
+   */
+  function scenario(opts: {
+    sweepConfirmSeconds: number;
+    maxTicks: number;
+    /** 1-based tick number after which the own-state fill is delivered; omit for none. */
+    deliverFillAfterTick?: number;
+    readBalances?: (owner: Hex) => Promise<{ owner: Hex; chainId: number; native: bigint; usdc: bigint; usdcAddress: Hex }>;
+    /** PositionModule allowance to report while the given 1-based tick is running (default: the fill-reduced `ALLOWANCE_WEI6`). */
+    positionAllowanceAtTick?: (tick: number) => bigint;
+    failClosedOnReadError?: boolean;
+  }) {
+    const { moneyline, total } = seedTwoLegs();
+    const config = cfg({
+      mode: { dryRun: false },
+      fundingGuard: {
+        // Set EXPLICITLY: `underfundedCancelMode: 'none'` returns before the sweep,
+        // so a case copied from the sibling C1a tests would measure the mode rather
+        // than the confirmation window.
+        underfundedCancelMode: 'offchain',
+        checkIntervalMs: CHECK_INTERVAL_MS,
+        sweepConfirmSeconds: opts.sweepConfirmSeconds,
+        ...(opts.failClosedOnReadError === undefined ? {} : { failClosedOnReadError: opts.failClosedOnReadError }),
+      },
+    });
+    const recorder = healthyOwnStateRecorder();
+    const offchainCancels: Hex[] = [];
+    const cancelOnchain = onchainCancelRecorder();
+    let balanceReads = 0;
+    let tick = 0;
+    let fillDelivered = false;
+
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]),
+      { cancelCommitmentOffchain: (h) => { offchainCancels.push(h); return Promise.resolve(); }, cancelCommitmentOnchain: cancelOnchain.fn },
+      undefined, undefined,
+      {
+        listOpenCommitments: () => Promise.resolve([openRow(moneyline), openRow(total)]),
+        getCommitment: (h) => Promise.resolve(h === '0xtotal' ? openRow(total) : openRow(moneyline)),
+        readApprovals: () => Promise.resolve(approvalsSnapshotWith(opts.positionAllowanceAtTick?.(tick) ?? ALLOWANCE_WEI6)),
+        readBalances: opts.readBalances ?? ((owner) => {
+          balanceReads += 1;
+          return Promise.resolve({ owner, chainId: 137, native: 10n ** 18n, usdc: WALLET_USDC_WEI6, usdcAddress: '0xusdc' as Hex });
+        }),
+      },
+    );
+    vi.spyOn(adapter, 'subscribeOwnState').mockImplementation(recorder.subscribe);
+
+    const runner = makeRunner({
+      config, adapter, maxTicks: opts.maxTicks,
+      deps: {
+        now: () => T0 + Math.max(0, tick - 1) * TICK_SECONDS,
+        killFileExists: () => { tick += 1; return false; }, // exactly one call per loop iteration, before tick() — see the doc above
+        sleep: (ms: number) => {
+          // The wake path's debounce sleep: the drain runs immediately after it, so
+          // deliver nothing here (a re-fire would race its own application).
+          if (ms === config.ownState.debounceMs) return Promise.resolve();
+          recorder.frame(); // heartbeat — keeps §5 latch 2 (transportFresh) alive as the injected clock advances
+          if (!fillDelivered && opts.deliverFillAfterTick === tick) {
+            fillDelivered = true;
+            recorder.commitment(moneylineFilledDelta());
+          }
+          return Promise.resolve();
+        },
+      },
+    });
+
+    return {
+      runner, offchainCancels, cancelOnchain,
+      get balanceReads(): number { return balanceReads; },
+      get ticksRun(): number { return tick; },
+      get fillDelivered(): boolean { return fillDelivered; },
+    };
+  }
+
+  it('the observed 2026-08-05 race: a fill own-state has not delivered yet no longer reaches the cancel sweep — the posting halt is still entered immediately', async () => {
+    // Discrimination bounds — if a later edit breaks either of these, the case
+    // stops separating the confirmation window from the re-read throttle.
+    expect(TICK_SECONDS * 1000).toBeGreaterThan(CHECK_INTERVAL_MS); // tick 2 really RE-READS funding (a throttled early-return would look identical)
+    expect(TICK_SECONDS).toBeLessThan(CONFIRM_SECONDS); //             ...and is still INSIDE the confirmation window
+
+    const s = scenario({ sweepConfirmSeconds: CONFIRM_SECONDS, maxTicks: 2, deliverFillAfterTick: 1 });
+    await s.runner.run();
+
+    expect(s.ticksRun).toBe(2);
+    expect(s.balanceReads).toBe(2); // rule 3b-reach: BOTH ticks read funding — a tick that early-returned at the throttle produces the same "no cancels" observable
+    expect(s.fillDelivered).toBe(true);
+
+    // The fill reached CANONICAL state (not just the audit clone) — that is what drops `required`.
+    const reloaded = StateStore.at(stateDir).load().state;
+    expect(reloaded.commitments['0xmoneyline']?.filledRiskWei6).toBe(MONEYLINE_RISK_WEI6);
+
+    // Nothing was cancelled, on either rail, on either tick.
+    expect(s.offchainCancels).toEqual([]);
+    expect(s.cancelOnchain.calls).toEqual([]);
+    const events = readEvents();
+    expect(events.some((e) => e.kind === 'soft-cancel')).toBe(false);
+    expect(reloaded.commitments['0xtotal']?.lifecycle).toBe('visibleOpen'); // the market that did NOT fill is untouched
+
+    // ...but the posting halt is unchanged: entered on the first observed shortfall
+    // (tick 1) and cleared once own-state caught up (tick 2).
+    const holds = events.filter((e) => e.kind === 'funding-hold');
+    expect(holds.map((h) => h.state)).toEqual(['entered', 'cleared']);
+    expect(holds[0]).toMatchObject({ state: 'entered', reason: 'funding-shortfall', requiredWei6: GROSS_REQUIRED_WEI6, fundingWei6: ALLOWANCE_WEI6.toString() });
+    expect(holds[1]).toMatchObject({ state: 'cleared', reason: 'funding-shortfall', requiredWei6: ALLOWANCE_WEI6.toString(), fundingWei6: ALLOWANCE_WEI6.toString() });
+  });
+
+  it('NEGATIVE CONTROL — a shortfall still present once the window has elapsed DOES sweep: both hashes pulled, and not before tick 4', async () => {
+    const MAX_TICKS = 4;
+    // Tick N runs at T0 + (N-1) × TICK_SECONDS, so tick 4 is the first tick at or
+    // past the window and tick 3 is the last one inside it.
+    expect((MAX_TICKS - 1) * TICK_SECONDS).toBeGreaterThanOrEqual(CONFIRM_SECONDS);
+    expect((MAX_TICKS - 2) * TICK_SECONDS).toBeLessThan(CONFIRM_SECONDS);
+
+    const s = scenario({ sweepConfirmSeconds: CONFIRM_SECONDS, maxTicks: MAX_TICKS }); // no own-state fill — the shortfall is REAL
+    await s.runner.run();
+
+    expect(s.ticksRun).toBe(MAX_TICKS);
+    expect(s.balanceReads).toBe(MAX_TICKS);
+    expect([...s.offchainCancels].sort()).toEqual(['0xmoneyline', '0xtotal']);
+
+    const events = readEvents();
+    const tick4StartIdx = events.findIndex((e) => e.kind === 'tick-start' && e.tick === MAX_TICKS);
+    const firstCancelIdx = events.findIndex((e) => e.kind === 'soft-cancel');
+    expect(tick4StartIdx).toBeGreaterThan(-1);
+    expect(firstCancelIdx).toBeGreaterThan(tick4StartIdx); // the sweep waited out the window rather than firing on tick 1
+
+    const reloaded = StateStore.at(stateDir).load().state;
+    expect(reloaded.commitments['0xmoneyline']?.lifecycle).toBe('softCancelled');
+    expect(reloaded.commitments['0xtotal']?.lifecycle).toBe('softCancelled');
+  });
+
+  it('sweepConfirmSeconds: 0 reproduces the pre-fix single-tick sweep — hold entered AND both hashes pulled on tick 1', async () => {
+    const s = scenario({ sweepConfirmSeconds: 0, maxTicks: 1, deliverFillAfterTick: 1 }); // the fill is delivered, but the run ends before a tick can see it
+    await s.runner.run();
+
+    expect(s.ticksRun).toBe(1);
+    const events = readEvents();
+    expect(events.filter((e) => e.kind === 'funding-hold' && e.state === 'entered')).toHaveLength(1);
+    expect([...s.offchainCancels].sort()).toEqual(['0xmoneyline', '0xtotal']); // one sampled comparison, both markets gone
+  });
+
+  it('fail-closed is untouched: an unreadable balance sweeps on the SAME tick, with no confirmation wait', async () => {
+    const s = scenario({
+      sweepConfirmSeconds: CONFIRM_SECONDS, // long enough that a counted window would still be open on tick 1
+      maxTicks: 1,
+      failClosedOnReadError: true,
+      readBalances: () => Promise.reject(new Error('rpc 503')),
+    });
+    await s.runner.run();
+
+    const events = readEvents();
+    expect(events.filter((e) => e.kind === 'funding-hold' && e.state === 'entered' && e.reason === 'read-failed')).toHaveLength(1);
+    expect(events.some((e) => e.kind === 'error' && e.phase === 'funding-check')).toBe(true);
+    expect([...s.offchainCancels].sort()).toEqual(['0xmoneyline', '0xtotal']); // funding we cannot READ is not a transient to wait out
+  });
+
+  it('the window restarts after funding recovers — shortfall, recovery, shortfall again does not sweep on the strength of the FIRST episode', async () => {
+    // Tick 1 short, tick 2 covered (allowance raised to exactly `required`), ticks
+    // 3–4 short again. Measured from tick 3 the second episode is only 15s old at
+    // tick 4; measured from tick 1 it would be 45s, and would sweep.
+    const s = scenario({
+      sweepConfirmSeconds: CONFIRM_SECONDS,
+      maxTicks: 4,
+      positionAllowanceAtTick: (tick) => (tick === 2 ? BigInt(GROSS_REQUIRED_WEI6) : ALLOWANCE_WEI6),
+    });
+    await s.runner.run();
+
+    expect(s.ticksRun).toBe(4);
+    const holds = readEvents().filter((e) => e.kind === 'funding-hold');
+    expect(holds.map((h) => h.state)).toEqual(['entered', 'cleared', 'entered']); // the recovery really happened
+    expect(s.offchainCancels).toEqual([]);
   });
 });
 
@@ -8915,7 +9221,12 @@ describe('Runner — §5.1 stream-health active cancel-sweep (PR3b-ii)', () => {
 
   it('coexists with the funding sweep (both onchain): a record cancelled by the funding sweep is NOT double-cancelled by the stream-health sweep', async () => {
     const record = seedOne();
-    const config = cfg({ mode: { dryRun: false }, orders: { cancelMode: 'onchain' }, fundingGuard: { underfundedCancelMode: 'onchain' }, gas: { maxDailyGasPOL: 1, emergencyReservePOL: 0.2 } });
+    // `sweepConfirmSeconds: 0` (NOT the default — see the C1b block above): this
+    // case is about the funding sweep running FIRST on the same tick, and on a
+    // frozen clock the shipped 45s window would keep it from running at all —
+    // leaving the stream-health sweep to produce the same single cancel and the
+    // case green for the wrong reason.
+    const config = cfg({ mode: { dryRun: false }, orders: { cancelMode: 'onchain' }, fundingGuard: { underfundedCancelMode: 'onchain', sweepConfirmSeconds: 0 }, gas: { maxDailyGasPOL: 1, emergencyReservePOL: 0.2 } });
     const cancelOnchain = cancelOnchainRecorder();
     const adapter = liveSpiedAdapter(
       config, () => Promise.resolve([]),

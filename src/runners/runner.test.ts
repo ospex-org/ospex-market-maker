@@ -8753,16 +8753,16 @@ describe('Runner — funding guard sweep confirmation (issue #160)', () => {
   const TICK_SECONDS = 15;
 
   /** The moneyline + total legs of the observed instance, flushed as canonical state before boot. */
-  function seedTwoLegs(): { moneyline: MakerCommitmentRecord; total: MakerCommitmentRecord } {
+  function seedTwoLegs(expiryUnixSec = T0 + 10_000): { moneyline: MakerCommitmentRecord; total: MakerCommitmentRecord } {
     const moneyline = commitmentRecord({
       hash: '0xmoneyline', contestId: '86', speculationId: 'spec-moneyline', marketType: 'moneyline', lineTicks: 0,
       makerSide: 'away', riskAmountWei6: MONEYLINE_RISK_WEI6, filledRiskWei6: '0', lifecycle: 'visibleOpen',
-      expiryUnixSec: T0 + 10_000, postedAtUnixSec: T0 - 10, updatedAtUnixSec: T0 - 10,
+      expiryUnixSec, postedAtUnixSec: T0 - 10, updatedAtUnixSec: T0 - 10,
     });
     const total = commitmentRecord({
       hash: '0xtotal', contestId: '86', speculationId: 'spec-total', marketType: 'total', lineTicks: 95,
       makerSide: 'home', riskAmountWei6: TOTAL_RISK_WEI6, filledRiskWei6: '0', lifecycle: 'visibleOpen',
-      expiryUnixSec: T0 + 10_000, postedAtUnixSec: T0 - 10, updatedAtUnixSec: T0 - 10,
+      expiryUnixSec, postedAtUnixSec: T0 - 10, updatedAtUnixSec: T0 - 10,
     });
     StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { [moneyline.hash]: moneyline, [total.hash]: total } });
     return { moneyline, total };
@@ -8784,6 +8784,15 @@ describe('Runner — funding guard sweep confirmation (issue #160)', () => {
       riskAmount: MONEYLINE_RISK_WEI6, filledRiskAmount: MONEYLINE_RISK_WEI6, remainingRiskAmount: '0',
       status: 'filled', storedStatus: 'filled', expiry: '2099-01-01T00:00:00.000Z',
       updatedAtUnixSec: T0 + TICK_SECONDS, // recent: a stale stamp would let `pruneTerminalCommitments` delete the record before it can be asserted on
+    });
+  }
+
+  /** An own-state delta announcing a brand-new `visibleOpen` commitment — fresh matchable exposure the guard has not seen before. */
+  function newVisibleOpenDelta(hash: string, riskWei6: string, atUnixSec: number): Record<string, unknown> {
+    return mappableOwnerCommitment(hash, {
+      contestId: '86', speculationId: `spec-${hash}`, marketType: 'moneyline', lineTicks: 0, positionType: 1,
+      riskAmount: riskWei6, filledRiskAmount: '0', remainingRiskAmount: riskWei6,
+      status: 'open', storedStatus: 'open', expiry: '2099-01-01T00:00:00.000Z', updatedAtUnixSec: atUnixSec,
     });
   }
 
@@ -8847,14 +8856,16 @@ describe('Runner — funding guard sweep confirmation (issue #160)', () => {
   function scenario(opts: {
     sweepConfirmSeconds: number;
     maxTicks: number;
-    /** 1-based tick number after which the own-state fill is delivered; omit for none. */
-    deliverFillAfterTick?: number;
+    /** Own-state commitment deltas to deliver in the between-ticks wait after the given 1-based tick (each fires once). */
+    deliveries?: Array<{ afterTick: number; body: Record<string, unknown> }>;
     readBalances?: (owner: Hex) => Promise<{ owner: Hex; chainId: number; native: bigint; usdc: bigint; usdcAddress: Hex }>;
     /** PositionModule allowance to report while the given 1-based tick is running (default: the fill-reduced `ALLOWANCE_WEI6`). */
     positionAllowanceAtTick?: (tick: number) => bigint;
     failClosedOnReadError?: boolean;
+    /** `expiryUnixSec` for the two seeded legs (default: far future, so they never age out mid-case). */
+    seedExpiryUnixSec?: number;
   }) {
-    const { moneyline, total } = seedTwoLegs();
+    const { moneyline, total } = seedTwoLegs(opts.seedExpiryUnixSec);
     const config = cfg({
       mode: { dryRun: false },
       fundingGuard: {
@@ -8872,7 +8883,8 @@ describe('Runner — funding guard sweep confirmation (issue #160)', () => {
     const cancelOnchain = onchainCancelRecorder();
     let balanceReads = 0;
     let tick = 0;
-    let fillDelivered = false;
+    const pending = [...(opts.deliveries ?? [])];
+    let delivered = 0;
 
     const adapter = liveSpiedAdapter(
       config, () => Promise.resolve([]),
@@ -8900,9 +8912,12 @@ describe('Runner — funding guard sweep confirmation (issue #160)', () => {
           // deliver nothing here (a re-fire would race its own application).
           if (ms === config.ownState.debounceMs) return Promise.resolve();
           recorder.frame(); // heartbeat — keeps §5 latch 2 (transportFresh) alive as the injected clock advances
-          if (!fillDelivered && opts.deliverFillAfterTick === tick) {
-            fillDelivered = true;
-            recorder.commitment(moneylineFilledDelta());
+          for (let i = pending.length - 1; i >= 0; i -= 1) {
+            const d = pending[i];
+            if (d === undefined || d.afterTick !== tick) continue;
+            pending.splice(i, 1);
+            delivered += 1;
+            recorder.commitment(d.body);
           }
           return Promise.resolve();
         },
@@ -8913,7 +8928,8 @@ describe('Runner — funding guard sweep confirmation (issue #160)', () => {
       runner, offchainCancels, cancelOnchain,
       get balanceReads(): number { return balanceReads; },
       get ticksRun(): number { return tick; },
-      get fillDelivered(): boolean { return fillDelivered; },
+      /** How many of `deliveries` actually reached the runner's own-state handler (rule 3b-reach). */
+      get deliveredCount(): number { return delivered; },
     };
   }
 
@@ -8923,12 +8939,12 @@ describe('Runner — funding guard sweep confirmation (issue #160)', () => {
     expect(TICK_SECONDS * 1000).toBeGreaterThan(CHECK_INTERVAL_MS); // tick 2 really RE-READS funding (a throttled early-return would look identical)
     expect(TICK_SECONDS).toBeLessThan(CONFIRM_SECONDS); //             ...and is still INSIDE the confirmation window
 
-    const s = scenario({ sweepConfirmSeconds: CONFIRM_SECONDS, maxTicks: 2, deliverFillAfterTick: 1 });
+    const s = scenario({ sweepConfirmSeconds: CONFIRM_SECONDS, maxTicks: 2, deliveries: [{ afterTick: 1, body: moneylineFilledDelta() }] });
     await s.runner.run();
 
     expect(s.ticksRun).toBe(2);
     expect(s.balanceReads).toBe(2); // rule 3b-reach: BOTH ticks read funding — a tick that early-returned at the throttle produces the same "no cancels" observable
-    expect(s.fillDelivered).toBe(true);
+    expect(s.deliveredCount).toBe(1);
 
     // The fill reached CANONICAL state (not just the audit clone) — that is what drops `required`.
     const reloaded = StateStore.at(stateDir).load().state;
@@ -8980,7 +8996,7 @@ describe('Runner — funding guard sweep confirmation (issue #160)', () => {
   });
 
   it('sweepConfirmSeconds: 0 reproduces the pre-fix single-tick sweep — hold entered AND both hashes pulled on tick 1', async () => {
-    const s = scenario({ sweepConfirmSeconds: 0, maxTicks: 1, deliverFillAfterTick: 1 }); // the fill is delivered, but the run ends before a tick can see it
+    const s = scenario({ sweepConfirmSeconds: 0, maxTicks: 1, deliveries: [{ afterTick: 1, body: moneylineFilledDelta() }] }); // the fill is delivered, but the run ends before a tick can see it
     await s.runner.run();
 
     expect(s.ticksRun).toBe(1);
@@ -9054,6 +9070,44 @@ describe('Runner — funding guard sweep confirmation (issue #160)', () => {
     // ...and the second arm landed on tick 9, not on the tick the shortfall reopened.
     const secondArmIdx = events.lastIndexOf(holds[holds.length - 1] as Record<string, unknown>);
     expect(secondArmIdx).toBeGreaterThan(events.findIndex((e) => e.kind === 'tick-start' && e.tick === MAX_TICKS));
+  });
+
+  it('exposure falling to zero also ends the episode — fresh exposure afterwards waits out its own window before the sweep may run', async () => {
+    // The third recovery route. `checkFunding` short-circuits BEFORE reading funding
+    // when `required` is 0, so that branch clears the hold on its own and must end the
+    // episode too — otherwise a stamp (or an arm) from the previous exposure carries
+    // into the next one. Route: the two legs expire out of `required` (they are past
+    // `expiry + expiryReleaseGraceSeconds` from tick 6), then own-state announces a
+    // brand-new commitment, which reopens a shortfall on tick 7.
+    const MAX_TICKS = 8;
+    const GRACE_SECONDS = 60; // orders.expiryReleaseGraceSeconds default
+    const SEED_EXPIRY = T0 + 5;
+    // Bounds: still matchable (so the tick-4 sweep has something to pull), released by
+    // tick 6, and NOT before — tick 5 must still be inside the grace or the episode
+    // ends a tick early and the timings below stop lining up.
+    expect(T0 + 3 * TICK_SECONDS).toBeLessThan(SEED_EXPIRY + GRACE_SECONDS); //  tick 4 (T0+45): still counted
+    expect(T0 + 4 * TICK_SECONDS).toBeLessThan(SEED_EXPIRY + GRACE_SECONDS); //  tick 5 (T0+60): still counted
+    expect(T0 + 5 * TICK_SECONDS).toBeGreaterThanOrEqual(SEED_EXPIRY + GRACE_SECONDS); // tick 6 (T0+75): released → required 0
+    expect((MAX_TICKS - 7) * TICK_SECONDS).toBeLessThan(CONFIRM_SECONDS); //     tick 8 is only 15s into the new episode
+
+    const s = scenario({
+      sweepConfirmSeconds: CONFIRM_SECONDS,
+      maxTicks: MAX_TICKS,
+      seedExpiryUnixSec: SEED_EXPIRY,
+      deliveries: [{ afterTick: 6, body: newVisibleOpenDelta('0xreposted', GROSS_REQUIRED_WEI6, T0 + 6 * TICK_SECONDS) }],
+    });
+    await s.runner.run();
+
+    expect(s.ticksRun).toBe(MAX_TICKS);
+    expect(s.deliveredCount).toBe(1);
+    const reloaded = StateStore.at(stateDir).load().state;
+    expect(reloaded.commitments['0xreposted']?.lifecycle).toBe('visibleOpen'); // the new exposure reached canonical state AND survived
+
+    const holds = readEvents().filter((e) => e.kind === 'funding-hold');
+    expect(holds.map((h) => h.state)).toEqual(['entered', 'sweep-armed', 'cleared', 'entered']); // episode 1 armed; episode 2 has not, within 8 ticks
+    // The tick-4 sweep pulled the two seeded legs and nothing else: the reposted
+    // commitment is untouched, which is what a carried-over stamp or arm would break.
+    expect([...s.offchainCancels].sort()).toEqual(['0xmoneyline', '0xtotal']);
   });
 });
 

@@ -241,6 +241,10 @@ describe('loadConfig', () => {
     expect(c.pricing.economics.capitalUSDC).toBe(50);
     expect(c.risk.bankrollUSDC).toBe(50);
     expect(c.orders.expiryMode).toBe('fixed-seconds');
+    // The annotated example spells this one out, so pin it against the loader's own
+    // default rather than a literal — an example that drifts from the shipped default
+    // is a doc that lies about what a config-less operator gets.
+    expect(c.fundingGuard.sweepConfirmSeconds).toBe(parseConfig({ rpcUrl: 'x' }, {}).fundingGuard.sweepConfirmSeconds);
   });
 
   it('a missing config file throws a clear error', () => {

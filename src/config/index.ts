@@ -470,8 +470,9 @@ export function parseConfig(raw: unknown, env: EnvLike = {}): Config {
     // is only the own-state pipeline running late is normally gone before the
     // sweep may run. It is a WAIT, not a weakening: the posting halt is still
     // entered on the first observed shortfall, and a read FAILURE still arms the
-    // sweep immediately (see `checkFunding`). `0` restores the pre-#160
-    // behaviour exactly — hold and sweep from the same single comparison.
+    // sweep immediately (see `checkFunding`). `0` restores the pre-#160 TIMING —
+    // hold and sweep from the same single comparison — but not a pre-#160 event
+    // log: the `sweep-armed` marker is emitted whatever the window's length.
     sweepConfirmSeconds: def(fg.sweepConfirmSeconds, 45, (v) =>
       asNumberInRange(v, 'fundingGuard.sweepConfirmSeconds', 0, 300, { minInclusive: true, maxInclusive: true }),
     ),

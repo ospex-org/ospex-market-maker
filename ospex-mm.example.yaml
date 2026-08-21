@@ -186,8 +186,11 @@ fundingGuard:                       # solvency guard (DESIGN §6): halt NEW post
                                     #   GLOBAL scan (every speculation, not just the one that filled), so it waits for the
                                     #   shortfall to still be there on a later successful read. Range 0..300. Derived from
                                     #   ownState.indexerLagMaxSeconds (30 — the indexer lag already tolerated) plus one re-read
-                                    #   cadence. 0 = no wait (hold and sweep from the same single comparison). A failed funding
-                                    #   READ is never subject to this — it arms the sweep at once (see failClosedOnReadError).
+                                    #   cadence. 0 = no wait (hold and sweep from the same single comparison; the sweep-armed
+                                    #   telemetry marker is still emitted). The wait is a MINIMUM: the sweep can only arm on a
+                                    #   funding re-read, so on the shipped 30s/60s cadence a 45s window arms at 60s. A failed
+                                    #   funding READ is never subject to this — it arms the sweep at once, including mid-wait
+                                    #   (see failClosedOnReadError).
   underfundedCancelMode: offchain   # what to do with EXISTING visible quotes when underfunded (active cancel response):
                                     #   "offchain" pull off the relay (gasless) / "onchain" also authoritatively cancel on chain
                                     #   (gas) / "none" hold only (ride to expiry). NEW posting is ALWAYS halted while underfunded,

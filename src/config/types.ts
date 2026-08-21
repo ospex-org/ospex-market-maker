@@ -348,7 +348,15 @@ export interface FundingGuardConfig {
    * `ownState.indexerLagMaxSeconds` (default and floor `30`) is how much indexer lag
    * it tolerates before calling own-state degraded, and 45 sits above that with room
    * for one funding re-read cadence. Range `0..300`; `0` restores the pre-#160
-   * behaviour exactly (hold and sweep from the same single comparison).
+   * TIMING — hold and sweep from the same single comparison — but not a pre-#160
+   * event log, because the `sweep-armed` marker is emitted whatever the window's
+   * length.
+   *
+   * The wait is "at least" in a second sense too: the arm can only happen on a
+   * funding RE-READ, which is itself throttled to `checkIntervalMs` and paced by
+   * the tick. On the shipped defaults (30 s re-read, 60 s tick) a 45 s window
+   * arms at 60 s, so `shortfallHeldForSeconds` on the marker is normally larger
+   * than this value.
    *
    * A balance/allowance READ FAILURE is NOT subject to this window — under
    * `failClosedOnReadError` it arms the sweep on the spot. Funding the MM cannot read

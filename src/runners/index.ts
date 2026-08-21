@@ -453,7 +453,14 @@ export class Runner {
    *
    * A READ FAILURE arms this immediately under `failClosedOnReadError` — unreadable
    * funding is not a transient to wait out, and that path keeps its pre-#160
-   * same-tick sweep.
+   * same-tick sweep. That precedence holds PARTWAY THROUGH an open window too: a
+   * failed read while a shortfall is being timed arms on the spot rather than
+   * waiting out the remainder, so one flaky read inside the window costs the
+   * confirmation for that episode (DESIGN §6).
+   *
+   * Not persisted: a restart clears this and {@link shortfallFirstObservedAtSec},
+   * so the posting halt re-enters on the first tick (as before) and the sweep waits
+   * out a fresh window.
    */
   private fundingSweepArmed = false;
   /**
@@ -873,6 +880,10 @@ export class Runner {
         // real either way. Deliberately NOT routed through
         // `shortfallFirstObservedAtSec` — that counter only measures observed
         // shortfalls, and a run of read failures must not be one tick of it.
+        // Note the precedence this fixes: a failed read while a window is ALREADY
+        // open arms the sweep for the shortfall being timed, rather than waiting
+        // out the remainder. Deliberate (fail-closed wins), and it means the
+        // guarantee is about observed shortfalls rather than elapsed wall time.
         this.armFundingSweep({ reason: 'read-failed' });
       }
       return;
@@ -906,6 +917,12 @@ export class Runner {
    * reading the NDJSON can tell "held, waiting out the confirmation window" from
    * "held, and the sweep is now live", once per hold episode rather than per tick.
    * Idempotent: re-arming an already-armed sweep is silent.
+   *
+   * The marker says the sweep MAY now run, not that anything was cancelled — under
+   * `underfundedCancelMode: none` {@link fundingCancelSweep} returns without acting,
+   * and the marker still fires. What actually happened is in the `soft-cancel` /
+   * `onchain-cancel` / `nonce-floor-raise` events. It is also emitted whatever the
+   * window's length, so `sweepConfirmSeconds: 0` still writes it.
    */
   private armFundingSweep(ctx: {
     reason: 'funding-shortfall' | 'read-failed';

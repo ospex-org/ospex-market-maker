@@ -8967,12 +8967,23 @@ describe('Runner — funding guard sweep confirmation (issue #160)', () => {
 
   it('NEGATIVE CONTROL — a shortfall still present once the window has elapsed DOES sweep: both hashes pulled, and not before tick 4', async () => {
     const MAX_TICKS = 4;
+    // This case deliberately does NOT use the shared CONFIRM_SECONDS. Rule 3g-both:
+    // `shortfallHeldForSeconds` is meant to be the MEASURED hold duration, and every
+    // other case in this file arms exactly on the window boundary — where "measured"
+    // and "the configured window, copied" are the same number and therefore
+    // indistinguishable. A window that is not a multiple of TICK_SECONDS puts the
+    // fixture in the gap where the two candidate rules disagree. It is also the
+    // production-realistic shape: with the shipped `checkIntervalMs` 30s against a
+    // 60s tick, a 45s window arms at 60s, never at 45.
+    const WINDOW_SECONDS = 40;
+    const HELD_SECONDS = (MAX_TICKS - 1) * TICK_SECONDS; // 45 — tick 4 is the first re-read at or past the window
+    expect(HELD_SECONDS).not.toBe(WINDOW_SECONDS); // ...or this case cannot tell the measurement from the config value
     // Tick N runs at T0 + (N-1) × TICK_SECONDS, so tick 4 is the first tick at or
     // past the window and tick 3 is the last one inside it.
-    expect((MAX_TICKS - 1) * TICK_SECONDS).toBeGreaterThanOrEqual(CONFIRM_SECONDS);
-    expect((MAX_TICKS - 2) * TICK_SECONDS).toBeLessThan(CONFIRM_SECONDS);
+    expect(HELD_SECONDS).toBeGreaterThanOrEqual(WINDOW_SECONDS);
+    expect((MAX_TICKS - 2) * TICK_SECONDS).toBeLessThan(WINDOW_SECONDS);
 
-    const s = scenario({ sweepConfirmSeconds: CONFIRM_SECONDS, maxTicks: MAX_TICKS }); // no own-state fill — the shortfall is REAL
+    const s = scenario({ sweepConfirmSeconds: WINDOW_SECONDS, maxTicks: MAX_TICKS }); // no own-state fill — the shortfall is REAL
     await s.runner.run();
 
     expect(s.ticksRun).toBe(MAX_TICKS);
@@ -8987,7 +8998,18 @@ describe('Runner — funding guard sweep confirmation (issue #160)', () => {
 
     const armed = events.filter((e) => e.kind === 'funding-hold' && e.state === 'sweep-armed');
     expect(armed).toHaveLength(1); // once per hold episode, not per tick
-    expect(armed[0]).toMatchObject({ reason: 'funding-shortfall', shortfallHeldForSeconds: (MAX_TICKS - 1) * TICK_SECONDS });
+    // Rule 3d — assert the WHOLE arm payload, not two picked keys. `fundingWei6` and
+    // `requiredWei6` are same-typed decimal strings written on adjacent lines, so a
+    // positional swap is invisible to any assertion that names neither, and these are
+    // the two numbers an operator reads to judge whether a global sweep was justified.
+    // The fixture keeps them distinct (3130500 vs 4000000) so the swap reddens.
+    expect(armed[0]).toMatchObject({
+      state: 'sweep-armed',
+      reason: 'funding-shortfall',
+      fundingWei6: ALLOWANCE_WEI6.toString(), // the allowance is the binding side
+      requiredWei6: GROSS_REQUIRED_WEI6, //     both legs still counted at full size
+      shortfallHeldForSeconds: HELD_SECONDS, // the MEASURED duration, ≠ WINDOW_SECONDS above
+    });
     expect(events.indexOf(armed[0] as Record<string, unknown>)).toBeLessThan(firstCancelIdx); // the marker precedes the cancels it authorises
 
     const reloaded = StateStore.at(stateDir).load().state;
@@ -8995,7 +9017,7 @@ describe('Runner — funding guard sweep confirmation (issue #160)', () => {
     expect(reloaded.commitments['0xtotal']?.lifecycle).toBe('softCancelled');
   });
 
-  it('sweepConfirmSeconds: 0 reproduces the pre-fix single-tick sweep — hold entered AND both hashes pulled on tick 1', async () => {
+  it('sweepConfirmSeconds: 0 puts the hold and the sweep back on ONE comparison — both hashes pulled on tick 1 — but the NDJSON is not a pre-#160 run', async () => {
     const s = scenario({ sweepConfirmSeconds: 0, maxTicks: 1, deliveries: [{ afterTick: 1, body: moneylineFilledDelta() }] }); // the fill is delivered, but the run ends before a tick can see it
     await s.runner.run();
 
@@ -9003,6 +9025,15 @@ describe('Runner — funding guard sweep confirmation (issue #160)', () => {
     const events = readEvents();
     expect(events.filter((e) => e.kind === 'funding-hold' && e.state === 'entered')).toHaveLength(1);
     expect([...s.offchainCancels].sort()).toEqual(['0xmoneyline', '0xtotal']); // one sampled comparison, both markets gone
+
+    // ...and the bound on what `0` restores: the TIMING is the pre-#160 timing, but
+    // the event log is not identical to one. `armFundingSweep` emits regardless of
+    // the window's length, so a `0` run still writes the `sweep-armed` line a
+    // pre-#160 build never wrote — which matters because AGENTS.md §1 calls the
+    // NDJSON a stable contract. Asserted as a full SEQUENCE, not a filtered count:
+    // an assertion that filters on `state === 'entered'` is structurally unable to
+    // see the extra line, which is exactly how the over-claim survived review.
+    expect(events.filter((e) => e.kind === 'funding-hold').map((e) => e.state)).toEqual(['entered', 'sweep-armed']);
   });
 
   it('fail-closed is untouched: an unreadable balance sweeps on the SAME tick, with no confirmation wait', async () => {
@@ -9018,6 +9049,55 @@ describe('Runner — funding guard sweep confirmation (issue #160)', () => {
     expect(events.filter((e) => e.kind === 'funding-hold' && e.state === 'entered' && e.reason === 'read-failed')).toHaveLength(1);
     expect(events.some((e) => e.kind === 'error' && e.phase === 'funding-check')).toBe(true);
     expect([...s.offchainCancels].sort()).toEqual(['0xmoneyline', '0xtotal']); // funding we cannot READ is not a transient to wait out
+
+    // The ARM event, not just the hold. Every other assertion on an arm in this file
+    // is on a `funding-shortfall` one, so without this a build that labelled every
+    // arm `funding-shortfall` passes the whole file — and this reason is documented
+    // behaviour in AGENTS.md and the telemetry vocabulary.
+    const armed = events.filter((e) => e.kind === 'funding-hold' && e.state === 'sweep-armed');
+    expect(armed).toHaveLength(1);
+    expect(armed[0]).toMatchObject({ reason: 'read-failed' });
+    // No held duration and no wei6 context on this path: the read never produced
+    // either number, and there is no observed-shortfall run to measure.
+    expect(armed[0]?.shortfallHeldForSeconds).toBeUndefined();
+    expect(armed[0]?.fundingWei6).toBeUndefined();
+    expect(armed[0]?.requiredWei6).toBeUndefined();
+  });
+
+  it('a read failure INSIDE an open confirmation window arms the sweep on that tick — fail-closed wins over the wait', async () => {
+    // Where the two rules collide, and the one interaction the docs did not spell
+    // out: tick 1 opens a window that would not elapse until tick 4, and tick 2's
+    // balance read throws. Fail-closed wins by design — `required` is real whether or
+    // not the read completed, so an unreadable balance is not a transient the window
+    // can wait out. Realistic on a flaky RPC: one bad read inside the window and the
+    // confirmation buys nothing, which an operator should be able to read off DESIGN §6.
+    let reads = 0;
+    const s = scenario({
+      sweepConfirmSeconds: CONFIRM_SECONDS,
+      maxTicks: 2,
+      failClosedOnReadError: true,
+      readBalances: (owner) => {
+        reads += 1;
+        if (reads === 2) return Promise.reject(new Error('rpc 503'));
+        return Promise.resolve({ owner, chainId: 137, native: 10n ** 18n, usdc: WALLET_USDC_WEI6, usdcAddress: '0xusdc' as Hex });
+      },
+    });
+    await s.runner.run();
+
+    expect(s.ticksRun).toBe(2);
+    expect(reads).toBe(2); // rule 3b-reach: tick 2 got past the re-read throttle and really attempted the read
+    const events = readEvents();
+    expect(events.some((e) => e.kind === 'error' && e.phase === 'funding-check')).toBe(true);
+
+    // Tick 1: shortfall observed, hold entered, window opens (15s of 45s elapsed by
+    // tick 2, so the shortfall path alone would NOT arm). Tick 2: the read throws —
+    // no `entered` transition (already held), and the arm lands anyway.
+    const holds = events.filter((e) => e.kind === 'funding-hold');
+    expect(holds.map((h) => h.state)).toEqual(['entered', 'sweep-armed']);
+    expect(holds[0]).toMatchObject({ state: 'entered', reason: 'funding-shortfall' }); // ...the episode really began as an observed shortfall
+    expect(holds[1]).toMatchObject({ state: 'sweep-armed', reason: 'read-failed' }); // ...and the arm came from the read failure, not from the window elapsing
+    expect(holds[1]?.shortfallHeldForSeconds).toBeUndefined();
+    expect([...s.offchainCancels].sort()).toEqual(['0xmoneyline', '0xtotal']);
   });
 
   it('the window restarts after funding recovers — shortfall, recovery, shortfall again does not sweep on the strength of the FIRST episode', async () => {

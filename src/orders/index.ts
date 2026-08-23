@@ -432,19 +432,79 @@ export function matchableCommitmentRiskWei6(
   graceSeconds: number,
 ): bigint {
   let total = 0n;
-  for (const record of Object.values(state.commitments)) {
-    if (RELEASED_LIFECYCLES.includes(record.lifecycle)) continue;
-    if (isExpiredForRelease(record.expiryUnixSec, nowUnixSec, graceSeconds)) continue;
-    const riskWei6 = BigInt(record.riskAmountWei6);
-    const filledWei6 = BigInt(record.filledRiskWei6);
-    if (filledWei6 > riskWei6) {
-      throw new Error(
-        `orders: commitment ${record.hash} has filledRiskWei6 (${record.filledRiskWei6}) > riskAmountWei6 (${record.riskAmountWei6}) — corrupt inventory`,
-      );
-    }
-    total += riskWei6 - filledWei6;
+  for (const record of matchableCommitments(state, nowUnixSec, graceSeconds)) {
+    total += remainingRiskWei6(record, BigInt(record.filledRiskWei6));
   }
   return total;
+}
+
+/**
+ * The commitment SET the funding guard's `required` is summed over — every record
+ * that could STILL be filled on chain (`visibleOpen` / `softCancelled` /
+ * `partiallyFilled`, not past `expiry + graceSeconds`). Single source of the
+ * selection for both {@link matchableCommitmentRiskWei6} (local-state filled
+ * amounts) and {@link matchableCommitmentRiskFromChainWei6} (chain-read ones), so
+ * the two summations cannot select different sets — a drift between them would be
+ * the same class of bug as the one chain-truth `required` exists to fix (#160).
+ *
+ * The selection itself is still local: a lifecycle that has not yet caught up
+ * keeps a record IN the set, which over-states `required` (conservative). Filtering
+ * the maker's on-chain nonce floor in as well would tighten it further and is
+ * deliberately out of scope here.
+ */
+export function matchableCommitments(
+  state: MakerState,
+  nowUnixSec: number,
+  graceSeconds: number,
+): MakerCommitmentRecord[] {
+  return Object.values(state.commitments).filter(
+    (record) => !RELEASED_LIFECYCLES.includes(record.lifecycle) && !isExpiredForRelease(record.expiryUnixSec, nowUnixSec, graceSeconds),
+  );
+}
+
+/**
+ * The funding guard's `required`, summed from CHAIN-READ filled amounts (#160).
+ *
+ * Same set and same arithmetic as {@link matchableCommitmentRiskWei6}; the only
+ * difference is where `filled` comes from. `filledRisk` is
+ * `MatchingModule.s_filledRisk` for exactly these hashes, read at one pinned block
+ * (`commitments.getFilledRisk` → `OspexAdapter.readFilledRisk`) — so a caller that
+ * also pins its balance / allowance reads to that block has both sides of
+ * `funding < required` describing ONE instant. Summing the mirror instead counts a
+ * commitment that has already matched at full size for as long as the indexer
+ * lags, and the apparent shortfall equals the fill size exactly.
+ *
+ * Fails CLOSED on anything it cannot account for — a hash the snapshot does not
+ * cover, or a filled amount exceeding the record's risk. The SDK guarantees one
+ * entry per input hash, so a miss means the read did not describe the set it was
+ * asked about; treating it as `0n` would silently understate `required`, which is
+ * the fail-OPEN direction on a money path. Callers run this inside the same
+ * try/catch as the reads, so both land in the `failClosedOnReadError` hold.
+ */
+export function matchableCommitmentRiskFromChainWei6(
+  records: readonly MakerCommitmentRecord[],
+  filledRisk: ReadonlyMap<string, bigint>,
+): bigint {
+  let total = 0n;
+  for (const record of records) {
+    const filledWei6 = filledRisk.get(record.hash);
+    if (filledWei6 === undefined) {
+      throw new Error(`orders: no on-chain filled risk was read for commitment ${record.hash} — refusing to size the funding guard on a partial snapshot`);
+    }
+    total += remainingRiskWei6(record, filledWei6);
+  }
+  return total;
+}
+
+/** `riskAmountWei6 - filledWei6`, fail-closed on a filled amount that exceeds the record's risk (whatever its source). */
+function remainingRiskWei6(record: MakerCommitmentRecord, filledWei6: bigint): bigint {
+  const riskWei6 = BigInt(record.riskAmountWei6);
+  if (filledWei6 > riskWei6) {
+    throw new Error(
+      `orders: commitment ${record.hash} has filledRiskWei6 (${filledWei6}) > riskAmountWei6 (${record.riskAmountWei6}) — corrupt inventory`,
+    );
+  }
+  return riskWei6 - filledWei6;
 }
 
 // ── reconcileBook ────────────────────────────────────────────────────────────

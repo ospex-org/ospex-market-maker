@@ -234,6 +234,7 @@ function makeFakeClient(overrides: DeepPartial<OspexClientLike> = {}): OspexClie
       raiseMinNonce: notStubbed('commitments.raiseMinNonce'),
       approve: notStubbed('commitments.approve'),
       getNonceFloor: notStubbed('commitments.getNonceFloor'),
+      getFilledRisk: notStubbed('commitments.getFilledRisk'),
       prepareSubmit: notStubbed('commitments.prepareSubmit'),
       checkSubmitFundability: notStubbed('commitments.checkSubmitFundability'),
       submitPrepared: notStubbed('commitments.submitPrepared'),
@@ -584,6 +585,31 @@ describe('OspexAdapter — passthroughs', () => {
     expect(aArgs).toEqual({ owner: '0x1111111111111111111111111111111111111111' });
   });
 
+  it('readBalances / readApprovals forward an explicit blockNumber to the SDK, and OMIT the key when none is given (#160)', async () => {
+    // The runner-level pinning case spies on the ADAPTER, so it cannot see a block
+    // dropped between the adapter and the SDK — this is the wiring that carries it
+    // (rule 3i-install). Omission is asserted as an absent KEY rather than an
+    // undefined value: `exactOptionalPropertyTypes` is on, and "no opinion" and
+    // "explicitly undefined" are different requests to make of a driver.
+    const OWNER = '0x1111111111111111111111111111111111111111' as Hex;
+    let bArgs: Record<string, unknown> | null = null;
+    let aArgs: Record<string, unknown> | null = null;
+    const adapter = adapterWith({
+      balances: { read: (args) => { bArgs = (args ?? {}) as Record<string, unknown>; return Promise.resolve(SAMPLE_BALANCES); } },
+      approvals: { read: (args) => { aArgs = (args ?? {}) as Record<string, unknown>; return Promise.resolve(SAMPLE_APPROVALS); } },
+    });
+
+    await adapter.readBalances(OWNER, 91_473_035n);
+    await adapter.readApprovals(OWNER, 91_473_035n);
+    expect(bArgs).toEqual({ owner: OWNER, blockNumber: 91_473_035n });
+    expect(aArgs).toEqual({ owner: OWNER, blockNumber: 91_473_035n });
+
+    await adapter.readBalances(OWNER);
+    await adapter.readApprovals(OWNER);
+    expect(Object.prototype.hasOwnProperty.call(bArgs ?? {}, 'blockNumber')).toBe(false);
+    expect(Object.prototype.hasOwnProperty.call(aArgs ?? {}, 'blockNumber')).toBe(false);
+  });
+
   it('checkApiHealth resolves true on a successful health.check and false on any rejection (never throws)', async () => {
     const okAdapter = adapterWith({ health: { check: () => Promise.resolve({ status: 'ok' } as unknown as never) } });
     expect(await okAdapter.checkApiHealth()).toBe(true);
@@ -769,6 +795,24 @@ describe('OspexAdapter — write surface', () => {
       lineTicks: 0,
     };
     expect(await adapter.readMinNonceFloor(args)).toBe(42n);
+    expect(received).toEqual(args);
+  });
+
+  it('readFilledRisk forwards to commitments.getFilledRisk and returns the snapshot unchanged (#160)', async () => {
+    let received: unknown = null;
+    const snapshot = { atBlock: 91_473_035n, filledRisk: new Map<Hex, bigint>([['0xmoneyline' as Hex, 869_500n], ['0xtotal' as Hex, 0n]]) };
+    const adapter = liveAdapterWith({
+      commitments: {
+        getFilledRisk: (args) => {
+          received = args;
+          return Promise.resolve(snapshot);
+        },
+      },
+    });
+    const args = { hashes: ['0xmoneyline' as Hex, '0xtotal' as Hex] };
+    // Identity, not a deep compare: `0n` is a real filled amount and the funding guard
+    // must see the SDK's own map, not a reconstruction of it.
+    expect(await adapter.readFilledRisk(args)).toBe(snapshot);
     expect(received).toEqual(args);
   });
 

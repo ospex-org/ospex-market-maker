@@ -93,7 +93,7 @@
 import { existsSync } from 'node:fs';
 
 import { DEFAULT_PER_IP_OWNER_RESERVE, DEFAULT_PER_IP_STREAM_CAP, RESERVED_OWN_STATE_STREAMS, type Config } from '../config/index.js';
-import { buildDesiredQuote, inventoryFromState, isExpiredForRelease, isSeedSpeculationId, matchableCommitmentRiskWei6, oracleLineTicks, planNonceInvalidation, reconcileBook, referenceOddsEqual, referenceOddsFromSdk, seedSpeculationId, type BookReconciliation, type DesiredQuote, type NonceInvalidationGroup, type ReferenceOdds, type RetainedPartial, type RetainedPartialReason, type SoftCancelReason } from '../orders/index.js';
+import { buildDesiredQuote, inventoryFromState, isExpiredForRelease, isSeedSpeculationId, matchableCommitmentRiskFromChainWei6, matchableCommitments, oracleLineTicks, planNonceInvalidation, reconcileBook, referenceOddsEqual, referenceOddsFromSdk, seedSpeculationId, type BookReconciliation, type DesiredQuote, type NonceInvalidationGroup, type ReferenceOdds, type RetainedPartial, type RetainedPartialReason, type SoftCancelReason } from '../orders/index.js';
 import { OspexChainError, OspexStreamError } from '../ospex/index.js';
 import type {
   ApproveResult,
@@ -801,12 +801,25 @@ export class Runner {
    *                pay into `recordFill` right now;
    *   - required = the GROSS remaining maker risk over matchable commitments (visible +
    *                soft-cancelled-unexpired), NOT the risk engine's outcome-netted
-   *                worst-case and NOT position-inclusive — see {@link matchableCommitmentRiskWei6}.
+   *                worst-case and NOT position-inclusive — see
+   *                {@link matchableCommitmentRiskFromChainWei6}.
    *
-   * A balance/allowance READ failure enters the hold when `failClosedOnReadError`: a read
-   * we can't complete must never let the MM post commitments it might not be able to back.
-   * Caller gates this to live mode (it needs `makerAddress` + does chain reads); the hold
-   * only matters live, where `reconcileMarkets` actually posts.
+   * **Both sides come from chain, at ONE pinned block (issue #160).** `required`'s
+   * `filled` term is read from `MatchingModule.s_filledRisk` rather than from the
+   * own-state mirror, and the balance / allowance reads are pinned to the block that
+   * read resolved. Previously `funding` was chain-fresh while `filled` came from the
+   * indexer-derived mirror ~15 s behind it, so between a match landing and the stream
+   * observing it the maker counted an already-matched commitment at full size, read a
+   * shortfall equal to the fill size exactly, and {@link fundingCancelSweep} — a
+   * global scan — cancelled markets that had nothing to do with the fill.
+   *
+   * A READ failure enters the hold when `failClosedOnReadError`: a read we can't
+   * complete must never let the MM post commitments it might not be able to back. The
+   * `required` computation sits inside the same try/catch, so a snapshot that does not
+   * cover the set (or reports more filled than the record's risk) fails the same way
+   * rather than resolving to a number nothing verified. Caller gates this to live mode
+   * (it needs `makerAddress` + does chain reads); the hold only matters live, where
+   * `reconcileMarkets` actually posts.
    */
   private async checkFunding(): Promise<void> {
     const fg = this.config.fundingGuard;
@@ -814,13 +827,14 @@ export class Runner {
 
     const nowSec = this.deps.now();
 
-    // `required` is cheap local-state math — compute it every check. No matchable
-    // exposure ⇒ the wallet trivially backs it: clear any hold and skip the (RPC)
-    // reads entirely. This also keeps the guard inert (no balance/allowance reads)
-    // until the MM actually has outstanding commitments to back.
-    const requiredWei6 = matchableCommitmentRiskWei6(this.state, nowSec, this.config.orders.expiryReleaseGraceSeconds);
-    if (requiredWei6 === 0n) {
-      this.setFundingHold(false, { reason: 'funding-shortfall', requiredWei6 });
+    // Selecting the matchable set is cheap local math — do it every check. Nothing
+    // matchable ⇒ the wallet trivially backs it: clear any hold and skip every (RPC)
+    // read, including the filled-risk batch. This keeps the guard inert until the MM
+    // actually has outstanding commitments to back, and it is also what guarantees the
+    // batch below is non-empty (the SDK refuses an empty `hashes`).
+    const matchable = matchableCommitments(this.state, nowSec, this.config.orders.expiryReleaseGraceSeconds);
+    if (matchable.length === 0) {
+      this.setFundingHold(false, { reason: 'funding-shortfall', requiredWei6: 0n });
       return;
     }
 
@@ -832,11 +846,24 @@ export class Runner {
     }
     this.lastFundingCheckAtSec = nowSec;
 
+    let requiredWei6: bigint;
+    let atBlock: bigint;
     let walletUsdcWei6: bigint;
     let positionAllowanceWei6: bigint;
     try {
-      walletUsdcWei6 = (await this.adapter.readBalances(this.makerAddress)).usdc;
-      positionAllowanceWei6 = (await this.adapter.readApprovals(this.makerAddress)).usdc.allowances.positionModule.raw;
+      // ORDER IS LOAD-BEARING: filled risk FIRST (it resolves the block), funding
+      // SECOND, pinned to it. The pin is what makes the two sides describe one
+      // instant; the ordering is the defence if a future change ever drops it.
+      // Funding-first-unpinned leaves funding stale-HIGH against fresh-HIGH filled, so
+      // `required` comes out LOW and the guard MISSES a genuine shortfall — fail-open:
+      // quotes stay up and a taker's match reverts at the USDC pull. Filled-first-
+      // unpinned biases the other way, into the false shortfall of #160. Neither is
+      // acceptable, which is why the block is pinned; keep the order regardless.
+      const snapshot = await this.adapter.readFilledRisk({ hashes: matchable.map((r) => r.hash as Hex) });
+      atBlock = snapshot.atBlock;
+      requiredWei6 = matchableCommitmentRiskFromChainWei6(matchable, snapshot.filledRisk);
+      walletUsdcWei6 = (await this.adapter.readBalances(this.makerAddress, atBlock)).usdc;
+      positionAllowanceWei6 = (await this.adapter.readApprovals(this.makerAddress, atBlock)).usdc.allowances.positionModule.raw;
     } catch (err) {
       this.eventLog.emit('error', { class: errClass(err), detail: errMessage(err), phase: 'funding-check' });
       if (fg.failClosedOnReadError) this.setFundingHold(true, { reason: 'read-failed' });
@@ -850,13 +877,18 @@ export class Runner {
       requiredWei6,
       walletUsdcWei6,
       positionAllowanceWei6,
+      atBlock,
     });
   }
 
   /**
    * Flip `fundingHold` and emit a `funding-hold` telemetry event ONLY on a state
    * transition (enter / clear), so a sustained hold doesn't spam the log every check.
-   * Numeric context (wei6 decimal strings) is attached when known.
+   * Numeric context (wei6 decimal strings) is attached when known, plus `atBlock` —
+   * the block BOTH sides of the comparison were read at (#160), so a transition can be
+   * reconciled against chain state after the fact. `atBlock` is absent on the two
+   * transitions that never got that far: a read failure, and the clear when nothing is
+   * matchable.
    */
   private setFundingHold(
     hold: boolean,
@@ -866,6 +898,7 @@ export class Runner {
       requiredWei6?: bigint;
       walletUsdcWei6?: bigint;
       positionAllowanceWei6?: bigint;
+      atBlock?: bigint;
     },
   ): void {
     if (hold === this.fundingHold) return; // no transition — stay quiet
@@ -876,6 +909,7 @@ export class Runner {
     if (ctx.requiredWei6 !== undefined) payload.requiredWei6 = ctx.requiredWei6.toString();
     if (ctx.walletUsdcWei6 !== undefined) payload.walletUsdcWei6 = ctx.walletUsdcWei6.toString();
     if (ctx.positionAllowanceWei6 !== undefined) payload.positionModuleAllowanceWei6 = ctx.positionAllowanceWei6.toString();
+    if (ctx.atBlock !== undefined) payload.atBlock = ctx.atBlock.toString(); // string — a block number can exceed Number.MAX_SAFE_INTEGER (AGENTS §3)
     this.eventLog.emit('funding-hold', payload);
     this.deps.log(
       `[runner] funding hold ${hold ? 'ENTERED' : 'cleared'} (${ctx.reason})` +

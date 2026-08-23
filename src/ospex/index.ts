@@ -226,7 +226,7 @@ export type OspexClientLike = {
   speculations: Pick<OspexClient['speculations'], 'list' | 'get'>;
   commitments: Pick<
     OspexClient['commitments'],
-    'list' | 'get' | 'submitRaw' | 'cancel' | 'cancelOnchain' | 'raiseMinNonce' | 'approve' | 'getNonceFloor' | 'prepareSubmit' | 'checkSubmitFundability' | 'submitPrepared' | 'approveCreationFee'
+    'list' | 'get' | 'submitRaw' | 'cancel' | 'cancelOnchain' | 'raiseMinNonce' | 'approve' | 'getNonceFloor' | 'getFilledRisk' | 'prepareSubmit' | 'checkSubmitFundability' | 'submitPrepared' | 'approveCreationFee'
   >;
   positions: Pick<OspexClient['positions'], 'status' | 'byAddress' | 'settleSpeculation' | 'ensureSpeculationSettled' | 'claim' | 'ensurePositionClaimed' | 'claimAll'>;
   balances: Pick<OspexClient['balances'], 'read'>;
@@ -256,6 +256,10 @@ export type RaiseMinNonceArgs = Parameters<OspexClientLike['commitments']['raise
 export type RaiseMinNonceResult = Awaited<ReturnType<OspexClientLike['commitments']['raiseMinNonce']>>;
 /** `readMinNonceFloor` args — `{ maker, contestId, scorer, lineTicks }` (the speculation key is derived from the latter three). */
 export type NonceFloorArgs = Parameters<OspexClientLike['commitments']['getNonceFloor']>[0];
+/** `readFilledRisk` args — `{ hashes, blockNumber? }`. Hashes must be non-empty and duplicate-free (the SDK refuses both). */
+export type FilledRiskArgs = Parameters<OspexClientLike['commitments']['getFilledRisk']>[0];
+/** `readFilledRisk` result — `{ atBlock, filledRisk }`: the block every value was read at, and `s_filledRisk[hash]` in wei6 keyed by the hashes passed in, verbatim. */
+export type FilledRiskSnapshot = Awaited<ReturnType<OspexClientLike['commitments']['getFilledRisk']>>;
 /** `approveUSDC` amount — an exact wei6 allowance ceiling, or the literal `'max'` (only with explicit operator opt-in). */
 export type ApproveUSDCAmount = Parameters<OspexClientLike['commitments']['approve']>[0];
 /** `approveUSDC` result — tx hash, receipt, spender, token, and the amount set. */
@@ -473,12 +477,21 @@ export class OspexAdapter {
 
   // ── balances / approvals / health (signer-free via owner=…) ───────────
 
-  async readBalances(owner: Hex): Promise<BalancesSnapshot> {
-    return this.client.balances.read({ owner });
+  /**
+   * Wallet POL + USDC balances. `blockNumber` pins the read to that block — omit it
+   * (every caller but the funding guard does) for the current block, which is the
+   * behaviour that predates the option. The funding guard passes the `atBlock` from
+   * {@link readFilledRisk} so both sides of its comparison describe one instant
+   * (issue #160); on a load-balanced endpoint whose node has not reached that block
+   * the SDK throws `OspexChainError` rather than answering from a different one.
+   */
+  async readBalances(owner: Hex, blockNumber?: bigint): Promise<BalancesSnapshot> {
+    return this.client.balances.read(blockNumber === undefined ? { owner } : { owner, blockNumber });
   }
 
-  async readApprovals(owner: Hex): Promise<ApprovalsSnapshot> {
-    return this.client.approvals.read({ owner });
+  /** Ospex-relevant USDC allowances (`PositionModule` / `TreasuryModule`). `blockNumber` pins the read — see {@link readBalances}. */
+  async readApprovals(owner: Hex, blockNumber?: bigint): Promise<ApprovalsSnapshot> {
+    return this.client.approvals.read(blockNumber === undefined ? { owner } : { owner, blockNumber });
   }
 
   /** Liveness probe. Resolves `true` if the API responds; `false` on any failure — never throws. */
@@ -605,6 +618,27 @@ export class OspexAdapter {
    */
   async readMinNonceFloor(args: NonceFloorArgs): Promise<bigint> {
     return this.client.commitments.getNonceFloor(args);
+  }
+
+  /**
+   * Read `MatchingModule.s_filledRisk` for a batch of commitment hashes
+   * (`commitments.getFilledRisk`) — how much of each commitment's `riskAmount` has
+   * already been matched on chain, in USDC wei6. The chain is canonical; the
+   * Supabase mirror (`commitments.filled_risk_amount`, and the own-state stream
+   * derived from it) lags it by roughly an indexer poll cycle, so a maker sizing
+   * its remaining obligation from the mirror counts a just-matched commitment at
+   * full size (issue #160). Read-only but needs `rpcUrl` (no signer required).
+   *
+   * The batch goes out as ONE viem multicall operation (which viem may split into
+   * several Multicall3 aggregates), every chunk pinned to the same block, and
+   * `atBlock` names that block — pass it to {@link readBalances} /
+   * {@link readApprovals} to compare filled risk against funding at one instant.
+   * `0n` is a real value (the storage default, and indistinguishable from "no such
+   * commitment"), never a sentinel: every failure path throws `OspexChainError`,
+   * so a caller must not read a zero as "the read did not happen".
+   */
+  async readFilledRisk(args: FilledRiskArgs): Promise<FilledRiskSnapshot> {
+    return this.client.commitments.getFilledRisk(args);
   }
 
   /**

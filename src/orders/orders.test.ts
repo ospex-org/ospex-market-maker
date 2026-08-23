@@ -4,7 +4,7 @@ import { parseConfig, type Config } from '../config/index.js';
 import { decimalToAmerican, decimalToImpliedProb, tickToDecimal, toProtocolQuote, type QuoteSide } from '../pricing/index.js';
 import { contestWorstCaseUSDC, type ExposureItem, type Inventory, type Market } from '../risk/index.js';
 import { emptyMakerState, type MakerCommitmentRecord, type MakerPositionRecord, type MakerState } from '../state/index.js';
-import { breakdownReferenceOdds, buildDesiredQuote, commitmentNonce, inventoryFromState, isExpiredForRelease, matchableCommitmentRiskWei6, planNonceInvalidation, reconcileBook, toRiskCaps, type BookReconciliation, type DesiredQuote, type ReferenceOdds } from './index.js';
+import { breakdownReferenceOdds, buildDesiredQuote, commitmentNonce, inventoryFromState, isExpiredForRelease, matchableCommitmentRiskFromChainWei6, matchableCommitmentRiskWei6, matchableCommitments, planNonceInvalidation, reconcileBook, toRiskCaps, type BookReconciliation, type DesiredQuote, type ReferenceOdds } from './index.js';
 
 const cfg = (overrides: Record<string, unknown> = {}): Config => parseConfig({ rpcUrl: 'http://localhost:8545', ...overrides });
 
@@ -293,7 +293,7 @@ describe('buildDesiredQuote', () => {
   });
 });
 
-// ── matchableCommitmentRiskWei6 (funding guard `required`) ───────────────────
+// ── matchableCommitmentRiskWei6 (the LOCAL-STATE sum — the differential oracle, no longer `required`, #160) ──
 
 describe('matchableCommitmentRiskWei6', () => {
   it('is 0n on empty state', () => {
@@ -343,6 +343,69 @@ describe('matchableCommitmentRiskWei6', () => {
     };
     // each pulls its own makerRisk at fill, independently → 500000 (NOT netted to a smaller worst-case)
     expect(matchableCommitmentRiskWei6(stateWith({ commitments }), NOW, 0)).toBe(500_000n);
+  });
+
+  it('fails closed on a locally-corrupt record (filled > risk)', () => {
+    const commitments = { bad: commitmentRecord({ hash: 'bad', riskAmountWei6: '250000', filledRiskWei6: '250001' }) };
+    expect(() => matchableCommitmentRiskWei6(stateWith({ commitments }), NOW, 0)).toThrow(/corrupt inventory/);
+  });
+});
+
+// ── matchableCommitmentRiskFromChainWei6 (the funding guard's chain-truth `required`, #160) ──
+
+describe('matchableCommitmentRiskFromChainWei6', () => {
+  /** The records `matchableCommitments` selects out of a state — the input the chain-truth sum takes. */
+  const selected = (state: MakerState): MakerCommitmentRecord[] => matchableCommitments(state, NOW, 0);
+
+  it('selects the SAME set as the local-state sum — released and past-grace records are dropped by both', () => {
+    const commitments = {
+      keep: commitmentRecord({ hash: 'keep', lifecycle: 'visibleOpen', riskAmountWei6: '250000' }),
+      sc: commitmentRecord({ hash: 'sc', lifecycle: 'softCancelled', riskAmountWei6: '250000' }),
+      filled: commitmentRecord({ hash: 'filled', lifecycle: 'filled', riskAmountWei6: '999000' }),
+      dead: commitmentRecord({ hash: 'dead', expiryUnixSec: NOW - 100, riskAmountWei6: '999000' }),
+    };
+    const state = stateWith({ commitments });
+    expect(selected(state).map((r) => r.hash).sort()).toEqual(['keep', 'sc']);
+    // Same set, nothing filled on chain ⇒ the two summations agree exactly.
+    const nothingFilled = new Map(selected(state).map((r) => [r.hash, 0n]));
+    expect(matchableCommitmentRiskFromChainWei6(selected(state), nothingFilled)).toBe(matchableCommitmentRiskWei6(state, NOW, 0));
+  });
+
+  it('uses the CHAIN filled amount, not the record\'s — the mirror lagging at 0 does not inflate `required`', () => {
+    // The #160 shape in miniature: local state says nothing is filled, chain says 869500
+    // of the first leg is. A build reading either the record or the wrong key returns
+    // 4000000; only one reading the chain map by hash returns 3130500.
+    const commitments = {
+      '0xmoneyline': commitmentRecord({ hash: '0xmoneyline', riskAmountWei6: '869500', filledRiskWei6: '0' }),
+      '0xtotal': commitmentRecord({ hash: '0xtotal', riskAmountWei6: '3130500', filledRiskWei6: '0' }),
+    };
+    const records = selected(stateWith({ commitments }));
+    const filled = new Map([['0xmoneyline', 869_500n], ['0xtotal', 0n]]);
+    expect(matchableCommitmentRiskFromChainWei6(records, filled)).toBe(3_130_500n);
+  });
+
+  it('fails closed when the snapshot does not cover a selected hash — never treats a miss as 0n', () => {
+    // A miss and a genuine 0n are the same number and opposite facts. Defaulting to 0n
+    // would UNDER-state nothing here, but it would silently size the guard on a snapshot
+    // that did not describe the set it was asked about.
+    const commitments = {
+      a: commitmentRecord({ hash: 'a', riskAmountWei6: '250000' }),
+      b: commitmentRecord({ hash: 'b', riskAmountWei6: '250000' }),
+    };
+    const records = selected(stateWith({ commitments }));
+    expect(() => matchableCommitmentRiskFromChainWei6(records, new Map([['a', 0n]]))).toThrow(/no on-chain filled risk was read for commitment b/);
+  });
+
+  it('fails closed on a chain amount exceeding the record risk (corrupt inventory)', () => {
+    const commitments = { a: commitmentRecord({ hash: 'a', riskAmountWei6: '250000' }) };
+    const records = selected(stateWith({ commitments }));
+    expect(() => matchableCommitmentRiskFromChainWei6(records, new Map([['a', 250_001n]]))).toThrow(/corrupt inventory/);
+  });
+
+  it('a fully-filled record contributes 0 rather than a negative', () => {
+    const commitments = { a: commitmentRecord({ hash: 'a', riskAmountWei6: '250000' }), b: commitmentRecord({ hash: 'b', riskAmountWei6: '400000' }) };
+    const records = selected(stateWith({ commitments }));
+    expect(matchableCommitmentRiskFromChainWei6(records, new Map([['a', 250_000n], ['b', 150_000n]]))).toBe(250_000n);
   });
 });
 

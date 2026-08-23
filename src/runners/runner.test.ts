@@ -130,6 +130,9 @@ function makeRunner(opts: { config?: Config; adapter?: OspexAdapter; runId?: str
 /** The fake signer's address used across the live-mode tests (`liveSpiedAdapter` → `fakeSigner` → this). Re-exported as `SIGNER_ADDRESS` inside the `live execution` describe for symmetry with earlier test additions. */
 const DEFAULT_FAKE_MAKER_ADDRESS = '0x9999999999999999999999999999999999999999';
 
+/** The block `liveSpiedAdapter`'s default `readFilledRisk` pins to — the Polygon block the #160 match landed at, so a test reading it back sees a plausible height rather than a round number a wrong implementation could also produce. */
+const DEFAULT_FAKE_BLOCK = 91_473_035n;
+
 // ── async loop test harness (used by PR3 wakeable-loop + PR4a SSE wiring tests) ─
 
 /** A controllable sleep harness: each call pushes the requested ms to
@@ -429,8 +432,9 @@ function liveSpiedAdapter(
     listOpenCommitments?: (maker: string, limit: number) => Promise<Commitment[]>;
     getCommitment?: (hash: Hex) => Promise<Commitment>;
     getPositionStatus?: (owner: string) => Promise<PositionStatus>;
-    readApprovals?: (owner: Hex) => Promise<ApprovalsSnapshot>;
-    readBalances?: (owner: Hex) => Promise<{ owner: Hex; chainId: number; native: bigint; usdc: bigint; usdcAddress: Hex }>;
+    readApprovals?: (owner: Hex, blockNumber?: bigint) => Promise<ApprovalsSnapshot>;
+    readBalances?: (owner: Hex, blockNumber?: bigint) => Promise<{ owner: Hex; chainId: number; native: bigint; usdc: bigint; usdcAddress: Hex }>;
+    readFilledRisk?: OspexAdapter['readFilledRisk'];
     getOwnStateHealth?: () => Promise<OwnStateHealth>;
   },
 ): OspexAdapter {
@@ -458,6 +462,14 @@ function liveSpiedAdapter(
   // Default `readBalances` returns saturated USDC so exact-mode auto-approve isn't wallet-bound below the cap ceiling
   // unless a test explicitly underfunds the wallet. Other balances are non-zero placeholders.
   vi.spyOn(adapter, 'readBalances').mockImplementation(reads?.readBalances ?? ((owner: Hex) => Promise.resolve({ owner, chainId: 137, native: 1_000_000_000_000_000_000n, usdc: 2n ** 255n, usdcAddress: '0xusdc' as Hex })));
+  // Default `readFilledRisk` (#160) reports NOTHING filled on chain at a fixed block —
+  // the storage default, and a real value rather than a sentinel. That reproduces the
+  // pre-#160 `required` for any fixture whose records carry `filledRiskWei6: '0'`, so
+  // existing funding cases are unaffected; a fixture with a locally-filled record must
+  // stub this to say what the CHAIN reports, because that is now what `required` counts.
+  vi.spyOn(adapter, 'readFilledRisk').mockImplementation(
+    reads?.readFilledRisk ?? ((args) => Promise.resolve({ atBlock: DEFAULT_FAKE_BLOCK, filledRisk: new Map(args.hashes.map((h) => [h, 0n])) })),
+  );
   // Default the indexer-lag probe (latch 6, PR2c-i) to healthy so a live
   // test doesn't fail-closed on the per-tick health poll; latch-6 tests override it.
   vi.spyOn(adapter, 'getOwnStateHealth').mockImplementation(reads?.getOwnStateHealth ?? (() => Promise.resolve(MOCK_OWN_STATE_HEALTH)));
@@ -7845,7 +7857,7 @@ describe('Runner — on-chain kill path / killCancelOnChain (Phase 3 e-ii)', () 
     expect(reloaded.commitments['0xb']?.lifecycle).toBe('authoritativelyInvalidated');
     expect(reloaded.commitments['0xc']?.lifecycle).toBe('authoritativelyInvalidated');
     // All three land in `authoritativelyInvalidated`, which `inventoryFromState` /
-    // `matchableCommitmentRiskWei6` drop (RELEASED_LIFECYCLES) — so the exposure is released, the
+    // `matchableCommitments` drop (RELEASED_LIFECYCLES) — so the exposure is released, the
     // same terminal state a per-commitment on-chain cancel produces (covered in orders.test.ts).
 
     const events = readEvents();
@@ -8532,8 +8544,8 @@ describe('Runner — funding guard', () => {
     expect(events.some((e) => e.kind === 'error' && e.phase === 'funding-check')).toBe(true);
   });
 
-  it('C1a — no matchable exposure (required = 0): the funding guard skips its balance/allowance reads (only the boot allowance advisory reads, once)', async () => {
-    StateStore.at(stateDir).flush(emptyMakerState()); // no commitments → required 0
+  it('C1a — nothing matchable: the funding guard skips its balance/allowance reads (only the boot allowance advisory reads, once)', async () => {
+    StateStore.at(stateDir).flush(emptyMakerState()); // no commitments → the matchable set is empty
     const config = cfg({ mode: { dryRun: false }, fundingGuard: { underfundedCancelMode: 'none' } });
     let balanceReads = 0;
     let approvalReads = 0;
@@ -8542,8 +8554,8 @@ describe('Runner — funding guard', () => {
       readApprovals: () => { approvalReads += 1; return Promise.resolve(approvalsSnapshotWith(0n)); },
     });
     await makeRunner({ config, adapter, maxTicks: 1 }).run();
-    expect(balanceReads).toBe(0); // funding guard's required-first short-circuit reads no balance (the advisory reads only approvals)
-    expect(approvalReads).toBe(1); // the autoApprove:false boot allowance advisory reads once; the funding guard then adds none (required 0)
+    expect(balanceReads).toBe(0); // funding guard's nothing-matchable short-circuit reads no balance (the advisory reads only approvals)
+    expect(approvalReads).toBe(1); // the autoApprove:false boot allowance advisory reads once; the funding guard then adds none (nothing matchable)
     expect(readEvents().some((e) => e.kind === 'funding-hold')).toBe(false);
   });
 
@@ -8707,6 +8719,299 @@ describe('Runner — funding guard', () => {
     });
     await makeRunner({ config, adapter, maxTicks: 1 }).run();
     expect(reads).toBe(0);
+    expect(readEvents().some((e) => e.kind === 'funding-hold')).toBe(false);
+  });
+});
+
+// ── funding guard: `required` from CHAIN TRUTH (issue #160) ───────────────────
+//
+// The bug: `funding` was a fresh chain read (a landed match lowers wallet USDC
+// and the PositionModule allowance draw immediately) while `required` was summed
+// from `filledRiskWei6`, which only advances when the own-state stream observes
+// the fill (~15 s behind chain). For that window the maker counts a commitment
+// that is ALREADY matched at full size, reads a shortfall equal to the fill size
+// exactly, and `fundingCancelSweep()` — a GLOBAL scan — cancels the whole book.
+// Observed on Polygon mainnet 2026-08-05 (contest 86 / speculation 234): the
+// TOTAL market was cancelled because the MONEYLINE filled.
+//
+// The fixture is the observed episode, in wei6. It discriminates (rule 3g):
+// GROSS − ML_RISK === ALLOWANCE exactly, so a build that counts the filled leg
+// at full size reads a 0.869500 shortfall (and sweeps) while a build that reads
+// filled risk from chain reads funding === required (and does nothing). A round
+// or slack fixture would leave both builds holding, or neither.
+describe('Runner — funding guard: chain-truth `required` (issue #160)', () => {
+  const MAKER = DEFAULT_FAKE_MAKER_ADDRESS as Hex;
+
+  const ML_RISK = 869_500n; //     0.869500 USDC — the moneyline leg that matched on chain at block 91473035
+  const TOTAL_RISK = 3_130_500n; // 3.130500 USDC — the total leg the sweep wrongly cancelled
+  const GROSS = 4_000_000n; //     4.000000 USDC — ML + TOTAL, the pre-fill gross the local state still reports
+  const WALLET = 282_325_870n; //  282.325870 USDC wallet balance, post-fill
+  const ALLOWANCE = 3_130_500n; // 3.130500 USDC PositionModule allowance, post-fill — BINDS (< wallet), and equals GROSS − ML_RISK
+
+  /** Seed the two observed `visibleOpen` legs, both with `filledRiskWei6: '0'` — i.e. own-state has NOT yet observed the fill. */
+  function seedTwoLegs(): { ml: MakerCommitmentRecord; total: MakerCommitmentRecord } {
+    const ml = commitmentRecord({ hash: '0xmoneyline', contestId: '86', speculationId: 'spec-234', marketType: 'moneyline', makerSide: 'away', riskAmountWei6: ML_RISK.toString(), filledRiskWei6: '0', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 10, updatedAtUnixSec: T0 - 10 });
+    const total = commitmentRecord({ hash: '0xtotal', contestId: '86', speculationId: 'spec-235', marketType: 'total', lineTicks: 95, makerSide: 'home', riskAmountWei6: TOTAL_RISK.toString(), filledRiskWei6: '0', lifecycle: 'visibleOpen', expiryUnixSec: T0 + 1000, postedAtUnixSec: T0 - 10, updatedAtUnixSec: T0 - 10 });
+    StateStore.at(stateDir).flush({ ...emptyMakerState(), commitments: { [ml.hash]: ml, [total.hash]: total } });
+    return { ml, total };
+  }
+
+  /** The `listOpenCommitments` audit fixture — both legs still on the book, unfilled, exactly as the lagging indexer reports them. */
+  function openFixture(record: MakerCommitmentRecord): Commitment {
+    return orderbookEntry({
+      commitmentHash: record.hash, maker: MAKER, status: 'open', storedStatus: 'open', isLive: true,
+      riskAmount: record.riskAmountWei6, filledRiskAmount: record.filledRiskWei6,
+      remainingRiskAmount: (BigInt(record.riskAmountWei6) - BigInt(record.filledRiskWei6)).toString(),
+    });
+  }
+
+  function balances(usdc: bigint): (owner: Hex) => Promise<{ owner: Hex; chainId: number; native: bigint; usdc: bigint; usdcAddress: Hex }> {
+    return (owner) => Promise.resolve({ owner, chainId: 137, native: 10n ** 18n, usdc, usdcAddress: '0xusdc' as Hex });
+  }
+
+  /** A `readFilledRisk` stub reporting exactly these per-hash chain amounts at `atBlock` (any hash not named reads `0n`, the storage default). */
+  function chainFilled(byHash: Record<string, bigint>, atBlock = DEFAULT_FAKE_BLOCK): OspexAdapter['readFilledRisk'] {
+    return (args) => Promise.resolve({ atBlock, filledRisk: new Map(args.hashes.map((h) => [h, byHash[h] ?? 0n])) });
+  }
+
+  it('the fixture discriminates: the apparent shortfall equals the fill size EXACTLY', () => {
+    // Asserted inline so a later fixture edit cannot quietly un-discriminate the cases
+    // below (rule 3g-both). GROSS − ML_RISK === ALLOWANCE means a build that counts the
+    // filled leg at full size sees funding 3.130500 < required 4.000000 and sweeps,
+    // while a build reading filled risk from chain sees funding === required and does
+    // nothing. Slack in either direction and both builds would agree.
+    expect(ML_RISK + TOTAL_RISK).toBe(GROSS);
+    expect(GROSS - ML_RISK).toBe(ALLOWANCE);
+    expect(ALLOWANCE).toBeLessThan(WALLET); // the allowance BINDS — funding = min(wallet, allowance)
+  });
+
+  it('THE FIX — the chain reports the moneyline filled, so `required` drops to the total leg and nothing is swept', async () => {
+    const { ml, total } = seedTwoLegs();
+    // `offchain` is the shipped default and the mode under which the sweep actually
+    // runs. Sibling funding cases use `none`, which returns before the sweep — copying
+    // one would measure the mode, not the guard (rule 3b).
+    const config = cfg({ mode: { dryRun: false }, fundingGuard: { underfundedCancelMode: 'offchain' } });
+    const offchainCancels: Hex[] = [];
+    const filledRiskCalls: Hex[][] = [];
+    let balanceReads = 0;
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]),
+      { cancelCommitmentOffchain: (h) => { offchainCancels.push(h); return Promise.resolve(); } },
+      undefined, undefined,
+      {
+        listOpenCommitments: () => Promise.resolve([openFixture(ml), openFixture(total)]), // the indexer still shows BOTH legs unfilled — the lag this fixes
+        readBalances: (o) => { balanceReads += 1; return balances(WALLET)(o); },
+        readApprovals: () => Promise.resolve(approvalsSnapshotWith(ALLOWANCE)),
+        readFilledRisk: (args) => { filledRiskCalls.push([...args.hashes]); return chainFilled({ '0xmoneyline': ML_RISK })(args); },
+      },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    const events = readEvents();
+    // Reach (rule 3b-reach): a tick that early-returned at the `checkIntervalMs`
+    // throttle, or one where the guard never read at all, produces the same "no
+    // cancels" observable as the fix working.
+    expect(filledRiskCalls).toHaveLength(1);
+    expect([...(filledRiskCalls[0] ?? [])].sort()).toEqual(['0xmoneyline', '0xtotal']);
+    expect(balanceReads).toBe(1);
+    // At `origin/main` this run produced `['0xmoneyline', '0xtotal']` — the TOTAL leg
+    // pulled because the MONEYLINE filled, which is the reported production incident.
+    expect(offchainCancels).toEqual([]);
+    expect(events.filter((e) => e.kind === 'soft-cancel')).toHaveLength(0);
+    expect(events.filter((e) => e.kind === 'funding-hold')).toHaveLength(0); // no hold at all — not "entered then cleared"
+    const reloaded = StateStore.at(stateDir).load().state;
+    expect(reloaded.commitments['0xmoneyline']?.lifecycle).toBe('visibleOpen');
+    expect(reloaded.commitments['0xtotal']?.lifecycle).toBe('visibleOpen');
+  });
+
+  it('NEGATIVE CONTROL (chain varies) — the chain says NOTHING is filled, so the shortfall is real: hold and sweep', async () => {
+    // One variable moved from the case above: the chain read. Nothing is filled, so
+    // `required` really is 4.000000 against 3.130500 of funding and the guard must act.
+    const { ml, total } = seedTwoLegs();
+    const config = cfg({ mode: { dryRun: false }, fundingGuard: { underfundedCancelMode: 'offchain' } });
+    const offchainCancels: Hex[] = [];
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]),
+      { cancelCommitmentOffchain: (h) => { offchainCancels.push(h); return Promise.resolve(); } },
+      undefined, undefined,
+      {
+        listOpenCommitments: () => Promise.resolve([openFixture(ml), openFixture(total)]),
+        readBalances: balances(WALLET),
+        readApprovals: () => Promise.resolve(approvalsSnapshotWith(ALLOWANCE)),
+        readFilledRisk: chainFilled({}),
+      },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    const hold = readEvents().filter((e) => e.kind === 'funding-hold');
+    expect(hold).toHaveLength(1);
+    expect(hold[0]).toMatchObject({ state: 'entered', reason: 'funding-shortfall', requiredWei6: '4000000', fundingWei6: '3130500', atBlock: DEFAULT_FAKE_BLOCK.toString() });
+    expect([...offchainCancels].sort()).toEqual(['0xmoneyline', '0xtotal']);
+  });
+
+  it('NEGATIVE CONTROL (funding varies) — chain-truth `required` is still compared, and a genuinely short allowance still holds and sweeps', async () => {
+    // The other one-variable move: the same chain read as the fix case, a genuinely
+    // short allowance. The hold must carry the CHAIN-derived 3.130500 — a build that
+    // held on the stale 4.000000 would also hold here, so the payload is what
+    // discriminates, not the fact of holding.
+    const { ml, total } = seedTwoLegs();
+    const config = cfg({ mode: { dryRun: false }, fundingGuard: { underfundedCancelMode: 'offchain' } });
+    const offchainCancels: Hex[] = [];
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]),
+      { cancelCommitmentOffchain: (h) => { offchainCancels.push(h); return Promise.resolve(); } },
+      undefined, undefined,
+      {
+        listOpenCommitments: () => Promise.resolve([openFixture(ml), openFixture(total)]),
+        readBalances: balances(WALLET),
+        readApprovals: () => Promise.resolve(approvalsSnapshotWith(1_000_000n)), // 1.000000 USDC cannot back 3.130500 however `filled` is read
+        readFilledRisk: chainFilled({ '0xmoneyline': ML_RISK }),
+      },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    const hold = readEvents().filter((e) => e.kind === 'funding-hold');
+    expect(hold).toHaveLength(1);
+    expect(hold[0]).toMatchObject({ state: 'entered', reason: 'funding-shortfall', requiredWei6: '3130500', fundingWei6: '1000000' });
+    expect([...offchainCancels].sort()).toEqual(['0xmoneyline', '0xtotal']);
+  });
+
+  it('FAIL-CLOSED — a filled-risk read failure enters the hold and sweeps on the SAME tick, exactly as a balance-read failure does', async () => {
+    // Funding here is ABUNDANT (5.000000 > the pre-fill gross 4.000000), so no
+    // shortfall of any flavour can produce a hold — the fail-closed path is the only
+    // mechanism that can (rule 3b). A build that swallowed the throw into `0n` filled
+    // would read required 4.000000 < funding 5.000000 and do nothing at all.
+    const { ml, total } = seedTwoLegs();
+    const config = cfg({ mode: { dryRun: false }, fundingGuard: { underfundedCancelMode: 'offchain', failClosedOnReadError: true } });
+    const offchainCancels: Hex[] = [];
+    let balanceReads = 0;
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]),
+      { cancelCommitmentOffchain: (h) => { offchainCancels.push(h); return Promise.resolve(); } },
+      undefined, undefined,
+      {
+        listOpenCommitments: () => Promise.resolve([openFixture(ml), openFixture(total)]),
+        readBalances: (o) => { balanceReads += 1; return balances(5_000_000n)(o); },
+        readApprovals: () => Promise.resolve(approvalsSnapshotWith(5_000_000n)),
+        readFilledRisk: () => Promise.reject(new OspexChainError('multicall reverted: header not found')),
+      },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    const events = readEvents();
+    const hold = events.filter((e) => e.kind === 'funding-hold');
+    expect(hold).toHaveLength(1);
+    expect(hold[0]).toMatchObject({ state: 'entered', reason: 'read-failed' }); // a read failure is reported AS a read failure, never converted into a shortfall
+    expect(hold[0]).not.toHaveProperty('atBlock'); // no block was ever resolved
+    expect(events.some((e) => e.kind === 'error' && e.phase === 'funding-check')).toBe(true);
+    expect([...offchainCancels].sort()).toEqual(['0xmoneyline', '0xtotal']); // the sweep ran on the same tick as the hold
+    expect(balanceReads).toBe(0); // filled risk is read FIRST, so a throw there costs no further RPC
+  });
+
+  it('FAIL-CLOSED — a chain snapshot reporting more filled than the record risks holds rather than resolving to an unverified number', async () => {
+    const { ml, total } = seedTwoLegs();
+    const config = cfg({ mode: { dryRun: false }, fundingGuard: { underfundedCancelMode: 'offchain', failClosedOnReadError: true } });
+    const offchainCancels: Hex[] = [];
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]),
+      { cancelCommitmentOffchain: (h) => { offchainCancels.push(h); return Promise.resolve(); } },
+      undefined, undefined,
+      {
+        listOpenCommitments: () => Promise.resolve([openFixture(ml), openFixture(total)]),
+        readBalances: balances(5_000_000n), // again abundant, so only the corrupt-inventory refusal can produce a hold
+        readApprovals: () => Promise.resolve(approvalsSnapshotWith(5_000_000n)),
+        readFilledRisk: chainFilled({ '0xmoneyline': ML_RISK + 1n }), // one wei6 more filled than the commitment risks
+      },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    const events = readEvents();
+    expect(events.filter((e) => e.kind === 'funding-hold')).toMatchObject([{ state: 'entered', reason: 'read-failed' }]);
+    expect(events.some((e) => e.kind === 'error' && e.phase === 'funding-check' && /corrupt inventory/.test(String(e.detail)))).toBe(true);
+    expect([...offchainCancels].sort()).toEqual(['0xmoneyline', '0xtotal']);
+  });
+
+  it('PINNING — the balance and allowance reads carry the block the filled-risk read resolved, on every tick', async () => {
+    // Two ticks with DIFFERENT resolved blocks: a build that pinned to a constant, or
+    // to the first tick's block, or passed nothing, fails here. `checkIntervalMs` is
+    // lowered to 10 s against a 15 s-per-tick clock so the second tick is past the
+    // throttle — otherwise this would measure the throttle, not the pin (rule 3b).
+    const { ml, total } = seedTwoLegs();
+    const BLOCKS = [91_473_035n, 91_473_041n];
+    const config = cfg({ mode: { dryRun: false }, fundingGuard: { underfundedCancelMode: 'offchain', checkIntervalMs: 10_000 } });
+    const filledRiskBlocks: bigint[] = [];
+    const balanceBlocks: Array<bigint | undefined> = [];
+    const approvalBlocks: Array<bigint | undefined> = [];
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]),
+      { cancelCommitmentOffchain: () => Promise.resolve() },
+      undefined, undefined,
+      {
+        listOpenCommitments: () => Promise.resolve([openFixture(ml), openFixture(total)]),
+        readBalances: (o, blockNumber) => { balanceBlocks.push(blockNumber); return balances(WALLET)(o); },
+        readApprovals: (_o, blockNumber) => { approvalBlocks.push(blockNumber); return Promise.resolve(approvalsSnapshotWith(ALLOWANCE)); },
+        readFilledRisk: (args) => {
+          const atBlock = BLOCKS[filledRiskBlocks.length] ?? 0n;
+          filledRiskBlocks.push(atBlock);
+          return chainFilled({ '0xmoneyline': ML_RISK }, atBlock)(args);
+        },
+      },
+    );
+    let t = T0;
+    await makeRunner({ config, adapter, maxTicks: 2, deps: { now: () => t, sleep: () => { t += 15; return Promise.resolve(); } } }).run();
+
+    // Assert against what the adapter was CALLED WITH, compared to what the filled-risk
+    // stub RETURNED — never against a block this test also handed the runner (rule 3i).
+    expect(BLOCKS).toHaveLength(2); // two DISTINCT blocks, or "pinned to a constant" and "pinned per tick" are the same observation
+    expect(filledRiskBlocks).toEqual(BLOCKS); // both ticks reached the read: the throttle did not swallow the second
+    expect(balanceBlocks).toEqual(BLOCKS);
+    // The leading `undefined` is the boot allowance advisory (`position-allowance-short`),
+    // which reads approvals once before tick 1 and is deliberately unpinned — it asks what
+    // the allowance is NOW, not what it was at some comparison instant. Asserted in place
+    // rather than filtered out, so a GUARD read that lost its pin still reddens this.
+    expect(approvalBlocks).toEqual([undefined, ...BLOCKS]);
+  });
+
+  it('ORDERING — filled risk is read BEFORE funding', async () => {
+    // The pin makes the order not matter for correctness; the order is the defence if a
+    // future change drops the pin. Unpinned funding-first is the fail-OPEN direction
+    // (stale-high funding vs fresh-high filled ⇒ `required` low ⇒ a genuine shortfall
+    // missed), so it must not be reachable by accident.
+    const { ml, total } = seedTwoLegs();
+    const config = cfg({ mode: { dryRun: false }, fundingGuard: { underfundedCancelMode: 'offchain' } });
+    const order: string[] = [];
+    const adapter = liveSpiedAdapter(
+      config, () => Promise.resolve([]),
+      { cancelCommitmentOffchain: () => Promise.resolve() },
+      undefined, undefined,
+      {
+        listOpenCommitments: () => Promise.resolve([openFixture(ml), openFixture(total)]),
+        readBalances: (o) => { order.push('balances'); return balances(WALLET)(o); },
+        readApprovals: () => { order.push('approvals'); return Promise.resolve(approvalsSnapshotWith(ALLOWANCE)); },
+        readFilledRisk: (args) => { order.push('filledRisk'); return chainFilled({ '0xmoneyline': ML_RISK })(args); },
+      },
+    );
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    // The leading `approvals` is the boot allowance advisory, before tick 1 — kept in the
+    // expectation rather than filtered out, so this stays a statement about the WHOLE
+    // sequence of reads the run issued.
+    expect(order).toEqual(['approvals', 'filledRisk', 'balances', 'approvals']);
+  });
+
+  it('INERT — with nothing matchable the guard issues NO chain read at all, filled risk included', async () => {
+    StateStore.at(stateDir).flush(emptyMakerState());
+    const config = cfg({ mode: { dryRun: false }, fundingGuard: { underfundedCancelMode: 'offchain' } });
+    let filledRiskReads = 0;
+    let balanceReads = 0;
+    const adapter = liveSpiedAdapter(config, () => Promise.resolve([]), undefined, undefined, undefined, {
+      readBalances: (o) => { balanceReads += 1; return balances(WALLET)(o); },
+      readFilledRisk: (args) => { filledRiskReads += 1; return chainFilled({})(args); },
+    });
+    await makeRunner({ config, adapter, maxTicks: 1 }).run();
+
+    expect(filledRiskReads).toBe(0); // the SDK refuses an empty `hashes`, and there is nothing to back anyway
+    expect(balanceReads).toBe(0);
     expect(readEvents().some((e) => e.kind === 'funding-hold')).toBe(false);
   });
 });

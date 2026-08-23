@@ -182,7 +182,8 @@ fundingGuard:                       # solvency guard (DESIGN §6): halt NEW post
   enabled: true                     # master switch. false = never read funding, never hold.
   checkIntervalMs: 30000            # min interval between on-chain funding re-reads (filled risk + balance + allowance);
                                     #   funding moves slowly. One batched multicall plus the two funding reads per check,
-                                    #   with the batch bounded by risk.maxOpenCommitments.
+                                    #   with the batch sized by risk.maxOpenCommitments, plus any commitment already fully
+                                    #   filled on chain whose lifecycle has not been released yet.
   underfundedCancelMode: offchain   # what to do with EXISTING visible quotes when underfunded (active cancel response):
                                     #   "offchain" pull off the relay (gasless) / "onchain" also authoritatively cancel on chain
                                     #   (gas) / "none" hold only (ride to expiry). NEW posting is ALWAYS halted while underfunded,

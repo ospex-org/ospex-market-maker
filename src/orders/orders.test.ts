@@ -293,7 +293,7 @@ describe('buildDesiredQuote', () => {
   });
 });
 
-// ── matchableCommitmentRiskWei6 (funding guard `required`) ───────────────────
+// ── matchableCommitmentRiskWei6 (the LOCAL-STATE sum — the differential oracle, no longer `required`, #160) ──
 
 describe('matchableCommitmentRiskWei6', () => {
   it('is 0n on empty state', () => {

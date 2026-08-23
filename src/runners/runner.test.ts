@@ -7857,7 +7857,7 @@ describe('Runner — on-chain kill path / killCancelOnChain (Phase 3 e-ii)', () 
     expect(reloaded.commitments['0xb']?.lifecycle).toBe('authoritativelyInvalidated');
     expect(reloaded.commitments['0xc']?.lifecycle).toBe('authoritativelyInvalidated');
     // All three land in `authoritativelyInvalidated`, which `inventoryFromState` /
-    // `matchableCommitmentRiskWei6` drop (RELEASED_LIFECYCLES) — so the exposure is released, the
+    // `matchableCommitments` drop (RELEASED_LIFECYCLES) — so the exposure is released, the
     // same terminal state a per-commitment on-chain cancel produces (covered in orders.test.ts).
 
     const events = readEvents();
@@ -8544,8 +8544,8 @@ describe('Runner — funding guard', () => {
     expect(events.some((e) => e.kind === 'error' && e.phase === 'funding-check')).toBe(true);
   });
 
-  it('C1a — no matchable exposure (required = 0): the funding guard skips its balance/allowance reads (only the boot allowance advisory reads, once)', async () => {
-    StateStore.at(stateDir).flush(emptyMakerState()); // no commitments → required 0
+  it('C1a — nothing matchable: the funding guard skips its balance/allowance reads (only the boot allowance advisory reads, once)', async () => {
+    StateStore.at(stateDir).flush(emptyMakerState()); // no commitments → the matchable set is empty
     const config = cfg({ mode: { dryRun: false }, fundingGuard: { underfundedCancelMode: 'none' } });
     let balanceReads = 0;
     let approvalReads = 0;
@@ -8554,8 +8554,8 @@ describe('Runner — funding guard', () => {
       readApprovals: () => { approvalReads += 1; return Promise.resolve(approvalsSnapshotWith(0n)); },
     });
     await makeRunner({ config, adapter, maxTicks: 1 }).run();
-    expect(balanceReads).toBe(0); // funding guard's required-first short-circuit reads no balance (the advisory reads only approvals)
-    expect(approvalReads).toBe(1); // the autoApprove:false boot allowance advisory reads once; the funding guard then adds none (required 0)
+    expect(balanceReads).toBe(0); // funding guard's nothing-matchable short-circuit reads no balance (the advisory reads only approvals)
+    expect(approvalReads).toBe(1); // the autoApprove:false boot allowance advisory reads once; the funding guard then adds none (nothing matchable)
     expect(readEvents().some((e) => e.kind === 'funding-hold')).toBe(false);
   });
 

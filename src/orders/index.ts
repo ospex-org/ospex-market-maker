@@ -405,16 +405,15 @@ export function inventoryFromState(state: MakerState, nowUnixSec: number, graceS
 }
 
 /**
- * Gross matchable-commitment risk in wei6 — the funding guard's `required`.
+ * Gross matchable-commitment risk in wei6, from LOCAL STATE.
  *
- * Σ of remaining maker risk (`riskAmountWei6 - filledRiskWei6`) over every
- * commitment that could STILL be filled on chain — `visibleOpen` / `softCancelled`
- * / `partiallyFilled`, not past `expiry + graceSeconds` — mirroring
- * {@link inventoryFromState}'s commitment filter exactly (same
- * {@link RELEASED_LIFECYCLES} drop, same {@link isExpiredForRelease} grace, same
- * corrupt-record fail-closed).
+ * Σ of remaining maker risk (`riskAmountWei6 - filledRiskWei6`) over
+ * {@link matchableCommitments} — mirroring {@link inventoryFromState}'s commitment
+ * filter exactly (same {@link RELEASED_LIFECYCLES} drop, same
+ * {@link isExpiredForRelease} grace, same corrupt-record fail-closed).
  *
- * It is deliberately NOT the risk engine's `totalWorstCaseUSDC`:
+ * The gross/net reasoning is the same one {@link matchableCommitmentRiskFromChainWei6}
+ * carries, and it is why neither is the risk engine's `totalWorstCaseUSDC`:
  *   - **Gross, not outcome-netted.** Each commitment that matches pulls its own
  *     remaining maker risk from the wallet via `PositionModule.recordFill`
  *     INDEPENDENTLY; if every open commitment fills, the wallet pays the full sum.
@@ -423,8 +422,14 @@ export function inventoryFromState(state: MakerState, nowUnixSec: number, graceS
  *   - **Commitments only — no positions.** A filled position's USDC was already
  *     pulled on chain at fill time, so it is not a future wallet obligation.
  *
- * This is the exposure a funding guard keeps `min(walletUSDC,
- * positionModuleAllowance)` at or above. Exact BigInt wei6 (no USDC/Number lossiness).
+ * **This is no longer the funding guard's `required`** — the guard reads `filled`
+ * from chain instead (#160), because `filledRiskWei6` only advances when the
+ * own-state stream observes a fill and this sum therefore counts a just-matched
+ * commitment at full size until it does. What survives here is the differential
+ * ORACLE the chain-truth sum is checked against: over the same set with nothing
+ * filled on chain the two must agree exactly, which is what pins that the only
+ * difference between them is where `filled` comes from. Exact BigInt wei6
+ * (no USDC/Number lossiness).
  */
 export function matchableCommitmentRiskWei6(
   state: MakerState,

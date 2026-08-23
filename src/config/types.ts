@@ -339,7 +339,7 @@ export interface FundingGuardConfig {
    */
   underfundedCancelMode: UnderfundedCancelMode;
   /**
-   * When a balance/allowance read FAILS, enter the hold (halt new posting) rather than
+   * When a funding read FAILS, enter the hold (halt new posting) rather than
    * proceed — a read failure must never let the MM post commitments it might not be
    * able to back. Strongly recommended `true`.
    */

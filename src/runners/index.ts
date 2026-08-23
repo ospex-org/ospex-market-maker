@@ -930,7 +930,7 @@ export class Runner {
    *                  `cancelCommitmentOffchain` → `softCancelled`, reason `'funding'`), so no
    *                  NEW fills arrive through the relay. **Does NOT reduce `required`**: an
    *                  off-chain pull is visibility-only — the signed payload stays matchable on
-   *                  chain until expiry, so {@link matchableCommitmentRiskWei6} keeps counting
+   *                  chain until expiry, so {@link matchableCommitmentRiskFromChainWei6} keeps counting
    *                  it. The hold therefore persists until those commitments expire.
    *   - `onchain`  — the off-chain pull above, THEN an authoritative on-chain invalidation of
    *                  every still-matchable non-terminal record: one `cancelCommitment` per record
@@ -945,7 +945,7 @@ export class Runner {
    *                  `gas-budget-blocks-onchain-cancel` candidate per hold episode (see
    *                  {@link fundingOnchainGasDeniedWarned}) and stops the sweep for the tick.
    *
-   * Eligibility mirrors {@link matchableCommitmentRiskWei6} (the `required` this responds to)
+   * Eligibility mirrors {@link matchableCommitments} (the very selection the `required` this responds to sums over)
    * exactly — non-terminal lifecycle, not past `expiry + expiryReleaseGraceSeconds` — so the
    * sweep acts on precisely the commitments that count toward the shortfall. A within-grace
    * record may still match on chain (the grace exists for host/chain clock skew), so it is
@@ -2941,7 +2941,7 @@ export class Runner {
    * read the canonical on-chain floor; short-circuit a group already below an existing floor
    * (terminalize locally, no tx); gas-gate (`mayUseReserve` per the caller); send the raise; on
    * success account the receipt gas, stamp every affected record `authoritativelyInvalidated`
-   * (which IS the exposure release — `inventoryFromState` / `matchableCommitmentRiskWei6` drop that
+   * (which IS the exposure release — `inventoryFromState` / `matchableCommitments` drop that
    * lifecycle, DESIGN §6), and emit `nonce-floor-raise`. Returns `'gas-denied'` (a group was
    * refused — a `mayUseReserve` caller then breaks), `'transient-failure'` (a floor read or a raise
    * threw — retry next cadence), else `'done'`. `makerAddress` is guaranteed non-null on the live

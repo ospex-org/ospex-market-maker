@@ -1874,9 +1874,10 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
    *
    * The server writes `degraded` and then `ready` three lines apart
    * (`ospex-core-api/src/v1/ownState/stream.ts`), and the SDK turns the second into
-   * `onStatus('connected')`. On the COLD-START leg that is harmless — the snapshot
-   * body carries `positionsTruncated` and `handleOwnerReady` latches it
-   * independently. On a RESUME there is no snapshot, so before this latch the
+   * `onStatus('connected')`. On the COLD-START leg a truncation-caused warning is also
+   * recorded by `positionsTruncated` — but an INDEPENDENT hub warning on a complete
+   * snapshot is not, so that leg had a gap too (reproduced against base in the PR #168
+   * review). On a RESUME there is no snapshot at all, so before this latch the
    * maker's only record of the warning was `lastStatus`, which `connected`
    * overwrote: health went true and, after `recoveryHoldMs`, quoting resumed
    * against a position view the server had explicitly called partial.
@@ -1936,10 +1937,23 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
     await runPromise;
   });
 
-  it('#95: a fresh COMPLETE baseline supersedes the hint and releases the hold', async () => {
-    // The latch is a stand-in for a field the resume leg cannot deliver, so it must
-    // yield the moment something authoritative arrives. A snapshot saying the view
-    // is complete is exactly that.
+  /**
+   * The PR #168 review blocker, and the case I first wrote asserting the OPPOSITE.
+   *
+   * My reasoning was that a snapshot reporting `positionsTruncated: false` is
+   * authoritative and therefore supersedes the transport hint. It is authoritative
+   * about ONE thing — whether that snapshot enumerated the whole position set — and a
+   * hub `degraded` is about something else: whether the LIVE feed is keeping its
+   * cached statuses current. Those are independent, and core-api emits the pair on
+   * purpose (`degradedPending` routes a hub saturation into the same pre-`ready`
+   * emission on a connection whose snapshot is complete).
+   *
+   * So a complete baseline must NOT clear a warning raised on the same connection.
+   * What supersedes it is a REBASELINE — `resetOwnStateForRebaseline`, which every
+   * path delivering a fresh cursor-less baseline already goes through — because that
+   * is a re-grounding rather than merely a swap.
+   */
+  it('#95 B1: a COMPLETE fresh baseline does NOT clear a warning from the same connection', async () => {
     const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
     // `transportFresh` anchor at the frozen clock — the composite cannot be healthy
     // without an observed frame, so without this every health assertion below would
@@ -1950,6 +1964,53 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
 
     recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: false }, { cursor: 'snap-1' });
     recorder.fire('onReady', undefined, { cursor: 'ready-1' });
+    recorder.fire('onStatus', 'connected');
+
+    // SETUP: the snapshot really was complete, so nothing else is holding and a
+    // green here cannot be the truncation field doing the work.
+    expect(runner.ownStateSessionView().positionsTruncated).toBe(false);
+    // The behaviour under test.
+    expect(runner.ownStateStatusDegradedForTest()).toBe(true);
+    expect(runner.ownStateHealthyForTest()).toBe(false);
+
+    triggerKill();
+    await runPromise;
+  });
+
+  it('#95 B1: the same with the frames transposed — snapshot first, then the hub warning', async () => {
+    // core-api can emit the warning either side of the snapshot depending on when the
+    // hub saturates, so a fix keyed on "did a degraded arrive before accumulation
+    // started" would pass the case above and fail this one.
+    const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
+    recorder.fire('onFrame', { receivedAtMs: 0, kind: 'heartbeat' });
+    recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: false }, { cursor: 'snap-1' });
+    recorder.fire('onStatus', 'degraded');
+    expect(runner.ownStateStatusDegradedForTest()).toBe(true);
+    recorder.fire('onReady', undefined, { cursor: 'ready-1' });
+    recorder.fire('onStatus', 'connected');
+
+    expect(runner.ownStateSessionView().positionsTruncated).toBe(false);
+    expect(runner.ownStateStatusDegradedForTest()).toBe(true);
+    expect(runner.ownStateHealthyForTest()).toBe(false);
+
+    triggerKill();
+    await runPromise;
+  });
+
+  it('#95: a REBASELINE supersedes it — a fresh baseline after a resync is healthy again', async () => {
+    // The other half of the pair, and the reason the rule is "only a rebaseline
+    // clears it" rather than "nothing clears it": a transport-caused warning must
+    // still recover, or a blip strands the maker. `resetOwnStateForRebaseline` — here
+    // via `resync`, and identically via the self-heal's cold restart — clears the
+    // latch, and the fresh snapshot that follows is trusted normally.
+    const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
+    recorder.fire('onFrame', { receivedAtMs: 0, kind: 'heartbeat' });
+    recorder.fire('onStatus', 'degraded');
+    recorder.fire('onStatus', 'resync'); // the re-grounding
+    expect(runner.ownStateStatusDegradedForTest()).toBe(false);
+    recorder.fire('onFrame', { receivedAtMs: 0, kind: 'heartbeat' });
+    recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: false }, { cursor: 'snap-2' });
+    recorder.fire('onReady', undefined, { cursor: 'ready-2' });
     recorder.fire('onStatus', 'connected');
 
     expect(runner.ownStateStatusDegradedForTest()).toBe(false);
@@ -1973,9 +2034,12 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
     recorder.fire('onReady', undefined, { cursor: 'ready-1' });
     recorder.fire('onStatus', 'connected');
 
-    expect(runner.ownStateStatusDegradedForTest()).toBe(false); // superseded
-    expect(runner.ownStateSessionView().positionsTruncated).toBe(true); // by this
-    expect(runner.ownStateHealthyForTest()).toBe(false); // so the hold stands
+    // BOTH hold now: the warning came from this connection, and the snapshot
+    // independently reports truncation. Retaining one cannot prove the other — which
+    // is exactly why the complete-baseline cases above exist separately.
+    expect(runner.ownStateStatusDegradedForTest()).toBe(true);
+    expect(runner.ownStateSessionView().positionsTruncated).toBe(true);
+    expect(runner.ownStateHealthyForTest()).toBe(false);
 
     triggerKill();
     await runPromise;

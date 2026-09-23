@@ -541,10 +541,17 @@ export class Runner {
    *
    * ## Why a latch is needed at all
    *
-   * `lastStatus` already holds the §5.1 gate while it reads `degraded`, and on the
-   * COLD-START leg that is belt-and-braces: the snapshot body carries
-   * `positionsTruncated`, which {@link handleOwnerReady} latches independently. The
-   * RESUME leg has no snapshot, so that field is never written — and the server
+   * `lastStatus` already holds the §5.1 gate while it reads `degraded`, but only until
+   * the next status overwrites it, and BOTH legs need more than that.
+   *
+   * On the COLD-START leg a `degraded` caused by snapshot truncation is also recorded
+   * by `positionsTruncated`, so the hold survives on that field. A cold start can
+   * equally carry a hub warning INDEPENDENT of enumeration completeness, and
+   * `positionsTruncated: false` is not evidence about that — so before this latch that
+   * warning was lost on the cold-start leg too. (The PR #168 review reproduced that
+   * against base: it is an inherited gap, not a resume-only one.)
+   *
+   * The RESUME leg has no snapshot at all, so the field is never written — and the server
    * emits `degraded` and then `ready` three lines later
    * (`ospex-core-api/src/v1/ownState/stream.ts`), which the SDK turns into
    * `onStatus('degraded')` followed one frame later by `onStatus('connected')`.
@@ -562,9 +569,23 @@ export class Runner {
    * fail-closed direction, and it is why the self-heal below exists rather than
    * leaving the hold to be cleared only by a server-driven resync.
    *
-   * Cleared on a clean rebaseline ({@link resetOwnStateForRebaseline}) and by a
-   * fresh baseline in {@link handleOwnerReady}, because a snapshot's own
-   * `positionsTruncated` is authoritative where this is only a hint.
+   * ## What clears it, and what pointedly does not
+   *
+   * ONLY a rebaseline ({@link resetOwnStateForRebaseline}). A baseline SWAP in
+   * {@link handleOwnerReady} does not, and an earlier draft of this latch made
+   * exactly that mistake: snapshot-enumeration completeness and live-hub coverage
+   * are independent facts, so `positionsTruncated: false` is not evidence that a hub
+   * saturation has passed. core-api emits a complete snapshot together with a
+   * `degraded` on purpose, via `degradedPending`.
+   *
+   * That still leaves a transport-caused warning recoverable, because every path
+   * delivering a fresh cursor-less baseline passes through a rebaseline first — the
+   * `resync` branch, the `reconnecting`-with-truncated-baseline branch, and
+   * `performOwnStateColdRestart`. The residue worth naming rather than denying: an
+   * SDK-internal reconnect that somehow delivered a fresh snapshot WITHOUT any of
+   * those would hold until the next rebaseline. None of the SDK's enumerated
+   * cursor-clearing paths does that, and the hold is the fail-closed direction, but
+   * it is an argument from an enumeration rather than a guarantee.
    */
   private ownStateStatusDegraded = false;
   /**
@@ -3905,11 +3926,25 @@ export class Runner {
       this.ownStateDedupSet.clear();
       this.ownStateSession.truncated = baseline.truncated;
       this.ownStateSession.positionsTruncated = baseline.positionsTruncated;
-      // `#95`: the snapshot just told us authoritatively whether the view is
-      // complete, so the transport hint has served its purpose and yields to it. The
-      // hold does NOT disappear when the snapshot is truncated — the line above
-      // latches that separately, and the composite reads both.
-      this.ownStateStatusDegraded = false;
+      // `#95` — NOTE WHAT IS DELIBERATELY ABSENT HERE. An earlier draft cleared
+      // `ownStateStatusDegraded` on this swap, reasoning that a snapshot reporting
+      // `positionsTruncated: false` is authoritative and therefore supersedes the
+      // transport hint. It is authoritative about ONE thing — whether THIS snapshot
+      // enumerated the whole position set — and a hub `degraded` is about something
+      // else: whether the LIVE feed is keeping its cached statuses current. The two
+      // are independent, and core-api emits the pair on purpose: `degradedPending`
+      // routes a hub saturation into the same pre-`ready` emission on a connection
+      // whose snapshot is complete. Clearing here therefore erased a warning that
+      // was still true, and the PR #168 review caught it end to end through the
+      // pinned SDK.
+      //
+      // What DOES supersede the warning is a REBASELINE
+      // ({@link resetOwnStateForRebaseline}) — a re-grounding rather than a swap —
+      // and every path that delivers a fresh cursor-less baseline already goes
+      // through one: the `resync` branch, the `reconnecting`-with-truncated-baseline
+      // branch, and `performOwnStateColdRestart` (which the self-heal below
+      // requests). So the transport-caused warning still recovers without this line,
+      // and a warning raised on THIS connection is kept.
       this.ownStateSession.pendingBaseline = null;
     }
     // A real baseline was swapped, OR this is a mid-session reconnect whose

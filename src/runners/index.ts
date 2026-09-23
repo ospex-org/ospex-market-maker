@@ -578,16 +578,45 @@ export class Runner {
    * saturation has passed. core-api emits a complete snapshot together with a
    * `degraded` on purpose, via `degradedPending`.
    *
-   * That still leaves a transport-caused warning recoverable, because every path
-   * delivering a fresh cursor-less baseline passes through a rebaseline first — the
-   * `resync` branch, the `reconnecting`-with-truncated-baseline branch, and
-   * `performOwnStateColdRestart`. The residue worth naming rather than denying: an
-   * SDK-internal reconnect that somehow delivered a fresh snapshot WITHOUT any of
-   * those would hold until the next rebaseline. None of the SDK's enumerated
-   * cursor-clearing paths does that, and the hold is the fail-closed direction, but
-   * it is an argument from an enumeration rather than a guarantee.
+   * A transport-caused warning stays recoverable two ways, and the second exists
+   * because the first was an incomplete enumeration. Most paths that deliver a fresh
+   * cursor-less baseline pass through a rebaseline, which clears this — the `resync`
+   * branch, the `reconnecting`-with-truncated-baseline branch, and
+   * `performOwnStateColdRestart`. The FIRST connection does not: the SDK has no cursor
+   * to clear before its first snapshot, so ordinary retries recover through none of
+   * them. {@link ownStateStatusDegradedBindsBaseline} covers that, by asking what the
+   * warning could have been about rather than which path delivered the recovery.
    */
   private ownStateStatusDegraded = false;
+  /**
+   * Qualifier on {@link ownStateStatusDegraded} (`#168` B2) — `true` once a latched
+   * warning arrived while the session HELD a baseline or was accumulating one, so no
+   * swap of that same view can supersede it.
+   *
+   * The distinction is what the warning can possibly be ABOUT, which is why it is
+   * neither an ordering heuristic nor a connection counter:
+   *
+   * - A warning that arrives while `ready` is true, or while a snapshot is
+   *   accumulating, concerns the position view the maker is trading on. Swapping that
+   *   view for a newer copy of itself is not evidence the condition passed.
+   * - A warning that arrives when the session holds NOTHING and has nothing in
+   *   flight — every connection so far ended before its first snapshot — cannot be
+   *   about a position view, because there is not one. It is a pre-baseline transport
+   *   failure, and the first good baseline genuinely does supersede it.
+   *
+   * Sticky while the latch is set, so a pre-baseline failure followed by a real hub
+   * warning on the connection that finally delivers a baseline still binds. Cleared
+   * with the latch by {@link resetOwnStateForRebaseline}.
+   *
+   * Why this case needed its own mechanism rather than the enumeration I first shipped:
+   * the SDK's cursor is UNDEFINED before the first snapshot, so there is nothing to
+   * clear and ordinary retries deliver a fresh cursor-less snapshot without crossing
+   * any rebaseline path. The `baseline === null` self-heal cannot reach it either,
+   * because that snapshot makes `baseline !== null`. A recovered startup was therefore
+   * held until an unrelated rebaseline — a liveness defect, demonstrated against the
+   * pinned SDK in the `#168` review.
+   */
+  private ownStateStatusDegradedBindsBaseline = false;
   /**
    * Per-audit-cycle flag (Phase 3 PR3b source flip) — `true` if THIS cycle's audit
    * poll (detectFills/pollPositionStatus/reconcileSoftCancelledFills) hit an API
@@ -3942,9 +3971,19 @@ export class Runner {
       // ({@link resetOwnStateForRebaseline}) — a re-grounding rather than a swap —
       // and every path that delivers a fresh cursor-less baseline already goes
       // through one: the `resync` branch, the `reconnecting`-with-truncated-baseline
-      // branch, and `performOwnStateColdRestart` (which the self-heal below
-      // requests). So the transport-caused warning still recovers without this line,
-      // and a warning raised on THIS connection is kept.
+      // branch, and `performOwnStateColdRestart` (which the self-heal below requests).
+      //
+      // `#168` B2 corrected that enumeration: it missed the FIRST connection, where the
+      // SDK has no cursor to clear, so ordinary retries deliver a fresh cursor-less
+      // snapshot through none of those paths. A startup that failed three times and
+      // then recovered cleanly was held indefinitely. So a fresh baseline DOES
+      // supersede a warning that could only have been about the transport — one that
+      // arrived while the session held no view and had none in flight — and does not
+      // supersede one that concerns a view (see
+      // {@link ownStateStatusDegradedBindsBaseline}).
+      if (!this.ownStateStatusDegradedBindsBaseline) {
+        this.ownStateStatusDegraded = false;
+      }
       this.ownStateSession.pendingBaseline = null;
     }
     // A real baseline was swapped, OR this is a mid-session reconnect whose
@@ -4115,6 +4154,12 @@ export class Runner {
       // discard a valid in-flight baseline and undercount exposure. Latching holds
       // posting without touching the baseline, which is the whole point.
       this.ownStateStatusDegraded = true;
+      // `#168` B2 — qualify what this warning can be about. Set-only: a pre-baseline
+      // failure followed by a warning on the connection that does deliver a baseline
+      // must end up bound, not clearable.
+      if (this.ownStateSession.ready || this.ownStateSession.pendingBaseline !== null) {
+        this.ownStateStatusDegradedBindsBaseline = true;
+      }
     } else if (status === 'connected') {
       // Transport recovered — clear any prior transport-level error mark
       // (including the fatal-error input the recompute below reads). A queue
@@ -4195,6 +4240,7 @@ export class Runner {
     // because `emitDegradedOnce` is per-CONNECTION on the server side, a new
     // connection can signal again where the old one could not.
     this.ownStateStatusDegraded = false;
+    this.ownStateStatusDegradedBindsBaseline = false;
     // The rebaseline cleared `ready` + the overflow latch, so re-derive composite
     // health (it goes unhealthy on `ready=false`, which also clears the recovery
     // hold so the fresh baseline must re-earn `recoveryHoldMs` of stability before
@@ -4746,6 +4792,14 @@ export class Runner {
    */
   ownStateStatusDegradedForTest(): boolean {
     return this.ownStateStatusDegraded;
+  }
+
+  /**
+   * The `#168` B2 qualifier, read directly: whether the latch is clearable by a fresh
+   * baseline is the property under test, and composite health cannot express it.
+   */
+  ownStateStatusDegradedBindsBaselineForTest(): boolean {
+    return this.ownStateStatusDegradedBindsBaseline;
   }
 
   streamOverflowDegradedForTest(): boolean {

@@ -536,6 +536,38 @@ export class Runner {
    */
   private ownStateMappingDegraded = false;
   /**
+   * Latch (`ospex-core-api#95`) — `true` while a `degraded` transport status has
+   * been observed and NOT yet superseded by an authoritative baseline.
+   *
+   * ## Why a latch is needed at all
+   *
+   * `lastStatus` already holds the §5.1 gate while it reads `degraded`, and on the
+   * COLD-START leg that is belt-and-braces: the snapshot body carries
+   * `positionsTruncated`, which {@link handleOwnerReady} latches independently. The
+   * RESUME leg has no snapshot, so that field is never written — and the server
+   * emits `degraded` and then `ready` three lines later
+   * (`ospex-core-api/src/v1/ownState/stream.ts`), which the SDK turns into
+   * `onStatus('degraded')` followed one frame later by `onStatus('connected')`.
+   * `lastStatus` is therefore back to `connected` before the next recompute, and
+   * after `recoveryHoldMs` the maker quotes against a view the server explicitly
+   * said was partial.
+   *
+   * ## Why it does not discriminate the reason, and what that costs
+   *
+   * It cannot: `onStatus` carries only the status string. The SDK emits `degraded`
+   * both for the server's `event: degraded` AND from its own reconnect loop once
+   * `PERSISTENT_FAILURE_THRESHOLD` attempts have failed, and
+   * `OwnerStateDegradedReason` is exported without ever being delivered. So this
+   * latches on either, which means a reconnect storm also holds posting — the
+   * fail-closed direction, and it is why the self-heal below exists rather than
+   * leaving the hold to be cleared only by a server-driven resync.
+   *
+   * Cleared on a clean rebaseline ({@link resetOwnStateForRebaseline}) and by a
+   * fresh baseline in {@link handleOwnerReady}, because a snapshot's own
+   * `positionsTruncated` is authoritative where this is only a hint.
+   */
+  private ownStateStatusDegraded = false;
+  /**
    * Per-audit-cycle flag (Phase 3 PR3b source flip) — `true` if THIS cycle's audit
    * poll (detectFills/pollPositionStatus/reconcileSoftCancelledFills) hit an API
    * read failure. The audit reseeds `auditState` from canonical BEFORE polling, so
@@ -3873,6 +3905,11 @@ export class Runner {
       this.ownStateDedupSet.clear();
       this.ownStateSession.truncated = baseline.truncated;
       this.ownStateSession.positionsTruncated = baseline.positionsTruncated;
+      // `#95`: the snapshot just told us authoritatively whether the view is
+      // complete, so the transport hint has served its purpose and yields to it. The
+      // hold does NOT disappear when the snapshot is truncated — the line above
+      // latches that separately, and the composite reads both.
+      this.ownStateStatusDegraded = false;
       this.ownStateSession.pendingBaseline = null;
     }
     // A real baseline was swapped, OR this is a mid-session reconnect whose
@@ -3902,6 +3939,17 @@ export class Runner {
     // → health recovers normally.
     if (baseline !== null && this.ownStateMappingDegraded) {
       this.requestOwnStateColdRestart('mapping-degraded');
+    }
+    // `#95` self-heal: a `degraded` on a leg that brought NO baseline leaves the
+    // latch set with nothing authoritative to clear it, and a plain resume never
+    // delivers a snapshot — so without this the hold would wait for a
+    // server-driven resync that may never come. A cursor-less cold restart fetches
+    // one: if the view really is partial its `positionsTruncated` takes over the
+    // hold, and if it is not, step 5 above clears the latch. Converges in one
+    // restart either way, and is rate-limited to one per `ownState.debounceMs` by
+    // the wake loop exactly as the mapping-degraded case is.
+    if (baseline === null && this.ownStateStatusDegraded) {
+      this.requestOwnStateColdRestart('status-degraded');
     }
     // No telemetry emit in PR4a — PR5 wires the proper `stream-ready` /
     // comparator-pass shape. Wake the loop so the next iteration drains.
@@ -4024,6 +4072,14 @@ export class Runner {
       // `resync` on paging failure the resync branch above covers this and this
       // branch becomes belt-and-braces.
       this.resetOwnStateForRebaseline();
+    } else if (status === 'degraded') {
+      // `#95`: latch it, so a `connected` one frame later cannot silently clear the
+      // one signal the resume leg has. Deliberately NO `resetOwnStateForRebaseline`
+      // here — the branch above states why, and it still holds: `degraded` also
+      // arrives DURING a healthy cold-start snapshot delivery, where a reset would
+      // discard a valid in-flight baseline and undercount exposure. Latching holds
+      // posting without touching the baseline, which is the whole point.
+      this.ownStateStatusDegraded = true;
     } else if (status === 'connected') {
       // Transport recovered — clear any prior transport-level error mark
       // (including the fatal-error input the recompute below reads). A queue
@@ -4099,6 +4155,11 @@ export class Runner {
     // incomplete one. If the offending row is still malformed, the new snapshot's
     // accumulation re-sets it (and holds again); a clean snapshot heals it.
     this.ownStateMappingDegraded = false;
+    // `#95`: same reasoning — a rebaseline supersedes a transport hint. If the
+    // condition persists the fresh connection's server signal re-sets it, and
+    // because `emitDegradedOnce` is per-CONNECTION on the server side, a new
+    // connection can signal again where the old one could not.
+    this.ownStateStatusDegraded = false;
     // The rebaseline cleared `ready` + the overflow latch, so re-derive composite
     // health (it goes unhealthy on `ready=false`, which also clears the recovery
     // hold so the fresh baseline must re-earn `recoveryHoldMs` of stability before
@@ -4253,6 +4314,7 @@ export class Runner {
       !this.streamOverflowDegraded &&
       !this.ownStateSession.positionsTruncated &&
       !this.ownStateMappingDegraded &&
+      !this.ownStateStatusDegraded &&
       this.ownStateSession.lastError?.reason !== 'fatal' &&
       !this.tokenRefreshFailureInFlight;
     const instant = this.instantOwnStateHealthy(nowSec);
@@ -4642,6 +4704,15 @@ export class Runner {
   }
 
   /** Test seam — reads the `streamOverflowDegraded` latch. */
+  /**
+   * `#95` latch, read directly rather than through `ownStateHealthyForTest()`: the
+   * composite cannot distinguish WHICH conjunct is holding, so a test that only
+   * asserted health could pass on the wrong one (rule 3b-outcome).
+   */
+  ownStateStatusDegradedForTest(): boolean {
+    return this.ownStateStatusDegraded;
+  }
+
   streamOverflowDegradedForTest(): boolean {
     return this.streamOverflowDegraded;
   }

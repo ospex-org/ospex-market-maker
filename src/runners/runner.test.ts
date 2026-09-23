@@ -1868,6 +1868,173 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
     expect(readEvents().filter((e) => e.kind === 'stream-cold-restart')).toHaveLength(0);
   });
 
+  /**
+   * `ospex-core-api#95` — a `degraded` on a leg that brings no snapshot must not be
+   * cleared by the `connected` that follows one frame later.
+   *
+   * The server writes `degraded` and then `ready` three lines apart
+   * (`ospex-core-api/src/v1/ownState/stream.ts`), and the SDK turns the second into
+   * `onStatus('connected')`. On the COLD-START leg that is harmless — the snapshot
+   * body carries `positionsTruncated` and `handleOwnerReady` latches it
+   * independently. On a RESUME there is no snapshot, so before this latch the
+   * maker's only record of the warning was `lastStatus`, which `connected`
+   * overwrote: health went true and, after `recoveryHoldMs`, quoting resumed
+   * against a position view the server had explicitly called partial.
+   *
+   * Nothing in this suite pinned that, which is how it shipped.
+   */
+  it('#95: a resume-path degraded holds posting even after the connected that follows it', async () => {
+    const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
+    // `transportFresh` anchor at the frozen clock — the composite cannot be healthy
+    // without an observed frame, so without this every health assertion below would
+    // be measuring the missing frame rather than the latch.
+    recorder.fire('onFrame', { receivedAtMs: 0, kind: 'heartbeat' });
+
+    // Cold connect, complete — establishes a baseline and a healthy composite, so
+    // the assertion below cannot pass merely because the session was never healthy.
+    recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: false }, { cursor: 'snap-1' });
+    recorder.fire('onReady', undefined, { cursor: 'ready-1' });
+    recorder.fire('onStatus', 'connected');
+    expect(runner.ownStateHealthyForTest()).toBe(true);
+
+    // The resume leg, in the order the wire actually delivers it: the degraded
+    // frame, then the ready frame (which the SDK reports as onReady + connected).
+    // No snapshot — that is what makes it a resume.
+    recorder.fire('onStatus', 'degraded');
+    recorder.fire('onReady', undefined, { cursor: 'ready-2' });
+    recorder.fire('onStatus', 'connected');
+
+    expect(runner.ownStateSessionView().lastStatus).toBe('connected'); // the overwrite still happens
+    expect(runner.ownStateSessionView().ready).toBe(true);
+    expect(runner.ownStateSessionView().positionsTruncated).toBe(false); // no snapshot wrote it
+    // …and the hold survives anyway, because the latch is what carries it now.
+    expect(runner.ownStateStatusDegradedForTest()).toBe(true);
+    expect(runner.ownStateHealthyForTest()).toBe(false);
+
+    triggerKill();
+    await runPromise;
+  });
+
+  it('#95 CONTROL: the same resume WITHOUT a degraded stays healthy', async () => {
+    // The negative half (rule 5). Without it, a build that simply never went
+    // healthy after a second `onReady` would pass the case above.
+    const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
+    // `transportFresh` anchor at the frozen clock — the composite cannot be healthy
+    // without an observed frame, so without this every health assertion below would
+    // be measuring the missing frame rather than the latch.
+    recorder.fire('onFrame', { receivedAtMs: 0, kind: 'heartbeat' });
+    recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: false }, { cursor: 'snap-1' });
+    recorder.fire('onReady', undefined, { cursor: 'ready-1' });
+    recorder.fire('onStatus', 'connected');
+    recorder.fire('onReady', undefined, { cursor: 'ready-2' });
+    recorder.fire('onStatus', 'connected');
+
+    expect(runner.ownStateStatusDegradedForTest()).toBe(false);
+    expect(runner.ownStateHealthyForTest()).toBe(true);
+
+    triggerKill();
+    await runPromise;
+  });
+
+  it('#95: a fresh COMPLETE baseline supersedes the hint and releases the hold', async () => {
+    // The latch is a stand-in for a field the resume leg cannot deliver, so it must
+    // yield the moment something authoritative arrives. A snapshot saying the view
+    // is complete is exactly that.
+    const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
+    // `transportFresh` anchor at the frozen clock — the composite cannot be healthy
+    // without an observed frame, so without this every health assertion below would
+    // be measuring the missing frame rather than the latch.
+    recorder.fire('onFrame', { receivedAtMs: 0, kind: 'heartbeat' });
+    recorder.fire('onStatus', 'degraded');
+    expect(runner.ownStateStatusDegradedForTest()).toBe(true);
+
+    recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: false }, { cursor: 'snap-1' });
+    recorder.fire('onReady', undefined, { cursor: 'ready-1' });
+    recorder.fire('onStatus', 'connected');
+
+    expect(runner.ownStateStatusDegradedForTest()).toBe(false);
+    expect(runner.ownStateHealthyForTest()).toBe(true);
+
+    triggerKill();
+    await runPromise;
+  });
+
+  it('#95: a fresh TRUNCATED baseline clears the hint and keeps holding on its own field', async () => {
+    // The discriminating case for the clear above: clearing the latch must not
+    // remove the protection, because `positionsTruncated` took it over. A build that
+    // cleared BOTH would pass the previous test and fail here.
+    const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
+    // `transportFresh` anchor at the frozen clock — the composite cannot be healthy
+    // without an observed frame, so without this every health assertion below would
+    // be measuring the missing frame rather than the latch.
+    recorder.fire('onFrame', { receivedAtMs: 0, kind: 'heartbeat' });
+    recorder.fire('onStatus', 'degraded');
+    recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: true }, { cursor: 'snap-1' });
+    recorder.fire('onReady', undefined, { cursor: 'ready-1' });
+    recorder.fire('onStatus', 'connected');
+
+    expect(runner.ownStateStatusDegradedForTest()).toBe(false); // superseded
+    expect(runner.ownStateSessionView().positionsTruncated).toBe(true); // by this
+    expect(runner.ownStateHealthyForTest()).toBe(false); // so the hold stands
+
+    triggerKill();
+    await runPromise;
+  });
+
+  it('#95: a resync clears the latch', async () => {
+    const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
+    // `transportFresh` anchor at the frozen clock — the composite cannot be healthy
+    // without an observed frame, so without this every health assertion below would
+    // be measuring the missing frame rather than the latch.
+    recorder.fire('onFrame', { receivedAtMs: 0, kind: 'heartbeat' });
+    recorder.fire('onStatus', 'degraded');
+    expect(runner.ownStateStatusDegradedForTest()).toBe(true);
+    recorder.fire('onStatus', 'resync');
+    expect(runner.ownStateStatusDegradedForTest()).toBe(false);
+    triggerKill();
+    await runPromise;
+  });
+
+  it('#95: the resume leg self-heals by requesting exactly one cursor-less cold restart', async () => {
+    // Without this the hold would wait on a server-driven resync that may never
+    // come, because the SDK cannot tell the maker WHY it went degraded and a plain
+    // resume never delivers a snapshot. The restart fetches one, which either
+    // clears the latch or replaces it with `positionsTruncated`.
+    const { recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
+    // `transportFresh` anchor at the frozen clock — the composite cannot be healthy
+    // without an observed frame, so without this every health assertion below would
+    // be measuring the missing frame rather than the latch.
+    recorder.fire('onFrame', { receivedAtMs: 0, kind: 'heartbeat' });
+    recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: false }, { cursor: 'snap-1' });
+    recorder.fire('onReady', undefined, { cursor: 'ready-1' });
+    recorder.fire('onStatus', 'connected');
+    recorder.fire('onStatus', 'degraded');
+    recorder.fire('onReady', undefined, { cursor: 'ready-2' }); // resume: no snapshot
+    triggerKill();
+    await runPromise;
+
+    const restarts = readEvents().filter((e) => e.kind === 'stream-cold-restart');
+    expect(restarts.filter((e) => e.reason === 'status-degraded')).toHaveLength(1);
+  });
+
+  it('#95: a degraded whose ready DID bring a baseline requests no restart', async () => {
+    // The sibling of the case above, and the reason it is scoped to `baseline === null`:
+    // a cold start already has its authoritative answer, so restarting would be a
+    // needless close-and-reopen — and, repeated, a loop.
+    const { recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
+    // `transportFresh` anchor at the frozen clock — the composite cannot be healthy
+    // without an observed frame, so without this every health assertion below would
+    // be measuring the missing frame rather than the latch.
+    recorder.fire('onFrame', { receivedAtMs: 0, kind: 'heartbeat' });
+    recorder.fire('onStatus', 'degraded');
+    recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: false }, { cursor: 'snap-1' });
+    recorder.fire('onReady', undefined, { cursor: 'ready-1' });
+    triggerKill();
+    await runPromise;
+
+    expect(readEvents().filter((e) => e.reason === 'status-degraded')).toHaveLength(0);
+  });
+
   it('resync rebaseline: ready drops, and a fresh snapshot + onReady re-establishes it', async () => {
     const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
     recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: false }, { cursor: 'snap-1' });
@@ -2014,10 +2181,21 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
       fireHealthyBaseline(recorder); // anchored at T0
       t = T0 + 30;
       expect(runner.ownStateHealthyForTest()).toBe(true); // hold earned
-      // Transport degrades — the latch trips: gate + mirror false, anchor cleared.
-      recorder.fire('onStatus', 'degraded');
+      // Transport wobbles — the latch trips: gate + mirror false, anchor cleared.
+      //
+      // `reconnecting` rather than `degraded`, and the swap matters: this case isolates
+      // latch 8 (the recovery hold re-earning its window) and only ever needed SOME
+      // latch to trip. A `degraded` no longer recovers on a bare `connected` — it sets
+      // the `#95` latch, which a transport recovery deliberately cannot clear, because
+      // that silent clearing was the defect. Using it here would have made this case
+      // pin the behaviour `#95` exists to remove. `reconnecting` trips the same
+      // conjunct (`lastStatus !== 'connected'`) and clears the same way, so latch 8 is
+      // exercised identically. Its truncated-baseline sub-branch cannot fire: the
+      // baseline above was already swapped, so `pendingBaseline` is null.
+      recorder.fire('onStatus', 'reconnecting');
       expect(runner.ownStateSessionView().healthy).toBe(false);
       expect(runner.ownStateHealthyForTest()).toBe(false);
+      expect(runner.ownStateStatusDegradedForTest()).toBe(false); // this path must NOT latch
       // Recover — the hold RESTARTS from here (T0+30), not from the original anchor.
       recorder.fire('onStatus', 'connected');
       expect(runner.ownStateHealthyForTest()).toBe(false); // 0s into the new hold

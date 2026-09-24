@@ -50,6 +50,20 @@ If the stream degrades — it goes silent, overflows, lags the indexer, fails to
 
 So before you go live with `orders.cancelMode: onchain`, know that a flaky stream can trigger automatic, gas-spending on-chain cancels. Keep POL funded, and watch for `stream-health-hold` / `onchain-cancel` telemetry (or `nonce-floor-raise` if you've set `orders.onchainCancelStrategy: bulk-nonce` — the stream-health sweep then invalidates by raising the nonce floor per speculation rather than one `cancelCommitment` per record).
 
+### A degraded stream costs one extra connection, and a repeated warning holds until re-grounded
+
+Two behaviours of the guard above are worth knowing before you see them in telemetry, because both look like faults and neither is one.
+
+**One extra cursor-less subscription per degraded episode.** When the server tells the MM its position view may be incomplete, the MM cannot tell *why*: the status arrives without a reason, and the SDK collapses repeats of it (tracked upstream as [ospex-sdk#219](https://github.com/ospex-org/ospex-sdk/issues/219)). A transport wobble and a genuinely unmaintained view look identical. Rather than guess, the MM holds posting and re-opens the stream **once** to get a fresh answer — you will see a single `stream-cold-restart` with `reason: 'status-degraded'`, followed by a new snapshot. That is the MM asking the question rather than assuming an answer; it is not a reconnect loop.
+
+**If the fresh connection warns again, the hold stays.** That is the correct reading — the condition is current, not stale — and the MM deliberately does **not** keep restarting, so a persistently degraded feed costs you one extra connection, not a restart storm. What it means in practice:
+
+- you will see `stream-health-hold` and **no further** `stream-cold-restart` for that episode;
+- posting stays stopped, and with open exposure the cancel behaviour described above applies;
+- it clears when the stream is genuinely re-grounded — a server-driven `resync`, a cold restart another guard requests, or restarting the MM process. It does **not** clear on its own while the warning keeps repeating, and that is intentional: it means the server is still telling the MM it cannot vouch for your position view.
+
+If you see that hold persist, the question to ask is what the server is warning about — not whether the MM is stuck.
+
 ## Dry-run first
 
 `mode.dryRun: true` is the default. Run `ospex-mm run --dry-run` for a meaningful window before going live. The MM does everything except post — it logs what it *would* submit/cancel/replace, runs the risk engine, and measures quote competitiveness against the visible order book. Read the output:

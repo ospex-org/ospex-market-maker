@@ -1868,6 +1868,372 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
     expect(readEvents().filter((e) => e.kind === 'stream-cold-restart')).toHaveLength(0);
   });
 
+  /**
+   * `ospex-core-api#95` — a `degraded` on a leg that brings no snapshot must not be
+   * cleared by the `connected` that follows one frame later.
+   *
+   * The server writes `degraded` and then `ready` three lines apart
+   * (`ospex-core-api/src/v1/ownState/stream.ts`), and the SDK turns the second into
+   * `onStatus('connected')`. On the COLD-START leg a truncation-caused warning is also
+   * recorded by `positionsTruncated` — but an INDEPENDENT hub warning on a complete
+   * snapshot is not, so that leg had a gap too (reproduced against base in the PR #168
+   * review). On a RESUME there is no snapshot at all, so before this latch the
+   * maker's only record of the warning was `lastStatus`, which `connected`
+   * overwrote: health went true and, after `recoveryHoldMs`, quoting resumed
+   * against a position view the server had explicitly called partial.
+   *
+   * Nothing in this suite pinned that, which is how it shipped.
+   */
+  it('#95: a resume-path degraded holds posting even after the connected that follows it', async () => {
+    const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
+    // `transportFresh` anchor at the frozen clock — the composite cannot be healthy
+    // without an observed frame, so without this every health assertion below would
+    // be measuring the missing frame rather than the latch.
+    recorder.fire('onFrame', { receivedAtMs: 0, kind: 'heartbeat' });
+
+    // Cold connect, complete — establishes a baseline and a healthy composite, so
+    // the assertion below cannot pass merely because the session was never healthy.
+    recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: false }, { cursor: 'snap-1' });
+    recorder.fire('onReady', undefined, { cursor: 'ready-1' });
+    recorder.fire('onStatus', 'connected');
+    expect(runner.ownStateHealthyForTest()).toBe(true);
+
+    // The resume leg, in the order the wire actually delivers it: the degraded
+    // frame, then the ready frame (which the SDK reports as onReady + connected).
+    // No snapshot — that is what makes it a resume.
+    recorder.fire('onStatus', 'degraded');
+    recorder.fire('onReady', undefined, { cursor: 'ready-2' });
+    recorder.fire('onStatus', 'connected');
+
+    expect(runner.ownStateSessionView().lastStatus).toBe('connected'); // the overwrite still happens
+    expect(runner.ownStateSessionView().ready).toBe(true);
+    expect(runner.ownStateSessionView().positionsTruncated).toBe(false); // no snapshot wrote it
+    // …and the hold survives anyway, because the latch is what carries it now.
+    expect(runner.ownStateStatusDegradedForTest()).toBe(true);
+    expect(runner.ownStateHealthyForTest()).toBe(false);
+
+    triggerKill();
+    await runPromise;
+  });
+
+  it('#95 CONTROL: the same resume WITHOUT a degraded stays healthy', async () => {
+    // The negative half (rule 5). Without it, a build that simply never went
+    // healthy after a second `onReady` would pass the case above.
+    const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
+    // `transportFresh` anchor at the frozen clock — the composite cannot be healthy
+    // without an observed frame, so without this every health assertion below would
+    // be measuring the missing frame rather than the latch.
+    recorder.fire('onFrame', { receivedAtMs: 0, kind: 'heartbeat' });
+    recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: false }, { cursor: 'snap-1' });
+    recorder.fire('onReady', undefined, { cursor: 'ready-1' });
+    recorder.fire('onStatus', 'connected');
+    recorder.fire('onReady', undefined, { cursor: 'ready-2' });
+    recorder.fire('onStatus', 'connected');
+
+    expect(runner.ownStateStatusDegradedForTest()).toBe(false);
+    expect(runner.ownStateHealthyForTest()).toBe(true);
+
+    triggerKill();
+    await runPromise;
+  });
+
+  /**
+   * The PR #168 review blocker, and the case I first wrote asserting the OPPOSITE.
+   *
+   * My reasoning was that a snapshot reporting `positionsTruncated: false` is
+   * authoritative and therefore supersedes the transport hint. It is authoritative
+   * about ONE thing — whether that snapshot enumerated the whole position set — and a
+   * hub `degraded` is about something else: whether the LIVE feed is keeping its
+   * cached statuses current. Those are independent, and core-api emits the pair on
+   * purpose (`degradedPending` routes a hub saturation into the same pre-`ready`
+   * emission on a connection whose snapshot is complete).
+   *
+   * So a complete baseline must NOT clear a warning raised on the same connection.
+   * What supersedes it is a REBASELINE — `resetOwnStateForRebaseline`, which every
+   * path delivering a fresh cursor-less baseline already goes through — because that
+   * is a re-grounding rather than merely a swap.
+   */
+  /**
+   * The PR #168 **B2** review blocker, and the sibling of B1 rather than a contradiction
+   * of it. This same frame order — `degraded` before any snapshot, on a session that has
+   * never been ready — is not a hub warning about a position view, because there is no
+   * view: it is what the SDK emits from its own retry loop after
+   * `PERSISTENT_FAILURE_THRESHOLD` connections died before their first frame. core-api
+   * never produces it, since its cold-start path writes the snapshot before the
+   * `degraded`.
+   *
+   * My B1 correction held it anyway, on an enumeration that missed the first connection:
+   * the SDK has no cursor to clear before its first snapshot, so ordinary retries deliver
+   * a fresh cursor-less snapshot through none of the rebaseline paths, and the
+   * `baseline === null` self-heal cannot reach it either because that snapshot makes
+   * `baseline !== null`. A startup that failed three times and then recovered cleanly was
+   * held until an unrelated rebaseline — a liveness defect, reproduced against the pinned
+   * SDK.
+   */
+  it('#95 B2: a pre-baseline transport failure recovers — by RE-GROUNDING, not by a clear', async () => {
+    const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
+    // `transportFresh` anchor at the frozen clock — the composite cannot be healthy
+    // without an observed frame, so without this every health assertion below would
+    // be measuring the missing frame rather than the latch.
+    recorder.fire('onFrame', { receivedAtMs: 0, kind: 'heartbeat' });
+    // SETUP: nothing held and nothing in flight, which is what makes this pre-baseline.
+    expect(runner.ownStateSessionView().ready).toBe(false);
+    expect(runner.ownStateSessionView().pendingBaseline).toBeNull();
+    recorder.fire('onStatus', 'degraded');
+    expect(runner.ownStateStatusDegradedForTest()).toBe(true);
+
+    // The recovering connection brings a complete baseline. The latch is NOT cleared by
+    // that swap — B1 established that a swap is not evidence, and B3 established that
+    // nothing readable distinguishes this warning from a hub one. So the runner spends
+    // its one re-grounding instead of guessing.
+    recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: false }, { cursor: 'snap-1' });
+    recorder.fire('onReady', undefined, { cursor: 'ready-1' });
+    recorder.fire('onStatus', 'connected');
+    expect(runner.ownStateStatusDegradedForTest()).toBe(true);
+    expect(runner.ownStateHealthyForTest()).toBe(false);
+    expect(runner.ownStateDegradedRegroundAttemptedForTest()).toBe(true);
+
+    // …and the re-grounding is what recovers it. `performOwnStateColdRestart` resets and
+    // reopens cursor-less; `resync` drives the same reset here. The fresh generation comes
+    // up with no warning, which is the observation that proves the feed is clean.
+    recorder.fire('onStatus', 'resync');
+    recorder.fire('onFrame', { receivedAtMs: 0, kind: 'heartbeat' });
+    recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: false }, { cursor: 'snap-2' });
+    recorder.fire('onReady', undefined, { cursor: 'ready-2' });
+    recorder.fire('onStatus', 'connected');
+
+    expect(runner.ownStateStatusDegradedForTest()).toBe(false);
+    expect(runner.ownStateHealthyForTest()).toBe(true);
+    // The retry budget is restored only by that clean generation.
+    expect(runner.ownStateDegradedRegroundAttemptedForTest()).toBe(false);
+
+    triggerKill();
+    await runPromise;
+  });
+
+  it('#95: a warning raised while a baseline was HELD survives a later swap with no rebaseline', async () => {
+    // The `ready` half of the qualifier, which a surviving mutant showed nothing
+    // covered: every other case raises its warning either with a snapshot in flight or
+    // with nothing at all, so `pendingBaseline !== null` alone answered them.
+    //
+    // The interleaving that needs it is narrow and real. A resume-path warning requests
+    // a cold restart, and the restart runs off the wake path — so the SDK can deliver a
+    // fresh cursor-less snapshot in the window before it executes. At that `ready` the
+    // baseline is non-null and no rebaseline has happened, so the qualifier is the only
+    // thing standing between the swap and a warning that concerned the view the maker
+    // was actually trading on.
+    const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
+    recorder.fire('onFrame', { receivedAtMs: 0, kind: 'heartbeat' });
+    recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: false }, { cursor: 'snap-1' });
+    recorder.fire('onReady', undefined, { cursor: 'ready-1' });
+    recorder.fire('onStatus', 'connected');
+    expect(runner.ownStateHealthyForTest()).toBe(true);
+
+    // SETUP: a baseline is HELD and none is in flight — the state the `ready` half is about.
+    expect(runner.ownStateSessionView().ready).toBe(true);
+    expect(runner.ownStateSessionView().pendingBaseline).toBeNull();
+    recorder.fire('onStatus', 'degraded');
+
+    // A fresh snapshot arrives and swaps, with no rebaseline in between.
+    recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: false }, { cursor: 'snap-2' });
+    recorder.fire('onReady', undefined, { cursor: 'ready-2' });
+    recorder.fire('onStatus', 'connected');
+
+    expect(runner.ownStateStatusDegradedForTest()).toBe(true);
+    expect(runner.ownStateHealthyForTest()).toBe(false);
+
+    triggerKill();
+    await runPromise;
+  });
+
+  /**
+   * The PR #168 **B3** blocker, and the reason this latch reads nothing about the warning.
+   *
+   * The SDK de-dupes `degraded` as a health LEVEL — `emitStatus` returns early when
+   * `lastStatus` already equals it — so a genuine hub warning arriving on a connection
+   * whose consumer already reads `degraded` produces NO callback. Rounds 1 and 2 both
+   * tried to key the clear on something about the warning (the snapshot's
+   * `positionsTruncated`, then whether a view was held or in flight); round 3 showed the
+   * strengthening event simply never arrives, so no qualifier can be strengthened.
+   *
+   * What makes that survivable is that ONE delivered warning is enough: the swap clears
+   * nothing, so a suppressed repeat changes no decision. This case pins that property
+   * directly — it is the reason the de-duplication cannot hurt us any more.
+   */
+  it('#95 B3: one delivered warning suffices — a suppressed repeat cannot change the outcome', async () => {
+    const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
+    recorder.fire('onFrame', { receivedAtMs: 0, kind: 'heartbeat' });
+    // A single `degraded` before any snapshot — what the SDK emits after three failed
+    // startup connections, and after which it will suppress any further `degraded`.
+    recorder.fire('onStatus', 'degraded');
+    // The connection that recovers brings a complete baseline AND (in production) a hub
+    // warning the SDK swallows. Firing it twice here is the closest a direct-callback
+    // test gets; the point is that the second delivery is irrelevant either way.
+    recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: false }, { cursor: 'snap-1' });
+    recorder.fire('onStatus', 'degraded'); // in production: suppressed, never delivered
+    recorder.fire('onReady', undefined, { cursor: 'ready-1' });
+    recorder.fire('onStatus', 'connected');
+
+    expect(runner.ownStateSessionView().positionsTruncated).toBe(false);
+    expect(runner.ownStateStatusDegradedForTest()).toBe(true);
+    expect(runner.ownStateHealthyForTest()).toBe(false);
+
+    triggerKill();
+    await runPromise;
+  });
+
+  it('#95 B1: a COMPLETE fresh baseline does NOT clear a warning that concerns the view', async () => {
+    // The B1 blocker proper, in the order core-api actually emits on a cold start: the
+    // snapshot frame is written first (`stream.ts`), then `degraded`, then `ready`. So a
+    // hub warning always arrives while a view is in flight, which is exactly what
+    // distinguishes it from the pre-baseline case above — and a complete snapshot is no
+    // evidence that a hub saturation has passed.
+    const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
+    recorder.fire('onFrame', { receivedAtMs: 0, kind: 'heartbeat' });
+    recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: false }, { cursor: 'snap-1' });
+    recorder.fire('onStatus', 'degraded');
+    expect(runner.ownStateStatusDegradedForTest()).toBe(true);
+    recorder.fire('onReady', undefined, { cursor: 'ready-1' });
+    recorder.fire('onStatus', 'connected');
+
+    expect(runner.ownStateSessionView().positionsTruncated).toBe(false);
+    expect(runner.ownStateStatusDegradedForTest()).toBe(true);
+    expect(runner.ownStateHealthyForTest()).toBe(false);
+
+    triggerKill();
+    await runPromise;
+  });
+
+  it('#95: a REBASELINE supersedes it — a fresh baseline after a resync is healthy again', async () => {
+    // The other half of the pair, and the reason the rule is "only a rebaseline
+    // clears it" rather than "nothing clears it": a transport-caused warning must
+    // still recover, or a blip strands the maker. `resetOwnStateForRebaseline` — here
+    // via `resync`, and identically via the self-heal's cold restart — clears the
+    // latch, and the fresh snapshot that follows is trusted normally.
+    const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
+    recorder.fire('onFrame', { receivedAtMs: 0, kind: 'heartbeat' });
+    recorder.fire('onStatus', 'degraded');
+    recorder.fire('onStatus', 'resync'); // the re-grounding
+    expect(runner.ownStateStatusDegradedForTest()).toBe(false);
+    recorder.fire('onFrame', { receivedAtMs: 0, kind: 'heartbeat' });
+    recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: false }, { cursor: 'snap-2' });
+    recorder.fire('onReady', undefined, { cursor: 'ready-2' });
+    recorder.fire('onStatus', 'connected');
+
+    expect(runner.ownStateStatusDegradedForTest()).toBe(false);
+    expect(runner.ownStateHealthyForTest()).toBe(true);
+
+    triggerKill();
+    await runPromise;
+  });
+
+  it('#95: a TRUNCATED baseline and a view-bound warning BOTH hold, independently', async () => {
+    // Retaining one cannot prove the other, which is why this sits beside the
+    // complete-baseline cases rather than standing in for them.
+    const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
+    // `transportFresh` anchor at the frozen clock — the composite cannot be healthy
+    // without an observed frame, so without this every health assertion below would
+    // be measuring the missing frame rather than the latch.
+    recorder.fire('onFrame', { receivedAtMs: 0, kind: 'heartbeat' });
+    // Snapshot first, then the warning — the producer's real order, and the order that
+    // makes the warning bind the view rather than read as a pre-baseline failure.
+    recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: true }, { cursor: 'snap-1' });
+    recorder.fire('onStatus', 'degraded');
+    recorder.fire('onReady', undefined, { cursor: 'ready-1' });
+    recorder.fire('onStatus', 'connected');
+
+    // BOTH hold now: the warning came from this connection, and the snapshot
+    // independently reports truncation. Retaining one cannot prove the other — which
+    // is exactly why the complete-baseline cases above exist separately.
+    expect(runner.ownStateStatusDegradedForTest()).toBe(true);
+    expect(runner.ownStateSessionView().positionsTruncated).toBe(true);
+    expect(runner.ownStateHealthyForTest()).toBe(false);
+
+    triggerKill();
+    await runPromise;
+  });
+
+  it('#95: a resync clears the latch', async () => {
+    const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
+    // `transportFresh` anchor at the frozen clock — the composite cannot be healthy
+    // without an observed frame, so without this every health assertion below would
+    // be measuring the missing frame rather than the latch.
+    recorder.fire('onFrame', { receivedAtMs: 0, kind: 'heartbeat' });
+    recorder.fire('onStatus', 'degraded');
+    expect(runner.ownStateStatusDegradedForTest()).toBe(true);
+    recorder.fire('onStatus', 'resync');
+    expect(runner.ownStateStatusDegradedForTest()).toBe(false);
+    triggerKill();
+    await runPromise;
+  });
+
+  it('#95: the resume leg self-heals by requesting exactly one cursor-less cold restart', async () => {
+    // Without this the hold would wait on a server-driven resync that may never
+    // come, because the SDK cannot tell the maker WHY it went degraded and a plain
+    // resume never delivers a snapshot. The restart fetches one, which either
+    // clears the latch or replaces it with `positionsTruncated`.
+    const { recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
+    // `transportFresh` anchor at the frozen clock — the composite cannot be healthy
+    // without an observed frame, so without this every health assertion below would
+    // be measuring the missing frame rather than the latch.
+    recorder.fire('onFrame', { receivedAtMs: 0, kind: 'heartbeat' });
+    recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: false }, { cursor: 'snap-1' });
+    recorder.fire('onReady', undefined, { cursor: 'ready-1' });
+    recorder.fire('onStatus', 'connected');
+    recorder.fire('onStatus', 'degraded');
+    recorder.fire('onReady', undefined, { cursor: 'ready-2' }); // resume: no snapshot
+    triggerKill();
+    await runPromise;
+
+    const restarts = readEvents().filter((e) => e.kind === 'stream-cold-restart');
+    expect(restarts.filter((e) => e.reason === 'status-degraded')).toHaveLength(1);
+  });
+
+  it('#95: a ready that DID bring a baseline still re-grounds once — B2 was that scoping', async () => {
+    // The inverse of what this asserted before. Scoping the re-grounding to
+    // `baseline === null` is precisely what stranded a recovered startup (B2): that
+    // recovery arrives WITH a baseline, so the guard excluded the only case that needed
+    // it. Every warning now gets exactly one re-grounding regardless of what the `ready`
+    // carried.
+    const { recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
+    recorder.fire('onStatus', 'degraded');
+    recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: false }, { cursor: 'snap-1' });
+    recorder.fire('onReady', undefined, { cursor: 'ready-1' });
+    triggerKill();
+    await runPromise;
+
+    expect(readEvents().filter((e) => e.reason === 'status-degraded')).toHaveLength(1);
+  });
+
+  it('#95: the re-grounding is BOUNDED — a second consecutive warning requests no second restart', async () => {
+    // What stops a persistently saturated hub from becoming a restart loop. The fresh
+    // generation warns again, and that is the answer rather than a reason to try again:
+    // the hold stands, and the whole episode has cost exactly one extra connect.
+    const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
+    recorder.fire('onFrame', { receivedAtMs: 0, kind: 'heartbeat' });
+    recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: false }, { cursor: 'snap-1' });
+    recorder.fire('onStatus', 'degraded');
+    recorder.fire('onReady', undefined, { cursor: 'ready-1' });
+    expect(runner.ownStateDegradedRegroundAttemptedForTest()).toBe(true);
+
+    // The re-grounding happens (reset + fresh cursor-less snapshot) and the new
+    // generation warns again.
+    recorder.fire('onStatus', 'resync');
+    recorder.fire('onFrame', { receivedAtMs: 0, kind: 'heartbeat' });
+    recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: false }, { cursor: 'snap-2' });
+    recorder.fire('onStatus', 'degraded');
+    recorder.fire('onReady', undefined, { cursor: 'ready-2' });
+    recorder.fire('onStatus', 'connected');
+
+    expect(runner.ownStateStatusDegradedForTest()).toBe(true);
+    expect(runner.ownStateHealthyForTest()).toBe(false);
+    triggerKill();
+    await runPromise;
+
+    // Exactly ONE, not two: the bound is what keeps a saturated hub from looping.
+    expect(readEvents().filter((e) => e.reason === 'status-degraded')).toHaveLength(1);
+  });
+
   it('resync rebaseline: ready drops, and a fresh snapshot + onReady re-establishes it', async () => {
     const { runner, recorder, runPromise, triggerKill } = await makePausedSubscribedRunner();
     recorder.fire('onSnapshot', { commitments: [], positions: [], truncated: false, positionsTruncated: false }, { cursor: 'snap-1' });
@@ -2014,10 +2380,21 @@ describe('Runner — own-state SSE subscription wiring (Phase 2 PR4a)', () => {
       fireHealthyBaseline(recorder); // anchored at T0
       t = T0 + 30;
       expect(runner.ownStateHealthyForTest()).toBe(true); // hold earned
-      // Transport degrades — the latch trips: gate + mirror false, anchor cleared.
-      recorder.fire('onStatus', 'degraded');
+      // Transport wobbles — the latch trips: gate + mirror false, anchor cleared.
+      //
+      // `reconnecting` rather than `degraded`, and the swap matters: this case isolates
+      // latch 8 (the recovery hold re-earning its window) and only ever needed SOME
+      // latch to trip. A `degraded` no longer recovers on a bare `connected` — it sets
+      // the `#95` latch, which a transport recovery deliberately cannot clear, because
+      // that silent clearing was the defect. Using it here would have made this case
+      // pin the behaviour `#95` exists to remove. `reconnecting` trips the same
+      // conjunct (`lastStatus !== 'connected'`) and clears the same way, so latch 8 is
+      // exercised identically. Its truncated-baseline sub-branch cannot fire: the
+      // baseline above was already swapped, so `pendingBaseline` is null.
+      recorder.fire('onStatus', 'reconnecting');
       expect(runner.ownStateSessionView().healthy).toBe(false);
       expect(runner.ownStateHealthyForTest()).toBe(false);
+      expect(runner.ownStateStatusDegradedForTest()).toBe(false); // this path must NOT latch
       // Recover — the hold RESTARTS from here (T0+30), not from the original anchor.
       recorder.fire('onStatus', 'connected');
       expect(runner.ownStateHealthyForTest()).toBe(false); // 0s into the new hold

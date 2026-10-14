@@ -12,6 +12,10 @@ It is built on **[`@ospex/sdk`](https://github.com/ospex-org/ospex-sdk)** — ev
 
 ---
 
+## Run 2 house-bettor notice — proposed, not started
+
+Our house wallets are maker A `0x5316fa54c170d1927f30d1a497ac9e85e3826a9b` and the second house wallet `0x16dc5d67d080a5521ef2c79680dbfc2abf724d30`, which will also be the bettor; their activity is ours, not independent demand. We propose taking any maker's public quote when the bettor's price is better than the reference feed, or at most **1.0 percentage point** worse in implied probability, for the same game, market, line and side. The one proposed cap is **1.00 USDC of cumulative stakes across all house wallets**; as of **2026-10-14**, **0.00 USDC placed, 1.00 USDC left**. Winnings do not replenish it. We will update these totals here after each take and before another. No taking starts until Vince approves both numbers, merges this notice and separately orders taking.
+
 ## Current status
 
 What works:

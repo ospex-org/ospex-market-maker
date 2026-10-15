@@ -2,6 +2,7 @@
 import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import yaml from 'js-yaml';
+import { TakerError } from './errors.js';
 
 export interface TakerConfig {
   schemaVersion: 1;
@@ -26,7 +27,7 @@ const DECIMAL_6 = /^(?:0|[1-9]\d*)(?:\.\d{1,6})?$/;
 
 function fail(path: string, detail: string): never {
   // Report the field, never its value: a mistyped config can contain credentials.
-  throw new Error(`taker config: ${path} ${detail}`);
+  throw new TakerError('TAKER_CONFIG', `taker config: ${path} ${detail}`);
 }
 
 function object(value: unknown, path: string, keys: readonly string[]): Record<string, unknown> {
@@ -36,7 +37,7 @@ function object(value: unknown, path: string, keys: readonly string[]): Record<s
   const prototype: unknown = Object.getPrototypeOf(value);
   if (prototype !== Object.prototype && prototype !== null) fail(path, 'must be a plain mapping');
   for (const key of Reflect.ownKeys(value)) {
-    if (typeof key !== 'string' || !keys.includes(key)) fail(path, `has unknown key ${String(key)}`);
+    if (typeof key !== 'string' || !keys.includes(key)) fail(path, 'has unknown key; compare the supported schema');
   }
   for (const key of keys) {
     if (!Object.hasOwn(value, key)) fail(`${path}.${key}`, 'is required');
@@ -159,10 +160,13 @@ export function parseConfig(value: unknown): TakerConfig {
 /** Only read this config file. Paths are config-relative; no keystore/state is opened or initialized. */
 export function loadConfig(path: string): TakerConfig {
   const absolutePath = resolve(path);
-  const config = parseConfig(yaml.load(readFileSync(absolutePath, 'utf8'), {
-    filename: absolutePath,
-    schema: yaml.CORE_SCHEMA,
-  }));
+  let source: string;
+  try { source = readFileSync(absolutePath, 'utf8'); }
+  catch { throw new TakerError('TAKER_CONFIG', 'Cannot read the taker config file. Check its path and permissions.'); }
+  let value: unknown;
+  try { value = yaml.load(source, { schema: yaml.CORE_SCHEMA }); }
+  catch { throw new TakerError('TAKER_CONFIG', 'Malformed taker YAML. Check syntax; source values are hidden.'); }
+  const config = parseConfig(value);
   const base = dirname(absolutePath);
   return {
     ...config,

@@ -1,4 +1,4 @@
-# OSP-69: separate house-taker configuration; never use a maker's state directory.
+# Separate house-taker configuration; never use a maker's state directory.
 # All addresses below are PUBLIC SYNTHETIC PLACEHOLDERS, not real operator wallets.
 # Replace them with reviewed addresses and honest labels/controller identities.
 # Do not put private keys, passwords, or other secrets in this file.
@@ -34,7 +34,9 @@ capUSDC: '10.000000'  # Mandatory quoted positive USDC amount, at most 6 decimal
 # Full quote remainder only: a take exceeding unspent/unreserved cap is skipped,
 # not clipped. The cap covers taker stake, not maker stake; it is not a daily reset.
 minSecondsLeft: 30
-pollIntervalMs: 1000
+# Shares the read budget with other clients on the same egress IP.
+# Slow polling plus a cheap price precheck reduces load; size for the maker/quote count.
+pollIntervalMs: 30000
 # Relative to this config file. A missing journal is NOT silently initialized:
 # use the separate taker CLI's explicit initialization before starting a new run.
 stateDir: ./state/house-taker

@@ -541,7 +541,7 @@ Measured fill-rate model (per sport / time-to-tip / price-competitiveness) · pr
 
 ## 16. The firewall — what does NOT live in this repo
 
-The explicitly resolved OSP-69 house taker is the one narrow exception: it is a **second program**, `ospex-taker`, with separate configuration, wallet, state, process and stop control. See [`HOUSE_TAKER.md`](HOUSE_TAKER.md). It does not become a maker mode or general test harness.
+The house taker is the one narrow exception: it is a **second program**, `ospex-taker`, with separate configuration, wallet, state, process and stop control. See [`HOUSE_TAKER.md`](HOUSE_TAKER.md). It does not become a maker mode or general test harness.
 
 Other flow / taker agents, observer / settlement agents, and cross-agent scorecards are **not** part of this repo. They exist only to *exercise* a market maker and *prove the Ospex platform* (a lone maker with no takers proves nothing) — evidence-gathering apparatus, not the product. The test harness, when it's built, is a **separate repository** (location TBD; built once the MM is far enough along to be worth exercising). Through the live-micro-maker phase, the `ospex` CLI from a second wallet covers manual taker / observer testing — no harness needed yet.
 

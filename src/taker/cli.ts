@@ -4,16 +4,19 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { loadConfig, formatUSDC } from './config.js';
 import { Journal, lockTaker } from './store.js';
 import { Taker } from './engine.js';
+import { safeTakerError, TakerError } from './errors.js';
 import { createTakerGateway } from '../ospex/taker.js';
 import { unlockKeystoreSigner } from '../ospex/index.js';
 
-interface Options { config: string; live?: boolean; once?: boolean }
+interface Options { config: string; live?: boolean; once?: boolean; id?: string; replacementHash?: string }
 const program = new Command().name('ospex-taker').description('Independent house taker. Shadow by default; never approves or controls the maker.');
-for (const command of ['init', 'status', 'run']) {
+for (const command of ['init', 'status', 'run', 'reconcile']) {
   program.command(command)
     .requiredOption('-c, --config <file>', 'separate taker YAML configuration')
     .option('--live', 'live only together with mode.dryRun: false')
     .option('--once', 'one scan/reconciliation pass (run only)')
+    .option('--id <decision-id>', 'pending decision to reconcile (reconcile only; see status)')
+    .option('--replacement-hash <hash>', 'finalized same-wallet/same-nonce replacement hash (reconcile only)')
     .action(async (options: Options) => {
       const config = loadConfig(options.config);
       const dryRun = config.mode.dryRun || options.live !== true;
@@ -29,6 +32,13 @@ for (const command of ['init', 'status', 'run']) {
         }
         if (command === 'status') {
           console.log(`${dryRun ? 'Shadow' : 'Live'} journal: spent ${formatUSDC(journal.spentWei6)} USDC; reserved ${formatUSDC(journal.reservedWei6)}; cap ${config.capUSDC}; unresolved takes ${journal.pending.length}. Allowance is not the spend ledger.`);
+          for (const attempt of journal.pending) console.log(`Pending decision ${attempt.decision.id}: ${attempt.signed ? `signed ${attempt.signed.txHash}, nonce ${attempt.signed.nonce}` : 'unsigned reservation'}`);
+          return;
+        }
+        if (command === 'reconcile') {
+          if (!options.id) throw new TakerError('TAKER_RECONCILE', 'reconcile requires --id from status. Nothing changed.');
+          const taker = new Taker(config, journal, createTakerGateway(config));
+          console.log(await taker.reconcile(options.id, options.replacementHash));
           return;
         }
         process.on('SIGINT', onStop);
@@ -36,23 +46,22 @@ for (const command of ['init', 'status', 'run']) {
         let signer;
         if (!dryRun) {
           const passphrase = process.env.OSPEX_TAKER_PASSPHRASE;
-          if (!passphrase) throw new Error('Live taker needs OSPEX_TAKER_PASSPHRASE via its private process environment, never a command argument.');
-          signer = await unlockKeystoreSigner(config.wallet.keystorePath, passphrase);
           delete process.env.OSPEX_TAKER_PASSPHRASE;
-          if ((await signer.getAddress()).toLowerCase() !== config.wallet.address.toLowerCase()) throw new Error('Taker keystore/address mismatch.');
+          if (!passphrase) throw new TakerError('TAKER_KEYSTORE', 'Live taker needs OSPEX_TAKER_PASSPHRASE via its private process environment, never a command argument.');
+          try { signer = await unlockKeystoreSigner(config.wallet.keystorePath, passphrase); }
+          catch { throw new TakerError('TAKER_KEYSTORE', 'Cannot unlock the dedicated taker keystore. Check its path and private passphrase; details are hidden.'); }
+          if ((await signer.getAddress()).toLowerCase() !== config.wallet.address.toLowerCase()) throw new TakerError('TAKER_KEYSTORE', 'Taker keystore/address mismatch.');
         }
         const taker = new Taker(config, journal, createTakerGateway(config, signer), Date.now, () => stop);
         console.log(`${dryRun ? 'SHADOW: no wallet unlocked or transactions possible.' : 'LIVE: explicit two-key gate enabled.'} Stop only this process with SIGINT/SIGTERM. Maker is independent.`);
         let lastMessage: string | null = null;
         do {
-          let message: string | null;
-          try { message = await taker.tick(); }
-          catch { throw new Error('Taker read, record or preflight failed. Stop and inspect the private journal; maker is unaffected. No automatic retry of uncertain takes.'); }
+          const message = await taker.tick();
           if (message !== null && message !== lastMessage) console.log(message);
           lastMessage = message;
           if (options.once || stop) break;
           try { await sleep(config.pollIntervalMs, undefined, { signal: controller.signal }); }
-          catch { if (!stop) throw new Error('Taker poll wait failed.'); }
+          catch { if (!stop) throw new TakerError('TAKER_RUNTIME', 'Taker poll wait failed.'); }
         } while (!stop);
       } finally {
         process.off('SIGINT', onStop);
@@ -62,7 +71,7 @@ for (const command of ['init', 'status', 'run']) {
     });
 }
 // Never dump SDK/keystore exception causes: RPC failures may embed signed bytes.
-program.parseAsync().catch(() => {
-  console.error('Taker stopped on an error. Validate config, its separate state/lock, wallet identity and finite allowance. Restore/reconcile uncertain records; do not reset the cap journal. The maker is unaffected.');
+program.parseAsync().catch((error: unknown) => {
+  console.error(safeTakerError(error));
   process.exitCode = 1;
 });

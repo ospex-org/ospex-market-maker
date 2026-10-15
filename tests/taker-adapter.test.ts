@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { buildMatchPreview, getAddresses, type PublicVisibleCommitment, type Signer, type SignTransactionArgs } from '@ospex/sdk';
+import { OspexClient, buildMatchPreview, getAddresses, type PublicVisibleCommitment, type Signer, type SignTransactionArgs } from '@ospex/sdk';
 import { encodeAbiParameters, encodeEventTopics, keccak256, type TransactionReceipt, type Hex } from 'viem';
 import { createTakerGateway, guardedSigner, matchEvents, quoteFromCommitment, receiptStake } from '../src/ospex/taker.js';
 import { parseConfig } from '../src/taker/config.js';
@@ -11,7 +11,7 @@ import type { Attempt } from '../src/taker/store.js';
 const m = vi.hoisted(() => ({
   commitments: { list: vi.fn(), get: vi.fn(), getFilledRisk: vi.fn(), prepareMatch: vi.fn(), matchFromPreview: vi.fn() },
   odds: { snapshot: vi.fn() }, approvals: { read: vi.fn() },
-  rpc: { getChainId: vi.fn(), getTransactionReceipt: vi.fn(), getBlock: vi.fn() },
+  rpc: { getChainId: vi.fn(), getTransaction: vi.fn(), getTransactionReceipt: vi.fn(), getBlock: vi.fn() },
 }));
 vi.mock('@ospex/sdk', async original => ({ ...await original<typeof import('@ospex/sdk')>(), OspexClient: vi.fn(function () { return m; }) }));
 vi.mock('viem', async original => ({ ...await original<typeof import('viem')>(), createPublicClient: vi.fn(() => m.rpc) }));
@@ -33,14 +33,15 @@ function attempt(): Attempt {
   const q = quoteFromCommitment(commitment());
   return { decision: { type: 'decision', id: 'a', at: new Date(now).toISOString(), dryRun: false, quote: q, reference: ref, decision: evaluate(q, ref, c, now, 0n), makerLabel: 'test', makerController: 'test', capWei6: '1000000', distanceLimitPp: c.distancePp, txHash: null, submissionAt: null, receiptAt: null }, signed: { type: 'signed', id: 'a', at: new Date(now).toISOString(), txHash: h(101), nonce: 1, submissionAt: new Date(now).toISOString() } };
 }
-function receipt(): TransactionReceipt {
-  const topics = encodeEventTopics({ abi: matchEvents, eventName: 'CommitmentMatched', args: { commitmentHash: h(1), maker: c.makers[0]!.address as Hex, taker: c.wallet.address as Hex } });
-  const data = encodeAbiParameters([{ type: 'uint256' }, { type: 'uint256' }, { type: 'address' }, { type: 'int32' }, { type: 'uint8' }, { type: 'uint16' }, { type: 'uint256' }, { type: 'uint256' }, { type: 'uint256' }, { type: 'uint256' }, { type: 'uint256' }], [15n, 77n, addresses.scorers.moneyline, 0, 0, 200, 1_000_000n, 1_000_000n, 1_000_000n, 7n, 1_792_069_200n]);
+function receipt(event: Partial<{ maker: Hex; lineTicks: number; makerSide: number; makerRisk: bigint; takerRisk: bigint }> = {}): TransactionReceipt {
+  const topics = encodeEventTopics({ abi: matchEvents, eventName: 'CommitmentMatched', args: { commitmentHash: h(1), maker: event.maker ?? c.makers[0]!.address as Hex, taker: c.wallet.address as Hex } });
+  const data = encodeAbiParameters([{ type: 'uint256' }, { type: 'uint256' }, { type: 'address' }, { type: 'int32' }, { type: 'uint8' }, { type: 'uint16' }, { type: 'uint256' }, { type: 'uint256' }, { type: 'uint256' }, { type: 'uint256' }, { type: 'uint256' }], [15n, 77n, addresses.scorers.moneyline, event.lineTicks ?? 0, event.makerSide ?? 0, 200, event.makerRisk ?? 1_000_000n, event.takerRisk ?? 1_000_000n, 1_000_000n, 7n, 1_792_069_200n]);
   return { status: 'success', transactionHash: h(101), blockHash: h(200), blockNumber: 100n, from: c.wallet.address as Hex, to: addresses.matchingModule,
     logs: [{ address: addresses.matchingModule, data, topics, transactionHash: h(101), blockHash: h(200), blockNumber: 100n, transactionIndex: 0, logIndex: 0, removed: false }] } as TransactionReceipt;
 }
 beforeEach(() => {
   vi.clearAllMocks(); m.rpc.getChainId.mockResolvedValue(137);
+  m.rpc.getTransaction.mockReset();
   m.commitments.list.mockResolvedValue([commitment()]); m.commitments.get.mockResolvedValue(commitment());
   m.commitments.getFilledRisk.mockResolvedValue({ atBlock: 100n, filledRisk: new Map([[h(1), 0n]]) });
   m.commitments.prepareMatch.mockImplementation(async ({ commitment: row }) => preview(row));
@@ -91,6 +92,16 @@ describe('published SDK producer and taker adapter', () => {
       expect(await g.allowance(500_000n, spent)).toBe(expected);
     }
   });
+  it('rejects position allowance above cap after spend independently of the initial exact-cap guard', async () => {
+    const g = createTakerGateway(c);
+    // Nonzero spend bypasses the initial position === cap clause. Everything
+    // except the upper position allowance bound is valid in the negative case.
+    for (const [position, expected] of [[1_000_000n, true], [500_000n, true], [1_000_001n, false]] as const) {
+      m.approvals.read.mockResolvedValueOnce({ chainId: 137, owner: c.wallet.address, usdc: { allowances: { positionModule: { raw: position }, treasuryModule: { raw: 0n } } } });
+      expect(await g.allowance(500_000n, 500_000n)).toBe(expected);
+    }
+    expect(m.commitments.matchFromPreview).not.toHaveBeenCalled();
+  });
 });
 
 describe('signed authority handoff', () => {
@@ -125,6 +136,23 @@ describe('signed authority handoff', () => {
 });
 
 describe('exact final receipt binding', () => {
+  it('rejects a different event maker with every other receipt field valid', () => {
+    expect(receiptStake(receipt(), attempt(), c)).toBe(1_000_000n);
+    expect(receiptStake(receipt({ maker: c.houseWallets[0]!.address as Hex }), attempt(), c)).toBeNull();
+  });
+  it('rejects a different event side with every other receipt field valid', () => {
+    expect(receiptStake(receipt(), attempt(), c)).toBe(1_000_000n);
+    expect(receiptStake(receipt({ makerSide: 1 }), attempt(), c)).toBeNull();
+  });
+  it('rejects a different event line with every other receipt field valid', () => {
+    expect(receiptStake(receipt(), attempt(), c)).toBe(1_000_000n);
+    expect(receiptStake(receipt({ lineTicks: 1 }), attempt(), c)).toBeNull();
+  });
+  it('rejects incorrect stake formula within both positive risk and reservation bounds', () => {
+    expect(receiptStake(receipt({ makerRisk: 800_000n, takerRisk: 800_000n }), attempt(), c)).toBe(800_000n);
+    // Only the formula differs: both risks remain positive and below their caps.
+    expect(receiptStake(receipt({ makerRisk: 800_000n, takerRisk: 799_999n }), attempt(), c)).toBeNull();
+  });
   it('decodes an exact-match receipt and rejects unrelated hashes, sender, target and event emitter', () => {
     const a = attempt(); const r = receipt(); expect(receiptStake(r, a, c)).toBe(1_000_000n);
     expect(receiptStake({ ...r, transactionHash: h(102) }, a, c)).toBeNull();
@@ -143,5 +171,138 @@ describe('exact final receipt binding', () => {
     m.rpc.getBlock.mockResolvedValueOnce({ number: 99n }); expect(await g.receipt(a)).toBeNull();
     m.rpc.getBlock.mockResolvedValueOnce({ number: 100n }).mockResolvedValueOnce({ number: 100n, hash: h(201) }); expect(await g.receipt(a)).toBeNull();
     const out = await g.receipt(a); expect(out?.stakeWei6).toBe('1000000'); expect(out?.blockHash).toBe(h(200)); expect(out?.blockNumber).toBe('100'); expect(Number.isFinite(Date.parse(out!.receiptAt))).toBe(true);
+  });
+});
+
+describe('signer-free finalized replacement proof', () => {
+  // Synthetic read models, never signed transactions or captured wallet data.
+  function transaction() {
+    return { chainId: 137, hash: h(102), from: c.wallet.address as Hex, to: c.wallet.address as Hex,
+      nonce: 1, value: 0n, input: '0x', blockNumber: 100n, blockHash: h(200), transactionIndex: 0 };
+  }
+  function replacementReceipt(): TransactionReceipt {
+    return { ...receipt(), transactionHash: h(102), to: c.wallet.address as Hex, transactionIndex: 0, logs: [] };
+  }
+  function block(number: bigint) {
+    if (number === 100n) return { number, hash: h(200), transactions: [h(102)] };
+    if (number === 120n) return { number, hash: h(220), transactions: [] };
+    throw new Error('Unexpected synthetic block request.');
+  }
+  beforeEach(() => {
+    m.rpc.getTransaction.mockResolvedValue(transaction());
+    m.rpc.getTransactionReceipt.mockReset().mockResolvedValue(replacementReceipt());
+    m.rpc.getBlock.mockReset().mockImplementation(async ({ blockTag, blockNumber }) => block(blockTag === 'finalized' ? 120n : blockNumber));
+  });
+  it('returns exact proof for a canonical finalized same-nonce different-hash self-transfer without a signer', async () => {
+    const g = createTakerGateway(c);
+    expect(await g.replacementProof(attempt(), h(102))).toEqual({
+      kind: 'replaced', chainId: 137, wallet: c.wallet.address, nonce: 1, txHash: h(101), replacementHash: h(102),
+      blockNumber: '100', blockHash: h(200), finalizedBlockNumber: '120', finalizedBlockHash: h(220),
+    });
+    expect(m.rpc.getTransaction).toHaveBeenCalledExactlyOnceWith({ hash: h(102) });
+    expect(m.rpc.getTransactionReceipt).toHaveBeenCalledExactlyOnceWith({ hash: h(102) });
+    expect(m.rpc.getBlock.mock.calls.map(([args]) => args)).toEqual([{ blockTag: 'finalized' }, { blockNumber: 100n }, { blockNumber: 120n }]);
+    expect(vi.mocked(OspexClient)).toHaveBeenCalledExactlyOnceWith({ chainId: 137, apiUrl: c.apiUrl, rpcUrl: c.rpcUrl });
+    expect(m.commitments.matchFromPreview).not.toHaveBeenCalled();
+    expect(m.approvals.read).not.toHaveBeenCalled();
+  });
+  it('accepts inclusion at the finalized height itself', async () => {
+    m.rpc.getBlock.mockImplementation(async () => block(100n));
+    expect(await createTakerGateway(c).replacementProof(attempt(), h(102))).toMatchObject({ blockNumber: '100', finalizedBlockNumber: '100', finalizedBlockHash: h(200) });
+  });
+  it('holds unsigned attempts without making chain reads', async () => {
+    expect(await createTakerGateway(c).replacementProof({ decision: attempt().decision }, h(102))).toBeNull();
+    expect(m.rpc.getChainId).not.toHaveBeenCalled(); expect(m.rpc.getTransaction).not.toHaveBeenCalled();
+  });
+  it.each([h(101), '0x1234', 'not-a-hash'])('holds same or malformed replacement hash %s', async hash => {
+    expect(await createTakerGateway(c).replacementProof(attempt(), hash)).toBeNull();
+    expect(m.rpc.getTransaction).not.toHaveBeenCalled();
+  });
+  it('compares original and replacement hashes case-insensitively', async () => {
+    const a = attempt(); a.signed!.txHash = `0x${'ab'.repeat(32)}`;
+    expect(await createTakerGateway(c).replacementProof(a, `0x${'AB'.repeat(32)}`)).toBeNull();
+    expect(m.rpc.getTransaction).not.toHaveBeenCalled();
+  });
+  it.each([-1, 1.5, Number.MAX_SAFE_INTEGER + 1])('holds invalid recorded nonce %s', async nonce => {
+    const a = attempt(); a.signed!.nonce = nonce;
+    expect(await createTakerGateway(c).replacementProof(a, h(102))).toBeNull();
+    expect(m.rpc.getTransaction).not.toHaveBeenCalled();
+  });
+  it('holds malformed original hash without a transaction read', async () => {
+    const a = attempt(); a.signed!.txHash = '0x1234';
+    expect(await createTakerGateway(c).replacementProof(a, h(102))).toBeNull();
+    expect(m.rpc.getTransaction).not.toHaveBeenCalled();
+  });
+  it('holds an RPC on a different chain', async () => {
+    m.rpc.getChainId.mockResolvedValueOnce(80002);
+    expect(await createTakerGateway(c).replacementProof(attempt(), h(102))).toBeNull();
+    expect(m.rpc.getTransaction).not.toHaveBeenCalled();
+  });
+  it.each([
+    ['chain', { chainId: 80002 }], ['missing chain', { chainId: undefined }],
+    ['sender', { from: c.makers[0]!.address }], ['recipient', { to: addresses.matchingModule }],
+    ['creation', { to: null }], ['nonce', { nonce: 2 }], ['hash', { hash: h(103) }],
+    ['value', { value: 1n }], ['input', { input: '0x00' }], ['missing input', { input: undefined }],
+    ['authorization side effects', { authorizationList: [] }],
+    ['pending height', { blockNumber: null }], ['pending hash', { blockHash: null }],
+    ['negative height', { blockNumber: -1n }], ['malformed block hash', { blockHash: '0x1234' }],
+    ['receipt height', { blockNumber: 99n }], ['receipt block hash', { blockHash: h(201) }],
+    ['receipt index', { transactionIndex: 1 }], ['pending index', { transactionIndex: null }],
+  ])('holds mismatched replacement transaction %s', async (_label, changed) => {
+    m.rpc.getTransaction.mockResolvedValueOnce({ ...transaction(), ...changed });
+    expect(await createTakerGateway(c).replacementProof(attempt(), h(102))).toBeNull();
+  });
+  it('does not release a replacement match spend, even with the right sender and nonce', async () => {
+    m.rpc.getTransaction.mockResolvedValueOnce({ ...transaction(), to: addresses.matchingModule, input: '0xdead' });
+    expect(await createTakerGateway(c).replacementProof(attempt(), h(102))).toBeNull();
+  });
+  it.each([
+    ['hash', { transactionHash: h(103) }], ['sender', { from: c.makers[0]!.address }],
+    ['recipient', { to: addresses.matchingModule }], ['unknown status', { status: 'unknown' }],
+    ['missing block', { blockNumber: null }], ['missing block hash', { blockHash: null }],
+    ['event side effects', { logs: receipt().logs }],
+  ])('holds mismatched replacement receipt %s', async (_label, changed) => {
+    m.rpc.getTransactionReceipt.mockResolvedValueOnce({ ...replacementReceipt(), ...changed });
+    expect(await createTakerGateway(c).replacementProof(attempt(), h(102))).toBeNull();
+  });
+  it('a reverted finalized self-transfer still proves consumption of this nonce', async () => {
+    m.rpc.getTransactionReceipt.mockResolvedValueOnce({ ...replacementReceipt(), status: 'reverted' });
+    expect(await createTakerGateway(c).replacementProof(attempt(), h(102))).toMatchObject({ kind: 'replaced', nonce: 1 });
+  });
+  it.each([
+    ['not finalized', { number: 99n, hash: h(199) }], ['unknown height', { number: null, hash: h(220) }],
+    ['unknown hash', { number: 120n, hash: null }], ['malformed finalized hash', { number: 120n, hash: '0x1234' }],
+  ])('holds %s replacement', async (_label, finalized) => {
+    m.rpc.getBlock.mockResolvedValueOnce(finalized);
+    expect(await createTakerGateway(c).replacementProof(attempt(), h(102))).toBeNull();
+  });
+  it.each([
+    ['reorged inclusion', { ...block(100n), hash: h(201) }],
+    ['wrong inclusion height', { ...block(100n), number: 101n }],
+    ['absent from canonical block', { ...block(100n), transactions: [] }],
+    ['wrong canonical transaction index', { ...block(100n), transactions: [h(103), h(102)] }],
+  ])('holds %s', async (_label, inclusion) => {
+    m.rpc.getBlock.mockResolvedValueOnce(block(120n)).mockResolvedValueOnce(inclusion);
+    expect(await createTakerGateway(c).replacementProof(attempt(), h(102))).toBeNull();
+  });
+  it.each([
+    ['hash changed', { ...block(120n), hash: h(221) }], ['height changed', { ...block(120n), number: 119n }],
+  ])('holds finalized anchor whose %s on recheck', async (_label, recheck) => {
+    m.rpc.getBlock.mockResolvedValueOnce(block(120n)).mockResolvedValueOnce(block(100n)).mockResolvedValueOnce(recheck);
+    expect(await createTakerGateway(c).replacementProof(attempt(), h(102))).toBeNull();
+  });
+  it.each(['getTransaction', 'getTransactionReceipt', 'getBlock'] as const)('holds absent %s evidence', async method => {
+    m.rpc[method].mockResolvedValueOnce(null);
+    expect(await createTakerGateway(c).replacementProof(attempt(), h(102))).toBeNull();
+  });
+  it.each(['inclusion', 'anchor'])('holds unavailable canonical %s evidence', async stage => {
+    m.rpc.getBlock.mockResolvedValueOnce(block(120n));
+    if (stage === 'anchor') m.rpc.getBlock.mockResolvedValueOnce(block(100n));
+    m.rpc.getBlock.mockRejectedValueOnce(new Error('Synthetic canonical block unavailable.'));
+    expect(await createTakerGateway(c).replacementProof(attempt(), h(102))).toBeNull();
+  });
+  it.each(['getChainId', 'getTransaction', 'getTransactionReceipt', 'getBlock'] as const)('holds unknown %s results without exposing transport errors', async method => {
+    m.rpc[method].mockRejectedValueOnce(new Error('synthetic provider cause must not escape'));
+    expect(await createTakerGateway(c).replacementProof(attempt(), h(102))).toBeNull();
   });
 });

@@ -235,11 +235,11 @@ export function evaluate(
   const denominator = tickUnits * probability.denominator;
   decision.distancePp = displayRatio(difference * 100n, denominator);
 
-  if (stake > remaining) return pass(`would exceed the cap by ${formatUSDC(stake - remaining)} USDC`);
   const tolerance = decimalRational(cfg.distancePp);
   // Signed, inclusive comparison: better prices always pass, however far below reference.
   if (difference * 100n * tolerance.denominator > tolerance.numerator * denominator) {
     return pass(`price is worse than the raw reference by more than ${cfg.distancePp} pp`);
   }
+  if (stake > remaining) return pass(`would exceed the cap by ${formatUSDC(stake - remaining)} USDC`);
   return { ...decision, take: true, reason: 'within the raw reference price tolerance' };
 }

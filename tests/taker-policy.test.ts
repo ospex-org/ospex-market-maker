@@ -75,6 +75,12 @@ function fixtureFile(raw: unknown): string {
   return path;
 }
 
+it('checks price before cap when both would refuse the quote', () => {
+  const result = evaluate(quote({ makerOddsTick: 300 }), reference(), config({ capUSDC: '1' }), NOW, 0n);
+  expect(result.take).toBe(false);
+  expect(result.reason).toContain('price is worse');
+});
+
 describe('house-taker config', () => {
   it('requires an explicit, independent schema and canonicalizes address case without mutating input', () => {
     const raw = config();

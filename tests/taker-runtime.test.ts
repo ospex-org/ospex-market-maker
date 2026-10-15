@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { parseConfig, type TakerConfig } from '../src/taker/config.js';
+import { capWei6, parseConfig, type TakerConfig } from '../src/taker/config.js';
 import { Journal, lockTaker, type Attempt, type DecisionRecord } from '../src/taker/store.js';
 import { Taker, type TakerGateway, type SignHooks } from '../src/taker/engine.js';
 import { evaluate, type Quote, type Reference } from '../src/taker/policy.js';
@@ -28,11 +28,10 @@ const receipt = (a: Attempt, result: 'success' | 'reverted' = 'success', amount?
 function gateway(quotes = [quote()]): TakerGateway {
   return { book: vi.fn(async () => quotes), reference: vi.fn(async () => reference()), allowance: vi.fn(async () => true),
     prepare: vi.fn(async q => ({ quote: q, sign: vi.fn(async hooks => { await hooks.beforeSign(q); hooks.signed(hash(101), 1, '2026-10-15T12:00:00Z'); }) })),
-    receipt: vi.fn(async a => receipt(a)) };
+    receipt: vi.fn(async a => receipt(a)), replacementProof: vi.fn(async () => null) };
 }
-function reserve(c: TakerConfig, j: Journal, id = 'a'): void {
-  const q = quote();
-  const event: DecisionRecord = { type: 'decision', id, at: new Date(now).toISOString(), dryRun: false, quote: q, reference: reference(), decision: evaluate(q, reference(), c, now, 0n), makerLabel: 'test', makerController: 'test', capWei6: '1000000', distanceLimitPp: c.distancePp, txHash: null, submissionAt: null, receiptAt: null };
+function reserve(c: TakerConfig, j: Journal, id = 'a', q = quote()): void {
+  const event: DecisionRecord = { type: 'decision', id, at: new Date(now).toISOString(), dryRun: false, quote: q, reference: reference(), decision: evaluate(q, reference(), c, now, 0n), makerLabel: 'test', makerController: 'test', capWei6: capWei6(c).toString(), distanceLimitPp: c.distancePp, txHash: null, submissionAt: null, receiptAt: null };
   j.append(event);
 }
 afterEach(() => { for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true }); });
@@ -65,10 +64,11 @@ describe('durable cumulative stakes and reservations', () => {
   it('charges actual stakes only after a terminal receipt; winnings/restarts cannot reset it', () => {
     const c = config(); const j = new Journal(c, false, true); reserve(c, j);
     j.append({ type: 'signed', id: 'a', at: new Date(now).toISOString(), submissionAt: new Date(now).toISOString(), txHash: hash(101), nonce: 1 });
-    j.append({ type: 'outcome', id: 'a', at: new Date(now).toISOString(), ...receipt(j.pending[0]!, 'success', '800000') });
+    const completed = receipt(j.pending[0]!, 'success', '800000');
+    j.append({ type: 'outcome', id: 'a', at: new Date(now).toISOString(), ...completed });
     const reopened = new Journal(c, false); expect(reopened.spentWei6).toBe(800_000n); expect(reopened.reservedWei6).toBe(0n); expect(reopened.consumed(hash(1))).toBe(true);
     const raised = new Journal({ ...c, capUSDC: '2' }, false); expect(raised.spentWei6).toBe(800_000n);
-    expect(() => j.append({ type: 'outcome', id: 'a', at: new Date(now).toISOString(), ...receipt([...j.attempts.values()][0]!) })).toThrow('completed');
+    expect(() => j.append({ type: 'outcome', id: 'a', at: new Date(now).toISOString(), ...completed })).toThrow('completed');
   });
   it('rejects unrelated receipt hashes and success stakes larger than reservation', () => {
     const c = config(); const j = new Journal(c, false, true); reserve(c, j);
@@ -97,7 +97,7 @@ describe('one separate taker loop', () => {
     const c = config(); const j = new Journal(c, false, true); const g = gateway();
     const t = new Taker(c, j, g, () => now); expect(await t.tick()).toContain('cap has been reached');
     expect(j.spentWei6).toBe(1_000_000n); expect(j.reservedWei6).toBe(0n);
-    expect(g.reference).toHaveBeenCalledTimes(1); expect(await t.tick()).toContain('maker and everything else keep running');
+    expect(g.reference).toHaveBeenCalledTimes(2); expect(await t.tick()).toContain('maker and everything else keep running');
     expect(g.book).toHaveBeenCalledTimes(1);
     const rows = readFileSync(j.path, 'utf8').trim().split('\n').map(s => JSON.parse(s).event);
     expect(rows.map(x => x.type)).toEqual([undefined, 'decision', 'signed', 'outcome']);
@@ -114,7 +114,7 @@ describe('one separate taker loop', () => {
   it('reports true headroom and required full size while no fitting quote exists', async () => {
     const c = config(); const j = new Journal(c, false, true);
     const result = await new Taker(c, j, gateway([quote(1, '2000000')]), () => now).tick();
-    expect(result).toContain('remaining 1; next quote needs 2'); expect(j.spentWei6).toBe(0n);
+    expect(result).toContain('remaining 1; smallest price-eligible quote needs 2'); expect(j.spentWei6).toBe(0n);
   });
   it.each(['timeout', 'missing', 'pre-sign-crash'])('keeps %s uncertainty reserved across restart without resend', async mode => {
     const c = config(); const j = new Journal(c, false, true); const g = gateway();
@@ -154,5 +154,110 @@ describe('one separate taker loop', () => {
     const c = config(); const j = new Journal(c, false, true); const g = gateway(); let stop = false;
     g.reference = vi.fn(async () => { stop = true; return reference(); });
     await new Taker(c, j, g, () => now, () => stop).tick(); expect(j.pending).toHaveLength(0); expect(readFileSync(j.path, 'utf8')).toContain('stop requested');
+  });
+});
+
+
+describe('bounded observations and retryable book reads', () => {
+  it.each([true, false])('does not journal unchanged decisions each poll (shadow=%s)', async shadow => {
+    const c = config(); const j = new Journal(c, shadow, true);
+    const q = { ...quote(), makerOddsTick: shadow ? 200 : 300 }; const g = gateway([q]);
+    let time = now; const t = new Taker(c, j, g, () => time);
+    await t.tick(); const before = readFileSync(j.path, 'utf8');
+    time += 1000;
+    g.reference = vi.fn(async () => ({ ...reference(), pollCapturedAt: new Date(time).toISOString() }));
+    for (let n = 0; n < 30; n++) await t.tick();
+    expect(readFileSync(j.path, 'utf8')).toBe(before);
+    g.reference = vi.fn(async () => ({ ...reference(), changedAt: new Date(time).toISOString() }));
+    await t.tick(); expect(readFileSync(j.path, 'utf8').length).toBeGreaterThan(before.length);
+    const changed = readFileSync(j.path, 'utf8');
+    time += 3_600_000; await t.tick();
+    expect(readFileSync(j.path, 'utf8').length).toBeGreaterThan(changed.length);
+  });
+  it('prunes observation keys when quotes leave the book', async () => {
+    const c = config(); const j = new Journal(c, true, true); const g = gateway(); const t = new Taker(c, j, g, () => now);
+    await t.tick(); g.book = vi.fn(async () => []); await t.tick();
+    const before = readFileSync(j.path, 'utf8');
+    g.book = vi.fn(async () => [quote()]); await t.tick();
+    expect(readFileSync(j.path, 'utf8').length).toBeGreaterThan(before.length);
+  });
+  it('retries a failed book read on the next tick without signing or printing causes', async () => {
+    const c = config(); const j = new Journal(c, false, true); const g = gateway();
+    g.book = vi.fn().mockRejectedValueOnce(new Error('secret-rpc-credential')).mockResolvedValue([quote()]);
+    const t = new Taker(c, j, g, () => now); const before = readFileSync(j.path, 'utf8');
+    const result = await t.tick(); expect(result).toContain('retry'); expect(result).not.toContain('secret-rpc');
+    expect(readFileSync(j.path, 'utf8')).toBe(before); expect(g.prepare).not.toHaveBeenCalled();
+    await t.tick(); expect(j.spentWei6).toBe(1_000_000n);
+  });
+  it('rejects an off-price quote before SDK prepare and full signing preflight', async () => {
+    const c = config(); const j = new Journal(c, false, true); const g = gateway([{ ...quote(), makerOddsTick: 300 }]);
+    await new Taker(c, j, g, () => now).tick();
+    expect(g.reference).toHaveBeenCalledTimes(1); expect(g.prepare).not.toHaveBeenCalled(); expect(g.allowance).not.toHaveBeenCalled();
+  });
+  it('never uses the cheap precheck as the final signing reference', async () => {
+    const c = config(); const j = new Journal(c, false, true); const g = gateway();
+    g.reference = vi.fn().mockResolvedValueOnce(reference()).mockResolvedValue({ ...reference(), homeOddsAmerican: 200 });
+    await new Taker(c, j, g, () => now).tick();
+    expect(g.prepare).toHaveBeenCalledTimes(1); expect(g.reference).toHaveBeenCalledTimes(2);
+    expect(j.pending).toHaveLength(0); expect(j.spentWei6).toBe(0n); expect(readFileSync(j.path, 'utf8')).not.toContain('"type":"signed"');
+  });
+  it('does not mistake stale listed capacity for canonical full-size cap needs', async () => {
+    const c = config(); const j = new Journal(c, false, true); const g = gateway([quote(1, '2000000')]);
+    g.prepare = vi.fn(async q => ({ quote: { ...q, remainingMakerWei6: '1000000' }, sign: async (h: SignHooks) => { await h.beforeSign({ ...q, remainingMakerWei6: '1000000' }); h.signed(hash(101), 1, new Date(now).toISOString()); } }));
+    await new Taker(c, j, g, () => now).tick(); expect(j.spentWei6).toBe(1_000_000n);
+  });
+});
+
+describe('truthful cap messages', () => {
+  it('reports the smallest price-eligible full quote, not the last or an off-price quote', async () => {
+    const c = config(); const j = new Journal(c, false, true);
+    const quotes = [quote(1, '2000000'), quote(2, '3000000'), { ...quote(3, '1000000'), makerOddsTick: 300 }];
+    const result = await new Taker(c, j, gateway(quotes), () => now).tick();
+    expect(result).toContain('smallest price-eligible quote needs 2'); expect(result).not.toContain('needs 3');
+  });
+  it('does not invent a zero-sized next quote at a reached cap', async () => {
+    const c = config(); const j = new Journal(c, false, true); const t = new Taker(c, j, gateway(), () => now);
+    const result = await t.tick(); expect(result).toContain('next quote not evaluated'); expect(result).not.toContain('next quote needs 0');
+  });
+});
+
+describe('explicit proof-bound reconciliation', () => {
+  it('releases an unsigned reservation only through explicit reconciliation and preserves spend on replay', async () => {
+    const c = config(); const j = new Journal(c, false, true); reserve(c, j);
+    const g = gateway(); const t = new Taker(c, j, g, () => now);
+    await t.tick(); expect(j.reservedWei6).toBe(1_000_000n);
+    await t.reconcile('a');
+    const restored = new Journal(c, false); expect(restored.reservedWei6).toBe(0n); expect(restored.spentWei6).toBe(0n);
+    expect(readFileSync(j.path, 'utf8')).toContain('"type":"released"');
+    expect(g.book).not.toHaveBeenCalled(); expect(g.prepare).not.toHaveBeenCalled();
+    await expect(t.reconcile('a')).rejects.toThrow('pending');
+  });
+  it('never frees a signed reservation on absence, an RPC error, or unproven replacement', async () => {
+    const c = config(); const j = new Journal(c, false, true); reserve(c, j);
+    j.append({ type: 'signed', id: 'a', at: new Date(now).toISOString(), submissionAt: new Date(now).toISOString(), txHash: hash(101), nonce: 1 });
+    const g = gateway(); g.receipt = vi.fn(async () => null);
+    g.replacementProof = vi.fn(async () => null); const t = new Taker(c, j, g, () => now);
+    await expect(t.reconcile('a')).rejects.toThrow('replacement');
+    await expect(t.reconcile('a', hash(102))).rejects.toThrow('proof');
+    g.replacementProof = vi.fn(async () => { throw new Error('private-rpc-token'); });
+    await expect(t.reconcile('a', hash(102))).rejects.toThrow('proof');
+    expect(j.reservedWei6).toBe(1_000_000n); expect(j.spentWei6).toBe(0n); expect(g.book).not.toHaveBeenCalled();
+  });
+  it('records final same-nonce replacement proof and preserves earlier spend across restart', async () => {
+    const c = { ...config(), capUSDC: '3' }; const j = new Journal(c, false, true); const g = gateway();
+    await new Taker(c, j, g, () => now).tick(); expect(j.spentWei6).toBe(1_000_000n);
+    reserve(c, j, 'b', quote(2));
+    j.append({ type: 'signed', id: 'b', at: new Date(now).toISOString(), submissionAt: new Date(now).toISOString(), txHash: hash(102), nonce: 2 });
+    g.receipt = vi.fn(async () => null);
+    g.replacementProof = vi.fn(async () => ({ kind: 'replaced', chainId: 137, wallet: c.wallet.address, nonce: 2, txHash: hash(102), replacementHash: hash(103), blockNumber: '100', blockHash: hash(500), finalizedBlockNumber: '102', finalizedBlockHash: hash(502) }));
+    await new Taker(c, j, g, () => now).reconcile('b', hash(103));
+    const restored = new Journal(c, false); expect(restored.spentWei6).toBe(1_000_000n); expect(restored.reservedWei6).toBe(0n);
+    expect(g.replacementProof).toHaveBeenCalledTimes(1); expect(g.book).toHaveBeenCalledTimes(1);
+  });
+  it('accounts a final original receipt before considering any release', async () => {
+    const c = config(); const j = new Journal(c, false, true); reserve(c, j);
+    j.append({ type: 'signed', id: 'a', at: new Date(now).toISOString(), submissionAt: new Date(now).toISOString(), txHash: hash(101), nonce: 1 });
+    const g = gateway(); await new Taker(c, j, g, () => now).reconcile('a', hash(102));
+    expect(j.spentWei6).toBe(1_000_000n); expect(j.reservedWei6).toBe(0n); expect(g.replacementProof).not.toHaveBeenCalled();
   });
 });

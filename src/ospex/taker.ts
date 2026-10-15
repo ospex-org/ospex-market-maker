@@ -3,15 +3,18 @@ import { createPublicClient, http, keccak256, parseAbi, parseEventLogs, type Tra
 import { capWei6, type TakerConfig } from '../taker/config.js';
 import type { PreparedTake, SignHooks, TakerGateway } from '../taker/engine.js';
 import type { Quote, Reference } from '../taker/policy.js';
-import type { Attempt, OutcomeRecord } from '../taker/store.js';
+import type { Attempt, OutcomeRecord, ReleaseProof } from '../taker/store.js';
 
 // Read-only decoding of the MatchingModule event in SDK 0.16.0's ABI.
-// All contract reads and every write still go through the SDK; viem is used
-// only for receipt/block RPCs, event decoding and hashing signed bytes in memory.
+// All contract reads and every write still go through the SDK. Read-only viem
+// additionally checks transaction identity/nonce and canonical finalized blocks
+// for explicit replacement proofs; never infer release from a latest nonce or
+// an absent transaction. Other uses are receipt decoding and in-memory hashing.
 export const matchEvents = parseAbi([
   'event CommitmentMatched(bytes32 indexed commitmentHash,address indexed maker,address indexed taker,uint256 contestId,uint256 speculationId,address scorer,int32 lineTicks,uint8 makerPositionType,uint16 oddsTick,uint256 makerRisk,uint256 takerRisk,uint256 commitmentRiskAmount,uint256 nonce,uint256 expiry)',
 ]);
 const lower = (v: string): string => v.toLowerCase();
+const isHash = (v: unknown): v is Hex => typeof v === 'string' && /^0x[0-9a-fA-F]{64}$/.test(v);
 export function quoteFromCommitment(c: PublicVisibleCommitment): Quote {
   return { hash: c.commitmentHash, maker: c.maker, contestId: c.contestId ?? '', market: c.marketType!,
     lineTicks: c.lineTicks!, makerSide: c.positionType!, makerOddsTick: c.oddsTick!,
@@ -121,6 +124,34 @@ export function createTakerGateway(config: TakerConfig, signer?: Signer): TakerG
       const treasury = a.usdc.allowances.treasuryModule.raw;
       const cap = capWei6(config);
       return a.chainId === config.chainId && lower(a.owner) === lower(config.wallet.address) && position <= cap && treasury <= cap && position >= stake && (spent !== 0n || position === cap);
+    },
+    async replacementProof(attempt: Attempt, replacementHash: string): Promise<ReleaseProof | null> {
+      const signed = attempt.signed;
+      if (!signed || !isHash(signed.txHash) || !isHash(replacementHash) || lower(signed.txHash) === lower(replacementHash) || !Number.isSafeInteger(signed.nonce) || signed.nonce < 0) return null;
+      try {
+        await chainIdentity();
+        const tx = await rpc.getTransaction({ hash: replacementHash });
+        // Only a plain zero-value self-transfer can release the reservation.
+        // A replacement match may itself spend the cap and must remain held.
+        if (!tx || tx.chainId !== config.chainId || !isHash(tx.hash) || lower(tx.hash) !== lower(replacementHash) || lower(tx.from) !== lower(config.wallet.address) || lower(tx.to ?? '') !== lower(config.wallet.address) || tx.nonce !== signed.nonce || tx.value !== 0n || tx.input !== '0x' || tx.authorizationList !== undefined) return null;
+        if (typeof tx.blockNumber !== 'bigint' || tx.blockNumber < 0n || !isHash(tx.blockHash) || typeof tx.transactionIndex !== 'number' || !Number.isSafeInteger(tx.transactionIndex) || tx.transactionIndex < 0) return null;
+        const receipt = await rpc.getTransactionReceipt({ hash: replacementHash });
+        if (!receipt || lower(receipt.transactionHash) !== lower(replacementHash) || lower(receipt.from) !== lower(config.wallet.address) || lower(receipt.to ?? '') !== lower(config.wallet.address) || receipt.blockNumber !== tx.blockNumber || lower(receipt.blockHash) !== lower(tx.blockHash) || receipt.transactionIndex !== tx.transactionIndex || receipt.logs.length !== 0 || (receipt.status !== 'success' && receipt.status !== 'reverted')) return null;
+        const finalized = await rpc.getBlock({ blockTag: 'finalized' });
+        if (!finalized || typeof finalized.number !== 'bigint' || finalized.number < tx.blockNumber || !isHash(finalized.hash)) return null;
+        const inclusion = await rpc.getBlock({ blockNumber: tx.blockNumber });
+        if (!inclusion || inclusion.number !== tx.blockNumber || lower(inclusion.hash) !== lower(tx.blockHash) || lower(inclusion.transactions[tx.transactionIndex] ?? '') !== lower(replacementHash)) return null;
+        // Recheck the exact finalized anchor, not latest: advancement is fine,
+        // but contradictory/reorged evidence must never authorize release.
+        const anchor = await rpc.getBlock({ blockNumber: finalized.number });
+        if (!anchor || anchor.number !== finalized.number || lower(anchor.hash) !== lower(finalized.hash)) return null;
+        return { kind: 'replaced', chainId: config.chainId, wallet: config.wallet.address, nonce: signed.nonce,
+          txHash: signed.txHash, replacementHash, blockNumber: tx.blockNumber.toString(), blockHash: tx.blockHash,
+          finalizedBlockNumber: finalized.number.toString(), finalizedBlockHash: finalized.hash };
+      } catch {
+        // Missing/unknown RPC evidence is a hold, without surfacing raw causes.
+        return null;
+      }
     },
     async receipt(attempt: Attempt): Promise<Omit<OutcomeRecord, 'type' | 'id' | 'at'> | null> {
       if (!attempt.signed) return null;

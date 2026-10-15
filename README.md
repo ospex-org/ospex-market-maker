@@ -16,6 +16,10 @@ It is built on **[`@ospex/sdk`](https://github.com/ospex-org/ospex-sdk)** — ev
 
 Our house wallets are maker A `0x5316fa54c170d1927f30d1a497ac9e85e3826a9b` and the second house wallet `0x16dc5d67d080a5521ef2c79680dbfc2abf724d30`, which will also be the bettor; their activity is ours, not independent demand. We propose taking any maker's public quote when the bettor's price is better than the reference feed, or at most **1.0 percentage point** worse in implied probability, for the same game, market, line and side. The one proposed cap is **1.00 USDC of cumulative stakes across all house wallets**; as of **2026-10-14**, **0.00 USDC placed, 1.00 USDC left**. Winnings do not replenish it. We will update these totals here after each take and before another. No taking starts until Vince approves both numbers, merges this notice and separately orders taking.
 
+## Separate house taker — draft implementation, not activated
+
+`ospex-taker` is an independent, shadow-by-default program for the resolved OSP-69 requirements. It uses the **raw posted reference on the exact bettor side**, a signed percentage-point tolerance, full-size fills, and a durable cumulative-stakes cap. It reads the chain and quote store, never the maker’s state, never takes a house quote, and never runs approvals or controls the maker. See [`docs/HOUSE_TAKER.md`](docs/HOUSE_TAKER.md) and [`ospex-taker.example.yaml`](ospex-taker.example.yaml). This code does not authorize a live run or change the notice above.
+
 ## Current status
 
 What works:

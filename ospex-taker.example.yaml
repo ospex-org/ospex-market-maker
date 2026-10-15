@@ -1,0 +1,43 @@
+# OSP-69: separate house-taker configuration; never use a maker's state directory.
+# All addresses below are PUBLIC SYNTHETIC PLACEHOLDERS, not real operator wallets.
+# Replace them with reviewed addresses and honest labels/controller identities.
+# Do not put private keys, passwords, or other secrets in this file.
+schemaVersion: 1
+mode:
+  dryRun: true  # Live requires BOTH false here and the separate --live CLI flag.
+chainId: 80002  # Explicit: 80002 (testnet) or 137 (mainnet).
+apiUrl: https://api.example.invalid
+rpcUrl: https://rpc.example.invalid
+wallet:
+  address: '0x1111111111111111111111111111111111111111'
+  keystorePath: ./keys/house-taker.json  # Relative to this config file; never a maker keystore.
+
+# Nonempty third-party maker allowlist. Neither house nor taker may appear here.
+makers:
+  - address: '0x2222222222222222222222222222222222222222'
+    label: Synthetic independent maker
+    controller: Independent test operator
+
+# Nonempty exclusion list: record every known house-controlled maker wallet.
+# The taker wallet is always excluded independently, even if not listed here.
+houseWallets:
+  - address: '0x3333333333333333333333333333333333333333'
+    label: Synthetic house maker
+    controller: House test operator
+
+# Raw posted reference on the exact bettor side, NOT a no-vig/fair probability.
+# This 1 pp tolerance is TEST ONLY. For the first live run, set distancePp: 0.
+# Compare signed taker implied probability minus raw reference probability;
+# equality is included, and better prices pass regardless of absolute distance.
+distancePp: 1
+capUSDC: '10.000000'  # Mandatory quoted positive USDC amount, at most 6 decimals.
+# Full quote remainder only: a take exceeding unspent/unreserved cap is skipped,
+# not clipped. The cap covers taker stake, not maker stake; it is not a daily reset.
+minSecondsLeft: 30
+pollIntervalMs: 1000
+# Relative to this config file. A missing journal is NOT silently initialized:
+# use the separate taker CLI's explicit initialization before starting a new run.
+stateDir: ./state/house-taker
+
+# Reference timestamps must be valid, but there is deliberately NO age cutoff.
+# Eight-hour-old unchanged raw posted odds remain a valid reference.

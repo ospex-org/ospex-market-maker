@@ -37,3 +37,4 @@ jobs:
       # smoke: the built CLI runs. (A fuller pack -> install-in-temp-dir -> run
       # `ospex-mm --help` smoke test is a follow-up.)
       - run: node dist/cli/index.js --help
+      - run: node dist/taker/cli.js --help

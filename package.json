@@ -9,11 +9,13 @@
     "node": ">=20.19"
   },
   "bin": {
-    "ospex-mm": "./dist/cli/index.js"
+    "ospex-mm": "./dist/cli/index.js",
+    "ospex-taker": "./dist/taker/cli.js"
   },
   "files": [
     "dist",
     "ospex-mm.example.yaml",
+    "ospex-taker.example.yaml",
     "docs"
   ],
   "scripts": {
@@ -24,6 +26,7 @@
     "lint": "eslint src",
     "dev": "tsx src/cli/index.ts",
     "mm": "node dist/cli/index.js",
+    "taker": "node dist/taker/cli.js",
     "smoke": "node scripts/smoke.mjs",
     "secret-scan": "node scripts/secret-scan.mjs",
     "prepack": "yarn build"
@@ -31,7 +34,8 @@
   "dependencies": {
     "@ospex/sdk": "https://github.com/ospex-org/ospex-sdk/releases/download/v0.16.0/ospex-sdk-0.16.0.tgz",
     "commander": "^14.0.3",
-    "js-yaml": "^4.3.1"
+    "js-yaml": "^4.3.1",
+    "viem": "2.55.10"
   },
   "devDependencies": {
     "@types/js-yaml": "^4.0.9",

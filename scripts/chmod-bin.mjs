@@ -7,7 +7,7 @@
 import { chmodSync, existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
-const target = fileURLToPath(new URL('../dist/cli/index.js', import.meta.url));
-if (existsSync(target)) {
-  chmodSync(target, 0o755);
+for (const entry of ['../dist/cli/index.js', '../dist/taker/cli.js']) {
+  const target = fileURLToPath(new URL(entry, import.meta.url));
+  if (existsSync(target)) chmodSync(target, 0o755);
 }

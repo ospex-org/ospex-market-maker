@@ -1455,7 +1455,7 @@ uri-js@^4.2.2:
   dependencies:
     punycode "^2.1.0"
 
-viem@^2.55.0:
+viem@2.55.10, viem@^2.55.0:
   version "2.55.10"
   resolved "https://registry.yarnpkg.com/viem/-/viem-2.55.10.tgz#e9ddc7f020248210ea282012965a2a2ec0717593"
   integrity sha512-Q9Ba+/ma81U2M5o5P2AQ7Ux8rTIwmCZvUcr8rKdQ22bV0IBFHllM2m5gWDP8hFaUN2nH2oW3QG44amRazflYNQ==

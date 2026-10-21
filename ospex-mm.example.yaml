@@ -1,3 +1,4 @@
+# Read the notice before using Ospex: https://ospex.org/notice — current gaps, what to check, and when to come back.
 # ospex-mm.example.yaml — annotated reference config (v0)
 #
 # Copy this to ospex-mm.yaml, fill in rpcUrl / pricing / risk (wallet only when

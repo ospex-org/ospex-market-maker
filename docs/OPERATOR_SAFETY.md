@@ -1,3 +1,5 @@
+Read [the notice](https://ospex.org/notice) before using Ospex: current gaps, what to check, and when to come back.
+
 # Operator safety
 
 Read this before running the market maker against real funds. It is the safe-operation checklist; the design rationale behind each point is in [`DESIGN.md`](DESIGN.md).

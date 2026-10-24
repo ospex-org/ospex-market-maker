@@ -1,5 +1,7 @@
 # ospex-market-maker
 
+Read [the notice](https://ospex.org/notice) before using Ospex: current gaps, what to check, and when to come back.
+
 A **reference market maker** for [Ospex](https://ospex.org) — a zero-vig peer-to-peer sports prediction protocol on Polygon. Clone it, point it at your wallet, bankroll, RPC URL, and return target, and it quotes two-sided liquidity on upcoming contests, manages its exposure, reacts to fills, settles and claims, and writes an auditable record of everything it did.
 
 It is built on **[`@ospex/sdk`](https://github.com/ospex-org/ospex-sdk)** — every chain and API interaction goes through the SDK; this repo never calls the Ospex contracts directly.
